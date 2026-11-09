@@ -14,7 +14,7 @@ With uv installed and a Python 3.12+ virtual environment activated:
 
 ```bash
 uv pip install --exclude-newer "7 days" --exclude-newer-package certifi=false \
-  "valkyrie-sdk @ git+https://github.com/vals-ai/Valkyrie@prod#subdirectory=packages/valkyrie-sdk"
+  --exclude-newer-package valkyrie-sdk=false valkyrie-sdk
 ```
 
 The SDK doesn't install the CLI. Sign in once with

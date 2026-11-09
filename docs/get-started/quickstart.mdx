@@ -16,9 +16,11 @@ You need:
 ## Install the CLI
 
 ```bash
-uv tool install --force --exclude-newer "7 days" --exclude-newer-package certifi=false \
-  git+https://github.com/vals-ai/Valkyrie@prod
+uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false \
+  --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
 ```
+
+If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
 
 This installs the Valkyrie CLI as `valkyrie`, with the short alias `valk`. To check it,
 run `valkyrie --help`, which lists the commands.
