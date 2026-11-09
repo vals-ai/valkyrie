@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, select
 
@@ -7,6 +8,7 @@ from tracker.database.models import BenchmarkStatus, Org, RunAccessKey
 from tracker.run_access_keys import delete_finished_run_keys
 
 
+@pytest.mark.description("A run access key sweep skips keys another sweep holds.")
 def test_sweep_skips_keys_another_sweep_holds(
     postgres_engine: Engine,
     postgres_session: Session,

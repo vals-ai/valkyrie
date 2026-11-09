@@ -1,55 +1,43 @@
-"""Shared CLI display helpers."""
-
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Callable, Mapping
+import json
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 import click
+from click.decorators import FC
 
-if TYPE_CHECKING:
-    from valkyrie.sdk.models import FailureCategory
+from valkyrie.display import terminal_safe
 
 Page = TypeVar("Page")
 
 
-def terminal_safe(value: str, *, preserve_newlines: bool) -> str:
-    """Escape terminal control characters in user-controlled text."""
-    escaped: list[str] = []
-    for character in value:
-        if character == "\n" and preserve_newlines:
-            escaped.append(character)
-        elif character == "\t":
-            escaped.append("    ")
-        elif character.isprintable():
-            escaped.append(character)
-        else:
-            escaped.append(character.encode("unicode_escape").decode("ascii"))
-
-    return "".join(escaped)
+def format_option(help: str = "Output format.", choices: Sequence[str] = ("text", "json")) -> Callable[[FC], FC]:
+    return click.option(
+        "--format",
+        "output_format",
+        type=click.Choice(list(choices), case_sensitive=False),
+        default="text",
+        show_default=True,
+        help=help,
+    )
 
 
-def group_task_errors(
-    task_errors: Mapping[str, str],
-    task_failure_categories: Mapping[str, FailureCategory] | None = None,
-) -> list[tuple[FailureCategory | None, str, tuple[str, ...]]]:
-    """Group task IDs that share a category and raw message, as `(category, message, task_ids)`.
+def one_line(value: str) -> str:
+    return terminal_safe(value, preserve_newlines=False)
 
-    Task IDs are sorted within each group; groups come largest first, ties broken by first task ID.
-    """
-    categories = task_failure_categories or {}
-    grouped: defaultdict[tuple[FailureCategory | None, str], list[str]] = defaultdict(list)
-    for task_id, message in task_errors.items():
-        grouped[(categories.get(task_id), message)].append(task_id)
 
-    groups = [(category, message, tuple(sorted(task_ids))) for (category, message), task_ids in grouped.items()]
-    return sorted(groups, key=lambda group: (-len(group[2]), group[2][0]))
+def status_label(value: str) -> str:
+    return value.replace("_", " ").title()
+
+
+def compact_json(payload: Mapping[str, object]) -> str:
+    return json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
 
 
 def utc_isoformat(value: datetime | None = None) -> str:
-    """Format a datetime (default: now) as a UTC ISO-8601 string ending in Z."""
     value = value or datetime.now(timezone.utc)
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -61,12 +49,10 @@ def progress_percent(finished_tasks: int, total_tasks: int) -> float:
 
 
 def local_time(dt: datetime) -> str:
-    """Convert UTC time to users local time."""
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def short_local_time(dt: datetime, include_date: bool = True) -> str:
-    """Convert UTC time to a short local time string."""
     fmt = "%m/%d %H:%M" if include_date else "%H:%M"
     return dt.astimezone().strftime(fmt)
 
@@ -79,7 +65,6 @@ def format_table(
     total_count: int | None = None,
     item_name: str = "item",
 ) -> None:
-    """Render rows as a padded CLI table."""
     if not rows:
         click.echo(click.style(f"No {item_name}s found.", fg="yellow"))
         return
@@ -115,13 +100,19 @@ def format_table(
     click.echo(separator)
 
     total_text = f"Total: {total_count} {item_name}(s)"
-    if total_pages > 1:
+    if total_pages > 1 and not _interactive_terminal():
+        click.echo(f"{total_text}, page {current_page}/{total_pages} (paging needs a terminal)")
+    elif total_pages > 1:
         nav_text_raw = f"[h] ← prev  {current_page}/{total_pages}  next → [l]  [q] quit"
         nav_text = click.style(nav_text_raw, fg="bright_black")
         padding = len(separator) - len(total_text) - len(nav_text_raw)
         click.echo(f"{total_text}{' ' * padding}{nav_text}")
     else:
         click.echo(total_text)
+
+
+def _interactive_terminal() -> bool:
+    return all(stream is not None and stream.isatty() for stream in (sys.stdin, sys.stdout))
 
 
 def _clear_pager() -> None:
@@ -135,20 +126,18 @@ def paginate_cli_pages(
     limit: int,
     render_empty: Callable[[], None],
 ) -> None:
-    """Page through CLI rows with h/l/q navigation."""
     current_page = 1
+    interactive = _interactive_terminal()
 
     while True:
-        offset = (current_page - 1) * limit
-        total_count, page = load_page(offset, limit)
+        total_count, page = load_page((current_page - 1) * limit, limit)
         total_pages = max(1, (total_count + limit - 1) // limit)
-        while current_page > total_pages:
+        if current_page > total_pages:
             current_page = total_pages
-            offset = (current_page - 1) * limit
-            total_count, page = load_page(offset, limit)
-            total_pages = max(1, (total_count + limit - 1) // limit)
+            continue
 
-        _clear_pager()
+        if interactive:
+            _clear_pager()
 
         if total_count == 0:
             render_empty()
@@ -156,13 +145,10 @@ def paginate_cli_pages(
 
         render_page(page, current_page, total_pages, total_count)
 
-        if total_pages <= 1:
+        if total_pages <= 1 or not interactive:
             break
 
-        try:
-            char = click.getchar()
-        except OSError as error:
-            raise click.ClickException(str(error)) from error
+        char = click.getchar()
 
         if char == "l" and current_page < total_pages:
             current_page += 1

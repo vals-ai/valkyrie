@@ -1,5 +1,3 @@
-"""Provider-neutral secret reads and reference resolution."""
-
 from typing import Protocol, TypeAlias
 
 from benchmark_service import SandboxProviderConfig, sandbox_provider_config_from_mapping
@@ -15,14 +13,12 @@ TENANT_SECRET_ROOT = "valkyrie/tenants/"
 
 
 def secret_display_name(name: str) -> str:
-    """Name a secret as its organization knows it, without the tenant prefix the platform adds."""
     if not name.startswith(TENANT_SECRET_ROOT):
         return name
     return name.removeprefix(TENANT_SECRET_ROOT).partition("/")[2] or name
 
 
 def sandbox_provider_config_from_secret(secret: SecretValue, provider_type: str) -> SandboxProviderConfig:
-    """Validate a provider secret and apply the selected provider type."""
     if not isinstance(secret, dict):
         raise InvalidSandboxConfigurationError("Expected sandbox provider secret to be a JSON object")
     try:
@@ -35,15 +31,11 @@ def sandbox_provider_config_from_secret(secret: SecretValue, provider_type: str)
 
 
 class SecretStore(Protocol):
-    """Asynchronous access to named secret values."""
-
     async def get(self, name: str) -> SecretValue:
-        """Return decoded JSON, or the raw string when the value is not JSON."""
         raise NotImplementedError
 
 
 async def resolve_secrets(secrets: dict[str, str], secret_store: SecretStore) -> dict[str, str]:
-    """Resolve environment-variable secret references to their current values."""
     resolved: dict[str, str] = {}
     for env_name, secret_name in secrets.items():
         secret_value = await secret_store.get(secret_name)

@@ -1,8 +1,3 @@
-"""Local credential scoping and literal file values.
-
-Run: pytest tests/unit/local/test_secrets.py
-"""
-
 from pathlib import Path
 
 import pytest
@@ -12,9 +7,9 @@ from tracker.local.secrets import InMemorySecretStore, load_execution_secrets
 from tracker.runtime.secrets import resolve_secrets
 
 
+@pytest.mark.description("Only declared keys enter the transient per-run store.")
 class TestLocalSecrets:
-    """Only declared keys enter the transient per-run store."""
-
+    @pytest.mark.description("Grouped secret references leave out undeclared values.")
     async def test_grouped_references_exclude_undeclared_values(self) -> None:
         references = {"FIRST_KEY": "shared", "SECOND_KEY": "shared", "THIRD_KEY": "other"}
         declared = {"FIRST_KEY": "first", "SECOND_KEY": "second", "THIRD_KEY": "third"}
@@ -26,10 +21,12 @@ class TestLocalSecrets:
         with pytest.raises(SecretsError, match="no values for secret reference 'UNDECLARED'"):
             await store.get("UNDECLARED")
 
+    @pytest.mark.description("A secret store missing declared keys fails to build and names every missing key.")
     def test_missing_declared_keys_fail_before_store_is_available(self) -> None:
         with pytest.raises(SecretsError, match="missing keys: FIRST_KEY, SECOND_KEY"):
             InMemorySecretStore({"SECOND_KEY": "shared", "FIRST_KEY": "shared"}, {"UNDECLARED": "private"})
 
+    @pytest.mark.description("A `${VAR}` in a secrets file stays literal, and undeclared keys are dropped.")
     def test_file_values_do_not_expand_host_credentials(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOST_ONLY_SECRET", "must-not-leak")
         source = tmp_path / "run.env"
@@ -39,6 +36,7 @@ class TestLocalSecrets:
 
         assert values == {"MODEL_KEY": "${HOST_ONLY_SECRET}"}
 
+    @pytest.mark.description("Optional secret files may be missing, and required ones may not.")
     def test_optional_and_missing_secret_files(self, tmp_path: Path) -> None:
         missing = tmp_path / "missing.env"
 

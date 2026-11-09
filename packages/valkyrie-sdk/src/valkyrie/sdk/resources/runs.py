@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
-from pathlib import Path
 from collections.abc import AsyncIterator, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from uuid import UUID
 
-from valkyrie.sdk.output_archive import extract_output_archive
 from valkyrie.sdk._sse import error_detail, server_sent_events
-from valkyrie.sdk.errors import ValkyrieRunError, ValkyrieStreamError
+from valkyrie.sdk._transfer import finish_before_cancelling
+from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieRunError, ValkyrieStreamError
 from valkyrie.sdk.models import (
     AgentContractRequest,
     AnalyzeBenchmarkRequest,
@@ -31,6 +31,7 @@ from valkyrie.sdk.models import (
     ProjectResponse,
     RunStreamEvent,
     S3UploadResultsResponse,
+    RunMonitoring,
     StartBenchmarkRequest,
     StartBenchmarkResponse,
     StopBenchmarkResponse,
@@ -39,6 +40,7 @@ from valkyrie.sdk.models import (
     UpdateBenchmarkConcurrencyRequest,
     UpdateBenchmarkConcurrencyResponse,
 )
+from valkyrie.sdk.output_archive import extract_output_archive
 
 if TYPE_CHECKING:
     from valkyrie.sdk.client import ValkyrieClient
@@ -70,6 +72,7 @@ class RunsResource:
         service_headers: Mapping[str, str] | None = None,
         ignore_custom_services: bool = False,
         project: str | None = None,
+        monitoring: RunMonitoring | None = None,
     ) -> StartBenchmarkResponse:
         """Start a run from an uploaded agent name or complete contract, in the project whose handle is ``project``."""
         if concurrency < 1:
@@ -98,6 +101,7 @@ class RunsResource:
             sandbox_provider=provider,
             ignore_custom_services=ignore_custom_services,
             project=project,
+            monitoring=monitoring,
         )
         return await self._sdk.request_model(
             "POST",
@@ -136,7 +140,7 @@ class RunsResource:
         """
         request = request or FetchBenchmarksRequest()
         if request.offset:
-            raise ValueError("Run iteration uses cursors; use list() for offset pagination")
+            raise ValkyrieInputError("Run iteration uses cursors; use list() for offset pagination")
         cursor = request.cursor or ""
         seen: set[str] = set()
         while True:
@@ -165,7 +169,8 @@ class RunsResource:
     async def events(self, run_id: UUID) -> AsyncIterator[RunStreamEvent]:
         """Yield each update, then the `complete`, `error` or `disconnect` event that ends the stream.
 
-        If the body ends without one of those, iteration stops after the last update.
+        Events with other names are skipped. If the body ends without one of those, iteration stops
+        after the last update.
         """
         async with self._sdk.stream_response(
             "GET",
@@ -214,9 +219,7 @@ class RunsResource:
         upload_to_s3: bool = False,
     ) -> RetrieveResultsResponse:
         """Fetch final results or upload them and return S3 links."""
-        params: dict[str, Any] = {"benchmark_id": str(run_id), "s3": upload_to_s3}
-        if task_ids:
-            params["task_ids"] = list(task_ids)
+        params = {"benchmark_id": str(run_id), "s3": upload_to_s3, **_task_ids_param(task_ids)}
         response_model = S3UploadResultsResponse if upload_to_s3 else FinalViewResponse
         return await self._sdk.request_model("GET", "/retrieve-results", response_model, params=params)
 
@@ -227,9 +230,7 @@ class RunsResource:
         task_ids: Sequence[str] | None = None,
     ) -> S3UploadResultsResponse:
         """Archive the current S3 results, replace them with a fresh snapshot, and run the optional callback."""
-        params: dict[str, Any] = {"benchmark_id": str(run_id)}
-        if task_ids:
-            params["task_ids"] = list(task_ids)
+        params = {"benchmark_id": str(run_id), **_task_ids_param(task_ids)}
         return await self._sdk.request_model("GET", "/preview-results", S3UploadResultsResponse, params=params)
 
     async def metadata(self, run_id: UUID) -> FetchBenchmarkMetadataResponse:
@@ -288,13 +289,10 @@ class RunsResource:
         task_ids: Sequence[str] | None = None,
     ) -> AsyncIterator[bytes]:
         """Yield chunks from the tar archive containing run outputs."""
-        params: dict[str, Any] = {}
-        if task_ids:
-            params["task_ids"] = list(task_ids)
         async with self._sdk.stream_response(
             "GET",
             f"/fetch-run-outputs/{run_id}",
-            params=params,
+            params=_task_ids_param(task_ids),
         ) as response:
             async for chunk in response.aiter_bytes():
                 yield chunk
@@ -315,7 +313,7 @@ class RunsResource:
         Positive limits bound the downloaded archive, expanded bytes, and total member count.
         """
         if min(max_archive_bytes, max_expanded_bytes, max_entries) <= 0:
-            raise ValueError("Output archive limits must be positive")
+            raise ValkyrieInputError("Output archive limits must be positive")
         output_dir = Path(output_dir)
         if await asyncio.to_thread(lambda: output_dir.exists() or output_dir.is_symlink()):
             raise FileExistsError(f"Output directory already exists: {output_dir}")
@@ -330,7 +328,7 @@ class RunsResource:
             await asyncio.to_thread(output_dir.parent.mkdir, parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=output_dir.parent) as temporary:
                 staging = Path(temporary) / "outputs"
-                extraction = asyncio.create_task(
+                await finish_before_cancelling(
                     asyncio.to_thread(
                         extract_output_archive,
                         stream,
@@ -339,30 +337,13 @@ class RunsResource:
                         max_entries=max_entries,
                     )
                 )
-                try:
-                    await asyncio.shield(extraction)
-                except asyncio.CancelledError:
-                    completion = asyncio.gather(extraction, return_exceptions=True)
-                    while not completion.done():
-                        try:
-                            await asyncio.shield(completion)
-                        except asyncio.CancelledError:
-                            continue
-                    raise
 
                 def publish() -> Path:
                     if output_dir.exists() or output_dir.is_symlink():
                         raise FileExistsError(f"Output directory already exists: {output_dir}")
                     return staging.rename(output_dir)
 
-                # Once publication starts, return its result even if cancellation arrives during the rename.
-                publication = asyncio.create_task(asyncio.to_thread(publish))
-                while not publication.done():
-                    try:
-                        await asyncio.shield(publication)
-                    except asyncio.CancelledError:
-                        continue
-                return publication.result()
+                return await finish_before_cancelling(asyncio.to_thread(publish))
 
     async def update_concurrency(self, run_id: UUID, *, concurrency: int) -> UpdateBenchmarkConcurrencyResponse:
         """Change an active run's concurrency limit. Existing tasks continue running."""
@@ -474,7 +455,6 @@ class RunsResource:
         benchmark_url: str | None,
         lambda_function: str | None,
     ) -> RetryOrResumeBenchmarkResponse:
-        """Send a retry or resume request."""
         if concurrency is not None and concurrency < 1:
             raise ValkyrieRunError("concurrency must be greater than 0")
 
@@ -510,7 +490,6 @@ class RunsResource:
         agent_kwargs: Mapping[str, str] | None,
         secrets: Mapping[str, str] | None,
     ) -> AgentContractRequest:
-        """Build an agent contract request."""
         if isinstance(agent, str):
             if not agent.strip():
                 raise ValkyrieRunError("agent must not be blank")
@@ -527,12 +506,16 @@ class RunsResource:
         return contract.model_copy(update=updates)
 
 
+def _task_ids_param(task_ids: Sequence[str] | None) -> dict[str, Any]:
+    return {"task_ids": list(task_ids)} if task_ids else {}
+
+
 def _run_stream_event(event_name: str, data: str) -> RunStreamEvent | None:
     if event_name == "error":
         return RunStreamEvent(event="error", detail=str(error_detail(data, "error")))
     if event_name in {"complete", "disconnect"}:
         return RunStreamEvent.model_validate({"event": event_name})
-    if not data:
+    if event_name not in {"", "message", "update"} or not data:
         return None
     try:
         return RunStreamEvent(event="update", run=FetchBenchmarkResponse.model_validate_json(data))

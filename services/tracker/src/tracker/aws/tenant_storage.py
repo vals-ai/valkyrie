@@ -1,5 +1,3 @@
-"""Give every hosted organization its own S3 bucket."""
-
 import hashlib
 from typing import TYPE_CHECKING, cast
 
@@ -10,6 +8,7 @@ from sqlmodel import Session
 from tracker import config
 from tracker.aws.tags import ORG_ID_TAG
 from tracker.database.models import Org
+from tracker.repositories.organization import OrganizationRepository
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -18,11 +17,10 @@ if TYPE_CHECKING:
 
 
 class TenantBucketError(RuntimeError):
-    """The organization's bucket could not be named or created."""
+    pass
 
 
 def tenant_bucket_name(org_name: str) -> str:
-    """Name an organization's bucket from a hash of its tenant name."""
     prefix = config.AWS_TENANT_BUCKET_PREFIX
     if not prefix:
         raise TenantBucketError("AWS_TENANT_BUCKET_PREFIX is not configured")
@@ -30,31 +28,22 @@ def tenant_bucket_name(org_name: str) -> str:
 
 
 def ensure_org_bucket(session: Session, org: Org) -> str:
-    """Return the organization's bucket, creating and recording one the first time it is needed."""
     if org.storage_key:
         return org.storage_key
 
     bucket = tenant_bucket_name(org.name)
     _create_bucket(bucket, org)
-    org.storage_key = bucket
-    session.add(org)
-    session.commit()
-    session.refresh(org)
+    OrganizationRepository(session).set_storage_key(org, bucket)
     return bucket
 
 
 def ensure_managed_org_bucket(session: Session, org: Org) -> None:
-    """Create the organization's bucket on a deployment with tenant buckets, if it has none yet."""
     if org.storage_key or not config.AWS_TENANT_BUCKET_PREFIX:
         return
     ensure_org_bucket(session, org)
 
 
 def _ensure_org_tag(s3: "S3Client", bucket: str, org: Org, account_id: str) -> None:
-    """Tag a bucket an earlier attempt left untagged; refuse one tagged for another organization.
-
-    Runs after every create, because us-east-1 answers 200 when re-creating a bucket we already own.
-    """
     try:
         tags = s3.get_bucket_tagging(Bucket=bucket, ExpectedBucketOwner=account_id)["TagSet"]
     except ClientError as error:
@@ -96,7 +85,6 @@ def _create_bucket(bucket: str, org: Org) -> None:
                 raise
         _ensure_org_tag(s3, bucket, org, account_id)
 
-        # Match the deployment bucket: versioned, with old versions and abandoned uploads cleaned up.
         s3.put_bucket_versioning(
             Bucket=bucket, VersioningConfiguration={"Status": "Enabled"}, ExpectedBucketOwner=account_id
         )

@@ -1,5 +1,3 @@
-"""Run with `uv run pytest tests/unit/executor/test_dispatch_recovery.py`."""
-
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from threading import Event
@@ -23,11 +21,13 @@ from tracker.database.models import (
     Task,
     TaskStatus,
 )
+from tracker.egress_proxy.policy import PolicyStore
 from tracker.executor import dispatch_recovery
 from tracker.executor.dispatch_payload import generate_payload_key, seal_payload
 from tracker.executor.release_control import create_executor_dispatch, pin_benchmark_to_release, register_release
 
 
+@pytest.mark.description("Dispatch recovery sweeps only payloads outside the queue.")
 @pytest.mark.parametrize(
     "terminal_status",
     [ExecutorDispatchStatus.FAILED, ExecutorDispatchStatus.FINISHED, ExecutorDispatchStatus.RUNNING],
@@ -85,6 +85,7 @@ def test_recovery_sweeps_only_nonqueued_payloads(
     assert database_session.get(ExecutorDispatchPayload, nonqueued.id) is None
 
 
+@pytest.mark.description("The recovery loop tries again after a failed pass.")
 def test_recovery_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -> None:
     stop_event = Event()
     attempts = 0
@@ -98,7 +99,14 @@ def test_recovery_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -> 
         return 1
 
     logger = Mock()
+
+    def skip_policy_sweep(_store: PolicyStore) -> int:
+        return 0
+
     monkeypatch.setattr(dispatch_recovery, "reconcile_dispatches_once", reconcile)
+
+    monkeypatch.setattr(dispatch_recovery, "report_unowned_pending_tasks", lambda: None)
+    monkeypatch.setattr(PolicyStore, "revoke_finished", skip_policy_sweep)
     monkeypatch.setattr(dispatch_recovery, "_logger", logger)
 
     dispatch_recovery.run_dispatch_recovery_loop(stop_event, interval_seconds=0)
@@ -110,6 +118,7 @@ def test_recovery_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -> 
     )
 
 
+@pytest.mark.description("Automatic recovery starts and stops its own thread.")
 def test_automatic_recovery_starts_and_stops_owned_thread(monkeypatch: MonkeyPatch) -> None:
     events: list[str] = []
 
@@ -149,6 +158,7 @@ def test_automatic_recovery_starts_and_stops_owned_thread(monkeypatch: MonkeyPat
     assert events == ["started", "joined"]
 
 
+@pytest.mark.description("Automatic recovery logs when its thread does not stop.")
 def test_automatic_recovery_logs_if_owned_thread_does_not_stop(monkeypatch: MonkeyPatch) -> None:
     logger = Mock()
 
@@ -176,6 +186,9 @@ def test_automatic_recovery_logs_if_owned_thread_does_not_stop(monkeypatch: Monk
     )
 
 
+@pytest.mark.description(
+    "Recovery fails a dispatch whose ECS task stopped and saves the stop reason, such as an out of memory kill."
+)
 @pytest.mark.parametrize(
     ("dispatch_status", "last_status"),
     [
@@ -265,6 +278,7 @@ def test_recovery_fails_dispatches_whose_task_stopped(
         assert "OutOfMemoryError: Container killed due to memory usage" in error.error_message
 
 
+@pytest.mark.description("An expired launch with no saved ARN recovers during an ECS outage.")
 def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
     database_session: Session, example_benchmark_object: Benchmark, monkeypatch: MonkeyPatch
 ) -> None:
@@ -298,3 +312,56 @@ def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
     assert lost_launch.status == ExecutorDispatchStatus.FAILED
     assert lost_launch.failure_reason == "CLAIM_DEADLINE_EXPIRED"
     assert other_launch.status == ExecutorDispatchStatus.QUEUED
+
+
+@pytest.mark.description(
+    "A PENDING task whose retry dispatch failed is reported every pass. One a live dispatch lists is not."
+)
+def test_recovery_flags_pending_tasks_whose_dispatch_failed(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    release = ExecutorRelease(
+        id="stranded-release",
+        artifact_uri="source:///artifacts/runner",
+        artifact_digest="a" * 64,
+        protocol_version="3",
+    )
+    benchmark = example_benchmark_object
+    register_release(database_session, release)
+    pin_benchmark_to_release(benchmark, release)
+    start = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["task-a", "task-b"]
+    )
+    start.status = ExecutorDispatchStatus.RUNNING
+    start.started_at = datetime.now(UTC)
+    start.lease_expires_at = datetime.now(UTC) + timedelta(hours=1)
+    retry = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.RETRY, dispatch_id=uuid4(), task_ids=["task-a"]
+    )
+    retry.created_at = start.created_at + timedelta(minutes=5)
+    retry.status = ExecutorDispatchStatus.FAILED
+    retry.failure_reason = "CLAIM_DEADLINE_EXPIRED"
+    tasks = [
+        Task(org_id=benchmark.org_id, benchmark=benchmark.id, task_id="task-a", status=TaskStatus.PENDING),
+        Task(org_id=benchmark.org_id, benchmark=benchmark.id, task_id="task-b", status=TaskStatus.PENDING),
+    ]
+    database_session.add_all([benchmark, start, retry, *tasks])
+    database_session.commit()
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
+    monkeypatch.setattr(dispatch_recovery, "engine", database_session.get_bind())
+
+    warning = Mock()
+    monkeypatch.setattr(dispatch_recovery._logger, "warning", warning)  # pyright: ignore[reportPrivateUsage]
+
+    assert dispatch_recovery.reconcile_dispatches_once() == 0
+    assert warning.call_count == 0
+
+    dispatch_recovery.report_unowned_pending_tasks()
+    assert warning.call_count == 1
+    message, *args = warning.call_args.args
+    assert message % tuple(args) == (
+        f"Run {benchmark.id} has 1 PENDING task(s) that no active executor dispatch will run: task-a"
+    )
+    assert warning.call_args.kwargs["extra"]["event"] == "pending_tasks_without_executor"

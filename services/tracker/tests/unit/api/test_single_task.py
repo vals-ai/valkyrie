@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/unit/api/test_single_task.py`.
-
-Cover task details and artifact-link behavior.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -34,17 +29,20 @@ from tracker.database.models import (
 _client = TestClient(app)
 
 
+@pytest.mark.description(
+    (
+        "Task detail must expose the latest terminal result without leaking another organization.\n"
+        "\n"
+        "Test cases:\n"
+        "- Finished, error, and pending tasks return status-appropriate result fields.\n"
+        "- The newest terminal result wins when a newer scheduled-retry row exists.\n"
+        "- A benchmark from another organization returns 404."
+    )
+)
 def test_single_task_returns_latest_terminal_result_and_enforces_org_scope(
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    """Task detail must expose the latest terminal result without leaking another organization.
-
-    Test cases:
-    - Finished, error, and pending tasks return status-appropriate result fields.
-    - The newest terminal result wins when a newer scheduled-retry row exists.
-    - A benchmark from another organization returns 404.
-    """
     now = datetime.now(ZoneInfo("UTC"))
     benchmark = example_benchmark_object
     database_session.add(benchmark)
@@ -161,6 +159,16 @@ def test_single_task_returns_latest_terminal_result_and_enforces_org_scope(
     assert other_org_response.status_code == 404
 
 
+@pytest.mark.description(
+    (
+        "Artifact detail must return useful links without signing a missing output archive.\n"
+        "\n"
+        "Test cases:\n"
+        "- Existing output receives a five-minute presigned URL and CloudWatch link.\n"
+        "- Missing output returns no S3 URL and does not call the signer again.\n"
+        "- Renamed task streams link to the run instead of guessing the historical encoding."
+    )
+)
 @pytest.mark.parametrize("task_id", ["task-with-output", "task:with-output", "task*with-output", "task%with-output"])
 def test_task_artifacts_only_presign_existing_output(
     task_id: str,
@@ -168,13 +176,6 @@ def test_task_artifacts_only_presign_existing_output(
     example_benchmark_object: Benchmark,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Artifact detail must return useful links without signing a missing output archive.
-
-    Test cases:
-    - Existing output receives a five-minute presigned URL and CloudWatch link.
-    - Missing output returns no S3 URL and does not call the signer again.
-    - Renamed task streams link to the run instead of guessing the historical encoding.
-    """
     benchmark = example_benchmark_object
     task = make_task(benchmark, task_id)
     database_session.add_all([benchmark, task])
@@ -212,6 +213,7 @@ def test_task_artifacts_only_presign_existing_output(
     assert create_presigned_url.await_count == 1
 
 
+@pytest.mark.description("Run artifacts are scoped to the run, and storage errors map to HTTP statuses.")
 @pytest.mark.parametrize("task_id", ["task", "task:one"])
 def test_run_artifacts_are_scoped_and_storage_errors_are_mapped(
     task_id: str,
@@ -281,16 +283,19 @@ def test_run_artifacts_are_scoped_and_storage_errors_are_mapped(
         )
 
 
+@pytest.mark.description(
+    (
+        "Serve local output over HTTP while enforcing organization and path boundaries.\n"
+        "\n"
+        "Test cases:\n"
+        "- Task and run download links return the existing artifact bytes.\n"
+        "- Traversal and symlink escapes fail without exposing files.\n"
+        "- Other organizations, unauthenticated requests, and missing files cannot download."
+    )
+)
 def test_local_task_artifacts_use_existing_files(
     database_session: Session, example_benchmark_object: Benchmark, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Serve local output over HTTP while enforcing organization and path boundaries.
-
-    Test cases:
-    - Task and run download links return the existing artifact bytes.
-    - Traversal and symlink escapes fail without exposing files.
-    - Other organizations, unauthenticated requests, and missing files cannot download.
-    """
     benchmark = example_benchmark_object
     benchmark.arguments = LocalBenchmarkArguments.model_validate(
         {

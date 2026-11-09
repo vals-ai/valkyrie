@@ -27,8 +27,9 @@ from tracker.exceptions import TrackerServiceError
 from tracker.executor.dependencies import get_execution_runtime
 from tracker.local.resources import LocalResources
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
-from tracker.utils import process_benchmark, start_benchmark_request_to_benchmark
-from tracker.utils.run_orchestration import (
+from tracker.services.runs.start import process_benchmark
+from tracker.services.benchmarks import start_benchmark_request_to_benchmark
+from tracker.services.runs.start import (
     _parse_queued_execution,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -84,6 +85,7 @@ def _persist_benchmark(
     return benchmark
 
 
+@pytest.mark.description("Rebuilding a saved request needs a provider secret.")
 def test_persisted_request_reconstruction_requires_a_provider_secret(
     contract: AgentContractRequest,
     database_session: Session,
@@ -95,6 +97,7 @@ def test_persisted_request_reconstruction_requires_a_provider_secret(
         managed_benchmark.managed_start_benchmark_request()
 
 
+@pytest.mark.description("An AWS run without a provider secret cannot be created.")
 def test_benchmark_creation_rejects_aws_runs_without_a_provider_secret(
     contract: AgentContractRequest,
     database_session: Session,
@@ -106,6 +109,7 @@ def test_benchmark_creation_rejects_aws_runs_without_a_provider_secret(
         _persist_benchmark(database_session, invalid_managed_request)
 
 
+@pytest.mark.description("The Taskiq adapter needs an execution context.")
 def test_taskiq_adapter_requires_execution_context(contract: AgentContractRequest) -> None:
     request = RunExecutionRequest(
         contract=contract,
@@ -123,6 +127,9 @@ def test_taskiq_adapter_requires_execution_context(contract: AgentContractReques
         )
 
 
+@pytest.mark.description(
+    "A v2 execution envelope parses into the request, run ID, and verified task IDs, and other versions are refused."
+)
 def test_execution_payload_parser_accepts_v2_envelope_only(contract: AgentContractRequest) -> None:
     request = _managed_request(contract)
     benchmark_id = uuid4()
@@ -139,6 +146,7 @@ def test_execution_payload_parser_accepts_v2_envelope_only(contract: AgentContra
     assert execution.verified_task_ids == _TASK_IDS
 
 
+@pytest.mark.description("The Taskiq adapter keeps queued local jobs as they are.")
 async def test_taskiq_adapter_preserves_queued_local_jobs(
     contract: AgentContractRequest, database_session: Session, tmp_path: Path
 ) -> None:
@@ -172,6 +180,7 @@ async def test_taskiq_adapter_preserves_queued_local_jobs(
     assert runtime.sandbox_provider == "docker"
 
 
+@pytest.mark.description("A queued execution with mixed or incomplete managed context raises `ValueError`.")
 def test_taskiq_adapter_rejects_mixed_and_invalid_managed_inputs(contract: AgentContractRequest) -> None:
     request = _managed_request(contract)
     benchmark_id = uuid4()
@@ -193,6 +202,7 @@ def test_taskiq_adapter_rejects_mixed_and_invalid_managed_inputs(contract: Agent
         _parse_queued_execution(None, None, None, context_without_provider)
 
 
+@pytest.mark.description("A queued execution that fails to parse marks the run as an error.")
 async def test_queued_execution_parse_failure_marks_run_error(
     contract: AgentContractRequest,
     database_session: Session,
@@ -210,6 +220,7 @@ async def test_queued_execution_parse_failure_marks_run_error(
     assert "Queued managed execution context is invalid" in (benchmark.error_message or "")
 
 
+@pytest.mark.description("An access key execution for a managed run marks the run as an error.")
 async def test_access_key_execution_for_managed_row_marks_run_error(
     contract: AgentContractRequest,
     database_session: Session,
@@ -231,6 +242,9 @@ async def test_access_key_execution_for_managed_row_marks_run_error(
     assert "benchmark request requires an execution context" in (benchmark.error_message or "")
 
 
+@pytest.mark.description(
+    "When managed storage is unavailable the run ends `ERROR` and a `run.finalized` span records it."
+)
 async def test_unavailable_managed_storage_marks_run_error(
     contract: AgentContractRequest,
     database_session: Session,
@@ -250,7 +264,8 @@ async def test_unavailable_managed_storage_marks_run_error(
         return MagicMock()
 
     monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", reject_managed_runtime)
-    monkeypatch.setattr("tracker.utils.run_orchestration.observability_span", record_span)
+    monkeypatch.setattr("tracker.services.runs.start.observability_span", record_span)
+    monkeypatch.setattr("tracker.services.runs.finalize.observability_span", record_span)
 
     await process_benchmark(
         execution_context_json=_execution_context(request, benchmark.id),
@@ -265,6 +280,7 @@ async def test_unavailable_managed_storage_marks_run_error(
     assert finalized_span["status"] == "ERROR"
 
 
+@pytest.mark.description("A managed execution completes on the deployment runtime.")
 @pytest.mark.parametrize("version", [2, 3])
 async def test_managed_execution_completes_with_the_deployment_runtime(
     version: int,
@@ -326,15 +342,15 @@ async def test_managed_execution_completes_with_the_deployment_runtime(
     monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", create_log_group)
     monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", fetch_provider)
     monkeypatch.setattr("tracker.aws.services.resolve_secrets", resolve_agent_secrets)
-    monkeypatch.setattr("tracker.utils.task_execution.resolve_secrets", resolve_agent_secrets)
+    monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", resolve_agent_secrets)
     monkeypatch.setattr("tracker.aws.services.dry_run_lambda", dry_run)
     monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.put_bytes", upload_results)
     monkeypatch.setattr("tracker.aws.services.invoke_lambda", invoke_post_run)
-    monkeypatch.setattr("tracker.utils.run_orchestration.observability_span", record_span)
+    monkeypatch.setattr("tracker.services.runs.start.observability_span", record_span)
+    monkeypatch.setattr("tracker.services.runs.finalize.observability_span", record_span)
 
     execution_context = _execution_context(request, benchmark.id)
     execution_context["version"] = version
-    # A resume may change stored inputs while this job is queued; the queued job must still run.
     benchmark.arguments = benchmark.arguments.model_copy(update={"concurrency": 20})
     database_session.add(benchmark)
     database_session.commit()
@@ -350,6 +366,7 @@ async def test_managed_execution_completes_with_the_deployment_runtime(
     assert finalized_span["status"] == "FINISHED"
 
 
+@pytest.mark.description("Managed execution checks its AWS dependencies in order before it starts.")
 async def test_managed_execution_preflight_checks_aws_dependencies_in_order(
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,
@@ -395,6 +412,7 @@ async def test_managed_execution_preflight_checks_aws_dependencies_in_order(
     assert calls == ["logs", "agent_secrets", "lambda", "sandbox_provider_secret"]
 
 
+@pytest.mark.description("A failed managed log preflight marks the run `ERROR` without creating a sandbox.")
 async def test_managed_preflight_failure_happens_before_sandbox(
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,
@@ -415,7 +433,7 @@ async def test_managed_preflight_failure_happens_before_sandbox(
 
     monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", deployment_runtime)
     monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", fail_log_preflight)
-    monkeypatch.setattr("tracker.utils.task_execution.create_sandbox", create_sandbox)
+    monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", create_sandbox)
 
     await process_benchmark(
         execution_context_json=_execution_context(request, benchmark.id),
@@ -428,6 +446,7 @@ async def test_managed_preflight_failure_happens_before_sandbox(
     create_sandbox.assert_not_awaited()
 
 
+@pytest.mark.description("Invalid saved storage marks the run `ERROR` before the runtime is built.")
 @pytest.mark.parametrize(
     ("version", "saved_bucket", "queued_bucket", "error"),
     [
@@ -465,6 +484,9 @@ async def test_managed_execution_rejects_invalid_saved_storage_before_runtime(
     runtime.assert_not_awaited()
 
 
+@pytest.mark.description(
+    "Queued resources that differ from the deployment are refused without reading deployment AWS settings."
+)
 async def test_runtime_factory_rejects_queued_resources_before_aws(
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,

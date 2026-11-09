@@ -1,5 +1,3 @@
-"""Behavioral tests for per-organization S3 buckets."""
-
 import hashlib
 from typing import Any
 from unittest.mock import MagicMock
@@ -45,13 +43,16 @@ def _org(session: Session, name: str, storage_key: str | None = None) -> Org:
     return org
 
 
+@pytest.mark.description(
+    (
+        "Bucket names never contain the tenant name and stay under S3's 63-character limit.\n"
+        "\n"
+        "Test cases:\n"
+        "- The name is the configured prefix plus the first 16 hex characters of the tenant name's SHA-256.\n"
+        "- Different tenants get different buckets."
+    )
+)
 def test_bucket_name_hashes_the_tenant_name() -> None:
-    """Bucket names never contain the tenant name and stay under S3's 63-character limit.
-
-    Test cases:
-    - The name is the configured prefix plus the first 16 hex characters of the tenant name's SHA-256.
-    - Different tenants get different buckets.
-    """
     name = tenant_bucket_name("acme.example")
 
     assert name == f"{_PREFIX}-{hashlib.sha256(b'acme.example').hexdigest()[:16]}"
@@ -60,6 +61,7 @@ def test_bucket_name_hashes_the_tenant_name() -> None:
     assert tenant_bucket_name("other.example") != name
 
 
+@pytest.mark.description("A tenant bucket name needs the configured prefix.")
 def test_bucket_name_requires_the_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "AWS_TENANT_BUCKET_PREFIX", None)
 
@@ -67,14 +69,17 @@ def test_bucket_name_requires_the_prefix(monkeypatch: pytest.MonkeyPatch) -> Non
         tenant_bucket_name("acme.example")
 
 
+@pytest.mark.description(
+    (
+        "A tenant's first bucket matches the deployment bucket's settings and is saved on the org row.\n"
+        "\n"
+        "Test cases:\n"
+        "- The bucket is created tagged with the org id, versioned, given a lifecycle rule, and has ABAC turned on.\n"
+        "- Every configuration call checks the expected bucket owner.\n"
+        "- A second call returns the recorded bucket without calling S3 again."
+    )
+)
 def test_new_tenant_gets_a_configured_bucket_recorded_on_its_org(database_session: Session, s3: MagicMock) -> None:
-    """A tenant's first bucket matches the deployment bucket's settings and is saved on the org row.
-
-    Test cases:
-    - The bucket is created tagged with the org id, versioned, given a lifecycle rule, and has ABAC turned on.
-    - Every configuration call checks the expected bucket owner.
-    - A second call returns the recorded bucket without calling S3 again.
-    """
     org = _org(database_session, "acme.example")
     org_tag = {"Key": "valkyrie:org-id", "Value": str(org.id)}
     s3.get_bucket_tagging.return_value = {"TagSet": [org_tag]}
@@ -99,11 +104,11 @@ def test_new_tenant_gets_a_configured_bucket_recorded_on_its_org(database_sessio
     s3.create_bucket.assert_not_called()
 
 
+@pytest.mark.description("Every setup call is valid for the installed S3 SDK, which a mock client never checks.")
 @pytest.mark.parametrize("region", ["us-east-1", "eu-west-1"])
 def test_bucket_setup_requests_match_the_s3_api(
     database_session: Session, monkeypatch: pytest.MonkeyPatch, region: str
 ) -> None:
-    """Every setup call is valid for the installed S3 SDK, which a mock client never checks."""
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_REGION", region)
     client = boto3.client("s3", region_name=region, aws_access_key_id="test", aws_secret_access_key="test")  # pyright: ignore[reportUnknownMemberType]
     monkeypatch.setattr(tenant_storage.boto3, "client", MagicMock(return_value=client))
@@ -139,6 +144,7 @@ def test_bucket_setup_requests_match_the_s3_api(
         stubber.assert_no_pending_responses()
 
 
+@pytest.mark.description("An existing tenant bucket gets the org tag only when it is missing.")
 @pytest.mark.parametrize(
     ("create_error", "untagged"),
     [("BucketAlreadyOwnedByYou", True), (None, True), ("BucketAlreadyOwnedByYou", False)],
@@ -170,6 +176,7 @@ def test_an_existing_bucket_is_tagged_for_its_org(
         s3.tag_resource.assert_not_called()
 
 
+@pytest.mark.description("A bucket tagged for a different org is not saved as the org's `storage_key`.")
 def test_bucket_tagged_for_another_org_is_refused(database_session: Session, s3: MagicMock) -> None:
     s3.create_bucket.side_effect = ClientError({"Error": {"Code": "BucketAlreadyOwnedByYou"}}, "CreateBucket")
     s3.get_bucket_tagging.return_value = {"TagSet": [{"Key": "valkyrie:org-id", "Value": "another-org"}]}
@@ -185,6 +192,7 @@ def test_bucket_tagged_for_another_org_is_refused(database_session: Session, s3:
     assert stored is not None and stored.storage_key is None
 
 
+@pytest.mark.description("When bucket creation or setup fails, the org's `storage_key` stays empty.")
 @pytest.mark.parametrize(
     "failing_call", ["create_bucket", "get_bucket_tagging", "tag_resource", "put_bucket_versioning", "put_bucket_abac"]
 )
@@ -203,14 +211,15 @@ def test_failed_bucket_setup_leaves_the_org_without_a_bucket(
     assert stored is not None and stored.storage_key is None
 
 
+@pytest.mark.description("Vals' migrated row points at the deployment bucket and follows the same path as every org.")
 def test_recorded_storage_key_is_used_as_is(database_session: Session, s3: MagicMock) -> None:
-    """Vals' migrated row points at the deployment bucket and follows the same path as every org."""
     org = _org(database_session, "vals.ai", storage_key="agentic-harness")
 
     assert ensure_org_bucket(database_session, org) == "agentic-harness"
     s3.create_bucket.assert_not_called()
 
 
+@pytest.mark.description("With no tenant bucket prefix configured, no bucket is created and `storage_key` stays empty.")
 def test_no_bucket_is_created_without_a_tenant_bucket_prefix(
     database_session: Session, s3: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -223,6 +232,7 @@ def test_no_bucket_is_created_without_a_tenant_bucket_prefix(
     assert org.storage_key is None
 
 
+@pytest.mark.description("An org's first request saves `tenant_bucket_name` of its domain as its `storage_key`.")
 def test_every_org_gets_a_bucket_on_its_first_request(
     database_session: Session, s3: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,8 +1,3 @@
-"""Behavioral tests for SDK-owned request and response models.
-
-Run: uv run pytest tests/unit/sdk/test_models.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -41,9 +36,9 @@ kwargs:
 """
 
 
+@pytest.mark.description("Reading contract.yaml and checking run kwargs before anything is uploaded.")
 class TestAgentContract:
-    """Reading contract.yaml and checking run kwargs before anything is uploaded."""
-
+    @pytest.mark.description("Agent kwargs validation coerces CLI strings and fills defaults.")
     def test_validate_kwargs_coerces_cli_strings_and_fills_defaults(self, tmp_path: Path) -> None:
         (tmp_path / "contract.yml").write_text(_CONTRACT)
         contract = AgentContract.from_directory(tmp_path)
@@ -62,6 +57,9 @@ class TestAgentContract:
             "  - 'temperature': Input should be a valid number, unable to parse string as a number",
         ]
 
+    @pytest.mark.description(
+        "`AgentContract.from_directory` raises `ValkyrieContractError` with the reason when the contract files are missing or invalid."
+    )
     @pytest.mark.parametrize(
         ("files", "message"),
         [
@@ -91,6 +89,7 @@ class TestAgentContract:
             AgentContract.from_directory(agent_path)
 
 
+@pytest.mark.description("`install_egress` URLs are kept as given in the contract's JSON.")
 def test_agent_contract_serializes_install_egress() -> None:
     legacy_contract = AgentContractRequest(name="legacy")
     staged_contract = AgentContractRequest(
@@ -102,6 +101,7 @@ def test_agent_contract_serializes_install_egress() -> None:
     assert staged_contract.model_dump(mode="json")["install_egress"] == ["https://packages.example.com"]
 
 
+@pytest.mark.description("An `install_egress` entry that is not a valid host or URL fails validation.")
 @pytest.mark.parametrize(
     "policy",
     ["packages.example.com", ["packages.example.com", 1], {"install": "*"}],
@@ -111,6 +111,7 @@ def test_agent_contract_rejects_invalid_install_egress(policy: object) -> None:
         AgentContractRequest.model_validate({"name": "agent", "install_egress": policy})
 
 
+@pytest.mark.description("A contract may set `install_egress` alongside the older run egress field.")
 def test_agent_contract_allows_install_and_legacy_run_egress_together() -> None:
     contract = AgentContractRequest(
         name="combined",
@@ -122,12 +123,14 @@ def test_agent_contract_allows_install_and_legacy_run_egress_together() -> None:
     assert contract.install_egress == ["packages.example.com"]
 
 
+@pytest.mark.description("A contract that uses the removed `egress` field fails validation.")
 @pytest.mark.parametrize("egress", [None, {"install": "*"}, {"run": []}])
 def test_agent_contract_rejects_obsolete_egress(egress: object) -> None:
     with pytest.raises(ValidationError, match="install_egress"):
         AgentContractRequest.model_validate({"name": "agent", "egress": egress})
 
 
+@pytest.mark.description("Output artifacts given as plain paths become objects with `required` set to false.")
 def test_agent_contract_normalizes_output_artifacts() -> None:
     contract = AgentContractRequest(
         name="agent",
@@ -158,12 +161,14 @@ def test_agent_contract_normalizes_output_artifacts() -> None:
     assert serialized[2]["required"] is False
 
 
+@pytest.mark.description("Absolute or `..` output artifact paths fail validation.")
 @pytest.mark.parametrize("path", ["/absolute", "../escape", "a/../b"])
 def test_agent_contract_rejects_unsafe_artifact_paths(path: str) -> None:
     with pytest.raises(ValidationError):
         AgentContractRequest(name="agent", output_artifacts=[path])
 
 
+@pytest.mark.description("The agent contract rejects output artifact paths that match after normalization.")
 @pytest.mark.parametrize(
     "artifacts",
     [
@@ -197,17 +202,22 @@ def test_agent_contract_rejects_duplicate_normalized_output_artifact_paths(
         AgentContractRequest(name="agent", output_artifacts=artifacts)
 
 
+@pytest.mark.description(
+    "An output artifact `source` that is relative, contains `..`, or uses a glob fails validation."
+)
 @pytest.mark.parametrize("source", ["relative/path", "/../escape", "/*.json"])
 def test_output_artifact_rejects_unsafe_sources(source: str) -> None:
     with pytest.raises(ValidationError):
         OutputArtifact(path="result.json", source=source)
 
 
+@pytest.mark.description("`StartBenchmarkRequest` parses the canonical payload and dumps it back unchanged.")
 def test_start_request_matches_canonical_wire_shape() -> None:
     payload = load_fixture("start.json")["request"]
     assert StartBenchmarkRequest.model_validate(payload).model_dump(mode="json") == payload
 
 
+@pytest.mark.description("Nested response models ignore added fields.")
 def test_nested_response_models_ignore_additive_fields() -> None:
     payload = load_fixture("fetch.json")["response"]
     assert isinstance(payload, dict)
@@ -221,6 +231,7 @@ def test_nested_response_models_ignore_additive_fields() -> None:
     assert response.benchmark_name == "swebench"
 
 
+@pytest.mark.description("Non empty lists and final results parse.")
 def test_non_empty_list_and_final_results_parse() -> None:
     list_response = FetchBenchmarksResponse.model_validate(load_fixture("list.json")["response"])
     result = FinalViewResponse.model_validate(load_fixture("results.json")["inline"])
@@ -230,6 +241,7 @@ def test_non_empty_list_and_final_results_parse() -> None:
     assert result.benchmark_arguments.contract.output_artifacts
 
 
+@pytest.mark.description("Final results saved without an `environment` load with `environment` set to `aws`.")
 def test_final_results_without_environment_parse_as_aws() -> None:
     payload = load_fixture("results.json")["inline"]
     assert isinstance(payload, dict)

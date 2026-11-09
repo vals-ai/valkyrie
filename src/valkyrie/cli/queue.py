@@ -1,18 +1,16 @@
-"""Inspect the organization's sandbox admission queue."""
-
 import click
 from valkyrie.sdk import SchedulerOverviewResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, terminal_safe
+from valkyrie.cli.display import format_option, format_table, one_line
 
 
-@click.group()
+@click.group(help="Inspect your organization's sandbox scheduler.")
 def queue() -> None:
-    """Inspect your organization's sandbox scheduler."""
+    pass
 
 
-@queue.command()
+@queue.command(help="Show live queue priorities, positions, and active tasks for your organization.")
 @click.option(
     "--waiting-limit", type=click.IntRange(1, 200), default=100, show_default=True, help="Maximum waiting task entries."
 )
@@ -25,16 +23,8 @@ def queue() -> None:
 @click.option(
     "--active-offset", type=click.IntRange(min=0), default=0, show_default=True, help="Active entries to skip."
 )
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format. JSON includes task pages, capped flags, and next offsets.",
-)
+@format_option("Output format. JSON includes task pages, capped flags, and next offsets.")
 def status(waiting_limit: int, active_limit: int, waiting_offset: int, active_offset: int, output_format: str) -> None:
-    """Show live queue priorities, positions, and active tasks for your organization."""
     response = call(
         lambda client: client.scheduler.overview(
             waiting_limit=waiting_limit,
@@ -66,10 +56,7 @@ def _format_overview(response: SchedulerOverviewResponse) -> None:
 
     if response.pools:
         format_table(
-            [
-                {"Pool": terminal_safe(pool.pool_id, preserve_newlines=False), "Waiting": str(pool.waiting)}
-                for pool in response.pools
-            ],
+            [{"Pool": one_line(pool.pool_id), "Waiting": str(pool.waiting)} for pool in response.pools],
             ["Pool", "Waiting"],
             item_name="pool",
         )
@@ -78,11 +65,11 @@ def _format_overview(response: SchedulerOverviewResponse) -> None:
     format_table(
         [
             {
-                "Pool": terminal_safe(entry.pool_id, preserve_newlines=False),
+                "Pool": one_line(entry.pool_id),
                 "Position": str(entry.position),
                 "Priority": f"P{entry.priority}",
                 "Run": str(entry.benchmark_uuid),
-                "Task": terminal_safe(entry.external_task_id, preserve_newlines=False),
+                "Task": one_line(entry.external_task_id),
                 "Wait (s)": f"{max(0, (response.observed_at - entry.enqueued_at).total_seconds()):.0f}",
             }
             for entry in response.waiting_entries
@@ -101,7 +88,7 @@ def _format_overview(response: SchedulerOverviewResponse) -> None:
         [
             {
                 "Run": str(entry.benchmark_uuid),
-                "Task": terminal_safe(entry.external_task_id, preserve_newlines=False),
+                "Task": one_line(entry.external_task_id),
                 "Status": entry.status.value,
             }
             for entry in response.active_entries

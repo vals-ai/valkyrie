@@ -1,20 +1,15 @@
-"""Shared SDK model behavior."""
-
 from datetime import datetime, timezone
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PlainSerializer
 
 
 class ResponseModel(BaseModel):
-    """Forward-compatible model for data returned by the Valkyrie API."""
-
     model_config = ConfigDict(extra="ignore")
 
 
-def serialize_utc(value: datetime | None) -> str | None:
-    """Serialize datetimes with an explicit UTC offset."""
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.isoformat()
+def _serialize_utc(value: datetime) -> str:
+    return (value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)).isoformat()
+
+
+UTCDateTime = Annotated[datetime, PlainSerializer(_serialize_utc)]

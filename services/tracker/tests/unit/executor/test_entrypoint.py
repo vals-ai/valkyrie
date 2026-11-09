@@ -1,5 +1,3 @@
-"""Run with `uv run pytest tests/unit/executor/test_entrypoint.py`."""
-
 import asyncio
 import os
 import signal
@@ -41,6 +39,7 @@ def _claimed(dispatch_id: UUID) -> ClaimedDispatch:
     )
 
 
+@pytest.mark.description("The executor entrypoint runs the dispatch and flushes telemetry.")
 def test_main_runs_the_dispatch_and_flushes(monkeypatch: MonkeyPatch) -> None:
     dispatch_id = uuid4()
     run_dispatch = AsyncMock()
@@ -59,6 +58,7 @@ def test_main_runs_the_dispatch_and_flushes(monkeypatch: MonkeyPatch) -> None:
     flush.assert_called_once_with()
 
 
+@pytest.mark.description("A dispatch that cannot be claimed runs nothing.")
 def test_unclaimable_dispatch_runs_nothing(monkeypatch: MonkeyPatch, lifecycle: dict[str, Mock]) -> None:
     process_benchmark = AsyncMock()
     monkeypatch.setattr(entrypoint, "_claim", lambda _dispatch_id: None)
@@ -71,6 +71,7 @@ def test_unclaimable_dispatch_runs_nothing(monkeypatch: MonkeyPatch, lifecycle: 
     lifecycle["_fail"].assert_not_called()
 
 
+@pytest.mark.description("A failed dispatch records the failure and raises again.")
 def test_failed_dispatch_records_the_failure_and_reraises(monkeypatch: MonkeyPatch, lifecycle: dict[str, Mock]) -> None:
     dispatch_id = uuid4()
     claimed = _claimed(dispatch_id)
@@ -89,6 +90,7 @@ def test_failed_dispatch_records_the_failure_and_reraises(monkeypatch: MonkeyPat
     capture.assert_called_once()
 
 
+@pytest.mark.description("SIGTERM records a cancellation for the dispatch without running the normal finish step.")
 def test_sigterm_cancels_the_dispatch_and_records_cancellation(
     monkeypatch: MonkeyPatch, lifecycle: dict[str, Mock]
 ) -> None:
@@ -127,6 +129,9 @@ def test_sigterm_cancels_the_dispatch_and_records_cancellation(
     cancellation.assert_called_once()
 
 
+@pytest.mark.description(
+    "Work is cancelled when lease renewal is blocked past the lease, and the finish step does not run."
+)
 def test_local_lease_cancels_work_while_renewal_is_blocked(
     monkeypatch: MonkeyPatch, lifecycle: dict[str, Mock]
 ) -> None:

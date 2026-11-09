@@ -1,5 +1,3 @@
-"""Counter reads and Tracker-owned cumulative generation accounting."""
-
 from collections.abc import Callable
 
 import httpx
@@ -14,6 +12,7 @@ from tracker.external_service_gateway import (
 )
 
 
+@pytest.mark.description("A zero, negative, or infinite credit cap raises `ValueError`.")
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
 def test_credit_cap_must_be_positive_and_finite(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("TEST_CREDIT_CAP", value)
@@ -34,6 +33,16 @@ def _client(
     return ExternalServiceGatewayClient("http://gateway.test", "tracker-control", client=http_client), http_client
 
 
+@pytest.mark.description(
+    "An active generation interval reports the same deadline at every observation time, so cutoffs derived from it match exactly."
+)
+def test_active_deadline_does_not_depend_on_observation_time() -> None:
+    controller = ExternalServiceDeadlineController(base_allowance_seconds=1.0)
+    controller.begin_generation(4095.1949631)
+    assert controller.deadline(4095.1949631) == controller.deadline(4095.3280151000004) == 4095.1949631 + 1.0
+
+
+@pytest.mark.description("A successful counter digest read extends the Tracker's deadline.")
 async def test_authenticated_counter_read_extends_tracker_deadline() -> None:
     requests: list[httpx.Request] = []
 
@@ -57,6 +66,7 @@ async def test_authenticated_counter_read_extends_tracker_deadline() -> None:
     assert [(request.method, request.url.path) for request in requests] == [("GET", "/counters/digest")]
 
 
+@pytest.mark.description("A counter read raises storage errors instead of reporting zero credit.")
 async def test_counter_read_propagates_storage_errors_instead_of_zero_credit() -> None:
     client, http_client = _client(lambda _request: httpx.Response(503))
     try:
@@ -70,6 +80,7 @@ async def test_counter_read_propagates_storage_errors_instead_of_zero_credit() -
         await http_client.aclose()
 
 
+@pytest.mark.description("Active intervals leave out idle gaps and keep credit across rounds.")
 async def test_active_intervals_exclude_idle_gaps_and_preserve_credit_across_rounds() -> None:
     controller = ExternalServiceDeadlineController(
         base_allowance_seconds=30.0, credit_cap_seconds=10.0, snapshot=_snapshot(12_500, 4)
@@ -93,6 +104,7 @@ async def test_active_intervals_exclude_idle_gaps_and_preserve_credit_across_rou
     )
 
 
+@pytest.mark.description("A counter read after the cutoff cannot change saved credit or observations.")
 async def test_late_counter_after_cutoff_cannot_change_persisted_credit_or_observation() -> None:
     requests = 0
 
@@ -120,6 +132,7 @@ async def test_late_counter_after_cutoff_cannot_change_persisted_credit_or_obser
         await http_client.aclose()
 
 
+@pytest.mark.description("A final read applies credit, and an unlimited clock stays unbounded.")
 async def test_natural_terminal_read_applies_credit_and_unlimited_clock_remains_unbounded() -> None:
     client, http_client = _client(lambda _request: httpx.Response(200, json=_snapshot(10_000, 3).model_dump()))
     try:
@@ -137,6 +150,7 @@ async def test_natural_terminal_read_applies_credit_and_unlimited_clock_remains_
         await http_client.aclose()
 
 
+@pytest.mark.description("A counter digest for a different token is ignored.")
 async def test_counter_for_another_token_is_rejected() -> None:
     client, http_client = _client(
         lambda _request: httpx.Response(200, json=_snapshot(accounting_id="other").model_dump())

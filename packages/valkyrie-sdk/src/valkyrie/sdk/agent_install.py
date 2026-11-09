@@ -2,11 +2,13 @@
 
 import asyncio
 import re
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import AsyncGenerator
 from urllib.parse import urljoin
+
+from valkyrie.sdk.errors import ValkyrieInputError
 
 
 async def _run_git_command(repo_path: Path | None, *args: str) -> str:
@@ -44,7 +46,6 @@ async def _run_git_command(repo_path: Path | None, *args: str) -> str:
 
 
 async def _checkout_submodules(repository_path: Path, repository_url: str) -> None:
-    """Validate each level's GitHub destinations before fetching its submodules."""
     if not await asyncio.to_thread((repository_path / ".gitmodules").is_file):
         return
     config = await _run_git_command(repository_path, "config", "--file", ".gitmodules", "--null", "--list")
@@ -73,35 +74,49 @@ async def _checkout_submodules(repository_path: Path, repository_url: str) -> No
         await _checkout_submodules(submodule_path, url)
 
 
+async def _split_tree_path(repository_path: Path, parts: list[str]) -> tuple[str, str]:
+    output = await _run_git_command(
+        repository_path, "for-each-ref", "--format=%(refname)", "refs/remotes/origin", "refs/tags"
+    )
+    references = {
+        reference.removeprefix("refs/remotes/origin/").removeprefix("refs/tags/") for reference in output.splitlines()
+    }
+    end = next((end for end in range(len(parts), 0, -1) if "/".join(parts[:end]) in references), 1)
+    return "/".join(parts[:end]), "/".join(parts[end:])
+
+
 @asynccontextmanager
 async def checkout_agent(github_url: str) -> AsyncGenerator[Path, None]:
-    """Check out a GitHub repository or tree URL, including submodules."""
+    """Check out a GitHub repository or /tree/ref[/subfolder] URL, including submodules."""
     match = re.fullmatch(
-        r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/tree/([^/]+)/(.+?))?/?",
+        r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/tree/(.+?))?/?",
         github_url,
     )
     if match is None:
-        raise ValueError("Invalid GitHub URL; expected a repository or /tree/branch/subfolder URL")
-    owner, repository, branch, subfolder = match.groups()
-    if owner in {".", ".."} or repository in {".", ".."} or (branch and branch.startswith("-")):
-        raise ValueError("Invalid GitHub repository or branch")
-    if subfolder and (
-        "\\" in subfolder or subfolder.startswith("-") or any(part in {"", ".", ".."} for part in subfolder.split("/"))
+        raise ValkyrieInputError("Invalid GitHub URL; expected a repository or /tree/ref[/subfolder] URL")
+    owner, repository, tree_path = match.groups()
+    if owner in {".", ".."} or repository in {".", ".."}:
+        raise ValkyrieInputError("Invalid GitHub repository")
+    tree_parts = tree_path.split("/") if tree_path else []
+    if tree_path and (
+        "\\" in tree_path or tree_path.startswith("-") or any(part in {"", ".", ".."} for part in tree_parts)
     ):
-        raise ValueError("Invalid GitHub subfolder")
+        raise ValkyrieInputError("Invalid GitHub branch or subfolder")
 
     with TemporaryDirectory() as temporary:
+        repository_url = f"https://github.com/{owner}/{repository}"
         repository_path = Path(temporary) / "repository"
         clone_args = ["clone", "--no-recurse-submodules"]
-        if subfolder:
+        if tree_parts:
             clone_args.extend(["--no-checkout", "--filter=blob:none"])
-        clone_args.extend([f"https://github.com/{owner}/{repository}", str(repository_path)])
+        clone_args.extend([repository_url, str(repository_path)])
         await _run_git_command(None, *clone_args)
+        reference, subfolder = await _split_tree_path(repository_path, tree_parts) if tree_parts else ("HEAD", "")
         if subfolder:
             await _run_git_command(repository_path, "sparse-checkout", "init", "--cone")
             await _run_git_command(repository_path, "sparse-checkout", "set", "--", subfolder)
-        await _run_git_command(repository_path, "checkout", branch or "HEAD", "--")
-        await _checkout_submodules(repository_path, f"https://github.com/{owner}/{repository}")
+        await _run_git_command(repository_path, "checkout", reference, "--")
+        await _checkout_submodules(repository_path, repository_url)
         agent_path = repository_path / subfolder if subfolder else repository_path
         if not agent_path.resolve().is_relative_to(repository_path.resolve()):
             raise ValueError("GitHub subfolder escapes repository")

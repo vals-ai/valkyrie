@@ -1,11 +1,5 @@
-"""Tests for the public async Valkyrie SDK.
-
-Run: uv run pytest tests/unit/sdk
-
-Covers config validation, request construction, response parsing, streaming, and SDK errors without live services.
-"""
-
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, assert_type
 from uuid import uuid4
@@ -35,6 +29,7 @@ def load_sdk_fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.description("The config hides the API key in its repr and sends the real value on requests.")
 def test_config_redacts_secrets_and_unwraps_them_for_requests(sdk_config) -> None:
     config = sdk_config()
 
@@ -44,10 +39,14 @@ def test_config_redacts_secrets_and_unwraps_them_for_requests(sdk_config) -> Non
     assert config.api_key is not None and config.api_key.get_secret_value() == "vals-key"
 
 
+@pytest.mark.description("`RunError` is a public SDK error.")
 def test_run_error_is_a_public_sdk_error() -> None:
     assert issubclass(ValkyrieRunError, ValkyrieSDKError)
 
 
+@pytest.mark.description(
+    "`runs.start` turns the agent into a contract and sends explicit service headers in the payload."
+)
 async def test_start_normalizes_agent_and_builds_payload(make_client) -> None:
     requests: list[httpx.Request] = []
     run_id = uuid4()
@@ -98,6 +97,7 @@ async def test_start_normalizes_agent_and_builds_payload(make_client) -> None:
     assert body["service_headers"] == {"X-Custom": "explicit"}
 
 
+@pytest.mark.description("`runs.start` sends one request to `/start-benchmark`.")
 async def test_start_uses_the_start_route(make_client) -> None:
     requests: list[httpx.Request] = []
 
@@ -124,6 +124,7 @@ async def test_start_uses_the_start_route(make_client) -> None:
     assert [request.url.path for request in requests] == ["/start-benchmark"]
 
 
+@pytest.mark.description("Start can leave out optional run configuration.")
 async def test_start_can_omit_optional_run_configuration(make_client) -> None:
     captured_body: dict[str, object] = {}
 
@@ -155,6 +156,7 @@ async def test_start_can_omit_optional_run_configuration(make_client) -> None:
     assert "properties" not in captured_body
 
 
+@pytest.mark.description("Start sends an explicit queue priority.")
 async def test_start_serializes_explicit_queue_priority(make_client, sdk_config) -> None:
     captured_body: dict[str, object] = {}
 
@@ -182,6 +184,7 @@ async def test_start_serializes_explicit_queue_priority(make_client, sdk_config)
     assert "properties" not in captured_body
 
 
+@pytest.mark.description("Start overlays a supplied contract without changing it.")
 async def test_start_overlays_a_supplied_contract_without_mutating_it(make_client) -> None:
     captured_body: dict[str, object] = {}
 
@@ -222,6 +225,7 @@ async def test_start_overlays_a_supplied_contract_without_mutating_it(make_clien
     assert contract.kwargs == {"keep": "yes"}
 
 
+@pytest.mark.description("Fetch, list, stop, and S3 result calls return typed models.")
 async def test_fetch_list_stop_and_s3_results_are_typed(make_client, fetch_response) -> None:
     run_id = uuid4()
     paths: list[str] = []
@@ -307,6 +311,9 @@ async def test_fetch_list_stop_and_s3_results_are_typed(make_client, fetch_respo
     ]
 
 
+@pytest.mark.description(
+    "`runs.resume` and `runs.retry` send their concurrency, retry, and override options in the body."
+)
 @pytest.mark.parametrize(("method_name", "retry"), [("resume", "false"), ("retry", "true")])
 async def test_resume_and_retry_send_their_options(method_name: str, retry: str, make_client) -> None:
     run_id = uuid4()
@@ -346,6 +353,7 @@ async def test_resume_and_retry_send_their_options(method_name: str, retry: str,
     }
 
 
+@pytest.mark.description("Resume without overrides sends an empty payload.")
 async def test_resume_without_optional_overrides_uses_empty_payload(make_client) -> None:
     run_id = uuid4()
     requests: list[httpx.Request] = []
@@ -363,6 +371,7 @@ async def test_resume_without_optional_overrides_uses_empty_payload(make_client)
     assert json.loads(request.content) == {"task_ids": [], "service_headers": {}, "secrets": {}}
 
 
+@pytest.mark.description("`runs.resume` sends the body in the canonical resume fixture.")
 async def test_resume_request_matches_canonical_wire_fixture(make_client) -> None:
     fixture = load_sdk_fixture("retry_resume.json")
     requests: list[httpx.Request] = []
@@ -388,6 +397,7 @@ async def test_resume_request_matches_canonical_wire_fixture(make_client) -> Non
     assert json.loads(request.content) == fixture["body"]
 
 
+@pytest.mark.description("`runs.stream` yields each snapshot, stops at the complete event, and uses no read timeout.")
 async def test_stream_yields_snapshots_and_stops_on_complete(make_client, fetch_response) -> None:
     event = load_sdk_fixture("fetch.json")["sse"]
     run_id = event["data"]["benchmark_id"]
@@ -407,19 +417,29 @@ async def test_stream_yields_snapshots_and_stops_on_complete(make_client, fetch_
     assert timeout == {"connect": 120, "read": None, "write": 120, "pool": 120}
 
 
+@pytest.mark.description(
+    (
+        "Updates arrive with their run. The ending event is yielded once and nothing after it.\n"
+        "\n"
+        "Test cases:\n"
+        "- Comments, empty events and events with unknown names are skipped.\n"
+        "- Unnamed, `message` and `update` events are updates, and an unterminated final update is still parsed.\n"
+        "- An empty body yields nothing.\n"
+        "- `disconnect` and `error` end the stream. `error` carries the server's message."
+    )
+)
 async def test_events_report_how_the_stream_ended(make_client, fetch_response) -> None:
-    """Updates arrive with their run; the ending event is yielded once and nothing after it.
-
-    Test cases:
-    - Comments and empty events are skipped, and an unterminated final update is still parsed.
-    - An empty body yields nothing.
-    - `disconnect` and `error` end the stream; `error` carries the server's message.
-    """
     run_id = uuid4()
     event = json.dumps(fetch_response(run_id))
     responses = iter(
         [
-            httpx.Response(200, text=f"\n: keepalive\n\nevent: message\n\nevent: message\ndata: {event}"),
+            httpx.Response(
+                200,
+                text=(
+                    f"\n: keepalive\n\nevent: message\n\nevent: heartbeat\ndata: {{}}\n\n"
+                    f"event: progress\ndata: {event}\n\nevent: message\ndata: {event}\n\nevent: update\ndata: {event}"
+                ),
+            ),
             httpx.Response(200, text=""),
             httpx.Response(200, text=f"data: {event}\n\nevent: disconnect\n\ndata: {event}\n\n"),
             httpx.Response(200, text='event: error\ndata: {"error":"Run not found"}\n\n'),
@@ -434,7 +454,7 @@ async def test_events_report_how_the_stream_ended(make_client, fetch_response) -
         streams = [[item async for item in client.runs.events(run_id)] for _ in range(4)]
 
     assert [[item.event for item in stream] for stream in streams] == [
-        ["update"],
+        ["update", "update"],
         [],
         ["update", "disconnect"],
         ["error"],
@@ -444,6 +464,7 @@ async def test_events_report_how_the_stream_ended(make_client, fetch_response) -
     assert streams[3][0].detail == "Run not found"
 
 
+@pytest.mark.description("`runs.stream` raises an SDK error for an error event or an unparseable event.")
 async def test_stream_converts_error_and_malformed_events(make_client) -> None:
     responses = iter(
         [
@@ -466,6 +487,7 @@ async def test_stream_converts_error_and_malformed_events(make_client) -> None:
             _ = [snapshot async for snapshot in client.runs.stream(uuid4())]
 
 
+@pytest.mark.description("`runs.stream` raises an SDK error for an error status or a dropped connection.")
 async def test_stream_converts_status_and_transport_failures(make_client) -> None:
     def status_error(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"detail": "run missing"})
@@ -484,6 +506,7 @@ async def test_stream_converts_status_and_transport_failures(make_client) -> Non
             _ = [snapshot async for snapshot in client.runs.stream(uuid4())]
 
 
+@pytest.mark.description("API and transport failures raise SDK exceptions.")
 async def test_api_and_transport_failures_use_sdk_exceptions(make_client) -> None:
     def api_error(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"detail": "invalid API key"})
@@ -512,6 +535,7 @@ async def test_api_and_transport_failures_use_sdk_exceptions(make_client) -> Non
             await client.runs.fetch(uuid4())
 
 
+@pytest.mark.description("`runs.start` raises for invalid inputs and sends no request.")
 async def test_start_validates_inputs_before_request(make_client, sdk_config) -> None:
     request_count = 0
 
@@ -542,6 +566,7 @@ async def test_start_validates_inputs_before_request(make_client, sdk_config) ->
     assert request_count == 0
 
 
+@pytest.mark.description("A start with only a Tracker URL sends the provider only when given.")
 @pytest.mark.parametrize("provider", [None, "modal"])
 async def test_tracker_url_only_start_sends_the_provider_only_when_given(provider: str | None) -> None:
     config = ValkyrieConfig(url="http://127.0.0.1:8765")
@@ -562,15 +587,60 @@ async def test_tracker_url_only_start_sends_the_provider_only_when_given(provide
         await client.runs.start("agent", "test", provider=provider)
 
 
+@pytest.mark.description("A client created without a config talks to `https://benchmark-tracker.vals.ai`.")
 async def test_a_client_without_a_config_uses_the_default_config() -> None:
     async with ValkyrieClient() as client:
         assert client.config == ValkyrieConfig()
         assert str(client._client.base_url) == "https://benchmark-tracker.vals.ai"
 
 
+@pytest.mark.description("Project create sends the budget and its reason.")
+async def test_projects_create_sends_the_budget_and_its_reason(make_client) -> None:
+    requests: list[httpx.Request] = []
+    project = {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "handle": "router-bench",
+        "name": "Router Bench",
+        "spend_type": "development",
+        "subcategory": "new_benchmark_generation",
+        "customer": None,
+        "extra_tags": {},
+        "created_at": "2026-10-23T12:00:00Z",
+        "created_by_email": "researcher@vals.ai",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=project)
+
+    async with make_client(handler) as client:
+        created = await client.projects.create(
+            "router-bench",
+            name="Router Bench",
+            spend_type=SpendType.DEVELOPMENT,
+            subcategory="new_benchmark_generation",
+            budget=Decimal("300.50"),
+            budget_reason="3 runs, about 100 each",
+        )
+
+    assert created.handle == "router-bench"
+    assert json.loads(requests[0].content) == {
+        "handle": "router-bench",
+        "name": "Router Bench",
+        "spend_type": "development",
+        "subcategory": "new_benchmark_generation",
+        "customer": None,
+        "extra_tags": {},
+        "budget": "300.50",
+        "budget_reason": "3 runs, about 100 each",
+    }
+
+
+@pytest.mark.description("Project update and delete use the project contract.")
 async def test_projects_update_and_delete_use_the_project_contract(make_client) -> None:
     requests: list[httpx.Request] = []
     project = {
+        "id": "22222222-2222-4222-8222-222222222222",
         "handle": "router-bench",
         "name": "Router Bench Updated",
         "spend_type": "development",
@@ -612,6 +682,7 @@ async def test_projects_update_and_delete_use_the_project_contract(make_client) 
     assert requests[1].content == b""
 
 
+@pytest.mark.description("Project methods raise for an empty, `.`, or `..` handle and send nothing.")
 @pytest.mark.parametrize("handle", ["", ".", ".."])
 async def test_projects_reject_normalized_path_segments_before_request(make_client, handle: str) -> None:
     requests: list[httpx.Request] = []

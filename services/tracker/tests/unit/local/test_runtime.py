@@ -1,5 +1,3 @@
-"""Local service composition uses persistent files and transient credentials."""
-
 import base64
 import os
 from pathlib import Path
@@ -18,17 +16,19 @@ from tracker.local.runtime import LocalRuntimeFactory
 from tracker.local.secrets import InMemorySecretStore
 
 
+@pytest.mark.description(
+    (
+        "The supplied file selects local execution and its executor release.\n"
+        "\n"
+        "Test cases:\n"
+        "- Without a file, the server runs AWS execution and registers no release.\n"
+        "- With a file, the server runs local execution and activates a source release for this checkout."
+    )
+)
 @pytest.mark.parametrize("local", [False, True])
 def test_server_configuration_selects_execution_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, database_session: Session, local: bool
 ) -> None:
-    """
-    Verify that the supplied file selects local execution and its executor release.
-
-    Test cases:
-    - Without a file, the server runs AWS execution and registers no release.
-    - With a file, the server runs local execution and activates a source release for this checkout.
-    """
     from tracker import serve
     from tracker.local import config
 
@@ -66,8 +66,8 @@ def test_server_configuration_selects_execution_mode(
         assert os.environ["DB_NAME"] == "tracker"
 
 
+@pytest.mark.description("Persist artifacts without allowing another organization to read them.")
 async def test_local_runtime_scopes_files_and_keeps_secrets_in_memory(tmp_path: Path) -> None:
-    """Persist artifacts without allowing another organization to read them."""
     org_id = uuid4()
     references = {"API_KEY": "agent-key"}
     secrets = InMemorySecretStore(references, {"API_KEY": "transient-value"})
@@ -83,12 +83,15 @@ async def test_local_runtime_scopes_files_and_keeps_secrets_in_memory(tmp_path: 
     assert all(b"transient-value" not in path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
 
 
+@pytest.mark.description("Reject a configuration that names both a secrets file and Secrets Manager.")
 def test_local_resources_accept_one_secrets_source(tmp_path: Path) -> None:
-    """Reject a configuration that names both a secrets file and Secrets Manager."""
     with pytest.raises(ValueError, match="not both"):
         LocalResources(data_root=tmp_path, secrets_file=tmp_path / "a.env", secrets_manager_region="us-east-1")
 
 
+@pytest.mark.description(
+    "Each dispatch rereads the declared secrets, and a missing provider key such as `DAYTONA_API_KEY` raises `SecretsError`."
+)
 async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(tmp_path: Path) -> None:
     from tracker.database.models import AgentContractRequest, Benchmark, LocalBenchmarkArguments, Org
     from tracker.executor.dependencies import get_execution_runtime

@@ -1,60 +1,36 @@
-"""Single-run detail endpoints."""
-
 from __future__ import annotations
 
 from typing import Literal
-from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import case
-from sqlalchemy.orm import aliased
-from sqlmodel import Session, col, desc, func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from tracker.api.parsing import parse_csv
-from tracker.api.dependencies import TrackedBenchmarkId
+from tracker.api.dependencies import RunBenchmarkDependency, TrackedBenchmarkId
 from tracker.auth import get_current_org
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogLocations
 from tracker.aws.resolver import resolve_run_metadata_aws_runtime
 from tracker.aws.s3 import create_benchmark_url
-from tracker.database.models import Benchmark, ErrorResult, Org, Task, TaskStatus
-from tracker.database.scoping import get_scoped
-from tracker.database.session import get_session
+from tracker.database.models import Org, TaskStatus
+from tracker.database.scoping import assert_org
+from tracker.repositories.benchmark import BenchmarkRepositoryDependency, TaskSort
 from tracker.types import SingleBenchmarkResponse, TasksResponse, TaskSummary
 
 router = APIRouter(prefix="/benchmarks")
 
 
-def _escape_sql_like_pattern(value: str) -> str:
-    """Escape \\, %, and _ so user input is treated as a literal in a LIKE clause."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-# Attention priority — higher is more urgent, so ORDER BY ... DESC surfaces
-# errors first, then abnormal/successful terminal, then active, then queued.
-_STATUS_SORT_PRIORITY = case(
-    {
-        TaskStatus.ERROR: 6,
-        TaskStatus.STOPPED: 5,
-        TaskStatus.FINISHED: 4,
-        TaskStatus.EVALUATING: 3,
-        TaskStatus.IN_PROGRESS: 2,
-        TaskStatus.BUILDING: 1,
-        TaskStatus.PENDING: 0,
-    },
-    value=col(Task.status),
-    else_=-1,
+@router.get(
+    "/{benchmark_id}",
+    response_model=SingleBenchmarkResponse,
+    description="Return a run with its task counts and final score.",
 )
-
-
-@router.get("/{benchmark_id}", response_model=SingleBenchmarkResponse)
 async def get_single_benchmark(
     benchmark_id: TrackedBenchmarkId,
     request: Request,
+    repository: BenchmarkRepositoryDependency,
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> SingleBenchmarkResponse:
-    """Fetch a single benchmark with task counts + final score for the SingleRun page."""
-    benchmark = get_scoped(Benchmark, benchmark_id, session, org)
+    benchmark = assert_org(repository.get(org.id, benchmark_id), org)
 
-    task_state_counts = benchmark.fetch_task_state_counts(session)
+    task_state_counts = repository.task_state_counts([benchmark.id]).get(benchmark.id, {})
     total = sum(task_state_counts.values())
     finished = (
         task_state_counts.get(TaskStatus.FINISHED, 0)
@@ -96,7 +72,7 @@ async def get_single_benchmark(
         finished_tasks=finished,
         task_state_counts={status.value: count for status, count in task_state_counts.items()},
         started_by_email=benchmark.started_by_email,
-        final_score=benchmark.fetch_final_score(session),
+        final_score=repository.final_score(benchmark),
         error_message=benchmark.error_message,
         cloudwatch_url=cloudwatch_url,
         s3_bucket_url=s3_bucket_url,
@@ -104,68 +80,33 @@ async def get_single_benchmark(
     )
 
 
-@router.get("/{benchmark_id}/tasks", response_model=TasksResponse)
+@router.get(
+    "/{benchmark_id}/tasks",
+    response_model=TasksResponse,
+    description=(
+        "List a run's tasks a page at a time, filtered by status or task ID.\n"
+        "\n"
+        "sort=status desc puts errors first. The default order is newest started first.\n"
+        "\n"
+        "Returns 422 when `status` names an unknown task status."
+    ),
+)
 def get_benchmark_tasks(
-    benchmark_id: TrackedBenchmarkId,
+    benchmark: RunBenchmarkDependency,
+    repository: BenchmarkRepositoryDependency,
     status: str = Query(default=""),
     task_id_search: str | None = None,
-    sort: Literal["task_id", "started_at", "duration", "status"] = Query(default="started_at"),
+    sort: TaskSort = Query(default="started_at"),
     sort_dir: Literal["asc", "desc"] = Query(default="desc"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> TasksResponse:
-    """Paginated tasks for a benchmark, with optional status filter + task-id search.
-
-    sort=status desc surfaces errors first (attention priority). Default: started_at desc."""
-    get_scoped(Benchmark, benchmark_id, session, org)
-
-    statuses = parse_csv(status, TaskStatus)
-    base_filters = [
-        col(Task.benchmark) == benchmark_id,
-        col(Task.org_id) == org.id,
-    ]
-    if statuses:
-        base_filters.append(col(Task.status).in_(statuses))
-
-    if task_id_search:
-        escaped_search = _escape_sql_like_pattern(task_id_search)
-        base_filters.append(col(Task.task_id).ilike(f"%{escaped_search}%", escape="\\"))
-
-    latest_error = aliased(ErrorResult)
-    latest_error_id = (
-        select(latest_error.id)
-        .where(latest_error.task == Task.id)
-        .where(latest_error.org_id == org.id)
-        .where(col(latest_error.retry_scheduled).is_(False))
-        .order_by(desc(latest_error.created_at))
-        .limit(1)
-        .scalar_subquery()
-    )
-    terminal_error_id = case(
-        (col(Task.status) == TaskStatus.ERROR, latest_error_id),
-        else_=None,
-    )
-    sort_expr = {
-        "task_id": col(Task.task_id),
-        "started_at": col(Task.started_at),
-        "duration": func.coalesce(col(Task.finished_at), func.now()) - col(Task.started_at),
-        "status": _STATUS_SORT_PRIORITY,
-    }[sort]
-    primary = sort_expr.asc() if sort_dir == "asc" else sort_expr.desc()
-    # Tie-break newest-first for stable ordering within equal keys.
-    order_by = [primary, col(Task.started_at).desc()]
-
-    rows = session.exec(
-        select(Task, col(ErrorResult.error_message), col(ErrorResult.category))
-        .outerjoin(ErrorResult, col(ErrorResult.id) == terminal_error_id)
-        .where(*base_filters)
-        .order_by(*order_by)
-        .limit(limit)
-        .offset(offset)
-    ).all()
-    total = session.exec(select(func.count()).select_from(Task).where(*base_filters)).one()
+    try:
+        statuses = parse_csv(status, TaskStatus)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    rows, total = repository.page_tasks(org.id, benchmark.id, statuses, task_id_search, sort, sort_dir, limit, offset)
 
     return TasksResponse(
         tasks=[

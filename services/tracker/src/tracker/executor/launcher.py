@@ -1,5 +1,3 @@
-"""Launch one executor task for an admitted dispatch."""
-
 from __future__ import annotations
 
 import asyncio
@@ -11,24 +9,24 @@ from uuid import UUID
 
 import boto3
 from botocore.config import Config
-from sqlmodel import Session, select
+from sqlmodel import Session
 
-from tracker.database.models import ExecutorDispatch, ExecutorRelease
+from tracker.database.models import ExecutorDispatch
 from tracker.database.session import engine
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 
 logger = logging.getLogger(__name__)
 _ECS_RUNNER_PYTHON = "/app/.venv/bin/python"
 
 
 class DefinitiveLaunchFailure(Exception):
-    """ECS rejected the launch without creating a task."""
+    pass
 
 
 def _task_definition(dispatch: ExecutorDispatch) -> str:
     with Session(engine) as session:
-        task_definition_arn = session.exec(
-            select(ExecutorRelease.task_definition_arn).where(ExecutorRelease.id == dispatch.executor_release_id)
-        ).one()
+        task_definition_arn = ExecutorReleaseRepository(session).task_definition_arn(dispatch.executor_release_id)
     if task_definition_arn is None:
         raise DefinitiveLaunchFailure(f"Executor release {dispatch.executor_release_id} has no task definition")
     return task_definition_arn
@@ -36,16 +34,14 @@ def _task_definition(dispatch: ExecutorDispatch) -> str:
 
 def _record_task_arn(dispatch_id: UUID, task_arn: str) -> None:
     with Session(engine) as session:
-        dispatch = session.get(ExecutorDispatch, dispatch_id)
+        dispatch = ExecutorDispatchRepository(session).get(dispatch_id)
         if dispatch is None:
             raise RuntimeError(f"Executor dispatch {dispatch_id} disappeared after launch")
         dispatch.ecs_task_arn = task_arn
-        session.add(dispatch)
         session.commit()
 
 
 async def _record_task_arn_after_launch(dispatch_id: UUID, task_arn: str) -> None:
-    # ECS already accepted the task, so a failed diagnostic write must not fail the launch.
     for attempt in range(3):
         try:
             await asyncio.to_thread(_record_task_arn, dispatch_id, task_arn)
@@ -62,7 +58,7 @@ async def launch_dispatch(dispatch: ExecutorDispatch) -> None:
     dispatch_id = str(dispatch.id)
     command = [sys.executable, "-m", "tracker.executor.entrypoint", "--dispatch-id", dispatch_id]
     if launcher == "local":
-        subprocess.Popen(command, start_new_session=True, env=os.environ)
+        await asyncio.to_thread(subprocess.Popen, command, start_new_session=True, env=os.environ)
         return
     if launcher != "ecs":
         raise ValueError("EXECUTOR_LAUNCHER must be ecs or local")

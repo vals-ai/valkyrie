@@ -21,6 +21,7 @@ description: "Every contract.yaml field, its placeholders, and the limits Valkyr
 | `kwargs` | no | Other [parameters](#parameters), which `-k` sets. |
 | `install_egress` | no | [Network access](#install-egress) while installing. |
 | `turns` | no | Commands for [benchmarks that run the agent several times](#turns). |
+| `allow_provider_tools` | no | Whether the agent can use [tools the model provider runs](#allow-provider-tools). |
 | `ingest_lambda` | no | The Lambda that [`valkyrie run analyze`](/integrations/docent) sends the run to. |
 | `provided` | no | Notes for people reading the contract. Valkyrie ignores it. |
 
@@ -30,8 +31,8 @@ Valkyrie ignores keys it doesn't recognize, so a misspelled field has no effect.
 
 For each task, Valkyrie:
 
-1. Copies the agent directory into the sandbox at `/bundle/AGENT_NAME/`, where *`AGENT_NAME`* is the
-   agent's name in your library.
+1. Copies the agent directory into the sandbox at `/bundle/AGENT_NAME/`, where
+   *`AGENT_NAME`* is the agent's name in your library.
 2. Runs `install_cmd` from that directory, before or after the benchmark sets the task up,
    as the benchmark chooses.
 3. Runs `run_cmd` from the benchmark's working directory, with placeholders filled in and
@@ -44,9 +45,10 @@ For each task, Valkyrie:
 - Runs with `sh -c` in `/bundle/AGENT_NAME/`, with a 10-minute limit.
 - A failed installation is tried up to three more times, then once more in a new sandbox,
   before the task fails.
-- Uploading leaves out `.git`, `.venv`, `venv`, and `__pycache__` directories, and every file
-  whose name contains `.env`, `.git`, `venv`, `.pyc`, `.pyo`, `.pyd`, `.so`, `.dll`,
-  `.dylib`, `.egg-info`, or `.DS_Store`. Symbolic links are refused.
+- Uploading leaves out every file and directory whose whole name matches `.git`, `.venv`,
+  `venv`, `__pycache__`, `*.egg-info`, `.env`, `.env.*`, `*.env`, `.envrc`, `*.pyc`,
+  `*.pyo`, `*.pyd`, `*.so`, `*.so.*`, `*.dll`, `*.dylib`, or `.DS_Store`. Symbolic links
+  are refused.
 
 ## Placeholders
 
@@ -112,7 +114,21 @@ What the agent can reach while it installs:
   can reach.
 - `egress_allowlist`, an earlier field that some contracts still set, adds hosts to the
   benchmark's run allowlist, or becomes the run allowlist when the benchmark sets none.
-- Hosts behind a shared content delivery network (CDN) can make an allowlist broader than the names in it.
+- Hosts behind a shared content delivery network (CDN) can make an allowlist broader than
+  the names in it.
+
+## The `allow_provider_tools` field {#allow-provider-tools}
+
+To let the agent use tools that the model provider runs on its side, such as hosted web
+search, set `allow_provider_tools`:
+
+```yaml contract.yaml
+allow_provider_tools: true
+```
+
+The default is `false`, which removes provider-side tools from the agent's model requests.
+They're also removed when the run limits where the agent can connect, through the
+benchmark's run allowlist or `egress_allowlist`, even with `allow_provider_tools: true`.
 
 ## Output files
 

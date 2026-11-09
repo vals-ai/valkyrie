@@ -1,5 +1,3 @@
-"""Register the checkout's executor source as the release for local runs."""
-
 import hashlib
 from pathlib import Path
 from uuid import uuid4
@@ -17,9 +15,7 @@ from tracker.executor.release_control import (
 
 
 def register_source_release(session: Session, source_root: Path) -> ExecutorRelease:
-    """Activate the release that always runs this checkout's current executor source."""
     artifact_uri = source_executor_artifact_uri(source_root.resolve())
-    # Source releases are not pinned: the digest names the checkout, not its contents, so edits reuse the release.
     artifact_digest = hashlib.sha256(artifact_uri.encode()).hexdigest()
 
     admission = lock_executor_admission(session)
@@ -43,7 +39,6 @@ def register_source_release(session: Session, source_root: Path) -> ExecutorRele
 
 
 def register_checkout_release() -> None:
-    """Activate the source release for the Tracker source tree that contains this module."""
     from tracker.database.session import engine
 
     source_root = Path(__file__).resolve().parents[2]

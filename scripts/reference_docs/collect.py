@@ -1,9 +1,10 @@
-"""Reflect the public Click and SDK surfaces into stable documentation records."""
-
 from __future__ import annotations
 
+import functools
 import inspect
+import operator
 import re
+import types
 import typing
 from collections.abc import Callable, Sequence
 from enum import Enum
@@ -40,6 +41,15 @@ def _format_value(value: object) -> str:
     raise TypeError(f"Unsupported default value of type {type(value).__name__!r}: {value!r}")
 
 
+def _without_metadata(annotation: object) -> object:
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _without_metadata(typing.get_args(annotation)[0])
+    if origin in (typing.Union, types.UnionType):
+        return functools.reduce(operator.or_, (_without_metadata(arg) for arg in typing.get_args(annotation)))
+    return annotation
+
+
 def _format_annotation(annotation: object) -> str:
     if annotation is inspect.Parameter.empty:
         return "Any"
@@ -48,7 +58,7 @@ def _format_annotation(annotation: object) -> str:
     if isinstance(annotation, str):
         return annotation
 
-    formatted = inspect.formatannotation(annotation).replace("typing.", "")
+    formatted = inspect.formatannotation(_without_metadata(annotation)).replace("typing.", "")
     return re.sub(r"\b(?:[A-Za-z_]\w*\.)+([A-Za-z_]\w*)\b", r"\1", formatted)
 
 
@@ -120,7 +130,6 @@ def _collect_click_parameter(parameter: click.Parameter) -> CLIParameterReferenc
 
 
 def collect_cli_commands() -> tuple[CLICommandReference, ...]:
-    """Collect registered leaf commands without invoking callbacks."""
     from valkyrie.cli.lazy import LazyGroup
     from valkyrie.cli.main import cli
 
@@ -331,12 +340,18 @@ def _validate_type_entries(entries: Sequence[SDKModelReference | SDKEnumReferenc
 
 
 def collect_sdk_reference() -> SDKReference:
-    """Collect the tested top-level SDK contract."""
     import valkyrie.sdk as sdk  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.client import ValkyrieClient  # pyright: ignore[reportMissingImports]
+    from valkyrie.sdk.login import SessionAuth, device_login  # pyright: ignore[reportMissingImports]
+    from valkyrie.sdk.resources.account import AccountResource  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.resources.artifacts import ArtifactsResource
     from valkyrie.sdk.resources.agents import AgentsResource  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.resources.benchmarks import BenchmarksResource  # pyright: ignore[reportMissingImports]
+    from valkyrie.sdk.resources.datasets import (  # pyright: ignore[reportMissingImports]
+        BenchmarkDefinitionsResource,
+        DatasetsResource,
+        DatasetTasksResource,
+    )
     from valkyrie.sdk.resources.logs import LogsResource  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.resources.projects import ProjectsResource  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.resources.runs import RunsResource  # pyright: ignore[reportMissingImports]
@@ -353,12 +368,16 @@ def collect_sdk_reference() -> SDKReference:
         ("BenchmarksResource", "client.benchmarks", BenchmarksResource),
         ("AgentsResource", "client.agents", AgentsResource),
         ("BenchmarkServicesResource", "client.services", BenchmarkServicesResource),
+        ("BenchmarkDefinitionsResource", "client.benchmark_definitions", BenchmarkDefinitionsResource),
+        ("DatasetsResource", "client.datasets", DatasetsResource),
+        ("DatasetTasksResource", "client.datasets.tasks", DatasetTasksResource),
         ("LogsResource", "client.logs", LogsResource),
         ("SchedulerResource", "client.scheduler", SchedulerResource),
         ("SecretsResource", "client.secrets", SecretsResource),
         ("ProjectsResource", "client.projects", ProjectsResource),
         ("ProvidersResource", "client.providers", ProvidersResource),
         ("SettingsResource", "client.settings", SettingsResource),
+        ("AccountResource", "client.account", AccountResource),
     )
     resources = tuple(_collect_resource(name, attribute, resource) for name, attribute, resource in resource_types)
 
@@ -396,6 +415,16 @@ def collect_sdk_reference() -> SDKReference:
         constructor,
         _collect_method("close", ValkyrieClient.close),
     )
+    session_auth = _collect_method("SessionAuth", SessionAuth.__init__)
+    session_auth = session_auth._replace(
+        description=_clean_docstring(inspect.getdoc(SessionAuth)),
+        signatures=(
+            _format_signature("SessionAuth", SessionAuth.__init__).removeprefix("def ").rsplit(" -> ", 1)[0]
+            + " -> SessionAuth",
+        ),
+        return_types=("SessionAuth",),
+    )
+    login_functions = (_collect_method("device_login", device_login), session_auth)
     return SDKReference(
         exports=tuple(sdk_exports),
         resources=resources,
@@ -403,4 +432,5 @@ def collect_sdk_reference() -> SDKReference:
         enums=tuple(enums),
         exceptions=tuple(exceptions),
         client_methods=client_methods,
+        login_functions=login_functions,
     )

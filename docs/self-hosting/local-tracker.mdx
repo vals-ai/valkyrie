@@ -3,9 +3,9 @@ title: "Run Tracker locally"
 description: "Run the Tracker on your machine without AWS, with sandboxes on Daytona, Modal, or Docker."
 ---
 
-A local Tracker keeps run state in a PostgreSQL container and writes artifacts and logs to a
-folder on your machine. Sandboxes run on Daytona, Modal, or your own Docker daemon, and no AWS
-account or login is needed.
+A local Tracker keeps run state in a PostgreSQL container and writes artifacts and logs to
+a folder on your machine. Sandboxes run on Daytona, Modal, or your own Docker daemon, and
+no AWS account or login is needed.
 
 You need Docker, the [Valkyrie CLI](/get-started/quickstart#install-the-cli), and a Daytona
 API key or Modal token unless you only use Docker sandboxes.
@@ -74,8 +74,8 @@ where *`CONFIG_FILE`* is its path. Relative paths in it resolve from its folder.
 Use one of these:
 
 - **A service Vals AI hosts.** Start the Tracker with the hosted services' domain, and set
-  `VALKYRIE_API_KEY` in the CLI's environment to a Valkyrie
-  [access key](/get-started/configuration#create-an-access-key-for-ci) that can use the benchmark:
+  `VALKYRIE_API_KEY` in the CLI's environment to a Valkyrie [access
+  key](/get-started/configuration#create-an-access-key-for-ci) that can use the benchmark:
 
   ```bash
   BENCHMARK_SERVICE_BASE_URL=benchmarks.vals.ai make local-tracker
@@ -96,29 +96,32 @@ export VALKYRIE_URL=http://127.0.0.1:8000
 
 valkyrie agent push ./my-agent
 
-valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation
+valkyrie project create my-project --name "My Project" --spend-type development \
+  --subcategory new_benchmark_generation \
+  --budget 300 --budget-reason "3 runs, about 100 each"
 
 valkyrie run start --agent my-agent --benchmark my-benchmark --project my-project \
   --provider daytona --concurrency 1
 ```
 
-Without `--provider` or a [default provider](/get-started/sandbox-providers#choose-the-provider-for-a-run),
-runs use `daytona`. Every other `valkyrie run` command works against the local Tracker,
-which serves artifacts over HTTP, so the CLI doesn't need access to `data_root`. Retries,
+Without `--provider` or a [default
+provider](/get-started/sandbox-providers#choose-the-provider-for-a-run), runs use
+`daytona`. Every other `valkyrie run` command works against the local Tracker, which
+serves artifacts over HTTP, so the CLI doesn't need access to `data_root`. Retries,
 resumes, and forced stops use the provider and secrets file saved on the run.
 
 ## Docker sandboxes
 
 Docker runs each task in a container on the daemon that the Tracker and your benchmark
-service share. Select the daemon with `DOCKER_HOST`, and pass `--provider docker` or set it as
-your default with `valkyrie provider default docker`.
+service share. Select the daemon with `DOCKER_HOST`, and pass `--provider docker` or set
+it as your default with `valkyrie provider default docker`.
 
 - Services Vals AI hosts can't use Docker sandboxes. Start your own service with
   `CBS_DOCKER_ENABLED=true`, built with the create-benchmark-service version that
   `services/tracker/pyproject.toml` pins.
 - Docker can't change network access between stages, so the benchmark and the agent must
-  allow unrestricted (`"*"`) access in every stage. Allowlists are refused before a container
-  starts.
+  allow unrestricted (`"*"`) access in every stage. Allowlists are refused before a
+  container starts.
 - Containers can't run Docker themselves.
 - If the Tracker stops mid-run, the run's containers keep running. To remove them, run the
   following, replacing *`RUN_ID`* with the run's ID:
@@ -154,10 +157,10 @@ Only this source can send a benchmark service's
 
 ## Limits
 
-- Post-run Lambdas, `valkyrie run results --s3`, result previews, and Docent analysis need S3
-  storage, so a local Tracker can't run them.
-- Some hosted benchmarks start sandboxes from snapshots or images that only Vals AI's Daytona
-  organization can read, so they fail with your own Daytona account.
+- Post-run Lambdas, `valkyrie run results --s3`, result previews, and Docent analysis need
+  S3 storage, so a local Tracker can't run them.
+- Some hosted benchmarks start sandboxes from snapshots or images that only Vals AI's
+  Daytona organization can read, so they fail with your own Daytona account.
 
 ## Fix common errors
 

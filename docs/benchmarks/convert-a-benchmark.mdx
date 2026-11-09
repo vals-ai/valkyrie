@@ -71,7 +71,8 @@ from benchmark_service.utils import stream_command
 
 `load_datasets` runs once when the service starts, and its result is kept in
 `self.datasets`. Key it by dataset name, then by task ID. Each task's value is whatever your
-benchmark needs, such as a problem statement, a repository and commit, or an expected answer.
+benchmark needs, such as a problem statement, a repository and commit, or an expected
+answer.
 
 ```python
 async def load_datasets(self) -> dict[str, dict[str, Any]]:
@@ -113,16 +114,17 @@ async def retrieve_task(
 
 - **Image:** return the same `ImageSource` for every task and do per-task work in
   `setup_task`, or build one image per task ahead of time and return each task's own.
-  `SnapshotSource` starts from a provider snapshot instead, and `ComposeSource` runs the task
-  as Docker Compose services. Build images for `linux/amd64`. Private images need registry
-  credentials in your sandbox provider account.
+  `SnapshotSource` starts from a provider snapshot instead, and `ComposeSource` runs the
+  task as Docker Compose services. Build images for `linux/amd64`. Private images need
+  registry credentials in your sandbox provider account.
 - **Time limit:** `agent_timeout` is the agent's generation limit in seconds. See
   [Task time limits](/runs/time-limits).
 - **Hardware:** request GPUs through `Resources`, for example
   `Resources(vcpu=8, memory=32, disk=50, gpu=1, gpu_type="H100")`.
 - **Docker inside the task:** Daytona and Modal sandboxes can run Docker. Use an image with
   Docker installed and start `dockerd` during setup.
-- **Install order:** Valkyrie installs the agent before `setup_task` runs. When setup must prepare the runtime first, set `agent_install_order="after_setup"`.
+- **Install order:** Valkyrie installs the agent before `setup_task` runs. When setup must
+  prepare the runtime first, set `agent_install_order="after_setup"`.
   `ComposeSource` tasks always run setup first.
 
 Set network access for each stage with `egress`:
@@ -262,7 +264,8 @@ the tunnel.
 3. Run one task, and [watch it](/runs/monitor) stream your setup and grading messages:
 
    ```bash
-   valkyrie run start --benchmark swebench --agent my-agent --slice 0:1 --connect --project my-project
+   valkyrie run start --benchmark swebench --agent my-agent --slice 0:1 --connect \
+     --project my-project
    ```
 
 Scale up after setup, grading, and scoring all behave. To stop using your copy, run
@@ -270,7 +273,7 @@ Scale up after setup, grading, and scoring all behave. To stop using your copy, 
 
 ## Publish the service
 
-A port is finished when it's listed in the
-[public benchmark services registry](https://github.com/vals-ai/public-benchmark-services-registry):
-the service lives in its own repository, named like `swebench-benchmark-service`, added to the
+A port is finished when it's listed in the [public benchmark services
+registry](https://github.com/vals-ai/public-benchmark-services-registry): the service
+lives in its own repository, named like `swebench-benchmark-service`, added to the
 registry as a Git submodule with a matching `services.yaml` entry.

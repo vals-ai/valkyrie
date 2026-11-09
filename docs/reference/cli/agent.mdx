@@ -27,7 +27,7 @@ valkyrie agent install \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--name, -n"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)"}</p>
+  <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)."}</p>
 </div>
 
 Task guidance: [Agent guides](/agents/manage-agents).
@@ -54,7 +54,7 @@ valkyrie agent push \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--name, -n"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)"}</p>
+  <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)."}</p>
 </div>
 
 Task guidance: [Agent guides](/agents/manage-agents).
@@ -63,11 +63,12 @@ Task guidance: [Agent guides](/agents/manage-agents).
 
 ## `valkyrie agent remove` {#remove}
 
-Remove an installed agent
+Remove an installed agent.
 
 ```bash Syntax
 valkyrie agent remove \
-  <AGENT_NAME>
+  <AGENT_NAME> \
+  [--yes|-y]
 ```
 
 **Arguments**
@@ -76,13 +77,20 @@ valkyrie agent remove \
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"AGENT_NAME"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
 </div>
 
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
+</div>
+
 Task guidance: [Agent guides](/agents/manage-agents).
 
 ---
 
 ## `valkyrie agent download` {#download}
 
-Download an installed agent
+Download an installed agent.
 
 ```bash Syntax
 valkyrie agent download \
@@ -101,7 +109,7 @@ valkyrie agent download \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--output-dir, -o"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"directory; readable"}</span></div>
-  <p className="mb-0 mt-1">{"Output directory for downloaded agent (default: current directory)"}</p>
+  <p className="mb-0 mt-1">{"Output directory for downloaded agent (default: current directory)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -115,7 +123,7 @@ Task guidance: [Agent guides](/agents/manage-agents).
 
 ## `valkyrie agent list` {#list}
 
-List installed agents
+List installed agents.
 
 ```bash Syntax
 valkyrie agent list \

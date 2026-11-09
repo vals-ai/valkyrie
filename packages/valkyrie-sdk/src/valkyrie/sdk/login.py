@@ -16,7 +16,8 @@ import httpx
 from filelock import FileLock
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
-from valkyrie.sdk.errors import ValkyrieConfigError
+from valkyrie.sdk._transfer import finish_before_cancelling
+from valkyrie.sdk.errors import ValkyrieConfigError, ValkyrieTransportError
 
 DEFAULT_SESSION_DIR = Path("~/.config/valkyrie/sessions")
 REFRESH_MARGIN_SECONDS = 60.0
@@ -84,7 +85,6 @@ class _Refreshed(_Response):
 
 
 def _replace(path: Path, text: str) -> None:
-    """Write a file in the 0700 sessions directory so readers never see it half-written."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete_on_close=False) as file:
         file.write(text)
@@ -102,6 +102,8 @@ def _read[Model: _Response](model: type[Model], response: httpx.Response, action
 
 
 class LoginSession(BaseModel):
+    """A browser login for one Tracker, saved under `~/.config/valkyrie/sessions` by `valkyrie login`."""
+
     model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
 
     tracker_url: str
@@ -204,6 +206,11 @@ class ApiKeyAuth(httpx.Auth):
 
 
 class SessionAuth(httpx.Auth):
+    """Send requests as a saved login, refreshing it before it expires and saving the rotated tokens.
+
+    Pass it as `ValkyrieClient(auth=SessionAuth(session))` to act as that login even when `VALKYRIE_API_KEY` is set.
+    """
+
     def __init__(self, session: LoginSession) -> None:
         self._session = session
         self._lock = asyncio.Lock()
@@ -265,24 +272,34 @@ class SessionAuth(httpx.Auth):
             if self._session.expiring and not self._adopt_stored():
                 response = yield self._refresh_request(request.extensions)
                 await response.aread()
-                # Preserve rotated tokens before cancellation releases the auth lock.
-                store_task = asyncio.create_task(asyncio.to_thread(self._store_refresh, response))
-                cancelled = False
-                while not store_task.done():
-                    try:
-                        await asyncio.shield(store_task)
-                    except asyncio.CancelledError:
-                        cancelled = True
-
-                store_task.result()
-                if cancelled:
-                    raise asyncio.CancelledError
+                await finish_before_cancelling(asyncio.to_thread(self._store_refresh, response))
 
         yield self._authorize(request)
 
 
-def device_login(tracker_url: str, http: httpx.Client, announce: Callable[[str, str], None]) -> LoginSession:
+def device_login(
+    tracker_url: str,
+    announce: Callable[[str, str], None],
+    *,
+    timeout: float = 30,
+    transport: httpx.BaseTransport | None = None,
+) -> LoginSession:
+    """Sign in to a Tracker with the OAuth device flow and return the new, unsaved login.
+
+    `announce(link, user_code)` is called once with the page the user opens and the code they confirm there.
+    The call blocks until the login is approved, denied or expires. Call `save()` and `remember()` on the
+    result to keep it. Raises `ValkyrieConfigError` when the login service refuses or the code expires, and
+    `ValkyrieTransportError` when the Tracker or login service can't be reached.
+    """
     tracker_url = tracker_url.rstrip("/")
+    try:
+        with httpx.Client(timeout=timeout, transport=transport) as http:
+            return _device_login(tracker_url, http, announce)
+    except httpx.HTTPError as error:
+        raise ValkyrieTransportError(f"The login to {tracker_url} could not finish: {error}") from error
+
+
+def _device_login(tracker_url: str, http: httpx.Client, announce: Callable[[str, str], None]) -> LoginSession:
     response = http.get(f"{tracker_url}/auth/cli")
     if response.status_code == 404:
         raise ValkyrieConfigError("This Tracker does not support `valkyrie login`. Set VALKYRIE_API_KEY instead.")

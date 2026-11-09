@@ -1,13 +1,11 @@
-"""Projects created once and linked to each run at start and by retag.
-
-Run: uv run pytest tests/unit/test_projects.py
-"""
-
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+import httpx
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import VerifyTaskIdsResponse
 from fastapi.testclient import TestClient
@@ -15,9 +13,15 @@ from pytest import MonkeyPatch
 from sqlmodel import Session, col, select
 
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
+import main as main_module
 from main import app
 from tests.utils import TEST_ORG_ID
-from tracker.auth import RequestIdentity, get_current_runner, get_current_starter
+import tracker.auth as tracker_auth
+from tracker.api.projects import reject_archived_project
+from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
+from tracker.aws.tags import ORG_ID_TAG
+from tracker.exceptions import ProjectNameTakenError
+from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
     AgentContractRequest,
     AWSBenchmarkArguments,
@@ -48,9 +52,77 @@ _CUSTOMER_PROJECT = {
 }
 
 
+class GatewayAPI:
+    def __init__(self) -> None:
+        self.request_id = uuid4()
+        self.key_id = uuid4()
+        self.status = "approved"
+        self.requests: list[dict[str, Any]] = []
+        self.collections: list[dict[str, Any]] = []
+        self.paths: list[str] = []
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.paths.append(path)
+        assert request.headers["authorization"] == "Bearer machine-test-key"
+        if path == "/admin/managed-auth/machine/requests":
+            assert request.method == "POST"
+            self.requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"id": str(self.request_id), "status": "pending"})
+        if path == f"/admin/managed-auth/machine/requests/{self.request_id}":
+            assert request.method == "GET"
+            return httpx.Response(
+                200,
+                json={"id": str(self.request_id), "status": self.status, "key_id": str(self.key_id)},
+            )
+        if path == f"/admin/managed-auth/machine/keys/{self.key_id}":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"id": str(self.key_id), "revision": 3, "status": "pending_collection"})
+        if path == f"/admin/managed-auth/machine/keys/{self.key_id}/collect":
+            assert request.method == "POST"
+            self.collections.append(json.loads(request.content))
+            return httpx.Response(200, json={"secret": "project-gateway-key"})
+        raise AssertionError(f"Unexpected Gateway request: {request.method} {path}")
+
+
+@pytest.fixture(autouse=True)
+def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
+    from tracker import project_gateway
+
+    gateway = GatewayAPI()
+    monkeypatch.setattr(project_gateway, "VALKYRIE_STAGE", "dev")
+    monkeypatch.delenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", raising=False)
+    monkeypatch.setenv("MODEL_GATEWAY_URL", "https://model-gateway.example")
+    monkeypatch.setenv("MODEL_GATEWAY_MACHINE_API_KEY", "machine-test-key")
+    monkeypatch.setattr(
+        project_gateway,
+        "_gateway_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://model-gateway.example/",
+            headers={"Authorization": "Bearer machine-test-key"},
+            transport=httpx.MockTransport(gateway.handle),
+        ),
+    )
+    return gateway
+
+
+@pytest.fixture
+def vals_org(monkeypatch: MonkeyPatch, database_session: Session) -> Org:
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+    org = database_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    org.name = "vals.ai"
+    database_session.add(org)
+    database_session.commit()
+    identity = RequestIdentity(org=org, email="alice@vals.ai")
+    monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
+    monkeypatch.setitem(app.dependency_overrides, get_current_runner, lambda: identity)
+    monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: org)
+    return org
+
+
 @pytest.fixture
 def active_executor_release(database_session: Session) -> None:
-    """Provide the admission target a run start needs."""
     release = ExecutorRelease(
         id="test-release",
         artifact_uri="s3://artifacts/test-release.pex",
@@ -140,6 +212,7 @@ def _link_rows(database_session: Session, run_id: UUID) -> list[RunProject]:
     )
 
 
+@pytest.mark.description("Creating a project saves it with its spend fields.")
 @pytest.mark.parametrize(
     "project",
     [
@@ -240,7 +313,7 @@ def _link_rows(database_session: Session, run_id: UUID) -> list[RunProject]:
     ],
 )
 def test_create_saves_the_project_with_its_spend_fields(
-    monkeypatch: MonkeyPatch, database_session: Session, project: dict[str, Any]
+    monkeypatch: MonkeyPatch, database_session: Session, project: dict[str, Any], gateway_api: GatewayAPI
 ) -> None:
     creator = RequestIdentity(org=Org(id=TEST_ORG_ID, name="default"), email="alice@vals.ai")
     monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: creator)
@@ -255,12 +328,88 @@ def test_create_saves_the_project_with_its_spend_fields(
     assert _project_fields(row) == expected
     assert (row.org_id, row.created_by_email) == (TEST_ORG_ID, "alice@vals.ai")
     assert {key: response.json()[key] for key in expected} == expected
+    assert row.gateway_request_id is None
+    assert row.gateway_key_id is None
+    assert gateway_api.requests == []
+    assert set(response.json()).isdisjoint({"gateway_request_id", "gateway_key_id"})
 
 
 _BLOG = {"handle": "blog", "name": "Blog", "spend_type": "internal", "subcategory": "blog"}
+_BUDGET = {"budget": "300", "budget_reason": "3 runs, about 100 each"}
 _HANDLE_RULE = "must be lowercase letters, digits and hyphens, at most 64 characters, e.g. my-project"
 
 
+@pytest.mark.description(
+    "Creating a Vals project files one gateway key request and keeps gateway fields out of the response."
+)
+def test_vals_project_creation_requests_gateway_key_with_generated_description(
+    database_session: Session, gateway_api: GatewayAPI, vals_org: Org
+) -> None:
+    response = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert response.status_code == 200, response.text
+    (project,) = database_session.exec(select(Project)).all()
+    project_id = str(project.id)
+    assert response.json()["id"] == project_id
+    listed = client.get("/projects")
+    assert listed.status_code == 200, listed.text
+    assert [item["id"] for item in listed.json()["projects"]] == [project_id]
+    read = client.get(f"/projects/by-id/{project.id}")
+    assert read.status_code == 200, read.text
+    assert read.json()["id"] == project_id
+    assert (project.gateway_request_id, project.gateway_key_id) == (gateway_api.request_id, None)
+    assert gateway_api.requests == [
+        {
+            "project_id": str(project.id),
+            "project_organization_id": str(project.org_id),
+            "project_environment": "dev",
+            "display_name": "Blog",
+            "description": "Valkyrie project blog",
+            "requested_budget": "300",
+            "budget_reason": "3 runs, about 100 each",
+        }
+    ]
+    assert gateway_api.paths == ["/admin/managed-auth/machine/requests"]
+    assert set(response.json()).isdisjoint({"gateway_request_id", "gateway_key_id", "budget", "budget_reason"})
+
+
+@pytest.mark.description(
+    "A Vals project with no budget or reason is refused, and no project or gateway request is created."
+)
+@pytest.mark.parametrize(
+    "budget",
+    [{}, {"budget": "300"}, {"budget_reason": "3 runs, about 100 each"}, {"budget": "300", "budget_reason": None}],
+    ids=["neither", "budget-only", "reason-only", "null-reason"],
+)
+def test_vals_project_creation_without_budget_and_reason_names_both_flags_and_files_nothing(
+    database_session: Session, gateway_api: GatewayAPI, vals_org: Org, budget: dict[str, Any]
+) -> None:
+    response = client.post("/projects", json={**_BLOG, **budget})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == (
+        "Project 'blog' needs --budget and --budget-reason: "
+        "creating it requests its main Gateway key, which carries that budget"
+    )
+    assert database_session.exec(select(Project)).all() == []
+    assert gateway_api.requests == []
+
+
+@pytest.mark.description("A project without gateway requests is created and its budget is dropped.")
+def test_project_creation_without_gateway_requests_accepts_and_drops_budget(
+    monkeypatch: MonkeyPatch, database_session: Session, gateway_api: GatewayAPI
+) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+
+    response = client.post("/projects", json={**_BLOG, **_BUDGET})
+
+    assert response.status_code == 200, response.text
+    (project,) = database_session.exec(select(Project)).all()
+    assert (project.handle, project.gateway_request_id) == ("blog", None)
+    assert gateway_api.requests == []
+    assert set(response.json()).isdisjoint({"budget", "budget_reason"})
+
+
+@pytest.mark.description("An invalid project is rejected without being saved.")
 @pytest.mark.parametrize(
     ("project", "message"),
     [
@@ -338,6 +487,7 @@ def test_create_rejects_invalid_projects_without_saving(
     assert database_session.exec(select(Project)).all() == []
 
 
+@pytest.mark.description("A project cannot reuse a handle the org already has.")
 def test_create_refuses_a_handle_the_org_already_uses(database_session: Session, router_bench: Project) -> None:
     response = client.post("/projects", json={**_BLOG, "handle": "router-bench", "name": "Another name"})
 
@@ -346,18 +496,88 @@ def test_create_refuses_a_handle_the_org_already_uses(database_session: Session,
     assert len(database_session.exec(select(Project)).all()) == 1
 
 
-def test_create_accepts_a_name_the_org_already_uses_under_another_handle(
-    database_session: Session, router_bench: Project
+@pytest.mark.description("A project cannot reuse a name the org already has, whatever its case or outer spaces.")
+@pytest.mark.parametrize("name", ["Router Bench", "router bench ", "  ROUTER BENCH"])
+def test_create_refuses_a_name_the_org_already_uses_and_names_its_handle(
+    database_session: Session, router_bench: Project, name: str
 ) -> None:
+    response = client.post("/projects", json={**_BLOG, "handle": "router-bench-2", "name": name})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "A project named 'Router Bench' already exists (handle router-bench). Choose another name."
+    )
+    assert [row.handle for row in database_session.exec(select(Project)).all()] == ["router-bench"]
+
+
+@pytest.mark.description("A non-ASCII name is matched the way the database's index folds it.")
+def test_create_refuses_a_taken_non_ascii_name_and_names_its_handle(database_session: Session) -> None:
+    assert client.post("/projects", json={**_BLOG, "handle": "equipe", "name": "Équipe"}).status_code == 200
+
+    response = client.post("/projects", json={**_BLOG, "handle": "equipe-2", "name": "Équipe"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A project named 'Équipe' already exists (handle equipe). Choose another name."
+
+
+@pytest.mark.description("An archived project still holds its name.")
+def test_create_refuses_the_name_of_an_archived_project(database_session: Session, router_bench: Project) -> None:
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
     response = client.post("/projects", json={**_BLOG, "handle": "router-bench-2", "name": "Router Bench"})
 
+    assert response.status_code == 409
+    assert "(handle router-bench)" in response.json()["detail"]
+
+
+@pytest.mark.description("Another org's project names do not block this org.")
+def test_create_accepts_a_name_another_org_uses(database_session: Session) -> None:
+    database_session.add(
+        Project(
+            org_id=_other_org(database_session).id,
+            handle="theirs",
+            name="Router Bench",
+            spend_type=SpendType.INTERNAL,
+            subcategory="blog",
+        )
+    )
+    database_session.commit()
+
+    response = client.post("/projects", json={**_BLOG, "handle": "router-bench", "name": "Router Bench"})
+
     assert response.status_code == 200, response.text
-    assert sorted((row.handle, row.name) for row in database_session.exec(select(Project)).all()) == [
-        ("router-bench", "Router Bench"),
-        ("router-bench-2", "Router Bench"),
-    ]
 
 
+@pytest.mark.description("A same-named insert that slips past the lookup is refused by the index and named.")
+def test_create_racing_a_same_named_insert_reports_the_name_from_the_index(
+    monkeypatch: MonkeyPatch, database_session: Session, router_bench: Project
+) -> None:
+    repository = ProjectRepository(database_session)
+    lookups = iter([None, router_bench])
+    monkeypatch.setattr(repository, "get_by_name", lambda _org_id, _name: next(lookups))
+    racer = Project(
+        org_id=TEST_ORG_ID,
+        handle="router-bench-2",
+        name="ROUTER BENCH",
+        spend_type=SpendType.INTERNAL,
+        subcategory="blog",
+    )
+
+    with pytest.raises(ProjectNameTakenError, match=r"\(handle router-bench\)"):
+        repository.create(racer)
+
+
+@pytest.mark.description("A taken name is refused before any Gateway key request is filed.")
+def test_vals_project_with_a_taken_name_files_no_gateway_request(
+    vals_org: Org, router_bench: Project, gateway_api: GatewayAPI
+) -> None:
+    response = client.post("/projects", json={**_BLOG, **_BUDGET, "name": "Router Bench"})
+
+    assert response.status_code == 409
+    assert gateway_api.requests == []
+
+
+@pytest.mark.description("Listing projects shows only the caller's org projects, by handle.")
 def test_list_shows_only_the_callers_org_projects_by_handle(
     database_session: Session, router_bench: Project, google_report: Project
 ) -> None:
@@ -393,6 +613,89 @@ def test_list_shows_only_the_callers_org_projects_by_handle(
     assert {key: projects[1][key] for key in _CUSTOMER_PROJECT} == _CUSTOMER_PROJECT
 
 
+@pytest.mark.description("A project ID lookup is scoped to the caller's org.")
+def test_project_id_lookup_is_scoped_to_the_callers_org(database_session: Session, router_bench: Project) -> None:
+    other = Project(
+        org_id=_other_org(database_session).id,
+        handle="theirs",
+        name="Theirs",
+        spend_type=SpendType.INTERNAL,
+        subcategory="blog",
+    )
+    database_session.add(other)
+    database_session.commit()
+
+    response = client.get(f"/projects/by-id/{router_bench.id}")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": str(router_bench.id), "org_id": str(TEST_ORG_ID)}
+    for project_id in (other.id, uuid4()):
+        assert client.get(f"/projects/by-id/{project_id}").status_code == 404
+
+
+@pytest.fixture
+def gateway_key_login(monkeypatch: MonkeyPatch) -> MagicMock:
+    monkeypatch.delitem(app.dependency_overrides, get_current_runner)
+    monkeypatch.setattr(tracker_auth, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker_auth, "DESCOPE_MANAGEMENT_KEY", "management-key")
+    monkeypatch.setattr(
+        tracker_auth,
+        "_validate_bearer",
+        lambda _token: {"sub": "U-alice", "tenants": {"default": {}}},
+    )
+    descope = MagicMock()
+    descope.mgmt.user.load_by_user_id.return_value = {
+        "user": {"userId": "U-alice", "userTenants": [{"tenantId": "default", "roleNames": []}]}
+    }
+    monkeypatch.setattr(tracker_auth, "_descope_client", descope)
+    return descope
+
+
+@pytest.mark.description("Gateway key eligibility needs a live human who is allowed to run.")
+def test_gateway_key_eligibility_requires_a_live_human_allowed_to_run(
+    database_session: Session, router_bench: Project, gateway_key_login: MagicMock
+) -> None:
+    path = f"/projects/by-id/{router_bench.id}/gateway-key-eligibility"
+    response = client.get(path, headers={"authorization": "Bearer human-session"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "project_id": str(router_bench.id),
+        "org_id": str(TEST_ORG_ID),
+        "subject": "U-alice",
+    }
+    gateway_key_login.mgmt.user.load_by_user_id.assert_any_call("U-alice")
+    assert client.get(path, headers={"x-api-key": "non-human-key"}).status_code == 403
+
+    gateway_key_login.mgmt.user.load_by_user_id.return_value["user"]["roleNames"] = ["valkyrie-no-start"]
+    assert client.get(path, headers={"authorization": "Bearer human-session"}).status_code == 403
+
+    gateway_key_login.mgmt.user.load_by_user_id.return_value["user"]["roleNames"] = []
+    gateway_key_login.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = [{"tenantId": "other"}]
+    assert client.get(path, headers={"authorization": "Bearer human-session"}).status_code == 403
+
+
+@pytest.mark.description("Gateway key eligibility for a project in another org returns 404.")
+def test_gateway_key_eligibility_hides_projects_outside_the_human_org(
+    database_session: Session, gateway_key_login: MagicMock
+) -> None:
+    other = Project(
+        org_id=_other_org(database_session).id,
+        handle="theirs",
+        name="Theirs",
+        spend_type=SpendType.INTERNAL,
+        subcategory="blog",
+    )
+    database_session.add(other)
+    database_session.commit()
+
+    for project_id in (other.id, uuid4()):
+        response = client.get(
+            f"/projects/by-id/{project_id}/gateway-key-eligibility",
+            headers={"authorization": "Bearer human-session"},
+        )
+        assert response.status_code == 404
+
+
+@pytest.mark.description("Updating a project changes its spend fields and keeps its identity.")
 def test_update_changes_spend_fields_without_replacing_project_identity(
     database_session: Session,
     contract: AgentContractRequest,
@@ -430,6 +733,48 @@ def test_update_changes_spend_fields_without_replacing_project_identity(
     }
 
 
+@pytest.mark.description("A rename to another project's name is refused and the old name stays.")
+def test_update_refuses_another_projects_name_and_keeps_the_old_one(
+    database_session: Session, router_bench: Project, google_report: Project
+) -> None:
+    response = client.put(
+        "/projects/router-bench", json={**_BLOG, "handle": "router-bench", "name": "google report xyz "}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "A project named 'Google Report XYZ' already exists (handle google-report-xyz). Choose another name."
+    )
+    database_session.expire_all()
+    saved = database_session.get(Project, router_bench.id)
+    assert saved is not None and saved.name == "Router Bench"
+
+
+@pytest.mark.description("A rename that slips past the lookup is refused by the index and named.")
+def test_update_racing_a_same_named_write_reports_the_name_from_the_index(
+    monkeypatch: MonkeyPatch, database_session: Session, router_bench: Project, google_report: Project
+) -> None:
+    repository = ProjectRepository(database_session)
+    lookups = iter([None, google_report])
+    monkeypatch.setattr(repository, "get_by_name", lambda _org_id, _name: next(lookups))
+    router_bench.name = "GOOGLE REPORT XYZ"
+
+    with pytest.raises(ProjectNameTakenError, match=r"'Google Report XYZ' already exists \(handle google-report-xyz\)"):
+        repository.update(router_bench)
+
+
+@pytest.mark.description("A project can keep its own name or change only its case.")
+@pytest.mark.parametrize("name", ["Router Bench", "router bench"])
+def test_update_keeps_or_recases_the_projects_own_name(
+    database_session: Session, router_bench: Project, name: str
+) -> None:
+    response = client.put("/projects/router-bench", json={**_BLOG, "handle": "router-bench", "name": name})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == name
+
+
+@pytest.mark.description("An update whose body handle differs from the path is rejected.")
 def test_update_rejects_a_body_handle_that_differs_from_the_path(
     database_session: Session, router_bench: Project
 ) -> None:
@@ -446,6 +791,7 @@ def test_update_rejects_a_body_handle_that_differs_from_the_path(
     assert _project_fields(saved) == before
 
 
+@pytest.mark.description("An update applies the same spend validation as creation.")
 def test_update_reuses_project_spend_validation(database_session: Session, router_bench: Project) -> None:
     project_id = router_bench.id
     before = _project_fields(router_bench)
@@ -463,6 +809,7 @@ def test_update_reuses_project_spend_validation(database_session: Session, route
     assert _project_fields(saved) == before
 
 
+@pytest.mark.description("Updating another org's project returns 404.")
 def test_update_hides_another_orgs_project(database_session: Session) -> None:
     database_session.add(
         Project(
@@ -480,6 +827,7 @@ def test_update_hides_another_orgs_project(database_session: Session) -> None:
     assert response.status_code == 404
 
 
+@pytest.mark.description("Deleting an unused project removes it and returns it.")
 def test_delete_returns_and_removes_an_unused_project(database_session: Session, router_bench: Project) -> None:
     project_id = router_bench.id
     expected = _project_fields(router_bench)
@@ -492,6 +840,7 @@ def test_delete_returns_and_removes_an_unused_project(database_session: Session,
     assert database_session.get(Project, project_id) is None
 
 
+@pytest.mark.description("Deleting an unknown or other org's project returns 404.")
 def test_delete_hides_unknown_and_other_org_projects(database_session: Session) -> None:
     other = Project(
         org_id=_other_org(database_session).id,
@@ -509,6 +858,7 @@ def test_delete_hides_unknown_and_other_org_projects(database_session: Session) 
     assert database_session.get(Project, other.id) is not None
 
 
+@pytest.mark.description("A project that was ever linked to a run cannot be deleted.")
 def test_delete_rejects_a_project_with_any_historical_run_link(
     database_session: Session,
     contract: AgentContractRequest,
@@ -529,6 +879,175 @@ def test_delete_rejects_a_project_with_any_historical_run_link(
     assert response.status_code == 409
     assert response.json()["detail"] == "Project 'router-bench' has run history and cannot be deleted"
     assert database_session.get(Project, router_bench.id) is not None
+
+
+@pytest.mark.usefixtures("active_executor_release")
+def test_provision_keeps_supplied_keys_then_automatic_selects_one_project_gateway_secret(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+    vals_org: Org,
+) -> None:
+    from tracker.aws.secrets import SecretsManagerStore
+
+    writes: list[tuple[str, str, dict[str, str]]] = []
+
+    async def store_secret(_self: SecretsManagerStore, name: str, value: str, *, tags: dict[str, str]) -> None:
+        writes.append((name, value, tags))
+
+    monkeypatch.setattr(SecretsManagerStore, "put", store_secret)
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "provision")
+    gateway_api.status = "pending"
+    created = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert created.status_code == 200, created.text
+    (project,) = database_session.exec(select(Project)).all()
+    assert (project.gateway_request_id, project.gateway_key_id) == (gateway_api.request_id, None)
+    supplied_secrets = {
+        "MODEL_GATEWAY_URL": "caller-url",
+        "MODEL_GATEWAY_API_KEY": "caller-key",
+        "UNRELATED_KEY": "caller-other",
+    }
+    request = _start_request(contract.model_copy(update={"secrets": supplied_secrets}), "blog")
+    response = client.post("/start-benchmark", json=request)
+    assert response.status_code == 200, response.text
+    provision_run_id = UUID(response.json()["benchmark_id"])
+    assert gateway_api.collections == []
+    assert writes == []
+    assert gateway_api.paths == ["/admin/managed-auth/machine/requests"]
+    assert len(mock_launcher.queued_calls) == 1
+    assert (
+        mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"]
+        == supplied_secrets
+    )
+
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+    gateway_api.status = "approved"
+    for _ in range(2):
+        response = client.post("/start-benchmark", json=request)
+        assert response.status_code == 200, response.text
+
+    reference = f"valkyrie/tenants/{TEST_ORG_ID}/model-gateway-{gateway_api.key_id}"
+    expected_secrets = {
+        "MODEL_GATEWAY_URL": reference,
+        "MODEL_GATEWAY_API_KEY": reference,
+        "UNRELATED_KEY": "caller-other",
+    }
+    assert len(writes) == 1
+    assert writes[0][0] == reference
+    assert json.loads(writes[0][1]) == {
+        "MODEL_GATEWAY_URL": "https://model-gateway.example",
+        "MODEL_GATEWAY_API_KEY": "project-gateway-key",
+    }
+    assert writes[0][2] == {ORG_ID_TAG: str(TEST_ORG_ID)}
+    assert gateway_api.collections == [{"expected_revision": 3}]
+    assert gateway_api.paths.count(f"/admin/managed-auth/machine/keys/{gateway_api.key_id}/collect") == 1
+    database_session.refresh(project)
+    assert (project.gateway_request_id, project.gateway_key_id) == (gateway_api.request_id, gateway_api.key_id)
+    database_session.expire_all()
+    saved_runs = database_session.exec(select(Benchmark)).all()
+    assert len(saved_runs) == 3
+    provision_run = database_session.get(Benchmark, provision_run_id)
+    assert provision_run is not None
+    assert provision_run.arguments.contract.secrets == supplied_secrets
+    assert provision_run.arguments.selected_project_gateway_secret_ref is None
+    assert all(run.arguments.contract.secrets == expected_secrets for run in saved_runs if run.id != provision_run_id)
+    assert all(
+        run.arguments.selected_project_gateway_secret_ref == reference
+        for run in saved_runs
+        if run.id != provision_run_id
+    )
+    assert all("selected_project_gateway_secret_ref" not in run.model_dump_json() for run in saved_runs)
+    assert len(mock_launcher.queued_calls) == 3
+    for payload in mock_launcher.queued_calls[1:]:
+        secrets = payload["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"]
+        assert secrets == expected_secrets
+        assert "project-gateway-key" not in str(payload)
+
+
+@pytest.mark.usefixtures("active_executor_release")
+def test_other_org_project_creation_and_run_keep_supplied_gateway_references(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+) -> None:
+    from tracker.aws.secrets import SecretsManagerStore
+
+    async def no_gateway_storage(_self: SecretsManagerStore, _name: str, _value: str, *, tags: dict[str, str]) -> None:
+        raise AssertionError("another organization's project must not store a Gateway key")
+
+    monkeypatch.delenv("MODEL_GATEWAY_URL")
+    monkeypatch.delenv("MODEL_GATEWAY_MACHINE_API_KEY")
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+    monkeypatch.setattr(SecretsManagerStore, "put", no_gateway_storage)
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    created = client.post("/projects", json=_BLOG)
+    assert created.status_code == 200, created.text
+    (project,) = database_session.exec(select(Project)).all()
+    assert (project.gateway_request_id, project.gateway_key_id) == (None, None)
+    supplied = {"MODEL_GATEWAY_URL": "caller-url", "MODEL_GATEWAY_API_KEY": "caller-key"}
+
+    response = client.post(
+        "/start-benchmark",
+        json=_start_request(contract.model_copy(update={"secrets": supplied}), "blog"),
+    )
+
+    assert response.status_code == 200, response.text
+    assert gateway_api.paths == []
+    assert len(mock_launcher.queued_calls) == 1
+    assert (
+        mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"]
+        == supplied
+    )
+    database_session.refresh(project)
+    assert (project.gateway_request_id, project.gateway_key_id) == (None, None)
+
+
+@pytest.mark.usefixtures("active_executor_release")
+def test_pending_gateway_approval_does_not_start_a_selected_project(
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+    vals_org: Org,
+) -> None:
+    gateway_api.status = "pending"
+    created = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert created.status_code == 200, created.text
+    response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "Gateway key request for project 'blog' is pending"
+    assert database_session.exec(select(Benchmark)).all() == []
+    assert database_session.exec(select(Task)).all() == []
+    assert mock_launcher.queued_calls == []
+    assert gateway_api.collections == []
+
+
+@pytest.mark.description("An existing project without a gateway binding needs one set explicitly.")
+def test_unbound_existing_project_requires_explicit_gateway_binding(
+    database_session: Session, contract: AgentContractRequest, vals_org: Org
+) -> None:
+    project = Project(
+        org_id=TEST_ORG_ID,
+        handle="old-project",
+        name="Old Project",
+        spend_type=SpendType.INTERNAL,
+        subcategory="blog",
+    )
+    database_session.add(project)
+    database_session.commit()
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "old-project"))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "Project 'old-project' has no Gateway key request; configure its Gateway binding before starting a run"
+    )
+    assert database_session.exec(select(Benchmark)).all() == []
 
 
 @pytest.mark.usefixtures("active_executor_release")
@@ -589,6 +1108,9 @@ async def test_start_whose_project_link_cannot_be_inserted_saves_no_run_and_no_t
     assert database_session.exec(select(RunProject)).all() == []
 
 
+@pytest.mark.description(
+    "Starting a run in an unknown project lists the existing handles and the create flags, and saves no run."
+)
 def test_start_in_an_unknown_project_is_refused_with_the_handles_that_exist(
     database_session: Session, contract: AgentContractRequest, router_bench: Project, google_report: Project
 ) -> None:
@@ -598,11 +1120,12 @@ def test_start_in_an_unknown_project_is_refused_with_the_handles_that_exist(
     assert response.json()["detail"] == (
         "Project 'router-bnech' does not exist. Existing projects: google-report-xyz, router-bench. "
         "Create it with: valkyrie project create router-bnech --name NAME "
-        "--spend-type development|internal|customer --subcategory SUBCATEGORY"
+        "--spend-type development|internal|customer --subcategory SUBCATEGORY --budget AMOUNT --budget-reason REASON"
     )
     assert database_session.exec(select(Benchmark)).all() == []
 
 
+@pytest.mark.description("A start cannot use another org's project.")
 def test_start_cannot_use_another_orgs_project(database_session: Session, contract: AgentContractRequest) -> None:
     database_session.add(
         Project(
@@ -637,6 +1160,55 @@ async def test_start_without_a_project_is_accepted_and_saves_no_link(
     assert client.get(f"/fetch-benchmark-metadata/{run_id}").json()["project"] is None
 
 
+_PROJECT_REQUIRED_DETAIL = (
+    "This organization requires a project for every run. Pass --project HANDLE (or project= in the SDK); "
+    "create one with: valkyrie project create HANDLE --name NAME "
+    "--spend-type development|internal|customer --subcategory SUBCATEGORY"
+)
+
+
+@pytest.fixture
+def project_required_org(monkeypatch: MonkeyPatch, database_session: Session) -> Org:
+    org = database_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    org.requires_project = True
+    database_session.add(org)
+    database_session.commit()
+    identity = RequestIdentity(org=org, email="alice@vals.ai")
+    monkeypatch.setitem(app.dependency_overrides, get_current_runner, lambda: identity)
+    return org
+
+
+@pytest.mark.usefixtures("project_required_org")
+def test_start_without_a_project_in_an_org_that_requires_one_is_refused_and_saves_no_run(
+    database_session: Session, contract: AgentContractRequest
+) -> None:
+    response = client.post("/start-benchmark", json=_start_request(contract, None))
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == _PROJECT_REQUIRED_DETAIL
+    assert database_session.exec(select(Benchmark)).all() == []
+    assert database_session.exec(select(Task)).all() == []
+
+
+@pytest.mark.usefixtures("active_executor_release", "project_required_org")
+async def test_start_with_a_project_in_an_org_that_requires_one_links_the_project(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    router_bench: Project,
+) -> None:
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "router-bench"))
+
+    assert response.status_code == 200, response.text
+    run_id = UUID(response.json()["benchmark_id"])
+    assert [link.project_id for link in _link_rows(database_session, run_id)] == [router_bench.id]
+
+
+@pytest.mark.description("Retagging a finished run adds a link, and metadata returns the newest one.")
 def test_retag_of_a_finished_run_adds_a_link_and_metadata_returns_the_newest(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -668,6 +1240,7 @@ def test_retag_of_a_finished_run_adds_a_link_and_metadata_returns_the_newest(
     assert (metadata["project"]["handle"], metadata["project"]["name"]) == ("google-report-xyz", "Google Report XYZ")
 
 
+@pytest.mark.description("When two project links share a timestamp, the one added last is the run's current project.")
 def test_the_last_link_appended_is_the_current_project_when_timestamps_tie(
     database_session: Session, contract: AgentContractRequest, router_bench: Project, google_report: Project
 ) -> None:
@@ -682,13 +1255,14 @@ def test_the_last_link_appended_is_the_current_project_when_timestamps_tie(
         )
     database_session.commit()
 
-    current = {handle: run.fetch_project(database_session) for handle, (run, _) in runs.items()}
+    current = {handle: ProjectRepository(database_session).get_for_run(run.id) for handle, (run, _) in runs.items()}
 
     assert {handle: project.handle if project else None for handle, project in current.items()} == {
         handle: handle for handle in runs
     }
 
 
+@pytest.mark.description("Retagging into an unknown project is refused and adds no link.")
 def test_retag_into_an_unknown_project_is_refused_without_a_link(
     database_session: Session, contract: AgentContractRequest, router_bench: Project
 ) -> None:
@@ -701,6 +1275,7 @@ def test_retag_into_an_unknown_project_is_refused_without_a_link(
     assert _link_rows(database_session, benchmark.id) == []
 
 
+@pytest.mark.description("Retagging a missing or other org's run returns 404.")
 def test_retag_hides_missing_and_other_org_runs(
     database_session: Session, contract: AgentContractRequest, router_bench: Project
 ) -> None:
@@ -710,3 +1285,223 @@ def test_retag_hides_missing_and_other_org_runs(
         response = client.post(f"/benchmarks/{run_id}/project", json={"project": "router-bench"})
         assert response.status_code == 404
     assert database_session.exec(select(RunProject)).all() == []
+
+
+_ARCHIVED_DETAIL = "Project 'router-bench' is archived, so new runs can't use it; unarchive it first"
+
+
+@pytest.mark.description("Archiving keeps the project and its run links but hides it from the default list.")
+def test_archive_keeps_the_project_and_its_run_links_and_hides_it_from_the_default_list(
+    database_session: Session,
+    contract: AgentContractRequest,
+    router_bench: Project,
+    google_report: Project,
+    gateway_api: GatewayAPI,
+) -> None:
+    running = _saved_run(database_session, contract)
+    running.status = BenchmarkStatus.IN_PROGRESS
+    request_id, key_id = uuid4(), uuid4()
+    router_bench.gateway_request_id, router_bench.gateway_key_id = request_id, key_id
+    database_session.add_all([running, router_bench])
+    database_session.add(RunProject(benchmark_id=running.id, project_id=router_bench.id))
+    database_session.commit()
+
+    response = client.post("/projects/router-bench/archive")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["handle"] == "router-bench"
+    assert response.json()["archived_at"] is not None
+    assert [project["handle"] for project in client.get("/projects").json()["projects"]] == ["google-report-xyz"]
+    archived_list = client.get("/projects", params={"include_archived": True}).json()["projects"]
+    assert [(project["handle"], project["archived_at"] is not None) for project in archived_list] == [
+        ("google-report-xyz", False),
+        ("router-bench", True),
+    ]
+    (link,) = _link_rows(database_session, running.id)
+    assert link.project_id == router_bench.id
+    stored = database_session.get(Benchmark, running.id)
+    assert stored is not None and stored.status == BenchmarkStatus.IN_PROGRESS
+    database_session.expire_all()
+    project = database_session.get(Project, router_bench.id)
+    assert project is not None and (project.gateway_request_id, project.gateway_key_id) == (request_id, key_id)
+    assert gateway_api.paths == []
+
+
+@pytest.mark.description("Unarchiving lists the project again.")
+def test_unarchive_lists_the_project_again(database_session: Session, router_bench: Project) -> None:
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
+    response = client.post("/projects/router-bench/unarchive")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["archived_at"] is None
+    assert [project["handle"] for project in client.get("/projects").json()["projects"]] == ["router-bench"]
+
+
+@pytest.mark.description("Repeated archive and unarchive calls return the project unchanged.")
+def test_archive_and_unarchive_return_the_project_as_it_is_when_repeated(
+    database_session: Session, router_bench: Project
+) -> None:
+    first = client.post("/projects/router-bench/archive").json()["archived_at"]
+
+    assert client.post("/projects/router-bench/archive").json()["archived_at"] == first
+    assert client.post("/projects/router-bench/unarchive").json()["archived_at"] is None
+    assert client.post("/projects/router-bench/unarchive").json()["archived_at"] is None
+
+
+@pytest.mark.description("Archive and unarchive return 404 for unknown and other org projects.")
+@pytest.mark.parametrize("action", ["archive", "unarchive"])
+def test_archive_and_unarchive_hide_unknown_and_other_org_projects(database_session: Session, action: str) -> None:
+    other = Project(
+        org_id=_other_org(database_session).id,
+        handle="theirs",
+        name="Theirs",
+        spend_type=SpendType.INTERNAL,
+        subcategory="blog",
+    )
+    database_session.add(other)
+    database_session.commit()
+
+    for handle in ("missing", "theirs"):
+        response = client.post(f"/projects/{handle}/{action}")
+        assert response.status_code == 404
+    database_session.expire_all()
+    stored = database_session.get(Project, other.id)
+    assert stored is not None and stored.archived_at is None
+
+
+@pytest.mark.usefixtures("active_executor_release")
+async def test_start_in_an_archived_project_is_refused_with_its_handle_and_accepted_after_unarchive(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    router_bench: Project,
+) -> None:
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
+    refused = client.post("/start-benchmark", json=_start_request(contract, "router-bench"))
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == _ARCHIVED_DETAIL
+    assert database_session.exec(select(Benchmark)).all() == []
+    assert database_session.exec(select(RunProject)).all() == []
+
+    assert client.post("/projects/router-bench/unarchive").status_code == 200
+    accepted = client.post("/start-benchmark", json=_start_request(contract, "router-bench"))
+
+    assert accepted.status_code == 200, accepted.text
+    (link,) = _link_rows(database_session, UUID(accepted.json()["benchmark_id"]))
+    assert link.project_id == router_bench.id
+
+
+@pytest.mark.description("Suggestions for an unknown project leave out archived handles.")
+def test_start_in_an_unknown_project_leaves_archived_handles_out_of_the_suggestions(
+    database_session: Session, contract: AgentContractRequest, router_bench: Project, google_report: Project
+) -> None:
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "router-bnech"))
+
+    assert response.status_code == 422
+    assert "Existing projects: google-report-xyz. " in response.json()["detail"]
+
+
+@pytest.mark.description("Retagging into an archived project is refused and adds no link.")
+def test_retag_into_an_archived_project_is_refused_without_a_link(
+    database_session: Session, contract: AgentContractRequest, router_bench: Project
+) -> None:
+    benchmark = _saved_run(database_session, contract)
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
+    response = client.post(f"/benchmarks/{benchmark.id}/project", json={"project": "router-bench"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _ARCHIVED_DETAIL
+    assert _link_rows(database_session, benchmark.id) == []
+
+
+@pytest.mark.description("Retrying or resuming a run in an archived project is refused and leaves the run unchanged.")
+@pytest.mark.parametrize("query", ["", "?retry=true"])
+def test_retry_or_resume_of_a_run_in_an_archived_project_is_refused_without_changing_the_run(
+    database_session: Session, contract: AgentContractRequest, router_bench: Project, query: str
+) -> None:
+    benchmark = _saved_run(database_session, contract)
+    benchmark.status = BenchmarkStatus.STOPPED
+    database_session.add(benchmark)
+    database_session.add(RunProject(benchmark_id=benchmark.id, project_id=router_bench.id))
+    database_session.commit()
+    assert client.post("/projects/router-bench/archive").status_code == 200
+
+    response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}{query}")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _ARCHIVED_DETAIL
+    database_session.expire_all()
+    stored = database_session.get(Benchmark, benchmark.id)
+    assert stored is not None and stored.status == BenchmarkStatus.STOPPED
+
+
+def _archive_in_the_background(database_session: Session, project: Project) -> None:
+    project.archived_at = datetime.now(UTC)
+    database_session.add(project)
+    database_session.commit()
+
+
+@pytest.mark.usefixtures("active_executor_release")
+async def test_start_whose_project_is_archived_after_the_lookup_is_refused_and_saves_nothing(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    router_bench: Project,
+) -> None:
+    looked_up = main_module.find_project
+
+    def archive_after_lookup(repository: ProjectRepository, org_id: UUID, handle: str) -> Project:
+        project = looked_up(repository, org_id, handle)
+        _archive_in_the_background(database_session, router_bench)
+        return project
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    monkeypatch.setattr(main_module, "find_project", archive_after_lookup)
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "router-bench"))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _ARCHIVED_DETAIL
+    assert database_session.exec(select(Benchmark)).all() == []
+    assert database_session.exec(select(Task)).all() == []
+    assert database_session.exec(select(RunProject)).all() == []
+
+
+@pytest.mark.description("A retry whose project is archived mid request is refused and leaves the run unchanged.")
+async def test_retry_whose_project_is_archived_after_the_first_check_is_refused_without_changing_the_run(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    router_bench: Project,
+) -> None:
+    benchmark = _saved_run(database_session, contract)
+    benchmark.status = BenchmarkStatus.STOPPED
+    database_session.add(benchmark)
+    database_session.add(RunProject(benchmark_id=benchmark.id, project_id=router_bench.id))
+    database_session.commit()
+
+    def archive_after_check(project: Project) -> Project:
+        checked = reject_archived_project(project)
+        _archive_in_the_background(database_session, router_bench)
+        return checked
+
+    monkeypatch.setattr(main_module, "reject_archived_project", archive_after_check)
+    monkeypatch.setattr(main_module, "reset_to_in_progress_status", lambda *_args, **_kwargs: ["task_0"])
+
+    response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}?retry=true")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _ARCHIVED_DETAIL
+    database_session.expire_all()
+    stored = database_session.get(Benchmark, benchmark.id)
+    assert stored is not None and stored.status == BenchmarkStatus.STOPPED

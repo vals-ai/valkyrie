@@ -1,8 +1,3 @@
-"""Unit tests for agent bundle creation and validation.
-
-Run: uv run pytest tests/unit/agent/test_bundler.py
-"""
-
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -16,9 +11,9 @@ from tracker.agent.schemas import AgentConfig, AgentContract, OutputArtifact, va
 from tracker.exceptions import BundlerError
 
 
+@pytest.mark.description("Contract loading from agent zip archives.")
 class TestGetContractFromZipBytes:
-    """Contract loading from agent zip archives."""
-
+    @pytest.mark.description("An agent zip's YAML contract loads from its bytes.")
     @pytest.mark.parametrize("agent_name", ["agent-a", "library-alias"])
     def test_get_contract_from_zip_bytes_loads_yaml_contract(self, agent_name: str) -> None:
         zip_buffer = BytesIO()
@@ -62,6 +57,7 @@ secrets:
         assert serialized_artifact["required"] is False
         assert contract.secrets == {"API_KEY": "API key"}
 
+    @pytest.mark.description("An agent zip without a contract reports the missing contract.")
     def test_get_contract_from_zip_bytes_reports_missing_contract(self) -> None:
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
@@ -71,24 +67,26 @@ secrets:
             get_contract_from_zip_bytes("agent-a", zip_buffer.getvalue(), AgentConfig())
 
 
+@pytest.mark.description("Agent name validation for bundles and contracts.")
 class TestAgentNameValidation:
-    """Agent name validation for bundles and contracts."""
-
+    @pytest.mark.description("Valid agent names pass validation.")
     def test_validate_agent_name_accepts_valid(self) -> None:
         assert validate_agent_name("my-agent_1.0") == "my-agent_1.0"
 
+    @pytest.mark.description("Invalid agent names fail validation.")
     def test_validate_agent_name_rejects_invalid(self) -> None:
         with pytest.raises(ValueError):
             validate_agent_name("bad name")
 
+    @pytest.mark.description("An agent contract with an invalid name is rejected.")
     def test_agent_contract_rejects_invalid_name(self) -> None:
         with pytest.raises(ValidationError):
             AgentContract(name="bad name", install_cmd="true", run_cmd="echo {problem_statement_path}")
 
 
+@pytest.mark.description("Agent name loading from contract files.")
 class TestReadAgentNameFromContract:
-    """Agent name loading from contract files."""
-
+    @pytest.mark.description("The agent name is read from its contract.")
     def test_read_agent_name_from_contract(self, tmp_path: Path) -> None:
         (tmp_path / "contract.yaml").write_text(
             'name: my_agent\ninstall_cmd: bash setup.sh\nrun_cmd: "agent --task {problem_statement_path}"\n'
@@ -96,16 +94,19 @@ class TestReadAgentNameFromContract:
 
         assert read_agent_name(tmp_path) == "my_agent"
 
+    @pytest.mark.description("Reading the name of an agent with no contract fails.")
     def test_read_agent_name_missing_contract(self, tmp_path: Path) -> None:
         with pytest.raises(BundlerError, match="No contract file found"):
             read_agent_name(tmp_path)
 
+    @pytest.mark.description("Reading the name from a malformed contract fails.")
     def test_read_agent_name_malformed_contract(self, tmp_path: Path) -> None:
         (tmp_path / "contract.yaml").write_text("")
 
         with pytest.raises(BundlerError, match="expected a mapping"):
             read_agent_name(tmp_path)
 
+    @pytest.mark.description("Reading the name from a contract missing required fields fails.")
     def test_read_agent_name_missing_required_fields(self, tmp_path: Path) -> None:
         (tmp_path / "contract.yaml").write_text("name: my_agent\n")
 

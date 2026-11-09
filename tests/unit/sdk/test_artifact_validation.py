@@ -1,5 +1,3 @@
-"""Tests for SDK wheel and source-distribution validation."""
-
 from __future__ import annotations
 
 import io
@@ -75,6 +73,7 @@ def write_sdist(path: Path, *, extra_members: dict[str, str] | None = None) -> N
             archive.addfile(info, io.BytesIO(encoded))
 
 
+@pytest.mark.description("The SDK package pins its build backend and ignores only build output.")
 def test_sdk_package_configuration_matches_release_boundaries() -> None:
     with (ROOT / "pyproject.toml").open("rb") as root_file:
         root_project = tomllib.load(root_file)
@@ -89,14 +88,16 @@ def test_sdk_package_configuration_matches_release_boundaries() -> None:
     assert (PACKAGE_ROOT / ".gitignore").read_text(encoding="utf-8") == ".ruff_cache/\n__pycache__/\ndist/\n"
 
 
-def test_cli_requires_sdk_project_maintenance_methods() -> None:
+@pytest.mark.description("The CLI requires an SDK version of at least 0.20.0.")
+def test_cli_requires_sdk_benchmark_and_dataset_methods() -> None:
     with (ROOT / "pyproject.toml").open("rb") as root_file:
         dependencies = tomllib.load(root_file)["project"]["dependencies"]
     requirement = next(Requirement(value) for value in dependencies if value.startswith("valkyrie-sdk"))
-    assert not requirement.specifier.contains("0.18.0")
-    assert requirement.specifier.contains("0.19.0")
+    assert not requirement.specifier.contains("0.19.1")
+    assert requirement.specifier.contains("0.20.0")
 
 
+@pytest.mark.description("A correctly built wheel and sdist pass validation.")
 def test_valid_artifacts_are_accepted(tmp_path: Path) -> None:
     wheel = tmp_path / f"valkyrie_sdk-{SDK_VERSION}-py3-none-any.whl"
     sdist = tmp_path / f"valkyrie_sdk-{SDK_VERSION}.tar.gz"
@@ -107,6 +108,9 @@ def test_valid_artifacts_are_accepted(tmp_path: Path) -> None:
     validate_sdist(sdist)
 
 
+@pytest.mark.description(
+    "Wheel metadata must match the version, Python range, and dependencies in the SDK `pyproject.toml`."
+)
 def test_version_python_and_dependencies_come_from_sdk_pyproject(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -137,6 +141,7 @@ Requires-Dist: httpx<2,>=0.27
     validate_wheel(wheel)
 
 
+@pytest.mark.description("A wheel that contains files outside the SDK package raises `ArtifactError`.")
 @pytest.mark.parametrize(
     "member",
     ["valkyrie/cli/main.py", "tracker/types.py", "valkyrie/__init__.py", "sdk/client.py"],
@@ -149,6 +154,9 @@ def test_wheel_rejects_forbidden_members(tmp_path: Path, member: str) -> None:
         validate_wheel(wheel)
 
 
+@pytest.mark.description(
+    "A wheel that depends on the Tracker raises `ArtifactError` for unexpected runtime dependencies."
+)
 def test_wheel_rejects_tracker_dependency(tmp_path: Path) -> None:
     wheel = tmp_path / "bad.whl"
     write_wheel(wheel, metadata=f"{METADATA}Requires-Dist: tracker\n")
@@ -157,6 +165,7 @@ def test_wheel_rejects_tracker_dependency(tmp_path: Path) -> None:
         validate_wheel(wheel)
 
 
+@pytest.mark.description("The wheel check rejects a forbidden dependency declared in `pyproject.toml`.")
 def test_wheel_rejects_forbidden_dependency_declared_by_pyproject(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -174,6 +183,7 @@ def test_wheel_rejects_forbidden_dependency_declared_by_pyproject(
         validate_wheel(wheel)
 
 
+@pytest.mark.description("A wheel that declares optional dependencies raises `ArtifactError`.")
 def test_wheel_rejects_unsupported_optional_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
@@ -189,6 +199,7 @@ def test_wheel_rejects_unsupported_optional_dependencies(tmp_path: Path, monkeyp
         validate_wheel(wheel)
 
 
+@pytest.mark.description("A wheel whose `dist-info` folder names another version raises `ArtifactError`.")
 def test_wheel_rejects_mismatched_dist_info_version(tmp_path: Path) -> None:
     wheel = tmp_path / "bad.whl"
     write_wheel(wheel, dist_info_version="999.0.0")
@@ -197,6 +208,7 @@ def test_wheel_rejects_mismatched_dist_info_version(tmp_path: Path) -> None:
         validate_wheel(wheel)
 
 
+@pytest.mark.description("An sdist that includes files from elsewhere in the repo raises `ArtifactError`.")
 def test_sdist_rejects_unrelated_repository_files(tmp_path: Path) -> None:
     sdist = tmp_path / "bad.tar.gz"
     write_sdist(sdist, extra_members={f"valkyrie_sdk-{SDK_VERSION}/services/tracker/app.py": ""})

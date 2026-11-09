@@ -12,7 +12,8 @@ Catch `ValkyrieSDKError` to handle every SDK-defined failure, or catch a specifi
 | [`ValkyrieAPIError`](#valkyrieapierror) | `ValkyrieSDKError` |
 | [`ValkyrieConfigError`](#valkyrieconfigerror) | `ValkyrieSDKError` |
 | [`ValkyrieContractError`](#valkyriecontracterror) | `ValkyrieSDKError` |
-| [`ValkyrieRunError`](#valkyrierunerror) | `ValkyrieSDKError` |
+| [`ValkyrieInputError`](#valkyrieinputerror) | `ValkyrieSDKError` |
+| [`ValkyrieRunError`](#valkyrierunerror) | `ValkyrieInputError` |
 | [`ValkyrieSDKError`](#valkyriesdkerror) | `Exception` |
 | [`ValkyrieStreamError`](#valkyriestreamerror) | `ValkyrieSDKError` |
 | [`ValkyrieTransportError`](#valkyrietransporterror) | `ValkyrieSDKError` |
@@ -41,9 +42,17 @@ Raised when an agent contract, or the kwargs passed to it, fails validation.
 ValkyrieContractError(*args: object)
 ```
 
+## `ValkyrieInputError`
+
+An SDK call received an invalid argument. It is also a `ValueError`.
+
+```python
+ValkyrieInputError(*args: object)
+```
+
 ## `ValkyrieRunError`
 
-A run operation received invalid input.
+A run or run log operation received invalid input.
 
 ```python
 ValkyrieRunError(*args: object)
@@ -59,7 +68,7 @@ ValkyrieSDKError(*args: object)
 
 ## `ValkyrieStreamError`
 
-A run update stream returned an error or invalid event.
+A Tracker stream or paginated listing returned an error, an invalid event, or a repeated cursor.
 
 ```python
 ValkyrieStreamError(*args: object)

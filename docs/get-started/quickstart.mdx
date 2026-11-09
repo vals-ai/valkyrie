@@ -16,7 +16,7 @@ You need:
 ## Install the CLI
 
 ```bash
-uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false \
+uv tool install --force --exclude-newer "7 days" --exclude-newer-package certifi=false \
   git+https://github.com/vals-ai/Valkyrie@prod
 ```
 
@@ -102,8 +102,11 @@ your organization's library as `hello-agent`.
 ## Run one task
 
 ```bash
-valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation
-valkyrie run start --agent hello-agent --benchmark swebench --slice 0:1 --connect --project my-project
+valkyrie project create my-project --name "My Project" --spend-type development \
+  --subcategory new_benchmark_generation \
+  --budget 300 --budget-reason "3 runs, about 100 each"
+valkyrie run start --agent hello-agent --benchmark swebench --slice 0:1 --connect \
+  --project my-project
 ```
 
 Valkyrie creates a sandbox in your Daytona account, sets up the first SWE-bench task in it,

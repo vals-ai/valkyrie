@@ -1,5 +1,3 @@
-"""Automatic retirement for drained executor releases."""
-
 from __future__ import annotations
 
 import logging
@@ -16,7 +14,6 @@ _logger = logging.getLogger(__name__)
 
 
 def retire_drained_releases_once() -> list[str]:
-    """Run one atomic retirement pass in a fresh database session."""
     with Session(engine) as session:
         try:
             retired_ids = retire_drained_releases(session)
@@ -32,7 +29,6 @@ def run_release_retirement_loop(
     *,
     interval_seconds: float = _RECONCILIATION_INTERVAL_SECONDS,
 ) -> None:
-    """Reconcile immediately and keep retrying until shutdown."""
     while not stop_event.is_set():
         try:
             retire_drained_releases_once()
@@ -45,8 +41,6 @@ def run_release_retirement_loop(
 
 
 class AutomaticReleaseRetirement:
-    """Own the Tracker process's bounded retirement thread lifecycle."""
-
     def __init__(
         self,
         *,

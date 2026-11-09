@@ -1,5 +1,4 @@
-"""Run with `uv run pytest tests/unit/executor/test_release_retirement.py`."""
-
+import pytest
 from collections.abc import Callable
 from threading import Event
 from unittest.mock import Mock
@@ -13,6 +12,7 @@ from tracker.database.models import ExecutorRelease, ExecutorReleaseStatus
 from tracker.executor.release_control import promote_release, register_release
 
 
+@pytest.mark.description("The retirement loop retires a release with nothing blocking it.")
 def test_retirement_loop_retires_a_blocker_free_release(
     database_session: Session,
     monkeypatch: MonkeyPatch,
@@ -58,6 +58,7 @@ def test_retirement_loop_retires_a_blocker_free_release(
     assert stored_release.status == ExecutorReleaseStatus.RETIRED
 
 
+@pytest.mark.description("The retirement loop tries again after a failed pass.")
 def test_retirement_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -> None:
     stop_event = Event()
     attempts = 0
@@ -83,6 +84,7 @@ def test_retirement_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -
     )
 
 
+@pytest.mark.description("Automatic retirement starts and stops its own thread.")
 def test_automatic_retirement_starts_and_stops_owned_thread(monkeypatch: MonkeyPatch) -> None:
     events: list[str] = []
 
@@ -122,6 +124,9 @@ def test_automatic_retirement_starts_and_stops_owned_thread(monkeypatch: MonkeyP
     assert events == ["started", "joined"]
 
 
+@pytest.mark.description(
+    "The Tracker lifespan runs release retirement while the app is up and stops it after recovery stops."
+)
 async def test_tracker_lifespan_starts_and_stops_automatic_retirement(monkeypatch: MonkeyPatch) -> None:
     events: list[str] = []
 
@@ -139,6 +144,13 @@ async def test_tracker_lifespan_starts_and_stops_automatic_retirement(monkeypatc
         def stop(self) -> None:
             events.append("recovery stopped")
 
+    class FakeSharedPoolScheduler:
+        def start(self) -> None:
+            events.append("scheduler started")
+
+        async def stop(self) -> None:
+            events.append("scheduler stopped")
+
     monkeypatch.setattr(main_module, "AutomaticReleaseRetirement", FakeAutomaticReleaseRetirement)
 
     class FakeAutomaticSandboxCost:
@@ -149,9 +161,19 @@ async def test_tracker_lifespan_starts_and_stops_automatic_retirement(monkeypatc
             events.append("cost stopped")
 
     monkeypatch.setattr(main_module, "AutomaticDispatchRecovery", FakeAutomaticDispatchRecovery)
+    monkeypatch.setattr(main_module, "SharedPoolScheduler", FakeSharedPoolScheduler)
     monkeypatch.setattr(main_module, "AutomaticSandboxCost", FakeAutomaticSandboxCost)
 
     async with main_module.tracker_lifespan(main_module.app):
-        assert events == ["started", "recovery started", "cost started"]
+        assert events == ["started", "recovery started", "cost started", "scheduler started"]
 
-    assert events == ["started", "recovery started", "cost started", "cost stopped", "recovery stopped", "stopped"]
+    assert events == [
+        "started",
+        "recovery started",
+        "cost started",
+        "scheduler started",
+        "scheduler stopped",
+        "cost stopped",
+        "recovery stopped",
+        "stopped",
+    ]

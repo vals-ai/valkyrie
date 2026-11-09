@@ -1,8 +1,3 @@
-"""Tests for CLI logging behavior.
-
-Run: uv run pytest tests/unit/cli/test_logging.py
-"""
-
 import io
 import json
 import logging
@@ -19,7 +14,8 @@ from uuid import uuid4
 
 import pytest
 
-from valkyrie.cli.logging import configure_cli_logging
+from valkyrie.cli import logging as cli_logging
+from valkyrie.cli.logging import configure_cli_logging, load_cli_environment
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +43,7 @@ def _emit_info_log() -> str:
     return stream.getvalue()
 
 
+@pytest.mark.description("CLI logging is off by default.")
 def test_configure_cli_logging_suppresses_logs_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VALKYRIE_CLI_LOGS", raising=False)
 
@@ -55,6 +52,7 @@ def test_configure_cli_logging_suppresses_logs_by_default(monkeypatch: pytest.Mo
     assert _emit_info_log() == ""
 
 
+@pytest.mark.description("CLI logging is on when enabled.")
 def test_configure_cli_logging_allows_logs_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VALKYRIE_CLI_LOGS", "true")
 
@@ -63,6 +61,7 @@ def test_configure_cli_logging_allows_logs_when_enabled(monkeypatch: pytest.Monk
     assert "HTTP Request" in _emit_info_log()
 
 
+@pytest.mark.description("CLI logging stays off for values other than true.")
 @pytest.mark.parametrize("value", ["1", "TRUE", "yes", "on", "false"])
 def test_configure_cli_logging_suppresses_logs_for_non_true_values(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VALKYRIE_CLI_LOGS", value)
@@ -72,8 +71,29 @@ def test_configure_cli_logging_suppresses_logs_for_non_true_values(value: str, m
     assert _emit_info_log() == ""
 
 
+@pytest.mark.description(
+    "Warnings raised while loading .env stay hidden, and VALKYRIE_CLI_LOGS set in .env still turns logging on."
+)
+def test_load_cli_environment_hides_dotenv_warnings_and_applies_dotenv_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VALKYRIE_CLI_LOGS", raising=False)
+    dotenv_warnings: list[str] = []
+
+    def load_dotenv() -> None:
+        dotenv_warnings.append(_emit_info_log())
+        monkeypatch.setenv("VALKYRIE_CLI_LOGS", "true")
+
+    monkeypatch.setattr(cli_logging, "load_dotenv", load_dotenv)
+
+    load_cli_environment()
+
+    assert dotenv_warnings == [""]
+    assert "HTTP Request" in _emit_info_log()
+
+
+@pytest.mark.description("A real CLI process must emit exactly one JSON document even when dotenv parsing warns.")
 def test_machine_json_subprocess_suppresses_import_time_dotenv_warnings(tmp_path: Path) -> None:
-    """A real CLI process must emit exactly one JSON document even when dotenv parsing warns."""
     run_id = uuid4()
 
     class TrackerHandler(BaseHTTPRequestHandler):

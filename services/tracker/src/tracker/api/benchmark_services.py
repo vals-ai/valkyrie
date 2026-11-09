@@ -1,5 +1,3 @@
-"""POST /benchmark-services — health-check caller-provided benchmark services."""
-
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +26,6 @@ router = APIRouter(prefix="/benchmark-services")
 
 
 async def _ping_service(client: httpx.AsyncClient, name: str, url: str) -> BenchmarkServiceHealth:
-    """Ping <url>/health and return the service health shape."""
     health_url = f"{url}/health"
     start = time.monotonic()
     try:
@@ -52,12 +49,15 @@ async def _ping_service(client: httpx.AsyncClient, name: str, url: str) -> Bench
         )
 
 
-@router.get("", response_model=BenchmarkServiceCatalogResponse)
+@router.get(
+    "",
+    response_model=BenchmarkServiceCatalogResponse,
+    description="List the catalog benchmark services visible to the caller.",
+)
 async def catalog_benchmark_services(
     request: Request,
     _org: Org = Depends(get_current_org),
 ) -> BenchmarkServiceCatalogResponse:
-    """Fetch catalog benchmark services visible to the caller."""
     if not BENCHMARK_CATALOG_URL:
         return BenchmarkServiceCatalogResponse(services=[])
 
@@ -88,12 +88,15 @@ async def catalog_benchmark_services(
         raise HTTPException(status_code=502, detail="Failed to list benchmark services") from exc
 
 
-@router.post("", response_model=BenchmarkServicesResponse)
+@router.post(
+    "",
+    response_model=BenchmarkServicesResponse,
+    description="Health-check the caller-provided benchmark services with concurrent pings.",
+)
 async def list_benchmark_services(
     request: BenchmarkServicesRequest,
     org: Org = Depends(get_current_org),
 ) -> BenchmarkServicesResponse:
-    """Health-check the caller-provided benchmark services with concurrent pings."""
     if not request.services:
         return BenchmarkServicesResponse(services=[])
 

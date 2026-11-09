@@ -1,11 +1,13 @@
-"""Task ID parsing helpers for run commands."""
-
+import http.client
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlparse
 
 import click
+
+_REMOTE_TIMEOUT_SECONDS = 30
+_REMOTE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _clean_task_ids(task_ids: Iterable[str]) -> list[str]:
@@ -14,15 +16,21 @@ def _clean_task_ids(task_ids: Iterable[str]) -> list[str]:
 
 
 def read_task_ids_source(source: str) -> list[str]:
-    """Read task IDs, one per line, from a local path or an http(s) URL."""
     try:
         if urlparse(source).scheme in {"http", "https"}:
-            with urllib.request.urlopen(source) as response:
-                content = response.read().decode("utf-8")
+            with urllib.request.urlopen(source, timeout=_REMOTE_TIMEOUT_SECONDS) as response:
+                body = response.read(_REMOTE_MAX_BYTES + 1)
+                if len(body) > _REMOTE_MAX_BYTES:
+                    raise click.ClickException(f"Task ids at {source} exceed {_REMOTE_MAX_BYTES // (1024 * 1024)} MiB")
+                if response.length:
+                    raise click.ClickException(f"Task ids at {source} were truncated")
+            content = body.decode("utf-8")
         else:
             content = Path(source).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise click.ClickException(f"Failed to read task ids from {source}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise click.ClickException(f"Task ids in {source} are not valid UTF-8: {exc}") from exc
 
     task_ids = _clean_task_ids(content.splitlines())
     if not task_ids:

@@ -1,5 +1,3 @@
-"""Resolve only the credentials supplied for the current local execution."""
-
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -16,8 +14,6 @@ PROVIDER_SETTING_NAMES = frozenset(
 
 
 class InMemorySecretStore:
-    """Group transient environment values by the contract's existing references."""
-
     def __init__(self, references: Mapping[str, str], values: Mapping[str, str]) -> None:
         missing = references.keys() - values.keys()
         if missing:
@@ -34,7 +30,6 @@ class InMemorySecretStore:
 
 
 def load_execution_secrets(path: Path | None, references: Mapping[str, str]) -> dict[str, str]:
-    """Read only contract-declared values from the configured source file."""
     if not references or path is None:
         return {}
     if reserved := sorted(references.keys() & PROVIDER_SETTING_NAMES):
@@ -46,7 +41,6 @@ def load_execution_secrets(path: Path | None, references: Mapping[str, str]) -> 
 
 
 def load_sandbox_provider_config(path: Path | None, provider: str) -> SandboxProviderConfig:
-    """Read the selected provider's settings from the configured source file."""
     if path is None:
         raise InvalidSandboxConfigurationError(f"Local {provider} execution requires a secrets_file")
     values: dict[str, SecretValue] = {

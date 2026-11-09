@@ -1,5 +1,3 @@
-"""Render collected reference metadata as deterministic Mintlify MDX and JSON."""
-
 from __future__ import annotations
 
 import html
@@ -23,6 +21,7 @@ from .model import (
     REDIRECTS,
     RESOURCE_CARDS,
     SDK_CLIENT,
+    SDK_LOGIN,
     SDK_ERRORS,
     SDK_INDEX,
     SDK_NAVIGATION,
@@ -46,6 +45,10 @@ TypeEntry = SDKModelReference | SDKEnumReference
 
 def _route(path: Path) -> str:
     return path.with_suffix("").as_posix()
+
+
+def _resource_page_name(resource: SDKResourceReference) -> str:
+    return resource.client_attribute.removeprefix("client.").replace(".", "-").replace("_", "-")
 
 
 def _page_path(root: Path, name: str) -> Path:
@@ -375,7 +378,7 @@ def _sdk_pages(reference: SDKReference) -> dict[Path, str]:
     resource_cards: list[str] = []
     resource_pages: dict[Path, str] = {}
     for resource in reference.resources:
-        page_name = resource.client_attribute.rsplit(".", 1)[-1]
+        page_name = _resource_page_name(resource)
         path = _page_path(SDK_ROOT, page_name)
         title, icon, purpose = RESOURCE_CARDS[resource.name]
         method_count = len(resource.methods)
@@ -395,21 +398,30 @@ def _sdk_pages(reference: SDKReference) -> dict[Path, str]:
         "This reference follows the tested `valkyrie.sdk` public contract. Internal models and helpers are excluded.",
         "## Client",
         f"Use [`ValkyrieClient`](/{_route(SDK_CLIENT)}) to configure the async client and access resource namespaces.",
+        f"Use [`device_login`](/{_route(SDK_LOGIN)}) to sign in with a browser and save a login the client can use.",
         "## Resource namespaces",
         _card_group(resource_cards),
         "## Types and errors",
         f"Browse [public models and enums](/{_route(TYPE_INDEX.parent)}) or the [SDK error hierarchy](/{_route(SDK_ERRORS)}).",
     )
-    client_sections = [
-        _join_blocks(
+
+    def function_section(method: SDKMethodReference) -> str:
+        return _join_blocks(
             f"## {method.name}",
             method.description,
             _signatures(method),
             _parameter_rows(method.parameters, routes, heading="### Parameters"),
             _returns(method, routes, "### Returns"),
         )
-        for method in reference.client_methods
-    ]
+
+    client_sections = [function_section(method) for method in reference.client_methods]
+    login = _page(
+        "Login",
+        "Sign in with a browser and authenticate the SDK client as a saved login.",
+        "`valkyrie login` uses these functions. A saved login is a "
+        f"[`LoginSession`]({routes['LoginSession']}), and `ValkyrieConfig` picks it up when no access key is set.",
+        *(function_section(method) for method in reference.login_functions),
+    )
     client = _page(
         "ValkyrieClient",
         "Construct and close the async Valkyrie SDK client.",
@@ -461,12 +473,14 @@ def _sdk_pages(reference: SDKReference) -> dict[Path, str]:
     navigation: list[object] = [
         _route(SDK_INDEX),
         _route(SDK_CLIENT),
+        _route(SDK_LOGIN),
         *(_route(path) for path in resource_pages),
         {"group": "Types", "pages": [_route(TYPE_INDEX), *(_route(path) for path in type_pages), _route(SDK_ERRORS)]},
     ]
     return {
         SDK_INDEX: index,
         SDK_CLIENT: client,
+        SDK_LOGIN: login,
         SDK_NAVIGATION: json.dumps(navigation, indent=2) + "\n",
         **resource_pages,
         TYPE_INDEX: types_index,
@@ -486,8 +500,8 @@ def _redirects(commands: Sequence[CLICommandReference], reference: SDKReference)
     ]
     methods = [
         {
-            "source": "/" + (SDK_ROOT / resource.client_attribute.rsplit(".", 1)[-1] / method.name).as_posix(),
-            "destination": f"/{_route(_page_path(SDK_ROOT, resource.client_attribute.rsplit('.', 1)[-1]))}#{method.name.replace('_', '-')}",
+            "source": "/" + (SDK_ROOT / _resource_page_name(resource) / method.name).as_posix(),
+            "destination": f"/{_route(_page_path(SDK_ROOT, _resource_page_name(resource)))}#{method.name.replace('_', '-')}",
         }
         for resource in reference.resources
         for method in resource.methods
@@ -500,7 +514,6 @@ def _redirects(commands: Sequence[CLICommandReference], reference: SDKReference)
 
 
 def render_reference() -> dict[Path, str]:
-    """Collect each source surface once and render the generated manifest."""
     commands = collect_cli_commands()
     sdk_reference = collect_sdk_reference()
     return {

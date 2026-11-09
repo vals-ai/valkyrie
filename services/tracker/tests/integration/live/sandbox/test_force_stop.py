@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/integration/live/sandbox/test_force_stop.py`.
-
-Exercise force-stop behavior against real sandbox infrastructure.
-"""
-
 import asyncio
 from typing import Any, Optional
 
@@ -12,19 +7,19 @@ from benchmark_service.client import BenchmarkServiceClient
 from fastapi.testclient import TestClient
 from sqlmodel import Session, col, select
 
-import tracker.utils as tracker_utils
 from tests.utils import TEST_ORG_ID, random_task_id
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.database.models import Benchmark, BenchmarkStatus, Org, Task, TaskStatus
 from tracker.logging import get_logger
+from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.sandbox import SandboxCreationState, create_sandbox
 from tracker.types import ManagedExecutionContext
-from tracker.utils import fetch_sandbox_provider_config, force_stop_sandboxes
-
-process_benchmark = getattr(tracker_utils, "process_benchmark")
-initiate_stop_benchmark = getattr(tracker_utils, "initiate_stop_benchmark")
+from tracker.clients.benchmark_service import fetch_sandbox_provider_config
+from tracker.services.runs.stop import initiate_stop_benchmark
+from tracker.services.sandboxes import force_stop_sandboxes
+from tracker.services.runs.start import process_benchmark
 
 logger = get_logger(__name__)
 
@@ -77,7 +72,6 @@ async def _wait_for_sandbox_setup(
     all_sandboxes_created: asyncio.Event,
     sandbox_creation_failed: asyncio.Event,
 ) -> None:
-    """Wait until every sandbox is ready, failing promptly if creation fails."""
     ready_waiter = asyncio.create_task(all_sandboxes_created.wait())
     failure_waiter = asyncio.create_task(sandbox_creation_failed.wait())
     waiters = {ready_waiter, failure_waiter}
@@ -97,12 +91,20 @@ async def _wait_for_sandbox_setup(
 
 def _assert_no_task_errors(benchmark: Benchmark, database_session: Session) -> None:
     database_session.expire_all()
-    assert benchmark.fetch_tasks_with_errors(database_session) is None
+    assert not BenchmarkRepository(database_session).task_failures(benchmark)
 
 
+@pytest.mark.description("Live graceful and forced sandbox stop flows.")
 class TestForceStop:
-    """Live graceful and forced sandbox stop flows."""
-
+    @pytest.mark.description(
+        (
+            "`force_stop_sandboxes` stops a sandbox whose context is still active.\n"
+            "\n"
+            "Test cases:\n"
+            "- A task already marked in progress is moved to STOPPED while its sandbox context is active.\n"
+            "- The created sandbox is deleted and provider lookup raises SandboxNotFoundError."
+        )
+    )
     async def test_force_stop_active_sandbox(
         self,
         example_benchmark_object: Benchmark,
@@ -114,12 +116,6 @@ class TestForceStop:
         test_image: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify force_stop_sandboxes stops a sandbox whose context is still active.
-
-        Test cases:
-        - A task already marked in progress is moved to STOPPED while its sandbox context is active.
-        - The created sandbox is deleted and provider lookup raises SandboxNotFoundError.
-        """
         example_benchmark_object.status = BenchmarkStatus.IN_PROGRESS
         database_session.add(example_benchmark_object)
         database_session.commit()
@@ -202,6 +198,16 @@ class TestForceStop:
         with pytest.raises(SandboxNotFoundError):
             await provider.get_sandbox(created_sandbox_name[0])
 
+    @pytest.mark.description(
+        (
+            "`force_stop_sandboxes` handles multiple active sandbox contexts.\n"
+            "\n"
+            "Test cases:\n"
+            "- In-progress and evaluating task sandbox kill signals are sent while their contexts are still open.\n"
+            "- Deleted sandbox races surface only SandboxNotFoundError and no task error messages are recorded.\n"
+            "- No benchmark-labeled sandboxes remain after force stop completes."
+        )
+    )
     async def test_force_stop_sandboxes(
         self,
         example_benchmark_object: Benchmark,
@@ -213,13 +219,6 @@ class TestForceStop:
         test_resources: Resources,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify force_stop_sandboxes handles multiple active sandbox contexts.
-
-        Test cases:
-        - In-progress and evaluating task sandbox kill signals are sent while their contexts are still open.
-        - Deleted sandbox races surface only SandboxNotFoundError and no task error messages are recorded.
-        - No benchmark-labeled sandboxes remain after force stop completes.
-        """
         example_benchmark_object.status = BenchmarkStatus.IN_PROGRESS
         database_session.add(example_benchmark_object)
         database_session.commit()
@@ -236,7 +235,6 @@ class TestForceStop:
         created_sandbox_count = 0
 
         async def create_sandbox_with_delay(sandbox_name: str) -> None:
-            """Keep a created sandbox open until force-stop completes."""
             nonlocal created_sandbox_count
 
             try:
@@ -310,6 +308,16 @@ class TestForceStop:
 
         await _wait_until_no_sandboxes(example_benchmark_object, provider)
 
+    @pytest.mark.description(
+        (
+            "The HTTP force-stop path finalizes DB state before provider teardown completes.\n"
+            "\n"
+            "Test cases:\n"
+            "- A five-task benchmark reaches an in-progress sandbox before the stop endpoint is called.\n"
+            "- The force stop endpoint returns success with the benchmark already STOPPED.\n"
+            "- The benchmark status becomes STOPPED and no benchmark-labeled sandboxes remain."
+        )
+    )
     async def test_force_stop_end_to_end(
         self,
         example_benchmark_object: Benchmark,
@@ -321,13 +329,6 @@ class TestForceStop:
         live_api_client: TestClient,
         executor_authority_kwargs: Any,
     ) -> None:
-        """Verify the HTTP force-stop path finalizes DB state before provider teardown completes.
-
-        Test cases:
-        - A five-task benchmark reaches an in-progress sandbox before the stop endpoint is called.
-        - The force stop endpoint returns success with the benchmark already STOPPED.
-        - The benchmark status becomes STOPPED and no benchmark-labeled sandboxes remain.
-        """
         example_benchmark_object.arguments.slice_str = ":5"
         example_benchmark_object.arguments.concurrency = 2
         database_session.add(example_benchmark_object)

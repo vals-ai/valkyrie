@@ -1,11 +1,8 @@
-"""Shared API dependencies."""
-
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, HTTPException
 from opentelemetry import trace
-from sqlmodel import Session, select
 
 from tracker.auth import get_current_org
 from tracker.aws.resolver import (
@@ -14,15 +11,14 @@ from tracker.aws.resolver import (
 )
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.database.models import Benchmark, Org, Task
-from tracker.database.scoping import get_scoped
-from tracker.database.session import get_session
+from tracker.repositories.benchmark import BenchmarkRepository, BenchmarkRepositoryDependency
+from tracker.database.scoping import assert_org
 from tracker.logging import benchmark_id_var
 from tracker.local import config as local_config
 from tracker.runtime.services import RuntimeServices
 
 
 async def bind_benchmark_id(benchmark_id: UUID) -> UUID:
-    """Bind a route's run identifier to logs, errors, and the active request span."""
     value = str(benchmark_id)
     benchmark_id_var.set(value)
     trace.get_current_span().set_attribute("benchmark_id", value)
@@ -34,11 +30,10 @@ TrackedBenchmarkId = Annotated[UUID, Depends(bind_benchmark_id)]
 
 def get_run_benchmark(
     benchmark_id: TrackedBenchmarkId,
-    session: Session = Depends(get_session),
+    repository: BenchmarkRepositoryDependency,
     org: Org = Depends(get_current_org),
 ) -> Benchmark:
-    """Load a run scoped to the authenticated organization."""
-    return get_scoped(Benchmark, benchmark_id, session, org)
+    return assert_org(repository.get(org.id, benchmark_id), org)
 
 
 RunBenchmarkDependency = Annotated[Benchmark, Depends(get_run_benchmark)]
@@ -48,7 +43,6 @@ async def get_run_runtime(
     benchmark: RunBenchmarkDependency,
     org: Org = Depends(get_current_org),
 ) -> RuntimeServices:
-    """Compose services for one authorized run operation."""
     arguments = benchmark.arguments
     if arguments.environment == "local":
         from tracker.local.runtime import LocalRuntimeFactory
@@ -77,7 +71,6 @@ RunRuntimeDependency = Annotated[RuntimeServices, Depends(get_run_runtime)]
 def get_agent_library_runtime(
     org: Org = Depends(get_current_org),
 ) -> RuntimeServices:
-    """Open agent storage without constructing sandbox access."""
     if local_config.resources is not None:
         from tracker.local.runtime import LocalRuntimeFactory
 
@@ -90,11 +83,10 @@ def get_agent_library_runtime(
 AgentLibraryRuntimeDependency = Annotated[RuntimeServices, Depends(get_agent_library_runtime)]
 
 
-def load_task_for_benchmark_or_404(benchmark: Benchmark, task_id: str, org: Org, session: Session) -> Task:
-    """Return a task from an already organization-scoped benchmark."""
-    task = session.exec(
-        select(Task).where(Task.benchmark == benchmark.id).where(Task.org_id == org.id).where(Task.task_id == task_id)
-    ).first()
+def load_task_for_benchmark_or_404(
+    benchmark: Benchmark, task_id: str, org: Org, repository: BenchmarkRepository
+) -> Task:
+    task = repository.get_task(org.id, benchmark.id, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task

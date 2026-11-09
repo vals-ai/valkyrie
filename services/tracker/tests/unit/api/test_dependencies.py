@@ -1,5 +1,3 @@
-"""Run: uv run pytest services/tracker/tests/unit/api/test_dependencies.py"""
-
 from unittest.mock import Mock
 
 from tracker.api.dependencies import get_run_runtime
@@ -9,6 +7,7 @@ from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import Benchmark
 
 
+@pytest.mark.description("A run's runtime uses the sandbox provider saved on the run.")
 async def test_get_run_runtime_uses_persisted_sandbox_provider(
     example_benchmark_object: Benchmark, aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:

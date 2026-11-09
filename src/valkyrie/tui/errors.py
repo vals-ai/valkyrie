@@ -1,5 +1,3 @@
-"""Shows a run's task errors grouped by failure category and message, the way `valk run errors` groups them."""
-
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -11,7 +9,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Static
 
-from valkyrie.cli.display import group_task_errors
+from valkyrie.display import group_task_errors
 from valkyrie.sdk.models import BenchmarkTableRow, FailureCategory, TaskStatus, TaskSummary
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.source import Environment
@@ -24,16 +22,10 @@ ErrorGroup = tuple[FailureCategory | None, str, tuple[str, ...]]
 
 
 def failed_tasks(tasks: Iterable[TaskSummary]) -> list[TaskSummary]:
-    """Return the tasks `valk run errors` lists: errored ones, and any other task with an error message."""
     return [task for task in tasks if task.status == TaskStatus.ERROR or task.error_message]
 
 
 class ErrorsScreen(BrowseScreen[str]):
-    """Lists a run's error groups, largest first, with the highlighted group's message and task IDs beside them.
-
-    Enter dismisses the screen with the group's first task, which the run view then highlights.
-    """
-
     KEYS: ClassVar[list[tuple[str, str]]] = [
         ("j k ↑ ↓", "move"),
         ("g G", "top, bottom"),
@@ -41,9 +33,6 @@ class ErrorsScreen(BrowseScreen[str]):
         ("/", "filter by failure category, error message or task id"),
         ("esc", "clear the filter, or go back to the run"),
         ("y", "copy the command on the bottom line"),
-        ("t", "light or dark theme"),
-        ("?", "these keys"),
-        ("q", "quit"),
     ]
     CAN_GO_BACK = True
 
@@ -86,9 +75,9 @@ class ErrorsScreen(BrowseScreen[str]):
 
     def refilter(self) -> None:
         table = self.query_one(Table)
-        shown = {str(index): _group_cells(group) for index, group in enumerate(self.groups) if self._matches(group)}
-        table.show_rows(shown)
-        count = f"{len(shown)}/{len(self.groups)}" if self.filter else str(len(self.groups))
+        rows = {str(index): _group_cells(group) for index, group in enumerate(self.groups) if self._matches(group)}
+        table.show_rows(rows)
+        count = self.filter_count(len(rows), len(self.groups))
         table.border_title = f"Errors · {self.task_count} tasks · {count} messages{self.filter_label()}"
         self._show_group()
 

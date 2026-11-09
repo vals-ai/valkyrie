@@ -1,5 +1,3 @@
-"""Validate that Valkyrie SDK artifacts are standalone and publishable."""
-
 from __future__ import annotations
 
 import argparse
@@ -20,7 +18,7 @@ from packaging.version import InvalidVersion, Version
 EXPECTED_NAME = "valkyrie-sdk"
 EXPECTED_LICENSE = "AGPL-3.0-only"
 EXPECTED_LICENSE_FILES = frozenset({"LICENSE"})
-FORBIDDEN_REQUIREMENTS = frozenset({"tracker", "valkyrie"})
+FORBIDDEN_REQUIREMENTS = frozenset({"tracker", "valkyrie", "valkyrie-cli"})
 PACKAGE_PYPROJECT = Path(__file__).resolve().parents[2] / "packages" / "valkyrie-sdk" / "pyproject.toml"
 REQUIRED_WHEEL_MEMBERS = {
     "valkyrie/sdk/__init__.py",
@@ -40,13 +38,11 @@ EXPECTED_GITIGNORE = ".ruff_cache/\n__pycache__/\ndist/\n"
 
 
 class ArtifactError(RuntimeError):
-    """An SDK distribution contains unexpected or incomplete content."""
+    pass
 
 
 @dataclass(frozen=True)
 class ExpectedMetadata:
-    """Package metadata read from the SDK's pyproject."""
-
     version: Version
     python: SpecifierSet
     requirements: frozenset[Requirement]
@@ -114,7 +110,6 @@ def _validate_metadata(raw_metadata: str) -> ExpectedMetadata:
 
 
 def validate_wheel(path: Path) -> None:
-    """Validate wheel members, metadata, license, and typed marker."""
     with zipfile.ZipFile(path) as archive:
         members = {name for name in archive.namelist() if not name.endswith("/")}
         metadata_members = [name for name in members if name.endswith(".dist-info/METADATA")]
@@ -142,7 +137,6 @@ def validate_wheel(path: Path) -> None:
 
 
 def validate_sdist(path: Path) -> None:
-    """Validate that an sdist contains only SDK source and packaging files."""
     with tarfile.open(path, "r:gz") as archive:
         files = [member for member in archive.getmembers() if member.isfile()]
         if any(member.issym() or member.islnk() for member in archive.getmembers()):
@@ -181,8 +175,7 @@ def validate_sdist(path: Path) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Validate all artifact paths supplied on the command line."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Validate that Valkyrie SDK artifacts are standalone and publishable.")
     parser.add_argument("artifacts", nargs="+", type=Path)
     args = parser.parse_args(argv)
 

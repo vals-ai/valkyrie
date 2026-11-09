@@ -1,8 +1,3 @@
-"""Tests for Tracker outbound benchmark-service trust boundaries.
-
-Run: uv run pytest tests/unit/test_outbound_security.py
-"""
-
 import pytest
 from pydantic import ValidationError
 
@@ -20,7 +15,7 @@ from tracker.types import (
     RunSettingsResponse,
     StartBenchmarkRequest,
 )
-from tracker.utils.resources import create_benchmark_service_client
+from tracker.clients.benchmark_service import create_benchmark_service_client
 
 _ASCII_CONTROL_URLS = [
     pytest.param(
@@ -40,9 +35,9 @@ def _start_benchmark_request(**overrides: object) -> StartBenchmarkRequest:
     return StartBenchmarkRequest.model_validate(values)
 
 
+@pytest.mark.description("Benchmark service names used to construct outbound URLs.")
 class TestBenchmarkServiceNameValidation:
-    """Benchmark service names used to construct outbound URLs."""
-
+    @pytest.mark.description("Reject names that can alter the derived benchmark-service destination.")
     @pytest.mark.parametrize(
         "benchmark_name",
         [
@@ -60,7 +55,6 @@ class TestBenchmarkServiceNameValidation:
         self,
         benchmark_name: str,
     ) -> None:
-        """Reject names that can alter the derived benchmark-service destination."""
         with pytest.raises(ValueError, match="Invalid benchmark name"):
             create_benchmark_service_url(benchmark_name)
 
@@ -70,11 +64,11 @@ class TestBenchmarkServiceNameValidation:
         with pytest.raises(ValidationError):
             _start_benchmark_request(benchmark_name=benchmark_name)
 
+    @pytest.mark.description("Keep a normal hosted benchmark name unchanged in the derived URL.")
     def test_benchmark_name_preserves_supported_dns_label(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Keep a normal hosted benchmark name unchanged in the derived URL."""
         monkeypatch.setattr("tracker.config._BENCHMARK_SERVICE_BASE_URL", None)
 
         assert create_benchmark_service_url("swebench") == "http://swebench.local:8001"
@@ -82,9 +76,9 @@ class TestBenchmarkServiceNameValidation:
         assert _start_benchmark_request().benchmark_name == "swebench"
 
 
+@pytest.mark.description("Credential forwarding trust derives from the exact hosted-service origin.")
 class TestBenchmarkServiceDestination:
-    """Credential forwarding trust derives from the exact hosted-service origin."""
-
+    @pytest.mark.description("Only the exact hosted origin counts as the hosted benchmark service.")
     @pytest.mark.parametrize(
         ("service_url", "expected"),
         [
@@ -107,6 +101,7 @@ class TestBenchmarkServiceDestination:
 
         assert classify_benchmark_service_destination("swebench", service_url) is expected
 
+    @pytest.mark.description("The default HTTP port is normalized when comparing origins.")
     def test_normalizes_default_http_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("tracker.config._BENCHMARK_SERVICE_BASE_URL", None)
         monkeypatch.setattr("tracker.config._BENCHMARK_SERVICE_CLOUDMAP_NAMESPACE", "local")
@@ -118,9 +113,9 @@ class TestBenchmarkServiceDestination:
         )
 
 
+@pytest.mark.description("Tenant-aware authorization for caller-supplied benchmark destinations.")
 class TestCustomServiceDestinationPolicy:
-    """Tenant-aware authorization for caller-supplied benchmark destinations."""
-
+    @pytest.mark.description("An external tenant cannot reach an internal destination.")
     @pytest.mark.parametrize(
         "service_url",
         [
@@ -156,6 +151,7 @@ class TestCustomServiceDestinationPolicy:
                 auth_required=True,
             )
 
+    @pytest.mark.description("An external tenant can reach a public destination.")
     @pytest.mark.parametrize(
         "service_url",
         [
@@ -172,6 +168,7 @@ class TestCustomServiceDestinationPolicy:
             auth_required=True,
         )
 
+    @pytest.mark.description("A trusted caller keeps access to internal destinations.")
     @pytest.mark.parametrize(
         ("org_name", "auth_required"),
         [("internal.example", True), ("partner-acme", True), ("default", False)],
@@ -191,9 +188,9 @@ class TestCustomServiceDestinationPolicy:
         )
 
 
+@pytest.mark.description("Custom benchmark service URL validation.")
 class TestCustomServiceUrlValidation:
-    """Custom benchmark service URL validation."""
-
+    @pytest.mark.description("Reject custom service URLs whose syntax can obscure routing or credentials.")
     @pytest.mark.parametrize(
         "service_url",
         [
@@ -212,7 +209,6 @@ class TestCustomServiceUrlValidation:
         self,
         service_url: str,
     ) -> None:
-        """Reject custom service URLs whose syntax can obscure routing or credentials."""
         with pytest.raises(ValidationError):
             FetchBenchmarkTasksRequest(benchmark_name="swebench", custom_benchmark_service=service_url)
 
@@ -222,16 +218,16 @@ class TestCustomServiceUrlValidation:
         with pytest.raises(ValidationError):
             BenchmarkServiceEntry(name="swebench", url=service_url)
 
+    @pytest.mark.description("Reject URL controls when constructing a client outside request-model validation.")
     @pytest.mark.parametrize("service_url", _ASCII_CONTROL_URLS)
     def test_client_factory_rejects_url_controls(self, service_url: str) -> None:
-        """Reject URL controls when constructing a client outside request-model validation."""
         with pytest.raises(ValueError, match="Invalid benchmark service URL"):
             create_benchmark_service_client(service_url)
 
+    @pytest.mark.description("Preserve the documented custom/internal benchmark-service capability.")
     def test_custom_service_url_preserves_intentional_internal_http_service(
         self,
     ) -> None:
-        """Preserve the documented custom/internal benchmark-service capability."""
         request = FetchBenchmarkTasksRequest(
             benchmark_name="swebench",
             custom_benchmark_service="http://internal-swebench.example.com:8001/",
@@ -250,6 +246,7 @@ class TestCustomServiceUrlValidation:
         assert service_entry.url == "http://internal-swebench.example.com:8001"
 
 
+@pytest.mark.description("Tenants that are not listed cannot reach internal destinations.")
 @pytest.mark.parametrize("org_name", ["partneracme", "acme-partner-", "vals.ai"])
 def test_unlisted_tenants_cannot_reach_internal_destinations(org_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("tracker.config.AWS_SHARED_SECRET_TENANTS", "internal.example,partner-*")
@@ -258,9 +255,9 @@ def test_unlisted_tenants_cannot_reach_internal_destinations(org_name: str, monk
         validate_custom_service_destination("http://service.internal:8001", org_name=org_name, auth_required=True)
 
 
+@pytest.mark.description("Run-scoped service clients tell the service which sandbox provider the run uses.")
 class TestRunSandboxProviderHeader:
-    """Run-scoped service clients tell the service which sandbox provider the run uses."""
-
+    @pytest.mark.description("The run's sandbox provider replaces the caller's header.")
     def test_run_provider_replaces_caller_header(self) -> None:
         client = create_benchmark_service_client(
             "https://service.example",
@@ -270,6 +267,9 @@ class TestRunSandboxProviderHeader:
 
         assert getattr(client, "_headers") == {"X-Other": "kept", "X-Vals-Sandbox-Provider": "modal"}
 
+    @pytest.mark.description(
+        "Both the start and execution service clients send the chosen provider in `X-Vals-Sandbox-Provider`."
+    )
     def test_start_and_execution_clients_send_requested_provider(self) -> None:
         request = _start_benchmark_request(
             sandbox_provider="daytona",

@@ -1,5 +1,7 @@
 """Access run artifacts without direct storage credentials."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import sys
@@ -10,8 +12,8 @@ from uuid import UUID
 
 import httpx
 
-from valkyrie.sdk.errors import ValkyrieStreamError, ValkyrieTransportError
-from valkyrie.sdk.models.artifacts import RunArtifactsResponse, RunArtifactDownloadResponse
+from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieStreamError, ValkyrieTransportError
+from valkyrie.sdk.models.artifacts import RunArtifactDownloadResponse, RunArtifactsResponse
 
 if TYPE_CHECKING:
     from valkyrie.sdk.client import ValkyrieClient
@@ -21,14 +23,14 @@ def _path(value: str, *, allow_empty: bool = False) -> str:
     if not value and allow_empty:
         return value
     if "\\" in value or any(part in {"", ".", ".."} for part in value.split("/")):
-        raise ValueError("Artifact path must be a relative file or directory path")
+        raise ValkyrieInputError("Artifact path must be a relative file or directory path")
     return value
 
 
 class ArtifactsResource:
     """List and download artifacts scoped to one run."""
 
-    def __init__(self, client: "ValkyrieClient") -> None:
+    def __init__(self, client: ValkyrieClient) -> None:
         self._sdk = client
 
     async def list(
@@ -36,7 +38,7 @@ class ArtifactsResource:
     ) -> RunArtifactsResponse:
         """List one page matching an exact artifact path or directory prefix. limit must be between 1 and 1000."""
         if not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000")
+            raise ValkyrieInputError("limit must be between 1 and 1000")
         params: dict[str, str | int] = {"prefix": _path(prefix.rstrip("/"), allow_empty=True), "limit": limit}
         if cursor is not None:
             params["cursor"] = cursor
@@ -69,7 +71,7 @@ class ArtifactsResource:
         """
         path = _path(path.rstrip("/"), allow_empty=True)
         if min(max_bytes, max_entries) <= 0:
-            raise ValueError("Artifact download limits must be positive")
+            raise ValkyrieInputError("Artifact download limits must be positive")
         output_dir = Path(output_dir)
         if await asyncio.to_thread(os.path.lexists, output_dir):
             raise FileExistsError(f"Output directory already exists: {output_dir}")
@@ -82,36 +84,29 @@ class ArtifactsResource:
             paths: set[str] = set()
             size = 0
             try:
-                async with httpx.AsyncClient(timeout=120) as download_client:
-                    while True:
-                        page = await self.list(run_id, prefix=path, cursor=cursor, limit=1000)
-                        for entry in page.artifacts:
-                            relative = _path(entry.path)
-                            if sys.platform == "win32" and ":" in relative:
-                                raise ValueError("Artifact path contains a colon unsupported by Windows filenames")
-                            if path and relative != path and not relative.startswith(path + "/"):
-                                raise ValueError("Tracker returned an artifact outside the requested path")
-                            if relative.casefold() in paths:
-                                raise ValueError("Tracker returned a duplicate artifact path")
-                            paths.add(relative.casefold())
-                            if len(paths) > max_entries or entry.size < 0 or entry.size > max_bytes - size:
-                                raise ValueError("Artifacts exceed download limits")
-                            url = await self.download_url(run_id, relative)
-                            destination = staging / relative
-                            await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
-                            size += await _download_file(
-                                download_client,
-                                url.download_url,
-                                destination,
-                                max_bytes - size,
-                                self._sdk.download_auth(url.download_url),
-                            )
-                        if page.next_cursor is None:
-                            break
-                        if page.next_cursor in cursors:
-                            raise ValkyrieStreamError("Tracker returned a repeated artifact cursor")
-                        cursors.add(page.next_cursor)
-                        cursor = page.next_cursor
+                while True:
+                    page = await self.list(run_id, prefix=path, cursor=cursor, limit=1000)
+                    for entry in page.artifacts:
+                        relative = _path(entry.path)
+                        if sys.platform == "win32" and ":" in relative:
+                            raise ValueError("Artifact path contains a colon unsupported by Windows filenames")
+                        if path and relative != path and not relative.startswith(path + "/"):
+                            raise ValueError("Tracker returned an artifact outside the requested path")
+                        if relative.casefold() in paths:
+                            raise ValueError("Tracker returned a duplicate artifact path")
+                        paths.add(relative.casefold())
+                        if len(paths) > max_entries or entry.size < 0 or entry.size > max_bytes - size:
+                            raise ValueError("Artifacts exceed download limits")
+                        url = await self.download_url(run_id, relative)
+                        destination = staging / relative
+                        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+                        size += await _download_file(self._sdk, url.download_url, destination, max_bytes - size)
+                    if page.next_cursor is None:
+                        break
+                    if page.next_cursor in cursors:
+                        raise ValkyrieStreamError("Tracker returned a repeated artifact cursor")
+                    cursors.add(page.next_cursor)
+                    cursor = page.next_cursor
             except httpx.HTTPError as error:
                 raise ValkyrieTransportError("Artifact download failed") from error
             if not paths:
@@ -122,20 +117,9 @@ class ArtifactsResource:
         return output_dir
 
 
-async def _download_file(
-    client: httpx.AsyncClient, url: str, destination: Path, max_bytes: int, auth: httpx.Auth | None
-) -> int:
-    size = 0
+async def _download_file(sdk: ValkyrieClient, url: str, destination: Path, max_bytes: int) -> int:
     output = await asyncio.to_thread(destination.open, "xb")
     try:
-        async with client.stream("GET", url, auth=auth, follow_redirects=auth is None) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                size += len(chunk)
-                if size > max_bytes:
-                    raise ValueError("Artifacts exceed download limits")
-                await asyncio.to_thread(output.write, chunk)
+        return await sdk.download(url, output, max_bytes=max_bytes, too_large="Artifacts exceed download limits")
     finally:
         await asyncio.to_thread(output.close)
-
-    return size

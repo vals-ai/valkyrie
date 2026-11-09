@@ -1,16 +1,11 @@
-"""Run with `uv run pytest tests/integration/local/api/test_single_benchmark.py`.
-
-Exercise single-benchmark routes through the real app and local database.
-"""
-
 import json
 import socket
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -18,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event, text
+from sqlalchemy.engine import Connection, Engine
 from sqlmodel import Session, SQLModel, create_engine
 from testcontainers.postgres import PostgresContainer
 
@@ -37,11 +33,12 @@ from tracker.database.models import (
 from tracker.aws.runtime import AWSResources
 from tracker.local.resources import LocalResources
 from tracker.database.session import get_session
+import tracker.services.results as results_module
 
 
+@pytest.mark.description("Single benchmark responses and missing runs.")
 class TestSingleBenchmark:
-    """Single benchmark responses and missing runs."""
-
+    @pytest.mark.description("Reading a run needs an API key.")
     @pytest.mark.parametrize("headers", [{}, {"X-Descope-Api-Key": "fake"}])
     def test_read_requires_api_key(self, client: TestClient, headers: dict[str, str]) -> None:
         response = client.get(f"/benchmarks/{uuid4()}", headers=headers)
@@ -49,10 +46,12 @@ class TestSingleBenchmark:
         assert response.status_code == 401
         assert response.json()["detail"] == "Missing Authorization or x-api-key header"
 
+    @pytest.mark.description(
+        "The dashboard signs in with a Descope session and still sends legacy X-Harness-* headers."
+    )
     def test_dashboard_session_reads_run_and_ignores_aws_headers(
         self, session_client: TestClient, database_session: Session
     ) -> None:
-        """The dashboard signs in with a Descope session and still sends legacy X-Harness-* headers."""
         benchmark = make_benchmark(name="dashboard-run", session=database_session)
         headers = {"Authorization": "Bearer session-token", "X-Harness-Aws-Access-Key-Id": "legacy-key"}
 
@@ -61,6 +60,7 @@ class TestSingleBenchmark:
         assert response.status_code == 200, response.text
         assert response.json()["id"] == str(benchmark.id)
 
+    @pytest.mark.description("Reading a run only sees runs in the API key's tenant.")
     def test_read_is_scoped_to_api_key_tenant(self, client: TestClient, database_session: Session) -> None:
         other_org = Org(id=uuid4(), name="other-tenant")
         database_session.add(other_org)
@@ -77,12 +77,15 @@ class TestSingleBenchmark:
         assert other_response.status_code == 404
         assert "other-run" not in other_response.text
 
+    @pytest.mark.description(
+        (
+            "Run detail must combine persisted benchmark metadata and task progress.\n"
+            "\n"
+            "Test cases:\n"
+            "- An authenticated request returns the expected run payload and counts."
+        )
+    )
     def test_get_single_benchmark_returns_payload(self, client: TestClient, database_session: Session) -> None:
-        """Run detail must combine persisted benchmark metadata and task progress.
-
-        Test cases:
-        - An authenticated request returns the expected run payload and counts.
-        """
         initial_release = ExecutorRelease(
             id="initial-release",
             artifact_uri="s3://artifacts/initial.pex",
@@ -118,12 +121,15 @@ class TestSingleBenchmark:
         assert response_body["final_score"] is None
         assert response_body["total_tasks"] == 0
 
+    @pytest.mark.description(
+        (
+            "Completed run detail must include its persisted final score.\n"
+            "\n"
+            "Test cases:\n"
+            "- A final-evaluation row appears in the API response."
+        )
+    )
     def test_get_single_benchmark_includes_final_score(self, client: TestClient, database_session: Session) -> None:
-        """Completed run detail must include its persisted final score.
-
-        Test cases:
-        - A final-evaluation row appears in the API response.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         database_session.add(FinalEvaluation(org_id=benchmark.org_id, benchmark=benchmark.id, final_score=0.42))
         database_session.commit()
@@ -132,12 +138,15 @@ class TestSingleBenchmark:
 
         assert response.json()["final_score"] == 0.42
 
+    @pytest.mark.description(
+        (
+            "Unknown run IDs must return a stable not-found response.\n"
+            "\n"
+            "Test cases:\n"
+            "- A missing benchmark UUID receives 404."
+        )
+    )
     def test_get_single_benchmark_unknown_returns_404(self, client: TestClient) -> None:
-        """Unknown run IDs must return a stable not-found response.
-
-        Test cases:
-        - A missing benchmark UUID receives 404.
-        """
         unknown_benchmark_id = uuid4()
 
         response = client.get(f"/benchmarks/{unknown_benchmark_id}", headers={"X-Api-Key": "fake"})
@@ -145,12 +154,11 @@ class TestSingleBenchmark:
         assert response.status_code == 404
 
 
+@pytest.mark.description("Live status streams on PostgreSQL.")
 class TestBenchmarkStatusStreamPostgres:
-    """Live status streams on PostgreSQL."""
-
+    @pytest.mark.description("An open status stream must not hold benchmark locks between events.")
     @pytest.mark.usefixtures("access_key_auth")
     def test_open_stream_releases_postgres_request_and_poll_transactions(self, local_app: FastAPI) -> None:
-        """An open status stream must not hold benchmark locks between events."""
         with PostgresContainer("postgres:16-alpine") as postgres:
             engine = create_engine(
                 postgres.get_connection_url(), connect_args={"application_name": "tracker-sse-test-app"}
@@ -206,33 +214,44 @@ class TestBenchmarkStatusStreamPostgres:
                     assert not server_thread.is_alive()
 
 
+@pytest.mark.description("Single-benchmark status streaming.")
 class TestBenchmarkStatusStream:
-    """Single-benchmark status streaming."""
-
+    @pytest.mark.description(
+        (
+            "An active run must remain streamable while its task rows are being discovered.\n"
+            "\n"
+            "Test cases:\n"
+            "- The first status event reports a valid empty task breakdown.\n"
+            "- A later poll reports the discovered task and completes normally."
+        )
+    )
     def test_stream_survives_task_discovery_transition(
         self,
         client: TestClient,
         database_session: Session,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An active run must remain streamable while its task rows are being discovered.
-
-        Test cases:
-        - The first status event reports a valid empty task breakdown.
-        - A later poll reports the discovered task and completes normally.
-        """
         benchmark = make_benchmark(name="discovering-benchmark", session=database_session)
+        reads = 0
 
-        async def finish_task_discovery(_seconds: float) -> None:
-            with Session(bind=database_session.bind) as poll_session:
-                persisted_benchmark = poll_session.get(Benchmark, benchmark.id)
-                assert persisted_benchmark is not None
+        def finish_task_discovery_before_poll(
+            bind: Engine | Connection | None, benchmark_ids: Sequence[UUID]
+        ) -> results_module._RunSnapshot:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                with Session(bind=bind) as poll_session:
+                    persisted_benchmark = poll_session.get(Benchmark, benchmark.id)
+                    assert persisted_benchmark is not None
 
-                persisted_benchmark.status = BenchmarkStatus.FINISHED
-                poll_session.add(make_task(persisted_benchmark, "discovered-task", status=TaskStatus.FINISHED))
-                poll_session.commit()
+                    persisted_benchmark.status = BenchmarkStatus.FINISHED
+                    poll_session.add(make_task(persisted_benchmark, "discovered-task", status=TaskStatus.FINISHED))
+                    poll_session.commit()
+            return read_runs(bind, benchmark_ids)
 
-        monkeypatch.setattr("tracker.utils.reporting.asyncio.sleep", finish_task_discovery)
+        read_runs = results_module._read_runs
+        monkeypatch.setattr(results_module, "_read_runs", finish_task_discovery_before_poll)
+        monkeypatch.setattr(results_module, "RESULT_POLL_INTERVAL", 0)
 
         with client.stream(
             "GET",
@@ -253,6 +272,16 @@ class TestBenchmarkStatusStream:
         assert streamed_statuses[0]["details"]["task_breakdown"] == {}
         assert streamed_statuses[1]["details"]["task_breakdown"] == {"FINISHED": 1}
 
+    @pytest.mark.description(
+        (
+            "Terminal run streams must return persisted state and close without polling.\n"
+            "\n"
+            "Test cases:\n"
+            "- A finished benchmark emits its current payload as a data event.\n"
+            "- The stream emits a completion event with SSE response headers.\n"
+            "- Local and AWS streams retain the artifact URL from ordinary fetches."
+        )
+    )
     @pytest.mark.parametrize("local", [False, True])
     def test_terminal_benchmark_streams_status_and_completes(
         self,
@@ -261,13 +290,6 @@ class TestBenchmarkStatusStream:
         tmp_path: Path,
         local: bool,
     ) -> None:
-        """Terminal run streams must return persisted state and close without polling.
-
-        Test cases:
-        - A finished benchmark emits its current payload as a data event.
-        - The stream emits a completion event with SSE response headers.
-        - Local and AWS streams retain the artifact URL from ordinary fetches.
-        """
         benchmark = make_benchmark(name="streamed-benchmark", status=BenchmarkStatus.FINISHED, session=database_session)
         if local:
             benchmark.arguments = LocalBenchmarkArguments.model_validate(
@@ -317,12 +339,12 @@ class TestBenchmarkStatusStream:
         if local:
             assert streamed_status["s3_bucket_url"] == f"http://testserver/benchmarks/{benchmark.id}/artifacts"
 
+    @pytest.mark.description("Terminal error streams expose the saved run error and current release ownership.")
     def test_error_benchmark_streams_release_provenance_and_message(
         self,
         client: TestClient,
         database_session: Session,
     ) -> None:
-        """Terminal error streams expose the saved run error and current release ownership."""
         initial_release = ExecutorRelease(
             id="initial-release",
             artifact_uri="s3://artifacts/initial.pex",
@@ -367,15 +389,17 @@ class TestBenchmarkStatusStream:
         assert streamed_status["executor_protocol_version"] == initial_release.protocol_version
 
 
+@pytest.mark.description("Benchmark task pagination, filtering, and status sorting.")
 class TestBenchmarkTaskListing:
-    """Benchmark task pagination, filtering, and status sorting."""
-
+    @pytest.mark.description(
+        (
+            "Task listing must honor limit and offset while reporting the full count.\n"
+            "\n"
+            "Test cases:\n"
+            "- A page contains the requested rows and the unpaginated total."
+        )
+    )
     def test_get_benchmark_tasks_paginates(self, client: TestClient, database_session: Session) -> None:
-        """Task listing must honor limit and offset while reporting the full count.
-
-        Test cases:
-        - A page contains the requested rows and the unpaginated total.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         for task_index in range(3):
             database_session.add(
@@ -429,15 +453,18 @@ class TestBenchmarkTaskListing:
         assert "CASE WHEN" in page_query.upper()
         assert "COUNT(*)" in count_query.upper()
 
+    @pytest.mark.description(
+        (
+            "Task listing must apply comma-separated status filters.\n"
+            "\n"
+            "Test cases:\n"
+            "- Only tasks in the requested statuses are returned and counted.\n"
+            "- Error tasks return the newest non-retry error from their organization.\n"
+            "- Non-error tasks skip error-message output even when error rows exist.\n"
+            "- Tasks and error rows from another organization are excluded."
+        )
+    )
     def test_get_benchmark_tasks_filters_by_status(self, client: TestClient, database_session: Session) -> None:
-        """Task listing must apply comma-separated status filters.
-
-        Test cases:
-        - Only tasks in the requested statuses are returned and counted.
-        - Error tasks return the newest non-retry error from their organization.
-        - Non-error tasks skip error-message output even when error rows exist.
-        - Tasks and error rows from another organization are excluded.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         other_org = Org(name="other-task-list-org")
         finished_task = make_task(benchmark, "ok", status=TaskStatus.FINISHED)
@@ -504,19 +531,21 @@ class TestBenchmarkTaskListing:
         assert finished_response_body["tasks"][0]["task_id"] == "ok"
         assert finished_response_body["tasks"][0]["error_message"] is None
 
+    @pytest.mark.description(
+        (
+            "Attention sorting must place task errors ahead of less urgent states.\n"
+            "\n"
+            "Test cases:\n"
+            "- Descending status order returns errors before terminal and active tasks."
+        )
+    )
     def test_get_benchmark_tasks_sort_by_status_surfaces_errors_first(
         self,
         client: TestClient,
         database_session: Session,
     ) -> None:
-        """Attention sorting must place task errors ahead of less urgent states.
-
-        Test cases:
-        - Descending status order returns errors before terminal and active tasks.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
 
-        # Seed tasks out of priority order to prove the route performs the sort.
         for task_id, status in [
             ("a-pending", TaskStatus.PENDING),
             ("b-finished", TaskStatus.FINISHED),
@@ -534,16 +563,19 @@ class TestBenchmarkTaskListing:
         statuses = [task["status"] for task in response.json()["tasks"]]
         assert statuses == ["ERROR", "FINISHED", "IN_PROGRESS", "PENDING"]
 
+    @pytest.mark.description(
+        (
+            "Task listing must support stable ascending task-ID order.\n"
+            "\n"
+            "Test cases:\n"
+            "- Ascending task sort returns IDs in lexical order."
+        )
+    )
     def test_get_benchmark_tasks_sort_by_task_id_ascending(
         self,
         client: TestClient,
         database_session: Session,
     ) -> None:
-        """Task listing must support stable ascending task-ID order.
-
-        Test cases:
-        - Ascending task sort returns IDs in lexical order.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         for task_id in ["t-c", "t-a", "t-b"]:
             database_session.add(make_task(benchmark, task_id))
@@ -558,6 +590,7 @@ class TestBenchmarkTaskListing:
 
 
 class TestBenchmarkConsoleUrls:
+    @pytest.mark.description("A fetched run carries console URLs for its runtime.")
     def test_get_single_benchmark_builds_run_console_urls(
         self,
         client: TestClient,
@@ -574,6 +607,7 @@ class TestBenchmarkConsoleUrls:
         assert "s3/buckets/test-bucket" in body["s3_bucket_url"]
         assert str(benchmark.id) in body["s3_bucket_url"]
 
+    @pytest.mark.description("A fetched run leaves out runtime links that are not available.")
     def test_get_single_benchmark_omits_unavailable_runtime_links(
         self,
         client: TestClient,
@@ -598,27 +632,32 @@ class TestBenchmarkConsoleUrls:
         assert body["s3_bucket_url"] is None
 
 
+@pytest.mark.description(
+    (
+        "Single-run routes must require authentication.\n"
+        "\n"
+        "Test cases:\n"
+        "- A request without a bearer session receives 401."
+    )
+)
 def test_unauth_returns_401(client: TestClient) -> None:
-    """Single-run routes must require authentication.
-
-    Test cases:
-    - A request without a bearer session receives 401.
-    """
     unknown_benchmark_id = uuid4()
 
     assert client.get(f"/benchmarks/{unknown_benchmark_id}").status_code == 401
     assert client.get(f"/benchmarks/{unknown_benchmark_id}/tasks").status_code == 401
 
 
+@pytest.mark.description("Benchmark task search matching and filter composition.")
 class TestBenchmarkTaskSearch:
-    """Benchmark task search matching and filter composition."""
-
+    @pytest.mark.description(
+        (
+            "Task-ID search must narrow a run without changing the original rows.\n"
+            "\n"
+            "Test cases:\n"
+            "- A substring query returns only matching task IDs."
+        )
+    )
     def test_get_benchmark_tasks_filters_by_task_id_search(self, client: TestClient, database_session: Session) -> None:
-        """Task-ID search must narrow a run without changing the original rows.
-
-        Test cases:
-        - A substring query returns only matching task IDs.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         database_session.add_all(
             [
@@ -640,16 +679,19 @@ class TestBenchmarkTaskSearch:
         task_ids = sorted(task["task_id"] for task in response_body["tasks"])
         assert task_ids == ["astropy__astropy-12907", "astropy__astropy-13033"]
 
+    @pytest.mark.description(
+        (
+            "Task-ID search must treat SQL wildcard characters as user text.\n"
+            "\n"
+            "Test cases:\n"
+            "- Percent and underscore characters match only literal task IDs."
+        )
+    )
     def test_get_benchmark_tasks_search_treats_like_wildcards_literally(
         self,
         client: TestClient,
         database_session: Session,
     ) -> None:
-        """Task-ID search must treat SQL wildcard characters as user text.
-
-        Test cases:
-        - Percent and underscore characters match only literal task IDs.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         database_session.add_all(
             [
@@ -677,12 +719,15 @@ class TestBenchmarkTaskSearch:
         assert percent_response.json()["total_count"] == 1
         assert percent_response.json()["tasks"][0]["task_id"] == "task%1"
 
+    @pytest.mark.description(
+        (
+            "Task-ID search must be case-insensitive for CLI and UI parity.\n"
+            "\n"
+            "Test cases:\n"
+            "- A differently cased query still finds the persisted task ID."
+        )
+    )
     def test_get_benchmark_tasks_search_case_insensitive(self, client: TestClient, database_session: Session) -> None:
-        """Task-ID search must be case-insensitive for CLI and UI parity.
-
-        Test cases:
-        - A differently cased query still finds the persisted task ID.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         database_session.add_all(
             [
@@ -701,14 +746,17 @@ class TestBenchmarkTaskSearch:
         assert response_body["total_count"] == 1
         assert response_body["tasks"][0]["task_id"] == "DJANGO__django-1"
 
+    @pytest.mark.description(
+        (
+            "Task search and status filters must compose as an intersection.\n"
+            "\n"
+            "Test cases:\n"
+            "- Results satisfy both the task-ID substring and requested status."
+        )
+    )
     def test_get_benchmark_tasks_search_combines_with_status(
         self, client: TestClient, database_session: Session
     ) -> None:
-        """Task search and status filters must compose as an intersection.
-
-        Test cases:
-        - Results satisfy both the task-ID substring and requested status.
-        """
         benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.FINISHED, session=database_session)
         database_session.add_all(
             [

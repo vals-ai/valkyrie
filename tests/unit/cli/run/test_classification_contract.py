@@ -1,5 +1,3 @@
-"""Consume captured process-task output through SDK models and CLI rendering."""
-
 import json
 from pathlib import Path
 
@@ -10,13 +8,13 @@ from valkyrie.sdk.models import FinalViewResponse, SingleTaskResponse, TasksResp
 from valkyrie.cli.run.errors import format_run_errors_json, format_run_errors_text
 
 
+@pytest.mark.description("Fixture was emitted by the SQLite producer/API test, not hand-built SDK data.")
 @pytest.mark.parametrize(
     "fixture_name,category", [("classification.json", "benchmark_service"), ("original-error.json", "agent")]
 )
 def test_stored_failure_crosses_sdk_and_cli(
     capsys: pytest.CaptureFixture[str], fixture_name: str, category: str
 ) -> None:
-    """Fixture was emitted by the SQLite producer/API test, not hand-built SDK data."""
     path = Path(__file__).parents[3] / "fixtures" / "sdk_api" / fixture_name
     wire = json.loads(path.read_text())
     task = SingleTaskResponse.model_validate(wire["task"])

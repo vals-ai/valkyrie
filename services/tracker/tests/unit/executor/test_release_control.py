@@ -56,6 +56,7 @@ def _dispatch(
     )
 
 
+@pytest.mark.description("An activated release ends `ACTIVE` and becomes the admission target.")
 def test_activate_release_registers_verifies_and_promotes_in_one_session(database_session: Session) -> None:
     content = b"executor artifact"
     release = ExecutorRelease(
@@ -76,6 +77,7 @@ def test_activate_release_registers_verifies_and_promotes_in_one_session(databas
     assert admission.release_id == release.id
 
 
+@pytest.mark.description("Activating the exact active release again changes nothing.")
 def test_activate_release_is_idempotent_for_exact_active_release(database_session: Session) -> None:
     content = b"executor artifact"
     release = ExecutorRelease(
@@ -106,6 +108,7 @@ def test_activate_release_is_idempotent_for_exact_active_release(database_sessio
     assert second.activated_at.replace(tzinfo=None) == activated_at.replace(tzinfo=None)
 
 
+@pytest.mark.description("Activating a draining release is rejected.")
 def test_activate_release_rejects_draining_release(database_session: Session) -> None:
     content = b"executor artifact"
     previous = ExecutorRelease(
@@ -141,6 +144,7 @@ def test_activate_release_rejects_draining_release(database_session: Session) ->
         )
 
 
+@pytest.mark.description("Activating a retired release is rejected.")
 def test_activate_release_rejects_retired_release(database_session: Session) -> None:
     content = b"executor artifact"
     release = ExecutorRelease(
@@ -166,6 +170,7 @@ def test_activate_release_rejects_retired_release(database_session: Session) -> 
         )
 
 
+@pytest.mark.description("Reusing a release ID with different content is rejected.")
 def test_activate_release_rejects_release_id_reuse_with_different_content(database_session: Session) -> None:
     existing = ExecutorRelease(
         id="git-abc123-def456",
@@ -187,14 +192,16 @@ def test_activate_release_rejects_release_id_reuse_with_different_content(databa
         )
 
 
+@pytest.mark.description("Registering a release with an unsupported protocol is rejected.")
 def test_register_release_rejects_unsupported_protocol(database_session: Session) -> None:
     release = _release("unsupported")
-    release.protocol_version = "6"
+    release.protocol_version = "999"
 
     with pytest.raises(ReleaseControlError, match="Unsupported executor protocol version"):
         register_release(database_session, release)
 
 
+@pytest.mark.description("Registering a release with an invalid image digest is rejected.")
 def test_register_release_rejects_invalid_digest(database_session: Session) -> None:
     release = _release("invalid-digest")
     release.artifact_digest = "not-a-digest"
@@ -203,6 +210,7 @@ def test_register_release_rejects_invalid_digest(database_session: Session) -> N
         register_release(database_session, release)
 
 
+@pytest.mark.description("Promoting the current release again changes nothing.")
 def test_promote_release_is_idempotent_for_current_release(database_session: Session) -> None:
     register_release(database_session, _release("v1"))
 
@@ -215,6 +223,7 @@ def test_promote_release_is_idempotent_for_current_release(database_session: Ses
     assert second.activated_at.replace(tzinfo=None) == activated_at.replace(tzinfo=None)
 
 
+@pytest.mark.description("Promoting a release refreshes the cached admission target and the previous release.")
 def test_promote_release_refreshes_cached_admission_and_previous_release(
     database_session: Session,
 ) -> None:
@@ -252,6 +261,7 @@ def test_promote_release_refreshes_cached_admission_and_previous_release(
         final_session.close()
 
 
+@pytest.mark.description("Promoting a release moves the previous one to draining.")
 def test_promote_release_moves_previous_admission_to_draining(database_session: Session) -> None:
     register_release(database_session, _release("v1"))
     register_release(database_session, _release("v2"))
@@ -266,6 +276,7 @@ def test_promote_release_moves_previous_admission_to_draining(database_session: 
     assert previous.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("Promoting a draining release is rejected.")
 def test_promote_release_rejects_draining_release(database_session: Session) -> None:
     register_release(database_session, _release("v1"))
     register_release(database_session, _release("v2"))
@@ -276,11 +287,15 @@ def test_promote_release_rejects_draining_release(database_session: Session) -> 
         promote_release(database_session, "v1")
 
 
+@pytest.mark.description("Selecting the active release needs an admission target.")
 def test_select_active_release_requires_an_admission_target(database_session: Session) -> None:
     with pytest.raises(ReleaseControlError, match="No active executor release"):
         select_active_release(database_session)
 
 
+@pytest.mark.description(
+    "`select_active_release` raises `ReleaseControlError` when the admission target is not an active release."
+)
 @pytest.mark.parametrize("status", [ExecutorReleaseStatus.CANDIDATE, ExecutorReleaseStatus.DRAINING])
 def test_select_active_release_rejects_invalid_admission_target(
     database_session: Session,
@@ -299,6 +314,7 @@ def test_select_active_release_rejects_invalid_admission_target(
         select_active_release(database_session)
 
 
+@pytest.mark.description("Promoting a release does not backfill ownership of legacy runs.")
 def test_promote_release_does_not_backfill_legacy_benchmark_ownership(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -334,6 +350,7 @@ def test_promote_release_does_not_backfill_legacy_benchmark_ownership(
     assert legacy.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("The current admission target cannot be retired.")
 def test_retirement_rejects_the_current_admission_target(database_session: Session) -> None:
     register_release(database_session, _release("v1"))
     promote_release(database_session, "v1")
@@ -347,6 +364,7 @@ def test_retirement_rejects_the_current_admission_target(database_session: Sessi
         retire_drained_releases(database_session)
 
 
+@pytest.mark.description("Partial run ownership is rejected.")
 def test_partial_benchmark_ownership_is_rejected(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -360,6 +378,7 @@ def test_partial_benchmark_ownership_is_rejected(
     database_session.rollback()
 
 
+@pytest.mark.description("Retirement waits for an active run the release owns.")
 def test_retirement_waits_for_owned_active_benchmark(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -399,6 +418,7 @@ def test_retirement_waits_for_owned_active_benchmark(
         promote_release(database_session, "v1")
 
 
+@pytest.mark.description("Active work counts a run once when its owner and dispatch use the same release.")
 def test_active_work_deduplicates_current_owner_and_dispatch_on_the_same_release(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -421,6 +441,7 @@ def test_active_work_deduplicates_current_owner_and_dispatch_on_the_same_release
     assert active_executor_release_work(database_session).counts_by_release == {release.id: 1}
 
 
+@pytest.mark.description("A run with no current owner but a start dispatch history blocks every retirement.")
 def test_null_current_owner_with_start_dispatch_history_blocks_every_retirement(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -447,6 +468,7 @@ def test_null_current_owner_with_start_dispatch_history_blocks_every_retirement(
     assert release_a.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("A draining release with an active dispatch is not retired and stays `DRAINING`.")
 @pytest.mark.parametrize(
     "dispatch_status",
     [ExecutorDispatchStatus.QUEUED, ExecutorDispatchStatus.RUNNING],
@@ -474,6 +496,7 @@ def test_retirement_waits_for_active_dispatch(
     assert release_v1.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("Only drained releases without active work are retired.")
 def test_retire_drained_releases_retires_only_releases_without_active_work(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -504,6 +527,7 @@ def test_retire_drained_releases_retires_only_releases_without_active_work(
     assert retire_drained_releases(database_session) == []
 
 
+@pytest.mark.description("Active work with no known release blocks all retirement.")
 def test_retire_drained_releases_fails_closed_for_unattributed_active_work(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -524,6 +548,7 @@ def test_retire_drained_releases_fails_closed_for_unattributed_active_work(
     assert release_v1.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("A retention timestamp without a timezone is read as UTC.")
 def test_artifact_deletion_allowed_treats_naive_retention_timestamp_as_utc(database_session: Session) -> None:
     retention_until = datetime(2026, 8, 19)
     release = _release("v1")
@@ -544,6 +569,7 @@ def test_artifact_deletion_allowed_treats_naive_retention_timestamp_as_utc(datab
     )
 
 
+@pytest.mark.description("An active retry dispatch keeps its release across later promotions.")
 def test_active_retry_dispatch_blocks_its_release_across_successive_promotions(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -587,18 +613,20 @@ def test_active_retry_dispatch_blocks_its_release_across_successive_promotions(
     assert retire_drained_releases(database_session) == ["v2"]
 
 
+@pytest.mark.description(
+    (
+        "Registering a checkout at startup keeps one release for it, whatever its files contain.\n"
+        "\n"
+        "Test cases:\n"
+        "- The first registration activates a source release that names the checkout.\n"
+        "- Restarting after editing a source file reuses the active release.\n"
+        "- Registering a different checkout activates a new release and drains the previous one."
+    )
+)
 def test_source_release_restart_reuses_the_checkout_release_across_edits(
     database_session: Session,
     tmp_path: Path,
 ) -> None:
-    """
-    Verify that registering a checkout at startup keeps one release for it, whatever its files contain.
-
-    Test cases:
-    - The first registration activates a source release that names the checkout.
-    - Restarting after editing a source file reuses the active release.
-    - Registering a different checkout activates a new release and drains the previous one.
-    """
     root = tmp_path / "src"
     (root / "tracker").mkdir(parents=True)
     module = root / "tracker" / "module.py"
@@ -622,6 +650,7 @@ def test_source_release_restart_reuses_the_checkout_release_across_edits(
     assert first.status == ExecutorReleaseStatus.DRAINING
 
 
+@pytest.mark.description("Activating an image release pins it to its registered task definition.")
 def test_activate_release_pins_image_releases_to_their_registered_task_definition(database_session: Session) -> None:
     image = f"123456789012.dkr.ecr.us-east-1.amazonaws.com/valkyrie-executor@sha256:{'c' * 64}"
     release = ExecutorRelease(
@@ -652,6 +681,7 @@ def test_activate_release_pins_image_releases_to_their_registered_task_definitio
     assert reactivated.task_definition_arn == release.task_definition_arn
 
 
+@pytest.mark.description("An image release without a task definition is rejected.")
 def test_register_release_rejects_a_non_source_release_without_a_task_definition(database_session: Session) -> None:
     release = ExecutorRelease(
         id="git-image-without-task-definition",

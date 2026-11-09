@@ -1,8 +1,7 @@
-"""API request and response types for the tracker service."""
-
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Self, cast
@@ -26,14 +25,20 @@ from pydantic import (
 from tracker.aws.runtime import AWSResources
 from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.config import create_benchmark_service_url
+from tracker.runtime.artifacts import TASK_ID_PATTERN
+from tracker.repositories.benchmark import BenchmarkFilters
 from tracker.database.models import (
     AgentContractRequest,
     BenchmarkArguments,
+    BenchmarkDefinition,
     BenchmarkStatus,
+    Dataset,
     DocentReadingStatus,
     FailureCategory,
     FinalEvaluation,
     Project,
+    RunMonitoring,
+    RunMonitoringRules,
     SpendType,
     TaskStatus,
 )
@@ -47,7 +52,6 @@ SecretReference = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_+=.@/-]
 
 
 def _serialize_utc(value: datetime | None) -> str | None:
-    """Tag naive datetimes as UTC so JS clients parse them as UTC, not local."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -82,7 +86,6 @@ class FetchBenchmarkTasksRequest(BaseModel):
     service_headers: dict[str, str] = Field(default_factory=dict, repr=False)
 
     def use_saved_service(self, settings: RunSettingsResponse) -> tuple[str, str] | None:
-        """Use the caller's saved service unless the request opts out; return its header and secret, if saved."""
         saved = None if self.ignore_custom_services else settings.benchmark_services.get(self.benchmark_name)
         self.custom_benchmark_service = saved.url if saved else None
         if saved and saved.auth_header_name and saved.auth_secret_name:
@@ -111,7 +114,6 @@ PROJECT_HANDLE_MAX_LENGTH = 64
 
 
 def validate_project_handle(handle: str) -> str:
-    """Accept a handle of lowercase letters, digits and single hyphens, at most 64 characters."""
     if len(handle) > PROJECT_HANDLE_MAX_LENGTH or not PROJECT_HANDLE_PATTERN.fullmatch(handle):
         raise ValueError(
             f"must be lowercase letters, digits and hyphens, at most {PROJECT_HANDLE_MAX_LENGTH} characters, "
@@ -125,8 +127,11 @@ ProjectHandle = Annotated[str, StringConstraints(strip_whitespace=True), AfterVa
 
 
 class ProjectCreateRequest(BaseModel):
-    """A new project: its immutable handle, its name, spend type and subcategory, and optional customer and extra tags."""
-
+    model_config = ConfigDict(
+        json_schema_extra={
+            "description": "A new project: its immutable handle, its name, spend type and subcategory, and optional customer and extra tags."
+        }
+    )
     handle: ProjectHandle
     name: NonBlankText
     spend_type: SpendType
@@ -151,7 +156,16 @@ class ProjectCreateRequest(BaseModel):
         return self
 
 
+class NewProjectRequest(ProjectCreateRequest):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "A project to create with its main key's budget and reason."}
+    )
+    budget: Decimal | None = Field(default=None, gt=0)
+    budget_reason: NonBlankText | None = None
+
+
 class ProjectResponse(BaseModel):
+    id: UUID
     handle: str
     name: str
     spend_type: SpendType
@@ -160,6 +174,7 @@ class ProjectResponse(BaseModel):
     extra_tags: dict[str, str] = Field(default_factory=dict)
     created_at: UTCDateTime
     created_by_email: str | None = None
+    archived_at: UTCDateTime | None = None
 
     @classmethod
     def from_row(cls, row: Project) -> "ProjectResponse":
@@ -170,9 +185,90 @@ class ProjectsResponse(BaseModel):
     projects: list[ProjectResponse]
 
 
-class RunProjectRequest(BaseModel):
-    """The handle of the project a run now belongs to."""
+class ProjectIdResponse(BaseModel):
+    id: UUID
+    org_id: UUID
 
+
+class GatewayKeyEligibilityResponse(BaseModel):
+    project_id: UUID
+    org_id: UUID
+    subject: str
+
+
+ResourceName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$", max_length=64)]
+ResourceDescription = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
+
+
+class ResourceCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "description": "A new benchmark or dataset: its name, unique among its siblings, and an optional description."
+        }
+    )
+    name: ResourceName
+    description: ResourceDescription = ""
+
+
+class ResourceUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "The description a benchmark or dataset now has; the name never changes."}
+    )
+    description: ResourceDescription
+
+
+class ResourceResponse(BaseModel):
+    name: str
+    description: str
+    created_by_email: str | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+    archived_at: UTCDateTime | None = None
+
+
+class BenchmarkDefinitionResponse(ResourceResponse):
+    @classmethod
+    def from_row(cls, row: BenchmarkDefinition) -> "BenchmarkDefinitionResponse":
+        return cls.model_validate(row, from_attributes=True)
+
+
+class BenchmarkDefinitionsResponse(BaseModel):
+    benchmarks: list[BenchmarkDefinitionResponse]
+
+
+class DatasetResponse(ResourceResponse):
+    benchmark: str
+
+    @classmethod
+    def from_row(cls, row: Dataset, benchmark: str) -> "DatasetResponse":
+        return cls.model_validate({**row.model_dump(), "benchmark": benchmark})
+
+
+class DatasetsResponse(BaseModel):
+    datasets: list[DatasetResponse]
+
+
+TaskId = Annotated[str, StringConstraints(pattern=f"^{TASK_ID_PATTERN}$")]
+
+
+class DatasetTaskResponse(BaseModel):
+    task_id: str
+    size: int
+    last_modified: UTCDateTime | None = None
+
+
+class DatasetTasksResponse(BaseModel):
+    tasks: list[DatasetTaskResponse]
+    next_cursor: str | None = None
+
+
+class DatasetTaskDownloadResponse(DatasetTaskResponse):
+    download_url: str
+    expires_in: int
+
+
+class RunProjectRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"description": "The handle of the project a run now belongs to."})
     project: NonBlankText
 
 
@@ -194,6 +290,7 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
     service_auth_header_name: str | None = None
     service_auth_secret_name: str | None = None
     project: NonBlankText | None = None
+    monitoring: RunMonitoring | None = None
 
     @model_validator(mode="after")
     def validate_execution_environment(self) -> "StartBenchmarkRequest":
@@ -212,7 +309,6 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
         return self
 
     def use_settings(self, settings: RunSettingsResponse, provider_secrets: dict[str, str]) -> None:
-        """Take the provider's secret and the benchmark service from the organization's and the caller's settings."""
         if "sandbox_provider" not in self.model_fields_set and settings.default_provider:
             self.sandbox_provider = settings.default_provider
         self.sandbox_provider_secret_name = provider_secrets.get(self.sandbox_provider)
@@ -220,7 +316,7 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
-        from tracker.utils import create_benchmark_service_client
+        from tracker.clients.benchmark_service import create_benchmark_service_client
 
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
         return create_benchmark_service_client(
@@ -231,13 +327,12 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
 
 
 class RunExecutionRequest(StartBenchmarkRequest):
-    """Internal request carrying the exact dataset version saved for a run."""
-
     resolved_dataset_version: DatasetVersion | None = None
+    monitoring_rules: RunMonitoringRules | None = None
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
-        from tracker.utils import create_benchmark_service_client
+        from tracker.clients.benchmark_service import create_benchmark_service_client
 
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
         return create_benchmark_service_client(
@@ -246,11 +341,6 @@ class RunExecutionRequest(StartBenchmarkRequest):
             dataset_version=self.resolved_dataset_version,
             sandbox_provider=self.sandbox_provider,
         )
-
-
-class StartBenchmarkErrorResponse(BaseModel):
-    benchmark_id: UUID
-    error_message: str
 
 
 class StartBenchmarkResponse(BaseModel):
@@ -288,8 +378,7 @@ class FetchBenchmarkResponse(BaseModel):
 
 
 class LogEventResponse(BaseModel):
-    """One provider-neutral benchmark log event."""
-
+    model_config = ConfigDict(json_schema_extra={"description": "One provider-neutral benchmark log event."})
     timestamp: datetime
     message: str
     task_id: str | None = None
@@ -298,10 +387,50 @@ class LogEventResponse(BaseModel):
 
 
 class LogPageResponse(BaseModel):
-    """A bounded page of benchmark log events."""
-
+    model_config = ConfigDict(json_schema_extra={"description": "A bounded page of benchmark log events."})
     events: list[LogEventResponse]
     next_cursor: str | None = None
+    available: bool = True
+
+
+class MonitorTaskResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Trusted identity and state for one current task attempt."}
+    )
+    task_id: str
+    task_row_id: UUID
+    attempt_id: str
+    started_at: datetime
+    status: TaskStatus
+
+    _started_at_utc = field_serializer("started_at")(_serialize_utc)
+
+
+class MonitoredRunResponse(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"description": "A run whose starter requested external monitoring."})
+    benchmark_id: UUID
+    benchmark_name: str
+    agent_name: str
+    policy: str | None = None
+    watcher_policy_pack: str | None = None
+    allowed_cidrs: list[str] = []
+    allowed_hosts: list[str] = []
+
+
+class MonitoredRunsResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "In-progress runs an external monitor should enroll, for one organization."}
+    )
+    runs: list[MonitoredRunResponse]
+
+
+class MonitorTasksResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Organization-scoped task identities for an external run observer."}
+    )
+    benchmark_id: UUID
+    status: BenchmarkStatus
+    tasks: list[MonitorTaskResponse]
 
 
 class AverageTaskBreakdown(BaseModel):
@@ -422,24 +551,7 @@ class ShedBenchmarkResponse(BaseModel):
     task_ids: list[str]
 
 
-class Order(str, Enum):
-    ASC = "asc"
-    DESC = "desc"
-
-
-class FetchBenchmarksRequest(BaseModel):
-    agent_name: list[str] | None = None
-    benchmark_name: list[str] | None = None
-    model: str | None = None
-    dataset: str | None = None
-    label: str | None = None
-    status: list[BenchmarkStatus] | None = None
-    started_by: list[str] | None = None
-    started_after: datetime | None = None
-    started_before: datetime | None = None
-    order_by: Order = Order.DESC  # Order is based off the time the benchmark was started at
-
-    # Pagination — cursor preferred, offset/limit kept for backward compat
+class FetchBenchmarksRequest(BenchmarkFilters):
     cursor: str | None = None
     limit: int = Field(default=50, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
@@ -462,8 +574,6 @@ class BenchmarkTableRow(BaseModel):
     status: BenchmarkStatus
     total_tasks: int
     finished_tasks: int
-    # Per-TaskStatus counts: {"PENDING": 1, "IN_PROGRESS": 2, "FINISHED": 4, ...}.
-    # Absent keys mean zero; sum equals total_tasks.
     task_state_counts: dict[str, int] = Field(default_factory=dict)
     final_score: float | None = None
     error_message: str | None = None
@@ -471,7 +581,7 @@ class BenchmarkTableRow(BaseModel):
     @field_serializer("started_at")
     def _serialize_started_at(self, value: datetime) -> str:
         result = _serialize_utc(value)
-        assert result is not None  # started_at is non-nullable
+        assert result is not None
         return result
 
     @field_serializer("finished_at")
@@ -501,8 +611,6 @@ class FetchBenchmarkMetadataResponse(BaseModel):
 
 class AnalyzeBenchmarkRequest(BaseModel):
     no_cache: bool = False
-    # CLI resolves the analyzer Lambda from the agent's current pushed contract
-    # and passes it here so the tracker doesn't have to parse the contract.
     lambda_function: str | None = None
 
 
@@ -548,7 +656,6 @@ class BenchmarkStatusEntry(BaseModel):
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
     finished_tasks: int
-    # Per-TaskStatus counts; same shape as BenchmarkTableRow.task_state_counts.
     task_state_counts: dict[str, int] = Field(default_factory=dict)
 
     @field_serializer("finished_at")
@@ -561,8 +668,9 @@ class BenchmarkStatusResponse(BaseModel):
 
 
 class SingleBenchmarkResponse(BaseModel):
-    """Single-run view: BenchmarkTableRow fields plus optional final_score."""
-
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Single-run view: BenchmarkTableRow fields plus optional final_score."}
+    )
     id: UUID
     name: str
     agent_name: str

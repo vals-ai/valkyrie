@@ -1,5 +1,3 @@
-"""Delete stale sandboxes through Create Benchmark Service providers."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +18,7 @@ from tracker.aws.secrets import SecretsManagerStore
 from tracker.config import AWS_DEPLOYMENT_REGION
 from tracker.logging import configure_logging, get_logger
 from tracker.sandbox import audit_sandbox_delete
-from tracker.utils.resources import fetch_sandbox_provider_config
+from tracker.clients.benchmark_service import fetch_sandbox_provider_config
 
 logger = get_logger(__name__)
 
@@ -47,8 +45,6 @@ _FAILURE_OUTCOMES = (
 
 
 class LambdaContext(Protocol):
-    """Lambda context operation used to preserve a shutdown margin."""
-
     def get_remaining_time_in_millis(self) -> int: ...
 
 
@@ -80,15 +76,12 @@ async def cleanup_old_sandboxes(
     *,
     now: datetime,
 ) -> Counter[str]:
-    """Delete sandboxes strictly older than 48 hours unless they opt out."""
     if now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
 
     cutoff = now.astimezone(UTC) - _MAX_SANDBOX_AGE
     query = SandboxQuery(labels={}, page_size=200, created_at_lte=cutoff)
 
-    # Complete inventory before the first mutation so pagination cannot be
-    # disturbed by deleting sandboxes from the same result set.
     sandboxes = [sandbox async for sandbox in provider.list_sandboxes(query)]
     outcomes: Counter[str] = Counter()
 
@@ -150,7 +143,6 @@ async def cleanup_old_sandboxes(
 
 
 async def run_cleanup(secret_name: str, provider_type: str, context: LambdaContext) -> Counter[str]:
-    """Load credentials and perform one cleanup sweep on the same event loop."""
     if AWS_DEPLOYMENT_REGION is None:
         raise RuntimeError("Sandbox cleanup requires AWS_DEPLOYMENT_REGION")
     async with asyncio.timeout(_remaining_cleanup_seconds(context)):
@@ -158,7 +150,6 @@ async def run_cleanup(secret_name: str, provider_type: str, context: LambdaConte
         try:
             provider_config = await fetch_sandbox_provider_config(secret_name, secret_store, provider_type)
         except (TypeError, ValueError):
-            # Provider validation may echo credentials, so do not expose or chain it.
             raise RuntimeError(f"Sandbox cleanup secret is invalid for provider {provider_type!r}") from None
 
         async with provider_config.create_provider() as provider:
@@ -173,7 +164,6 @@ def _remaining_cleanup_seconds(context: LambdaContext) -> float:
 
 
 def lambda_handler(_event: object, context: LambdaContext) -> dict[str, object]:
-    """Run one bounded cleanup sweep from EventBridge Scheduler."""
     configure_logging()
 
     provider_type = os.environ.get("SANDBOX_CLEANUP_PROVIDER", "daytona").strip().casefold()

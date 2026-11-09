@@ -29,8 +29,8 @@ valkyrie logout
 ## Join an organization
 
 Runs, agents, secrets, and access keys belong to an organization, and its members see its
-runs. Vals AI creates organizations: to get one, send an email to [contact@vals.ai](mailto:contact@vals.ai).
-To join an existing one:
+runs. Vals AI creates organizations: to get one, send an email to
+[contact@vals.ai](mailto:contact@vals.ai). To join an existing one:
 
 1. Ask one of its admins to run `valkyrie org invite you@example.com` with your email
    address.
@@ -68,7 +68,7 @@ Organization commands always use your login, even when `VALKYRIE_API_KEY` is set
 
 ## Create an access key for CI
 
-CI jobs and machines without a browser use an access key instead of a login. While logged
+CI jobs and machines without a browser use an access key instead of a login. While signed
 in, create one:
 
 ```bash
@@ -87,8 +87,9 @@ valkyrie token revoke KEY_ID
 
 Replace *`KEY_ID`* with the key ID that `valkyrie token create` printed.
 
-A revoked key can keep working for up to an hour. Creating and revoking keys needs a login,
-not an access key.
+A revoked key can keep working for up to a minute, and a session token already exchanged
+from it works until that token expires. Creating and revoking keys needs a login, not an
+access key.
 
 Runs started with a key use its creator's
 [default provider](/get-started/sandbox-providers#choose-the-provider-for-a-run) and

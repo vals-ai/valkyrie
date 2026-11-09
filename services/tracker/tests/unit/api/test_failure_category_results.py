@@ -1,5 +1,3 @@
-"""Stored categories follow the same result and task selection as error messages."""
-
 from datetime import datetime, timedelta
 
 import pytest
@@ -36,7 +34,6 @@ def test_results_keep_categories_with_selected_errors_and_history(
                 created_at=recorded_at,
             )
         )
-    # A later scheduled retry error must not replace the terminal message/category.
     database_session.add(
         ErrorResult(
             task=tasks[2].id,

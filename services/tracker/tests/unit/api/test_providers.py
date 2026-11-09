@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/unit/api/test_providers.py`.
-
-Cover the routes an organization uses to map sandbox providers to its own secrets.
-"""
-
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -34,7 +29,6 @@ def store(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 def _stored(store: MagicMock, *names: str) -> None:
-    """Let the organization's store hold these secrets, as AWS answers a read of one by its full name."""
 
     def get(reference: str) -> dict[str, str]:
         if reference not in {f"{_PREFIX}{name}" for name in names}:
@@ -44,6 +38,9 @@ def _stored(store: MagicMock, *names: str) -> None:
     store.get.side_effect = get
 
 
+@pytest.mark.description(
+    "A provider maps only to a secret that exists in the store, and removing an unmapped provider returns 404."
+)
 def test_members_map_a_provider_to_an_existing_secret(store: MagicMock) -> None:
     _stored(store, "thissecret", "thatsecret")
 
@@ -62,6 +59,7 @@ def test_members_map_a_provider_to_an_existing_secret(store: MagicMock) -> None:
     store.get.assert_awaited_with(f"{_PREFIX}thatsecret")
 
 
+@pytest.mark.description("Mapping a secret outside the organization's store is refused.")
 @pytest.mark.parametrize(
     ("secret_name", "looked_up"),
     [
@@ -84,6 +82,9 @@ def test_mapping_a_secret_outside_the_organizations_store_is_refused(
     assert _client.get("/sandbox-providers").json() == {"providers": {}}
 
 
+@pytest.mark.description(
+    "Shared secret tenants can map a provider to a `valkyrie/` secret name without a secret store read."
+)
 def test_shared_secret_tenants_map_shared_names_without_a_store_check(
     store: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -95,6 +96,7 @@ def test_shared_secret_tenants_map_shared_names_without_a_store_check(
     store.get.assert_not_awaited()
 
 
+@pytest.mark.description("An organization sees only its own provider mappings.")
 def test_an_organization_only_sees_its_own_mappings(store: MagicMock, database_session: Session) -> None:
     database_session.add(Org(id=_OTHER_ORG_ID, name="other", storage_key="other-bucket"))
     database_session.add(OrgProviderSecret(org_id=_OTHER_ORG_ID, provider="modal", secret_name="theirs"))
@@ -107,6 +109,7 @@ def test_an_organization_only_sees_its_own_mappings(store: MagicMock, database_s
     assert _client.delete("/sandbox-providers/modal").status_code == 404
 
 
+@pytest.mark.description("An unknown provider or invalid secret name returns 422 and saves no mapping.")
 @pytest.mark.parametrize(
     ("provider", "body"),
     [
@@ -124,6 +127,7 @@ def test_invalid_providers_and_secret_names_are_rejected(provider: str, body: di
     assert _client.get("/sandbox-providers").json() == {"providers": {}}
 
 
+@pytest.mark.description("On bench, only admins change the vals-ai provider mappings.")
 @pytest.mark.parametrize(
     ("roles", "status"),
     [

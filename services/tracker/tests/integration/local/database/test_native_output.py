@@ -1,8 +1,3 @@
-"""Attempt-fenced native descriptor persistence on an isolated local database.
-
-Run: .venv/bin/pytest tests/integration/local/database/test_native_output.py -q
-"""
-
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -22,7 +17,7 @@ from tracker.database.models import (
 from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.executor.execution_authority import ExecutionAuthority
 from tracker.executor.native_output import clear_native_output, publish_native_output
-from tracker.utils.run_control import apply_shed_benchmark, apply_stop_benchmark
+from tracker.services.runs.stop import apply_shed_benchmark, apply_stop_benchmark
 
 _STARTED_AT = datetime(2026, 7, 1, tzinfo=UTC)
 
@@ -40,9 +35,11 @@ def _descriptor(sandbox_id: str) -> ActiveNativeOutput:
     )
 
 
+@pytest.mark.description("Publish under current authority and revoke only the original generation.")
 class TestNativeOutputPersistence:
-    """Publish under current authority and revoke only the original generation."""
-
+    @pytest.mark.description(
+        "An old cleanup keeps the replacement reference, and a revoked reference can still clean itself up."
+    )
     @pytest.mark.parametrize("status", [TaskStatus.BUILDING, TaskStatus.IN_PROGRESS])
     def test_old_cleanup_preserves_replacement_and_revocation_allows_own_cleanup(
         self,
@@ -86,6 +83,7 @@ class TestNativeOutputPersistence:
         assert task.active_native_output is None
         assert task.status == TaskStatus.STOPPED
 
+    @pytest.mark.description("A stop revokes only the selected native output references.")
     @pytest.mark.parametrize(
         ("operation", "stopped"), [("force-stop", {"older"}), ("stop", {"newer", "evaluating"}), ("shed", {"newer"})]
     )
@@ -133,6 +131,7 @@ class TestNativeOutputPersistence:
                 assert task.active_native_output is not None
                 assert task.active_native_output.sandbox_id == task.task_id
 
+    @pytest.mark.description("A stale native output publish is rejected.")
     @pytest.mark.parametrize("changed", ["attempt", "status", "evaluating", "dispatch", "benchmark"])
     def test_stale_publish_is_rejected(
         self, database_session: Session, executor_authority: Callable[[Benchmark], ExecutionAuthority], changed: str

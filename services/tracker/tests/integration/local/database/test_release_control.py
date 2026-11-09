@@ -1,8 +1,4 @@
-"""Run with `uv run pytest tests/integration/local/database/test_release_control.py`.
-
-Exercise release lifecycle locking against disposable PostgreSQL.
-"""
-
+import pytest
 import hashlib
 from collections.abc import Callable
 from pathlib import Path
@@ -40,8 +36,8 @@ from tracker.executor.release_control import (
     register_release,
     retire_drained_releases,
 )
-from tracker.utils.resources import fetch_benchmark_row
-from tracker.utils.run_control import apply_stop_benchmark
+from tracker.services.benchmarks import fetch_benchmark_row
+from tracker.services.runs.stop import apply_stop_benchmark
 from tracker.local.releases import register_source_release
 
 
@@ -133,6 +129,7 @@ def _run_while_first_transaction_holds_locks(
     return outcomes
 
 
+@pytest.mark.description("Concurrent first activations serialize, so one creates the release and the other matches it.")
 def test_concurrent_first_activation_serializes_create_or_match(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -167,6 +164,7 @@ def test_concurrent_first_activation_serializes_create_or_match(
     assert admission.release_id == release.id
 
 
+@pytest.mark.description("Reconciliation and activation serialize in either lock order.")
 def test_reconciliation_and_activation_serialize_in_both_lock_orders(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -220,6 +218,7 @@ def test_reconciliation_and_activation_serialize_in_both_lock_orders(
     assert admission.release_id == "v4"
 
 
+@pytest.mark.description("Concurrent reconciliations retire each release once.")
 def test_concurrent_reconciliation_retires_each_release_once(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -249,6 +248,7 @@ def test_concurrent_reconciliation_retires_each_release_once(
     assert release.status == ExecutorReleaseStatus.RETIRED
 
 
+@pytest.mark.description("Terminal recovery and promotion take locks in the admission order.")
 def test_terminal_recovery_and_promotion_use_the_winning_admission_lock_order(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -336,6 +336,7 @@ def test_terminal_recovery_and_promotion_use_the_winning_admission_lock_order(
     assert admission.release_id == "race-c"
 
 
+@pytest.mark.description("Start admission saves the run before pending tasks autoflush.")
 def test_start_admission_persists_benchmark_before_pending_task_autoflush(
     postgres_session: Session,
 ) -> None:
@@ -373,6 +374,7 @@ def test_start_admission_persists_benchmark_before_pending_task_autoflush(
     assert dispatch.executor_release_id == "start-autoflush"
 
 
+@pytest.mark.description("Starting a run and promotion take locks in the admission order.")
 def test_start_and_promotion_use_the_winning_admission_lock_order(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -433,6 +435,7 @@ def test_start_and_promotion_use_the_winning_admission_lock_order(
     assert promotion_first_dispatch.executor_release_id == "start-c"
 
 
+@pytest.mark.description("An in progress retry blocks retiring the release it owns.")
 def test_in_progress_retry_blocks_retirement_of_the_owned_release(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -492,6 +495,7 @@ def test_in_progress_retry_blocks_retirement_of_the_owned_release(
     assert dispatch.executor_release_id == "retry-a"
 
 
+@pytest.mark.description("A retry of a finished run after retirement uses the active release.")
 def test_terminal_retry_after_retirement_uses_the_active_release(postgres_session: Session) -> None:
     org_id = uuid4()
     postgres_session.add(Org(id=org_id, name="terminal-retire-retry-org"))
@@ -538,6 +542,7 @@ def test_terminal_retry_after_retirement_uses_the_active_release(postgres_sessio
     assert dispatch.executor_release_id == "terminal-active"
 
 
+@pytest.mark.description("A whole run stop and a retry serialize on the run row.")
 def test_whole_stop_and_retry_serialize_on_the_benchmark_row(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -605,6 +610,9 @@ def test_whole_stop_and_retry_serialize_on_the_benchmark_row(
     assert stored_retry_first.status == BenchmarkStatus.STOPPED
 
 
+@pytest.mark.description(
+    "A run start waiting on the admission lock is rejected once maintenance begins and commits first."
+)
 def test_maintenance_commit_rejects_start_waiting_on_admission_lock(
     postgres_session: Session,
     postgres_engine: Engine,
@@ -642,6 +650,7 @@ def test_maintenance_commit_rejects_start_waiting_on_admission_lock(
     assert sorted(outcomes) == ["first-committed", "second-rejected"]
 
 
+@pytest.mark.description("Concurrent source registrations leave one active release.")
 def test_concurrent_source_registration_preserves_one_active_release(
     postgres_session: Session,
     postgres_engine: Engine,

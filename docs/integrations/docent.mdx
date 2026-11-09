@@ -9,8 +9,9 @@ turns the agent's outputs into [Transluce Docent](https://docent.transluce.org) 
 returns a link to read them. Valkyrie saves the link on the run. The analyzer decides what
 to upload, how to summarize it, and which models to use.
 
-Valkyrie invokes the analyzer the same way as a [post-run Lambda](/integrations/post-run-lambda),
-so the same AWS account requirement applies, and a local Tracker can't run analyses.
+Valkyrie invokes the analyzer the same way as a [post-run
+Lambda](/integrations/post-run-lambda), so the same AWS account requirement applies, and a
+local Tracker can't run analyses.
 
 ## Write an analyzer
 
@@ -58,8 +59,8 @@ valkyrie agent push ./my-agent
 ```
 
 `valkyrie run analyze` reads `ingest_lambda` from the agent's current version in your
-library, not from the contract the run used. Adding it and uploading again makes earlier runs
-of that agent analyzable too.
+library, not from the contract the run used. Adding it and uploading again makes earlier
+runs of that agent analyzable too.
 
 ## Analyze a run
 
@@ -67,8 +68,9 @@ of that agent analyzable too.
 valkyrie run analyze RUN_ID
 ```
 
-Replace *`RUN_ID`* with the run's ID. The run must be `FINISHED`. The command streams progress and prints the reading link when
-the analyzer returns. `valkyrie run fetch RUN_ID` also shows the link when it exists.
+Replace *`RUN_ID`* with the run's ID. The run must be `FINISHED`. The command streams
+progress and prints the reading link when the analyzer returns.
+`valkyrie run fetch RUN_ID` also shows the link when it exists.
 
 A run that already has a link returns it without calling the analyzer again. After you fix
 the analyzer, run it again with `--no-cache`:

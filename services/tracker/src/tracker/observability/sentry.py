@@ -1,5 +1,3 @@
-"""Sentry SDK initialization for Valkyrie service processes."""
-
 from collections.abc import Iterator
 from contextlib import contextmanager
 import logging
@@ -7,22 +5,30 @@ import os
 from typing import Any, cast
 
 import sentry_sdk
-from opentelemetry.trace import get_current_span
 from sentry_sdk.consts import INSTRUMENTER
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.otlp import OTLPIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 from sentry_sdk.types import Event, Hint, Log
 
 from tracker.exceptions import SSLConnectionError
 from tracker.logging import task_id_var
-from tracker.logging.context import attempt_started_at_var, get_context_tags
+from tracker.logging.context import (
+    attempt_started_at_var,
+    get_context_tags,
+    get_sandbox_fields,
+    get_trace_fields,
+    sandbox_id_var,
+)
 
 logger = logging.getLogger(__name__)
+
+_REPORTED_HTTP_STATUS_CODES = {500}
 
 
 @contextmanager
 def task_scope(task_id: str, *, attempt_started_at: str) -> Iterator[None]:
-    """Isolate Sentry events and logging context for one tracked task execution epoch."""
     with sentry_sdk.isolation_scope():
         token = task_id_var.set(task_id)
         attempt_token = attempt_started_at_var.set(attempt_started_at)
@@ -37,7 +43,6 @@ def _before_send(
     event: Event,
     hint: Hint,
 ) -> Event | None:
-    """Attach structured logging context vars as Sentry tags on every event."""
     exc_info = hint.get("exc_info")
     if exc_info:
         exc = exc_info[1]
@@ -52,7 +57,6 @@ def _before_send(
 
 
 def _before_send_transaction(event: Event, _hint: Hint) -> Event | None:
-    """Expose captured root identities as tags without using finishing-scope values."""
     attributes = event.get("contexts", {}).get("otel", {}).get("attributes", {})
     for key in get_context_tags():
         if key in attributes:
@@ -61,16 +65,14 @@ def _before_send_transaction(event: Event, _hint: Hint) -> Event | None:
 
 
 def _apply_current_otel_trace_context(telemetry: dict[str, Any]) -> None:
-    span_context = get_current_span().get_span_context()
-    if not span_context.is_valid:
-        return
-    telemetry["trace_id"] = f"{span_context.trace_id:032x}"
-    telemetry["span_id"] = f"{span_context.span_id:016x}"
+    trace_fields = get_trace_fields()
+    if trace_fields["trace_id"]:
+        telemetry.update(trace_fields)
 
 
 def _before_send_log(log: Log, _hint: Hint) -> Log | None:
     attributes = log.setdefault("attributes", {})
-    for key, value in get_context_tags().items():
+    for key, value in (get_context_tags() | get_sandbox_fields()).items():
         if value:
             attributes[key] = value
     _apply_current_otel_trace_context(cast(dict[str, Any], log))
@@ -78,12 +80,6 @@ def _before_send_log(log: Log, _hint: Hint) -> Log | None:
 
 
 def init_sentry(service_name: str, environment: str) -> None:
-    """Initialize Sentry SDK when configured.
-
-    Args:
-        service_name: Identifies the process in Sentry (e.g. "valkyrie-tracker").
-        environment: Deployment environment tag (e.g. "development", "production").
-    """
     dsn = os.environ.get("SENTRY_DSN", "")
     if not dsn:
         return
@@ -94,35 +90,27 @@ def init_sentry(service_name: str, environment: str) -> None:
             environment=os.environ.get("SENTRY_ENVIRONMENT", environment),
             release=os.environ.get("SENTRY_RELEASE", ""),
             server_name=service_name,
-            # Sampling happens upstream in OTel; pass everything through.
             traces_sample_rate=1.0,
             instrumenter=INSTRUMENTER.OTEL,
             enable_logs=True,
             send_default_pii=False,
-            # Request bodies can carry secret values and API tokens.
             max_request_body_size="never",
             include_local_variables=False,
             before_send=_before_send,
             before_send_transaction=_before_send_transaction,
             before_send_log=_before_send_log,
             integrations=[
-                # INFO records become both searchable logs and breadcrumbs. Explicit exception
-                # capture owns issue creation so an error log cannot create a duplicate issue.
                 LoggingIntegration(
                     level=logging.INFO,
                     event_level=None,
                     sentry_logs_level=logging.INFO,
                 ),
-                # Bridges the active OpenTelemetry span context into Sentry's scope.
-                # setup_otlp_traces_exporter=False: SentrySpanProcessor in tracing.py already ships
-                # spans to Sentry; the default would double-publish via an OTLP exporter.
-                # setup_propagator=False: tracing.py installs a CompositePropagator that supports
-                # both W3C traceparent (Daytona / benchmark_service) and sentry-trace; the default
-                # would replace it with SentryOTLPPropagator only.
                 OTLPIntegration(
                     setup_otlp_traces_exporter=False,
                     setup_propagator=False,
                 ),
+                StarletteIntegration(failed_request_status_codes=_REPORTED_HTTP_STATUS_CODES),
+                FastApiIntegration(failed_request_status_codes=_REPORTED_HTTP_STATUS_CODES),
             ],
         )
     except Exception as e:
@@ -130,7 +118,6 @@ def init_sentry(service_name: str, environment: str) -> None:
 
 
 def capture_exception(error: BaseException) -> None:
-    """Capture an exception without allowing Sentry failures to escape."""
     try:
         sentry_sdk.capture_exception(error)
     except Exception as telemetry_error:
@@ -138,7 +125,7 @@ def capture_exception(error: BaseException) -> None:
 
 
 def clear_sandbox_context() -> None:
-    """Remove sandbox identity before a task begins another attempt."""
+    sandbox_id_var.set("")
     try:
         scope = sentry_sdk.get_isolation_scope()
         scope.remove_tag("sandbox_id")
@@ -149,7 +136,7 @@ def clear_sandbox_context() -> None:
 
 
 def set_sandbox_context(sandbox: Any, *, image: str | None = None) -> None:
-    """Attach sandbox identifiers to Sentry tags/context, not metric attributes."""
+    sandbox_id_var.set(sandbox.id)
     try:
         sentry_sdk.set_tag("sandbox_id", sandbox.id)
         sentry_sdk.set_tag("sandbox_name", sandbox.name)

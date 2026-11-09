@@ -1,5 +1,3 @@
-"""Shared records and paths for generated reference documentation."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,26 +17,21 @@ CLI_NAVIGATION = CLI_ROOT / "navigation.json"
 REDIRECTS = REFERENCE_ROOT / "redirects.json"
 SDK_INDEX = SDK_ROOT / "index.mdx"
 SDK_CLIENT = SDK_ROOT / "client.mdx"
+SDK_LOGIN = SDK_ROOT / "login.mdx"
 SDK_NAVIGATION = SDK_ROOT / "navigation.json"
 TYPE_INDEX = TYPE_ROOT / "index.mdx"
 SDK_ERRORS = SDK_ROOT / "errors.mdx"
 
 STATIC_REDIRECTS = [
     {"source": "/introduction", "destination": "/introduction/what-is-valkyrie"},
-    # The overview and hosting pages merged into the introduction.
     {"source": "/get-started/overview", "destination": "/introduction/what-is-valkyrie"},
     {"source": "/get-started/hosting", "destination": "/introduction/what-is-valkyrie"},
-    # The CDK infrastructure guide left the public docs with `infra/`.
     {"source": "/self-hosting/infrastructure", "destination": "/introduction/what-is-valkyrie"},
-    # SDK error handling merged into the SDK quickstart.
     {"source": "/sdk/errors", "destination": "/sdk/quickstart"},
-    # Contributor guides moved to DEVELOPMENT.md and the service READMEs.
     {"source": "/contributing/local-development", "destination": "/self-hosting/local-tracker"},
     {"source": "/contributing/tracker-service", "destination": "/self-hosting/local-tracker"},
     {"source": "/contributing/database", "destination": "/self-hosting/local-tracker"},
-    # AWS self-hosting permissions moved to internal/tracker-operations.md.
     {"source": "/self-hosting/aws-permissions", "destination": "/self-hosting/local-tracker"},
-    # `config provider` and `config service` moved to `provider` and `benchmark service`.
     {"source": "/reference/cli/config/provider/set", "destination": "/reference/cli/provider#set"},
     {"source": "/reference/cli/config/provider/default", "destination": "/reference/cli/provider#default"},
     {"source": "/reference/cli/config/provider/remove", "destination": "/reference/cli/provider#remove"},
@@ -46,11 +39,9 @@ STATIC_REDIRECTS = [
     {"source": "/reference/cli/config/service/set", "destination": "/reference/cli/benchmark#service-set"},
     {"source": "/reference/cli/config/service/remove", "destination": "/reference/cli/benchmark#service-remove"},
     {"source": "/reference/cli/config/service/list", "destination": "/reference/cli/benchmark#service-list"},
-    # `config auth` credentials moved to organization secrets named by `benchmark service set --auth-secret`.
     {"source": "/reference/cli/config/auth/set", "destination": "/reference/cli/benchmark#service-set"},
     {"source": "/reference/cli/config/auth/remove", "destination": "/reference/cli/benchmark#service-set"},
     {"source": "/reference/cli/config/auth/list", "destination": "/reference/cli/benchmark#service-list"},
-    # `valkyrie config` is gone: the CLI and SDK read no config file.
     {"source": "/reference/cli/config", "destination": "/get-started/configuration"},
     {"source": "/reference/cli/config/set", "destination": "/get-started/configuration"},
     {"source": "/reference/cli/config/remove", "destination": "/get-started/configuration"},
@@ -109,6 +100,18 @@ RESOURCE_CARDS = {
         "sliders-horizontal",
         "choosing your default provider and saving benchmark service URLs",
     ),
+    "AccountResource": ("Account", "user-round", "checking who you are, and managing access keys and organizations"),
+    "BenchmarkDefinitionsResource": (
+        "Benchmark definitions",
+        "book-open",
+        "creating, updating, archiving, and restoring the benchmarks your datasets belong to",
+    ),
+    "DatasetsResource": ("Datasets", "database", "creating, updating, archiving, and restoring benchmark datasets"),
+    "DatasetTasksResource": (
+        "Dataset tasks",
+        "file-archive",
+        "uploading, listing, downloading, and removing dataset tasks",
+    ),
 }
 
 TYPE_CARDS = {
@@ -123,6 +126,8 @@ TYPE_CARDS = {
     "Projects": ("folder-kanban", "projects and the spend fields their runs share"),
     "Secrets": ("key-round", "stored secret names and references"),
     "Settings": ("sliders-horizontal", "sandbox provider mappings and saved run settings"),
+    "Account": ("user-round", "your identity, access keys, organizations, and members"),
+    "Login": ("log-in", "saved browser logins and their refresh"),
 }
 
 READ_ONLY_COMMANDS = frozenset(
@@ -235,3 +240,4 @@ class SDKReference(NamedTuple):
     enums: tuple[SDKEnumReference, ...]
     exceptions: tuple[SDKExceptionReference, ...]
     client_methods: tuple[SDKMethodReference, ...]
+    login_functions: tuple[SDKMethodReference, ...]

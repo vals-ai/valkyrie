@@ -1,7 +1,5 @@
-"""Run progress rendering and streaming helpers."""
-
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Literal
 from uuid import UUID
 
@@ -16,7 +14,9 @@ from valkyrie.sdk.models import (
     TaskStatus,
 )
 
-from valkyrie.cli.display import local_time, progress_percent, terminal_safe
+from valkyrie.cli.client import call
+from valkyrie.cli.display import local_time, progress_percent, status_label
+from valkyrie.display import terminal_safe
 from valkyrie.cli.project import describe_run_spend
 from valkyrie.cli.run.snapshot import RunEvent, fetch_run_metadata, format_run_snapshot_json
 
@@ -51,11 +51,10 @@ OUTCOME_MESSAGES = {
 
 
 def styled_status(status: BenchmarkStatus, *, bold: bool = False) -> str:
-    return click.style(status.value.replace("_", " ").title(), fg=STATUS_COLORS[status.value], bold=bold)
+    return click.style(status_label(status.value), fg=STATUS_COLORS[status.value], bold=bold)
 
 
 def _progress_lines(details: BenchmarkDetails, bar_width: int = 30) -> tuple[str, str]:
-    """Return the progress bar line and the colored per-status task breakdown line."""
     percent = progress_percent(details.finished_tasks, details.total_tasks)
     filled = int(bar_width * percent / 100)
     bar = "█" * filled + "░" * (bar_width - filled)
@@ -64,7 +63,7 @@ def _progress_lines(details: BenchmarkDetails, bar_width: int = 30) -> tuple[str
         f"{styled_status(details.status, bold=True)}"
     )
     breakdown = " │ ".join(
-        click.style(f"{status.value.replace('_', ' ').title()}: {count}", fg=STATUS_COLORS[status.value])
+        click.style(f"{status_label(status.value)}: {count}", fg=STATUS_COLORS[status.value])
         for status in TASK_STATUS_ORDER
         if (count := details.task_breakdown.get(status, 0))
     )
@@ -84,7 +83,6 @@ def _display_run_error(benchmark_response: FetchBenchmarkResponse) -> None:
 
 
 def format_benchmark_status(benchmark_response: FetchBenchmarkResponse, spend: str | None = None) -> None:
-    """Format and display run status in a box with a progress bar."""
     details = benchmark_response.details
     progress_line, breakdown_line = _progress_lines(details)
 
@@ -118,7 +116,6 @@ def format_run_identity(
     benchmark_response: FetchBenchmarkResponse,
     metadata: FetchBenchmarkMetadataResponse | None,
 ) -> None:
-    """Display stable run identity before connected progress updates."""
     rows: list[tuple[str, str | None]] = [("Benchmark:", benchmark_response.benchmark_name)]
     if metadata is None:
         rows += [("Run ID:", str(benchmark_response.benchmark_id)), ("Label:", benchmark_response.label)]
@@ -156,7 +153,6 @@ def _format_docent_analysis(details: BenchmarkDetails, run_id: UUID) -> str | No
 
 
 def echo_next_steps(run_id: UUID, *, track: bool = False, outputs: bool = False, s3_url: str | None = None) -> None:
-    """Print the follow-up commands for a run inside the Next Steps box."""
     steps = {
         "Track progress:": f"valkyrie run fetch {run_id} --connect" if track else None,
         "Get results:": f"valkyrie run results {run_id} --path ./results-{run_id}.json",
@@ -182,8 +178,8 @@ async def stream_benchmark_status(
     *,
     show_identity: bool = False,
     output_format: Literal["text", "jsonl"] = "text",
+    on_interrupt: Callable[[], None] = lambda: None,
 ) -> None:
-    """Stream and display live run status updates until the run ends or the user presses Ctrl+C."""
     initial = await client.runs.fetch(benchmark_id)
     jsonl = output_format == "jsonl"
     if not jsonl and initial.details.status in TERMINAL_STATUSES:
@@ -235,10 +231,34 @@ async def stream_benchmark_status(
             else:
                 finish("disconnect", disconnected, next_steps=False)
                 return
-    # asyncio.run turns Ctrl+C into a cancellation of this coroutine on the main thread.
     except (KeyboardInterrupt, asyncio.CancelledError):
         finish("interrupted", click.style("Streaming stopped.", fg="yellow"))
-        return
+        on_interrupt()
+        raise
 
     finish("disconnect", disconnected, next_steps=False)
     raise click.ClickException("Run stream ended without a terminal event.")
+
+
+def follow_run_status(
+    benchmark_id: UUID, *, show_identity: bool = False, output_format: Literal["text", "jsonl"] = "text"
+) -> None:
+    interrupted = False
+
+    def mark_interrupted() -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    try:
+        call(
+            lambda client: stream_benchmark_status(
+                client,
+                benchmark_id,
+                show_identity=show_identity,
+                output_format=output_format,
+                on_interrupt=mark_interrupted,
+            )
+        )
+    except KeyboardInterrupt:
+        if not interrupted:
+            raise

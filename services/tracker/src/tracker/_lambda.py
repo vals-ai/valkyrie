@@ -22,10 +22,6 @@ async def invoke_lambda(
     payload: dict[str, Any],
     config: Config,
 ) -> Any:
-    """Invoke a Lambda using the provided client source and return its parsed payload.
-
-    Raises LambdaError on AWS errors, Lambda-side FunctionError, or statusCode >= 400.
-    """
     try:
         async with client_provider.lambda_client(config) as client:
             response: dict[str, Any] = await client.invoke(
@@ -53,7 +49,6 @@ async def invoke_lambda(
 
 
 async def dry_run_lambda(client_provider: AWSClientProvider, function_name: str) -> None:
-    """Verify that the selected AWS authority can invoke a Lambda function."""
     try:
         async with client_provider.lambda_client() as client:
             await client.invoke(FunctionName=function_name, InvocationType="DryRun")

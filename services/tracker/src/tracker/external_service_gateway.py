@@ -1,5 +1,3 @@
-"""Passive External Service Gateway counter client and Tracker deadline accounting."""
-
 from dataclasses import dataclass
 import time
 
@@ -14,8 +12,6 @@ class AccountingSnapshot(BaseModel):
 
 
 class ExternalServiceGatewayClient:
-    """Authenticated Tracker-only reader for gateway counters."""
-
     def __init__(
         self,
         base_url: str,
@@ -55,8 +51,6 @@ class GenerationAccountingSummary:
 
 @dataclass
 class ExternalServiceDeadlineController:
-    """Tracker-owned cumulative active-time policy over optional gateway credit."""
-
     base_allowance_seconds: float | None
     credit_cap_seconds: float = 0.0
     client: ExternalServiceGatewayClient | None = None
@@ -78,7 +72,6 @@ class ExternalServiceDeadlineController:
         )
 
     def freeze_credit(self) -> None:
-        """Latch the accepted credit at the definitive generation cutoff."""
         self.credit_frozen = True
 
     def effective_allowance_seconds(self) -> float | None:
@@ -91,7 +84,10 @@ class ExternalServiceDeadlineController:
 
     def deadline(self, now: float) -> float | None:
         allowance = self.effective_allowance_seconds()
-        return None if allowance is None else now + allowance - self.elapsed_seconds(now)
+        if allowance is None:
+            return None
+        start = now if self.active_since is None else self.active_since
+        return start + allowance - self.active_elapsed_seconds
 
     def begin_generation(self, now: float | None = None) -> None:
         if self.active_since is not None:
@@ -118,7 +114,6 @@ class ExternalServiceDeadlineController:
         return self._accept(await self.client.read_counter(self.accounting_id))
 
     async def finalize_after_confirmed_stop(self, absence_confirmed_at: float) -> None:
-        """Observe terminal counter, without changing credit latched at exhaustion."""
         if self.active_since is not None:
             self.end_generation(absence_confirmed_at)
         if self.client is not None and not self.credit_frozen:

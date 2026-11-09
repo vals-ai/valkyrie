@@ -1,7 +1,4 @@
-"""Live S3 archive upload tests.
-
-Run: uv run pytest tests/integration/live/storage/test_upload_to_s3.py
-"""
+import pytest
 
 import asyncio
 import io
@@ -11,8 +8,9 @@ from benchmark_service import ImageSource, Resources, SandboxProvider
 
 from tests.utils import random_task_id
 from tracker.aws.runtime import AWSRuntime
-from tracker.aws.s3 import S3ObjectStore, delete_from_s3, get_agent_result_s3_key
+from tracker.aws.s3 import S3ObjectStore, delete_from_s3
 from tracker.database.models import Benchmark
+from tracker.runtime.artifacts import task_artifact_key
 from tracker.sandbox import SandboxCreationState, archive_and_upload_output, create_sandbox
 
 
@@ -34,9 +32,17 @@ def _member_content(members: dict[str, bytes], suffix: str) -> bytes:
     return matching_members[0]
 
 
+@pytest.mark.description("Live archive uploads for files and directories.")
 class TestUploadToS3:
-    """Live archive uploads for files and directories."""
-
+    @pytest.mark.description(
+        (
+            "Sandbox output archives preserve file contents when uploaded to S3.\n"
+            "\n"
+            "Test cases:\n"
+            "- A single output file is archived, uploaded, downloaded, and readable from S3.\n"
+            "- A directory output preserves nested files in the uploaded archive."
+        )
+    )
     async def test_archive_and_upload_file_and_directory(
         self,
         example_benchmark_object: Benchmark,
@@ -47,20 +53,14 @@ class TestUploadToS3:
         live_aws_runtime: AWSRuntime,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify sandbox output archives preserve file contents when uploaded to S3.
-
-        Test cases:
-        - A single output file is archived, uploaded, downloaded, and readable from S3.
-        - A directory output preserves nested files in the uploaded archive.
-        """
         file_path = "/tmp/test_output.json"
         file_content = '{"result": "success", "score": 95}'
         dir_path = "/tmp/test_output_dir"
         task_id = random_task_id()
         aws_runtime = live_aws_runtime
         object_store = S3ObjectStore(aws_runtime)
-        file_s3_key = get_agent_result_s3_key(str(example_benchmark_object.id), task_id, "test_output.json")
-        dir_s3_key = get_agent_result_s3_key(str(example_benchmark_object.id), task_id, "test_output_dir")
+        file_s3_key = task_artifact_key(str(example_benchmark_object.id), task_id, "test_output.json")
+        dir_s3_key = task_artifact_key(str(example_benchmark_object.id), task_id, "test_output_dir")
 
         try:
             async with create_sandbox(

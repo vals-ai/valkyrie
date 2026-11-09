@@ -1,22 +1,49 @@
-"""GET /costs/by-email and /costs/by-project — run costs for runs started in a window."""
-
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import Any, NamedTuple, Sequence, cast
+from enum import Enum
+from typing import Annotated, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from sqlalchemy import func
-from sqlmodel import Session, col, select
+from pydantic import BaseModel, PlainValidator
 
 from tracker.auth import get_current_org
-from tracker.database.models import Benchmark, Org, Project, RunCost, RunProject
-from tracker.database.session import get_session
+from tracker.database.models import Org
+from tracker.repositories.cost import DAYTONA_PROVIDER, CostRepositoryDependency
 
 router = APIRouter(prefix="/costs")
+
+
+def _parse_window_bound(value: Any) -> date | datetime:
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        pass
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        raise ValueError("a datetime bound must carry a timezone, e.g. 2026-10-30T21:00:00Z")
+    return moment
+
+
+WindowBound = Annotated[date | datetime, PlainValidator(_parse_window_bound, json_schema_input_type=date | datetime)]
+
+
+def _window_moment(bound: date | datetime) -> datetime:
+    utc = ZoneInfo("UTC")
+    if isinstance(bound, datetime):
+        return bound.astimezone(utc)
+    return datetime.combine(bound, time(), tzinfo=utc)
+
+
+def _window(start: date | datetime, end: date | datetime) -> tuple[datetime, datetime]:
+    window_start, window_end = _window_moment(start), _window_moment(end)
+    if window_end <= window_start:
+        raise HTTPException(status_code=422, detail="end must be after start")
+    return window_start, window_end
 
 
 class EmailCost(BaseModel):
@@ -33,45 +60,25 @@ class CostsByEmailResponse(BaseModel):
     costs: list[EmailCost]
 
 
-class _CostRow(NamedTuple):
-    email: str
-    cost_type: str
-    provider: str
-    amount_usd: float
-    run_count: int
-
-
-@router.get("/by-email", response_model=CostsByEmailResponse)
+@router.get(
+    "/by-email",
+    response_model=CostsByEmailResponse,
+    description="List each starter's recorded run costs in this organization, per cost type and provider, for runs started in [start, end).",
+)
 def get_costs_by_email(
-    start: date = Query(description="First UTC date whose runs are counted."),
-    end: date = Query(description="UTC date after the last counted one."),
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> CostsByEmailResponse:
-    """Each starter's recorded run costs in this org, per cost type and provider, for runs started in [start, end)."""
-    if end <= start:
-        raise HTTPException(status_code=422, detail="end must be after start")
-    utc = ZoneInfo("UTC")
-    window_start = datetime.combine(start, time(), tzinfo=utc)
-    window_end = datetime.combine(end, time(), tzinfo=utc)
-    email = func.lower(func.trim(col(Benchmark.started_by_email)))
-    statement = (
-        cast(Any, select)(
-            email.label("email"),
-            col(RunCost.cost_type).label("cost_type"),
-            col(RunCost.provider).label("provider"),
-            func.sum(col(RunCost.amount_usd)).label("amount_usd"),
-            func.count(func.distinct(col(Benchmark.id))).label("run_count"),
-        )
-        .join(Benchmark, col(Benchmark.id) == col(RunCost.benchmark_id))
-        .where(Benchmark.org_id == org.id)
-        .where(col(Benchmark.started_by_email).is_not(None))
-        .where(col(Benchmark.started_at) >= window_start)
-        .where(col(Benchmark.started_at) < window_end)
-        .group_by(email, col(RunCost.cost_type), col(RunCost.provider))
-        .order_by(email, col(RunCost.cost_type), col(RunCost.provider))
-    )
-    rows = cast(Sequence[_CostRow], cast(Any, session.exec(statement)).all())
+    window_start, window_end = _window(start, end)
+    rows = repository.by_email(org.id, window_start, window_end)
     return CostsByEmailResponse(
         start=window_start,
         end=window_end,
@@ -104,22 +111,6 @@ class CostsByProjectResponse(BaseModel):
     runs: list[ProjectRun]
 
 
-class _RunProjectRow(NamedTuple):
-    run_id: UUID
-    started_at: datetime
-    handle: str | None
-    name: str | None
-    spend_type: Any
-    subcategory: str | None
-    customer: str | None
-
-
-class _RunProviderCost(NamedTuple):
-    run_id: UUID
-    provider: str
-    amount_usd: float
-
-
 def _as_utc(moment: datetime) -> datetime:
     utc = ZoneInfo("UTC")
     return moment.replace(tzinfo=utc) if moment.tzinfo is None else moment.astimezone(utc)
@@ -129,87 +120,53 @@ def _vendor(provider: str) -> str:
     return provider.title()
 
 
-@router.get("/by-project", response_model=CostsByProjectResponse)
+@router.get(
+    "/by-project",
+    response_model=CostsByProjectResponse,
+    description=(
+        "List recorded run costs per month, vendor, and project for costs that ended in the `[start, end)` window.\n"
+        "\n"
+        "A cost is placed in the UTC month it ended. That is its `usage_end`, else its run's `finished_at`, else its run's\n"
+        "`started_at`.\n"
+        "\n"
+        "A cost counts under its run's newest project link. Runs with no project return null project fields.\n"
+        "\n"
+        "`runs` lists every run alive during the window or holding a cost in it, with its project. Model spend dated in the\n"
+        "window can then join to its project whatever day its run started.\n"
+        "\n"
+        "A run is alive if it started before `end` and finished on or after `start`, or is still in progress or stopping."
+    ),
+)
 def get_costs_by_project(
-    start: date = Query(description="First UTC date whose runs are counted."),
-    end: date = Query(description="UTC date after the last counted one."),
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose costs and runs are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> CostsByProjectResponse:
-    """Recorded run costs per month, vendor and project, for runs started in [start, end).
-
-    A run counts under the project of its newest link (the highest run_project id). Runs with no project come back
-    with null project fields. `runs` lists every run in the window with its project so other cost sources can join.
-    """
-    if end <= start:
-        raise HTTPException(status_code=422, detail="end must be after start")
-    utc = ZoneInfo("UTC")
-    window_start = datetime.combine(start, time(), tzinfo=utc)
-    window_end = datetime.combine(end, time(), tzinfo=utc)
-    ranked = (
-        cast(Any, select)(
-            col(RunProject.benchmark_id).label("benchmark_id"),
-            col(RunProject.project_id).label("project_id"),
-            func.row_number()
-            .over(partition_by=col(RunProject.benchmark_id), order_by=col(RunProject.id).desc())
-            .label("newest"),
-        )
-        .join(Benchmark, col(Benchmark.id) == col(RunProject.benchmark_id))
-        .where(Benchmark.org_id == org.id)
-        .where(col(Benchmark.started_at) >= window_start)
-        .where(col(Benchmark.started_at) < window_end)
-    ).subquery()
-    current = cast(Any, select)(ranked.c.benchmark_id, ranked.c.project_id).where(ranked.c.newest == 1).subquery()
-    runs_statement = (
-        cast(Any, select)(
-            col(Benchmark.id).label("run_id"),
-            col(Benchmark.started_at).label("started_at"),
-            col(Project.handle).label("handle"),
-            col(Project.name).label("name"),
-            col(Project.spend_type).label("spend_type"),
-            col(Project.subcategory).label("subcategory"),
-            col(Project.customer).label("customer"),
-        )
-        .select_from(Benchmark)
-        .outerjoin(current, current.c.benchmark_id == col(Benchmark.id))
-        .outerjoin(Project, (col(Project.id) == current.c.project_id) & (col(Project.org_id) == org.id))
-        .where(Benchmark.org_id == org.id)
-        .where(col(Benchmark.started_at) >= window_start)
-        .where(col(Benchmark.started_at) < window_end)
-        .order_by(col(Benchmark.started_at), col(Benchmark.id))
-    )
-    run_rows = cast(Sequence[_RunProjectRow], cast(Any, session.exec(runs_statement)).all())
-    costs_statement = (
-        cast(Any, select)(
-            col(RunCost.benchmark_id).label("run_id"),
-            col(RunCost.provider).label("provider"),
-            func.sum(col(RunCost.amount_usd)).label("amount_usd"),
-        )
-        .join(Benchmark, col(Benchmark.id) == col(RunCost.benchmark_id))
-        .where(Benchmark.org_id == org.id)
-        .where(col(Benchmark.started_at) >= window_start)
-        .where(col(Benchmark.started_at) < window_end)
-        .group_by(col(RunCost.benchmark_id), col(RunCost.provider))
-    )
-    cost_rows = cast(Sequence[_RunProviderCost], cast(Any, session.exec(costs_statement)).all())
-    by_run = {row.run_id: row for row in run_rows}
+    window_start, window_end = _window(start, end)
+    run_rows, cost_rows = repository.by_project(org.id, window_start, window_end)
     grouped: dict[tuple[str, str, str | None], dict[str, Any]] = {}
     for cost in cost_rows:
-        run = by_run[cost.run_id]
-        month = _as_utc(run.started_at).strftime("%Y-%m")
-        key = (month, _vendor(cost.provider), run.handle)
-        group = grouped.setdefault(key, {"run": run, "amount_usd": 0.0, "run_ids": set()})
+        month = _as_utc(cost.placed_at).strftime("%Y-%m")
+        key = (month, _vendor(cost.provider), cost.handle)
+        group = grouped.setdefault(key, {"project": cost, "amount_usd": 0.0, "run_ids": set()})
         group["amount_usd"] += cost.amount_usd
         group["run_ids"].add(cost.run_id)
     rows = [
         ProjectCostRow(
             month=month,
             vendor=vendor,
-            spend_type=getattr(group["run"].spend_type, "value", group["run"].spend_type),
-            subcategory=group["run"].subcategory,
+            spend_type=getattr(group["project"].spend_type, "value", group["project"].spend_type),
+            subcategory=group["project"].subcategory,
             project_handle=handle,
-            project_name=group["run"].name,
-            customer=group["run"].customer,
+            project_name=group["project"].name,
+            customer=group["project"].customer,
             amount_usd=group["amount_usd"],
             run_count=len(group["run_ids"]),
         )
@@ -224,5 +181,179 @@ def get_costs_by_project(
         runs=[
             ProjectRun(project_handle=row.handle, run_id=row.run_id, started_at=_as_utc(row.started_at))
             for row in run_rows
+        ],
+    )
+
+
+class ProjectDaytonaRow(BaseModel):
+    project_id: UUID
+    total_usd: float
+
+
+class ProjectDaytonaResponse(BaseModel):
+    start: str
+    end: str
+    rows: list[ProjectDaytonaRow]
+
+
+class ProjectSandboxRow(BaseModel):
+    project_id: UUID
+    provider: str
+    total_usd: float
+
+
+class ProjectSandboxResponse(BaseModel):
+    start: str
+    end: str
+    rows: list[ProjectSandboxRow]
+
+
+@router.get(
+    "/project-daytona",
+    response_model=ProjectDaytonaResponse,
+    description="List Daytona sandbox charges by each run's newest project link in this organization, for [start, end).",
+)
+def get_project_daytona_costs(
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
+    org: Org = Depends(get_current_org),
+) -> ProjectDaytonaResponse:
+    window_start, window_end = _window(start, end)
+    rows = repository.project_daytona_totals(org.id, window_start, window_end)
+    return ProjectDaytonaResponse(
+        start=start.isoformat(),
+        end=end.isoformat(),
+        rows=[ProjectDaytonaRow(**row._asdict()) for row in rows],
+    )
+
+
+@router.get(
+    "/project-sandbox",
+    response_model=ProjectSandboxResponse,
+    description="List sandbox charges per provider by each run's newest project link in this organization, for [start, end).",
+)
+def get_project_sandbox_costs(
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
+    org: Org = Depends(get_current_org),
+) -> ProjectSandboxResponse:
+    window_start, window_end = _window(start, end)
+    rows = repository.project_sandbox_totals(org.id, window_start, window_end)
+    return ProjectSandboxResponse(
+        start=start.isoformat(),
+        end=end.isoformat(),
+        rows=[ProjectSandboxRow(**row._asdict()) for row in rows],
+    )
+
+
+class SandboxRowKind(str, Enum):
+    HOURLY = "hourly"
+    LIFETIME = "lifetime"
+
+
+SANDBOX_ROWS_PAGE_SIZE = 5_000
+SANDBOX_ROWS_MAX_PAGE_SIZE = 20_000
+
+
+class SandboxCostEntry(BaseModel):
+    source_id: str | None
+    kind: SandboxRowKind
+    placed_at: datetime
+    amount_usd: float
+    usage_end: datetime | None
+    run_id: UUID
+    project_handle: str | None
+
+
+class SandboxDayTotal(BaseModel):
+    day: date
+    hourly_usd: float
+    lifetime_usd: float
+    total_usd: float
+
+
+class SandboxCostRowsResponse(BaseModel):
+    start: datetime
+    end: datetime
+    provider: str
+    limit: int
+    offset: int
+    total_rows: int
+    rows: list[SandboxCostEntry]
+    days: list[SandboxDayTotal]
+
+
+@router.get(
+    "/sandbox-rows",
+    response_model=SandboxCostRowsResponse,
+    description="Read out every sandbox cost row of one provider in this organization placed in [start, end), with per-UTC-day totals.",
+)
+def get_sandbox_cost_rows(
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose costs are listed."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which listing stops (excluded)."),
+    ],
+    provider: Annotated[str, Query(description="Sandbox provider whose cost rows are listed.")] = DAYTONA_PROVIDER,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=SANDBOX_ROWS_MAX_PAGE_SIZE, description="Most rows returned in one page."),
+    ] = SANDBOX_ROWS_PAGE_SIZE,
+    offset: Annotated[int, Query(ge=0, description="Rows skipped before the page starts.")] = 0,
+    org: Org = Depends(get_current_org),
+) -> SandboxCostRowsResponse:
+    window_start, window_end = _window(start, end)
+    rows = repository.sandbox_rows(org.id, provider, window_start, window_end, limit=limit, offset=offset)
+    days: dict[date, dict[SandboxRowKind, float]] = {}
+    total_rows = 0
+    for total in repository.sandbox_day_totals(org.id, provider, window_start, window_end):
+        amounts = days.setdefault(total.day, dict.fromkeys(SandboxRowKind, 0.0))
+        amounts[SandboxRowKind.HOURLY if total.hourly else SandboxRowKind.LIFETIME] += total.amount_usd
+        total_rows += total.row_count
+    return SandboxCostRowsResponse(
+        start=window_start,
+        end=window_end,
+        provider=provider,
+        limit=limit,
+        offset=offset,
+        total_rows=total_rows,
+        rows=[
+            SandboxCostEntry(
+                source_id=row.source_id,
+                kind=SandboxRowKind.HOURLY if row.hourly else SandboxRowKind.LIFETIME,
+                placed_at=_as_utc(row.placed_at),
+                amount_usd=row.amount_usd,
+                usage_end=None if row.usage_end is None else _as_utc(row.usage_end),
+                run_id=row.run_id,
+                project_handle=row.handle,
+            )
+            for row in rows
+        ],
+        days=[
+            SandboxDayTotal(
+                day=day,
+                hourly_usd=amounts[SandboxRowKind.HOURLY],
+                lifetime_usd=amounts[SandboxRowKind.LIFETIME],
+                total_usd=sum(amounts.values()),
+            )
+            for day, amounts in sorted(days.items())
         ],
     )

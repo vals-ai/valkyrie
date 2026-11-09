@@ -12,6 +12,15 @@ from pydantic import BaseModel, ValidationError
 from services.tracker.main import app
 from tracker.agent.schemas import AgentContract, Parameter
 from tracker.api.filter_options import FilterOptionsResponse
+from tracker.api.login import AccessKeyResponse, IdentityResponse
+from tracker.api.organizations import (
+    InviteResponse,
+    MemberEntry,
+    MembersResponse,
+    OrganizationEntry,
+    OrganizationResponse,
+    OrganizationsResponse,
+)
 from tracker.database.models import (
     AgentContractRequest,
     AWSBenchmarkArguments,
@@ -36,6 +45,13 @@ from tracker.types import (
     BenchmarkServiceHealth,
     BenchmarkServicesRequest,
     BenchmarkServicesResponse,
+    BenchmarkDefinitionResponse,
+    BenchmarkDefinitionsResponse,
+    DatasetResponse,
+    DatasetsResponse,
+    DatasetTaskDownloadResponse,
+    DatasetTaskResponse,
+    DatasetTasksResponse,
     BenchmarkStatusEntry,
     BenchmarkStatusResponse,
     BenchmarkTableRow,
@@ -60,6 +76,7 @@ from tracker.types import (
     ShedBenchmarkRequest,
     ShedBenchmarkResponse,
     SPEND_SUBCATEGORIES,
+    NewProjectRequest,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
@@ -71,12 +88,27 @@ from tracker.types import (
 )
 from valkyrie.sdk import ValkyrieClient, ValkyrieConfig
 from valkyrie.sdk.models import (
+    AccessKeyResponse as SDKAccessKeyResponse,
+    IdentityResponse as SDKIdentityResponse,
+    InviteResponse as SDKInviteResponse,
+    MemberEntry as SDKMemberEntry,
+    MembersResponse as SDKMembersResponse,
+    OrganizationEntry as SDKOrganizationEntry,
+    OrganizationResponse as SDKOrganizationResponse,
+    OrganizationsResponse as SDKOrganizationsResponse,
     AgentContract as SDKAgentContract,
     AgentContractRequest as SDKAgentContractRequest,
     Parameter as SDKParameter,
     AgentDownloadURLResponse as SDKAgentDownloadURLResponse,
     AgentEntry as SDKAgentEntry,
     AgentsResponse as SDKAgentsResponse,
+    BenchmarkDefinitionResponse as SDKBenchmarkDefinitionResponse,
+    BenchmarkDefinitionsResponse as SDKBenchmarkDefinitionsResponse,
+    DatasetResponse as SDKDatasetResponse,
+    DatasetsResponse as SDKDatasetsResponse,
+    DatasetTaskDownloadResponse as SDKDatasetTaskDownloadResponse,
+    DatasetTaskResponse as SDKDatasetTaskResponse,
+    DatasetTasksResponse as SDKDatasetTasksResponse,
     SecretEntry as SDKSecretEntry,
     SecretsResponse as SDKSecretsResponse,
     ProvidersResponse as SDKProvidersResponse,
@@ -119,6 +151,7 @@ from valkyrie.sdk.models import (
     ShedBenchmarkRequest as SDKShedBenchmarkRequest,
     ShedBenchmarkResponse as SDKShedBenchmarkResponse,
     SPEND_SUBCATEGORIES as SDK_SPEND_SUBCATEGORIES,
+    NewProjectRequest as SDKNewProjectRequest,
     ProjectCreateRequest as SDKProjectCreateRequest,
     ProjectResponse as SDKProjectResponse,
     ProjectsResponse as SDKProjectsResponse,
@@ -137,9 +170,25 @@ ROUTES = (
     ("/benchmarks/{benchmark_id}/shed", "post", "benchmark_id"),
     ("/benchmarks/{benchmark_id}/project", "post", "benchmark_id"),
     ("/projects", "post", ""),
-    ("/projects", "get", ""),
+    ("/projects", "get", "include_archived"),
     ("/projects/{handle}", "put", "handle"),
     ("/projects/{handle}", "delete", "handle"),
+    ("/v1/benchmarks", "post", ""),
+    ("/v1/benchmarks", "get", "include_archived"),
+    ("/v1/benchmarks/{benchmark}", "get", "benchmark"),
+    ("/v1/benchmarks/{benchmark}", "patch", "benchmark"),
+    ("/v1/benchmarks/{benchmark}", "delete", "benchmark"),
+    ("/v1/benchmarks/{benchmark}/restore", "post", "benchmark"),
+    ("/v1/benchmarks/{benchmark}/datasets", "post", "benchmark"),
+    ("/v1/benchmarks/{benchmark}/datasets", "get", "benchmark include_archived"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "get", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "patch", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "delete", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/restore", "post", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks", "get", "benchmark name cursor limit"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "put", "benchmark name task_id"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "get", "benchmark name task_id download"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "delete", "benchmark name task_id"),
     ("/benchmarks/{benchmark_id}/artifacts", "get", "benchmark_id prefix cursor limit"),
     ("/benchmarks/{benchmark_id}/artifacts/download-url", "get", "benchmark_id path download"),
     ("/start-benchmark", "post", ""),
@@ -180,6 +229,16 @@ ROUTES = (
     ("/secrets", "get", ""),
     ("/secrets/{name}", "put", "name"),
     ("/secrets/{name}", "delete", "name"),
+    ("/auth/me", "get", ""),
+    ("/access-keys", "post", ""),
+    ("/access-keys/{key_id}", "delete", "key_id"),
+    ("/orgs", "get", ""),
+    ("/orgs", "post", ""),
+    ("/orgs/members", "get", ""),
+    ("/orgs/members", "post", ""),
+    ("/orgs/members/{email}", "delete", "email"),
+    ("/orgs/invitations/{organization}/accept", "post", "organization"),
+    ("/orgs/invitations/{organization}", "delete", "organization"),
     ("/sandbox-providers", "get", ""),
     ("/sandbox-providers/{provider}", "put", "provider"),
     ("/sandbox-providers/{provider}", "delete", "provider"),
@@ -215,6 +274,11 @@ RESPONSE_MODELS = {
     ("/secrets", "get"): "SecretsResponse",
     ("/secrets/{name}", "put"): "SecretEntry",
     ("/secrets/{name}", "delete"): "SecretEntry",
+    ("/auth/me", "get"): "IdentityResponse",
+    ("/access-keys", "post"): "AccessKeyResponse",
+    ("/orgs", "get"): "OrganizationsResponse",
+    ("/orgs/members", "get"): "MembersResponse",
+    ("/orgs/members", "post"): "InviteResponse",
     ("/sandbox-providers", "get"): "ProvidersResponse",
     ("/sandbox-providers/{provider}", "put"): "ProvidersResponse",
     ("/sandbox-providers/{provider}", "delete"): "ProvidersResponse",
@@ -231,6 +295,20 @@ RESPONSE_MODELS = {
     ("/projects", "get"): "ProjectsResponse",
     ("/projects/{handle}", "put"): "ProjectResponse",
     ("/projects/{handle}", "delete"): "ProjectResponse",
+    ("/v1/benchmarks", "get"): "BenchmarkDefinitionsResponse",
+    ("/v1/benchmarks/{benchmark}", "get"): "BenchmarkDefinitionResponse",
+    ("/v1/benchmarks/{benchmark}", "patch"): "BenchmarkDefinitionResponse",
+    ("/v1/benchmarks/{benchmark}", "delete"): "BenchmarkDefinitionResponse",
+    ("/v1/benchmarks/{benchmark}/restore", "post"): "BenchmarkDefinitionResponse",
+    ("/v1/benchmarks/{benchmark}/datasets", "get"): "DatasetsResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "get"): "DatasetResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "patch"): "DatasetResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}", "delete"): "DatasetResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/restore", "post"): "DatasetResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks", "get"): "DatasetTasksResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "put"): "DatasetTaskResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "get"): "DatasetTaskDownloadResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "delete"): "DatasetTaskResponse",
     ("/preview-results", "get"): "S3UploadResultsResponse",
 }
 MODEL_PAIRS = (
@@ -238,6 +316,14 @@ MODEL_PAIRS = (
     (OutputArtifact, SDKOutputArtifact),
     (SecretEntry, SDKSecretEntry),
     (SecretsResponse, SDKSecretsResponse),
+    (AccessKeyResponse, SDKAccessKeyResponse),
+    (IdentityResponse, SDKIdentityResponse),
+    (InviteResponse, SDKInviteResponse),
+    (MemberEntry, SDKMemberEntry),
+    (MembersResponse, SDKMembersResponse),
+    (OrganizationEntry, SDKOrganizationEntry),
+    (OrganizationResponse, SDKOrganizationResponse),
+    (OrganizationsResponse, SDKOrganizationsResponse),
     (ProvidersResponse, SDKProvidersResponse),
     (RunSettingsResponse, SDKRunSettingsResponse),
     (SavedBenchmarkService, SDKSavedBenchmarkService),
@@ -262,8 +348,16 @@ MODEL_PAIRS = (
     (ShedBenchmarkRequest, SDKShedBenchmarkRequest),
     (ShedBenchmarkResponse, SDKShedBenchmarkResponse),
     (ProjectCreateRequest, SDKProjectCreateRequest),
+    (NewProjectRequest, SDKNewProjectRequest),
     (ProjectResponse, SDKProjectResponse),
     (ProjectsResponse, SDKProjectsResponse),
+    (BenchmarkDefinitionResponse, SDKBenchmarkDefinitionResponse),
+    (BenchmarkDefinitionsResponse, SDKBenchmarkDefinitionsResponse),
+    (DatasetResponse, SDKDatasetResponse),
+    (DatasetsResponse, SDKDatasetsResponse),
+    (DatasetTaskResponse, SDKDatasetTaskResponse),
+    (DatasetTasksResponse, SDKDatasetTasksResponse),
+    (DatasetTaskDownloadResponse, SDKDatasetTaskDownloadResponse),
     (RetryOrResumeBenchmarkResponse, SDKRetryResponse),
     (BenchmarkStatusEntry, SDKBenchmarkStatusEntry),
     (BenchmarkStatusResponse, SDKBenchmarkStatusResponse),
@@ -292,31 +386,29 @@ MODEL_PAIRS = (
     (FetchBenchmarkMetadataResponse, SDKFetchBenchmarkMetadataResponse),
 )
 INTERNAL_ROUTES = {
-    # Dashboard native previews use Tracker directly, not the Python SDK.
+    ("/benchmarks/{benchmark_id}/monitor/tasks", "get"),
+    ("/benchmarks/{benchmark_id}/monitor/stop-receipt", "get"),
+    ("/monitor/runs", "get"),
     ("/benchmarks/{benchmark_id}/tasks/{task_id}/native-output/files", "get"),
     ("/benchmarks/{benchmark_id}/tasks/{task_id}/native-output/file", "get"),
     ("/costs/by-email", "get"),
     ("/costs/by-project", "get"),
-    ("/access-keys", "post"),
-    ("/access-keys/{key_id}", "delete"),
+    ("/costs/project-daytona", "get"),
+    ("/costs/sandbox-rows", "get"),
+    ("/costs/project-sandbox", "get"),
+    ("/projects/{handle}/archive", "post"),
+    ("/projects/{handle}/unarchive", "post"),
     ("/auth/cli", "get"),
-    ("/auth/me", "get"),
     ("/aws-runtime", "get"),
     ("/health", "get"),
     ("/secrets", "get"),
     ("/secrets/{name}", "put"),
     ("/secrets/{name}", "delete"),
-    ("/orgs", "get"),
-    ("/orgs", "post"),
-    ("/orgs/members", "get"),
-    ("/orgs/members", "post"),
-    ("/orgs/members/{email}", "delete"),
-    ("/orgs/invitations/{organization}/accept", "post"),
-    ("/orgs/invitations/{organization}", "delete"),
+    ("/projects/by-id/{project_id}", "get"),
+    ("/projects/by-id/{project_id}/gateway-key-eligibility", "get"),
 }
 
 
-# Tracker sets these itself, from its deployment and its run settings; the SDK never sends them.
 TRACKER_ONLY_FIELDS: dict[type[BaseModel], set[str]] = {
     StartBenchmarkRequest: {
         "properties",
@@ -328,7 +420,6 @@ TRACKER_ONLY_FIELDS: dict[type[BaseModel], set[str]] = {
     FetchBenchmarkTasksRequest: {"custom_benchmark_service"},
 }
 
-# The SDK leaves these out unless the caller sets them, so the Tracker applies the caller's saved settings.
 SDK_OPTIONAL_FIELDS: dict[type[BaseModel], set[str]] = {StartBenchmarkRequest: {"sandbox_provider"}}
 
 
@@ -336,6 +427,9 @@ def load_fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.description(
+    "Each canonical fixture parses in both the SDK and Tracker models and dumps back to the same payload."
+)
 @pytest.mark.parametrize(
     ("name", "key", "tracker_model", "sdk_model"),
     [
@@ -367,6 +461,7 @@ def test_sdk_and_tracker_accept_canonical_fixture(
     assert sdk_value.model_dump(mode="json") == payload
 
 
+@pytest.mark.description("Matching SDK and Tracker wire models have the same fields with the same defaults.")
 @pytest.mark.parametrize(("tracker_model", "sdk_model"), MODEL_PAIRS)
 def test_sdk_and_tracker_wire_models_have_the_same_fields(
     tracker_model: type[BaseModel], sdk_model: type[BaseModel]
@@ -405,6 +500,7 @@ def test_sdk_and_tracker_wire_models_have_the_same_fields(
         assert _normalized_default(tracker_default) == _normalized_default(sdk_default)
 
 
+@pytest.mark.description("The start priority override is optional and strictly validated.")
 @pytest.mark.parametrize("model", [StartBenchmarkRequest, SDKStartBenchmarkRequest])
 def test_start_priority_override_is_optional_and_strict(model: type[BaseModel]) -> None:
     payload = load_fixture("start.json")["request"]
@@ -427,6 +523,7 @@ def test_start_priority_override_is_optional_and_strict(model: type[BaseModel]) 
             model.model_validate({**payload, "sandbox_provider": "modal", "priority": invalid})
 
 
+@pytest.mark.description("`client.runs.start` sends a body and API key header the Tracker start route accepts.")
 async def test_sdk_start_matches_tracker_api_key_contract() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -447,7 +544,6 @@ async def test_sdk_start_matches_tracker_api_key_contract() -> None:
 
 
 def _normalized_wire_schema(value: Any) -> Any:
-    """Compare wire shapes while ignoring documentation and intentional ID format hints."""
     if isinstance(value, dict):
         return {
             key: _normalized_wire_schema(item)
@@ -460,12 +556,14 @@ def _normalized_wire_schema(value: Any) -> Any:
 
 
 def _normalized_default(value: Any) -> Any:
-    """Compare enum defaults by their wire value."""
     if isinstance(value, Enum):
         return value.value
     return value
 
 
+@pytest.mark.description(
+    "Every event in the fetch stream fixture parses into both the Tracker and SDK fetch response models unchanged."
+)
 def test_fetch_stream_fixture_matches_tracker_and_sdk_response_models() -> None:
     event = load_fixture("fetch.json")["sse"]
 
@@ -476,6 +574,7 @@ def test_fetch_stream_fixture_matches_tracker_and_sdk_response_models() -> None:
     assert sdk_value.model_dump(mode="json") == event["data"]
 
 
+@pytest.mark.description("Each SDK route's method, path, and response model match the Tracker OpenAPI schema.")
 def test_tracker_routes_match_the_sdk_http_contract() -> None:
     schema = app.openapi()
     expected_methods: dict[str, set[str]] = {}
@@ -487,6 +586,9 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
     for path, method, names in ROUTES:
         operation = schema["paths"][path][method]
         actual_parameters = {(parameter["name"], parameter["in"]) for parameter in operation.get("parameters", [])}
+        if path in ("/benchmarks/{benchmark_id}/logs", "/benchmarks/{benchmark_id}/logs/stream"):
+            assert ("expected_attempt_id", "query") in actual_parameters
+            actual_parameters.remove(("expected_attempt_id", "query"))
         expected_parameters = {(name, "path" if f"{{{name}}}" in path else "query") for name in names.split()}
         assert actual_parameters == expected_parameters
 
@@ -597,6 +699,7 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
     }
 
 
+@pytest.mark.description("Every Tracker route is either called by the SDK or listed in `INTERNAL_ROUTES`.")
 def test_every_tracker_route_is_classified_as_sdk_supported_or_internal() -> None:
     schema = app.openapi()
     tracker_routes = {(path, method) for path, operations in schema["paths"].items() for method in operations}
@@ -605,6 +708,7 @@ def test_every_tracker_route_is_classified_as_sdk_supported_or_internal() -> Non
     assert tracker_routes == sdk_routes | INTERNAL_ROUTES
 
 
+@pytest.mark.description("Final evaluation keeps the Tracker's runtime string IDs.")
 def test_final_evaluation_preserves_tracker_runtime_string_ids() -> None:
     payload = load_fixture("results.json")["inline"]
     tracker_evaluation = FinalViewResponse.model_validate(payload).final_evaluation
@@ -620,6 +724,7 @@ def test_final_evaluation_preserves_tracker_runtime_string_ids() -> None:
     assert sdk_evaluation.model_dump() == tracker_evaluation.model_dump(warnings=False)
 
 
+@pytest.mark.description("The SDK and the Tracker list the same subcategories for each spend type.")
 def test_sdk_and_tracker_allow_the_final_subcategories() -> None:
     expected = {
         "development": (

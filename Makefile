@@ -1,5 +1,5 @@
-.PHONY: help install style format format-check lint typecheck \
-	tracker-service local-tracker venv_check tool-install build test unit-test docs-reference docs-reference-check
+.PHONY: help install style format format-check lint lint-fix typecheck \
+	tracker-service local-tracker venv_check tool-install build test unit-test sdk-models sdk-models-check docs-reference docs-reference-check
 
 PYTHON_VERSION := 3.12
 
@@ -12,8 +12,9 @@ help:
 	@echo "  make tool-install        Install valkyrie as a global executable"
 	@echo ""
 	@echo "Development:"
-	@echo "  make test                Run CLI unit and local integration tests with coverage"
-	@echo "  make style               Lint & Format"
+	@echo "  make test                Run CLI, TUI, SDK, contract, docs, run-monitor and local integration tests with coverage"
+	@echo "  make style               Format, apply ruff fixes, then lint"
+	@echo "  make lint                Lint without fixing (CI)"
 	@echo "  make typecheck           Typecheck"
 	@echo "  make docs-reference      Generate CLI and SDK reference pages"
 	@echo "  make docs-reference-check  Check generated reference pages"
@@ -39,7 +40,7 @@ install:
 	@echo "🎉 Done! Run 'source .venv/bin/activate' to activate the environment locally."
 
 tool-install:
-	uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false -e .
+	uv tool install --force --exclude-newer "7 days" --exclude-newer-package certifi=false -e .
 
 build: venv_check
 	@echo "Building valkyrie CLI binary..."
@@ -56,19 +57,30 @@ build: venv_check
 	@echo "✓ Binary built at dist/valkyrie"
 
 format: venv_check
-	@uv run ruff format .
+	@uv run ruff format --exclude services/run-monitor/vendor .
 
 format-check: venv_check
-	@uv run ruff format --check .
+	@uv run ruff format --check --exclude services/run-monitor/vendor .
 
 lint: venv_check
-	@uv run ruff check --fix .
+	@uv run ruff check --exclude services/run-monitor/vendor .
+	@uv run python scripts/check_no_comments.py
+	@uv run python scripts/check_descriptions.py
+	@uv run python scripts/check_tracker_no_utils.py
 
 test: venv_check
-	@uv run pytest tests/unit/cli tests/unit/tui tests/integration/local \
+	@uv run pytest tests/unit/cli tests/unit/tui tests/unit/sdk tests/unit/docs tests/contract \
+		$(wildcard tests/unit/egress_proxy) tests/integration/local \
 		--cov=src/valkyrie --cov-report=xml --cov-report=term-missing --cov-fail-under=80
+	@cd services/run-monitor && uv run --frozen pytest -q
 
 unit-test: test
+
+sdk-models:
+	uv run python -m scripts.sdk.generate_models
+
+sdk-models-check:
+	uv run python -m scripts.sdk.generate_models --check
 
 docs-reference:
 	uv run python scripts/generate_reference.py
@@ -76,10 +88,14 @@ docs-reference:
 docs-reference-check:
 	uv run python scripts/generate_reference.py --check
 
-style: format lint
+lint-fix: venv_check
+	@uv run ruff check --fix --exclude services/run-monitor/vendor .
+
+style: format lint-fix lint
 
 typecheck: venv_check
 	@uv run basedpyright
+	@cd services/run-monitor && uv run --frozen basedpyright
 
 tracker-service:
 	cd services/tracker && make tracker-service

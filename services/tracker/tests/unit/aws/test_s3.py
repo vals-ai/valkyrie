@@ -1,8 +1,3 @@
-"""Unit tests for tracker S3 streaming uploads.
-
-Run: uv run pytest tests/unit/aws/test_s3.py
-"""
-
 from collections.abc import AsyncIterator
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -22,9 +17,7 @@ from tracker.aws.s3 import (
     copy_s3_object,
     create_presigned_url,
     delete_from_s3,
-    download_many_from_s3,
     list_agents,
-    list_s3_objects,
     s3_object_exists,
     upload_to_s3,
     upload_stream_to_s3,
@@ -34,8 +27,6 @@ from tracker.exceptions import S3Error
 
 
 class MockS3Client:
-    """Record multipart upload operations without calling AWS."""
-
     def __init__(self, fail_on_part: int | None = None) -> None:
         self.fail_on_part = fail_on_part
         self.parts: list[tuple[int, bytes]] = []
@@ -113,20 +104,7 @@ class DownloadClient:
         return {"Body": DownloadBody(response)}
 
 
-async def test_download_many_reuses_one_client_and_skips_provider_failures(
-    monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
-) -> None:
-    missing = ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
-    client = DownloadClient({"first": b"one", "missing": missing, "last": b"three"})
-    monkeypatch.setattr(type(aws_runtime.clients), "s3_client", lambda _provider: client)
-
-    downloaded = [item async for item in download_many_from_s3(["first", "missing", "last"], aws_runtime)]
-
-    assert downloaded == [("first", b"one"), ("last", b"three")]
-    assert client.keys == ["first", "missing", "last"]
-    assert client.entries == 1
-
-
+@pytest.mark.description("`get_many` opens one S3 client and returns only the keys that downloaded.")
 async def test_object_store_get_many_reuses_one_client_and_skips_provider_failures(
     monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
 ) -> None:
@@ -167,6 +145,7 @@ class ReadClient(DownloadClient):
         return self._paginator
 
 
+@pytest.mark.description("Object store reads and listings keep object metadata.")
 async def test_object_store_read_session_and_listing_preserve_object_metadata(
     monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
 ) -> None:
@@ -193,6 +172,7 @@ async def test_object_store_read_session_and_listing_preserve_object_metadata(
     assert client.entries == 1
 
 
+@pytest.mark.description("Managed reads and `get_many` apply the bucket owner guard.")
 async def test_managed_read_session_and_get_many_apply_owner_guard(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -218,20 +198,16 @@ async def test_managed_read_session_and_get_many_apply_owner_guard(
         yield "agents/alpha.zip"
 
     assert [item async for item in S3ObjectStore(runtime).get_many(keys())] == [("agents/alpha.zip", b"alpha")]
-    assert [item async for item in download_many_from_s3(["agents/alpha.zip"], runtime)] == [
-        ("agents/alpha.zip", b"alpha")
-    ]
     assert client.requests == [
-        {"Bucket": "test-bucket", "Key": "agents/alpha.zip", "ExpectedBucketOwner": "123456789012"},
         {"Bucket": "test-bucket", "Key": "agents/alpha.zip", "ExpectedBucketOwner": "123456789012"},
         {"Bucket": "test-bucket", "Key": "agents/alpha.zip", "ExpectedBucketOwner": "123456789012"},
     ]
     assert paginator.calls == [{"Bucket": "test-bucket", "Prefix": "agents/", "ExpectedBucketOwner": "123456789012"}]
 
 
+@pytest.mark.description("Presigned URL lifetime behavior.")
 class TestCreatePresignedUrl:
-    """Presigned URL lifetime behavior."""
-
+    @pytest.mark.description("The default chain TTL applies to S3 presigned URLs.")
     async def test_default_chain_ttl_is_applied_to_s3(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -262,6 +238,7 @@ class TestCreatePresignedUrl:
         )
 
 
+@pytest.mark.description("Managed S3 calls pass `ExpectedBucketOwner` on every request.")
 async def test_managed_direct_operations_apply_owner_guard(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -289,10 +266,6 @@ async def test_managed_direct_operations_apply_owner_guard(
     await delete_from_s3("key", runtime, version_id="version-1")
     assert await copy_s3_object("source", "destination", runtime) == "version-1"
     assert await s3_object_exists("key", runtime)
-    assert [key async for key in list_s3_objects("benchmarks/", runtime)] == [
-        "benchmarks/run/result.json",
-        "agents/demo.zip",
-    ]
     assert await list_agents(runtime) == [("demo", None)]
 
     owner = {"ExpectedBucketOwner": "123456789012"}
@@ -306,12 +279,10 @@ async def test_managed_direct_operations_apply_owner_guard(
         **owner,
     )
     client.head_object.assert_awaited_once_with(Bucket="test-bucket", Key="key", **owner)
-    assert paginator.calls == [
-        {"Bucket": "test-bucket", "Prefix": "benchmarks/", **owner},
-        {"Bucket": "test-bucket", "Prefix": "agents/", **owner},
-    ]
+    assert paginator.calls == [{"Bucket": "test-bucket", "Prefix": "agents/", **owner}]
 
 
+@pytest.mark.description("Managed uploads add the bucket owner guard.")
 async def test_managed_upload_adds_owner_guard(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -331,6 +302,7 @@ async def test_managed_upload_adds_owner_guard(
     )
 
 
+@pytest.mark.description("A managed upload without an expected bucket owner is rejected.")
 async def test_managed_upload_rejects_missing_expected_bucket_owner(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -353,6 +325,9 @@ async def test_managed_upload_rejects_missing_expected_bucket_owner(
     client.put_object.assert_not_awaited()
 
 
+@pytest.mark.description(
+    "Managed run artifact reads pass the bucket owner guard and still return the presigned `download_url`."
+)
 async def test_managed_run_artifact_calls_guard_aws_without_changing_presigned_url_contract(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -402,6 +377,7 @@ async def test_managed_run_artifact_calls_guard_aws_without_changing_presigned_u
     assert response.download_url == "https://download.test/file"
 
 
+@pytest.mark.description("A versioned copy can be deleted by its exact version.")
 async def test_versioned_copy_can_be_deleted_exactly(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -428,6 +404,7 @@ async def test_versioned_copy_can_be_deleted_exactly(
     )
 
 
+@pytest.mark.description("S3 delete errors from AWS are translated.")
 async def test_delete_from_s3_translates_aws_errors(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
@@ -461,9 +438,19 @@ def mock_s3_client(monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime) -> 
     return client
 
 
+@pytest.mark.description("Multipart streaming upload behavior.")
 class TestUploadStreamToS3:
-    """Multipart streaming upload behavior."""
-
+    @pytest.mark.description(
+        (
+            "A refused conditional publication reports an existing alias only when one exists.\n"
+            "\n"
+            "Test cases:\n"
+            "- An unconditional success publishes the whole stream.\n"
+            "- A 412 precondition failure means the alias already exists.\n"
+            "- A 409 conflict means the alias exists when a concurrent publication won.\n"
+            "- A 409 conflict with no object left behind is a storage failure."
+        )
+    )
     @pytest.mark.parametrize(
         ("status", "concurrent_winner", "expected_error"),
         [
@@ -482,15 +469,6 @@ class TestUploadStreamToS3:
         concurrent_winner: bool,
         expected_error: type[Exception] | None,
     ) -> None:
-        """
-        Verify that a refused conditional publication reports an existing alias only when one exists.
-
-        Test cases:
-        - An unconditional success publishes the whole stream.
-        - A 412 precondition failure means the alias already exists.
-        - A 409 conflict means the alias exists when a concurrent publication won.
-        - A 409 conflict with no object left behind is a storage failure.
-        """
         complete = AsyncMock(
             side_effect=ClientError(
                 {
@@ -525,14 +503,18 @@ class TestUploadStreamToS3:
             assert await S3ObjectStore(aws_runtime).put_stream("agents/demo.zip", chunks(), overwrite=False) == 5
         assert complete.call_args.kwargs["IfNoneMatch"] == "*"
 
+    @pytest.mark.description(
+        (
+            "A streamed upload is split into numbered parts and then completed.\n"
+            "\n"
+            "Test cases:\n"
+            "- Chunks accumulate until the part-size threshold, then flush as numbered parts.\n"
+            "- The trailing partial buffer becomes the final part and the upload is completed."
+        )
+    )
     async def test_splits_stream_into_parts_and_completes(
         self, mock_s3_client: MockS3Client, aws_runtime: AWSRuntime
     ) -> None:
-        """
-        Test cases:
-        - Chunks accumulate until the part-size threshold, then flush as numbered parts.
-        - The trailing partial buffer becomes the final part and the upload is completed.
-        """
 
         async def chunks() -> AsyncIterator[bytes]:
             yield b"aaaa"
@@ -549,6 +531,7 @@ class TestUploadStreamToS3:
         ]
         assert not mock_s3_client.aborted
 
+    @pytest.mark.description("The object store keeps the multipart upload behavior.")
     async def test_object_store_preserves_multipart_behavior(
         self, mock_s3_client: MockS3Client, aws_runtime: AWSRuntime
     ) -> None:
@@ -566,6 +549,9 @@ class TestUploadStreamToS3:
             {"ETag": "etag-2", "PartNumber": 2},
         ]
 
+    @pytest.mark.description(
+        "A managed stream upload passes `ExpectedBucketOwner` on create, part, and complete calls."
+    )
     async def test_managed_upload_guards_every_multipart_operation(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -610,13 +596,10 @@ class TestUploadStreamToS3:
             }
         ]
 
+    @pytest.mark.description("An object-store upload failure aborts the multipart upload and raises S3Error.")
     async def test_object_store_translates_and_aborts_multipart_upload_on_failure(
         self, monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
     ) -> None:
-        """
-        Test cases:
-        - An object-store upload failure aborts the multipart upload and surfaces as S3Error.
-        """
         client = MockS3Client(fail_on_part=1)
 
         def s3_client(_provider: object) -> MockS3Client:
@@ -634,6 +617,7 @@ class TestUploadStreamToS3:
         assert client.aborted
         assert client.completed_parts is None
 
+    @pytest.mark.description("Aborting a managed multipart upload applies the owner guard.")
     async def test_managed_multipart_abort_applies_owner_guard(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -666,15 +650,12 @@ class TestUploadStreamToS3:
             }
         ]
 
+    @pytest.mark.description("Revoked upload authority aborts the multipart upload before completion.")
     async def test_aborts_before_completion_when_authority_is_revoked(
         self,
         mock_s3_client: MockS3Client,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """
-        Test cases:
-        - Revoked upload authority aborts the multipart upload before completion.
-        """
         authority_checks = iter([True, False])
 
         async def chunks() -> AsyncIterator[bytes]:
@@ -693,11 +674,11 @@ class TestUploadStreamToS3:
         assert mock_s3_client.aborted
 
 
+@pytest.mark.description("Sign locally with real botocore. URL-only clients must need no owner header.")
 async def test_managed_presigned_get_requires_only_the_host_header(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
 ) -> None:
-    """Sign locally with real botocore; URL-only clients must need no owner header."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.setattr("tracker.aws.clients._S3_CLIENT_CONFIG", Config(signature_version="s3v4"))

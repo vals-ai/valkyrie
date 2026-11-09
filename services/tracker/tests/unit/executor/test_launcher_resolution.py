@@ -1,5 +1,3 @@
-"""HTTP behavior for ambiguous executor task-launch acknowledgement."""
-
 from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import AsyncMock
@@ -12,6 +10,7 @@ import main
 from tracker.executor.dispatch_control import EnqueueFailureResolution
 
 
+@pytest.mark.description("A launch failure keeps the HTTP error contract.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolution", "expected_status", "expected_detail"),
@@ -49,6 +48,7 @@ async def test_launch_failure_preserves_http_contract(
         }
 
 
+@pytest.mark.description("An ambiguous launch result is accepted when the dispatch was claimed.")
 @pytest.mark.asyncio
 async def test_ambiguous_launch_acknowledgement_accepts_claimed_dispatch(
     monkeypatch: pytest.MonkeyPatch, database_session: Session

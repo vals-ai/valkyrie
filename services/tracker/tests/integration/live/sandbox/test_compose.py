@@ -1,8 +1,3 @@
-"""Integration tests for compose-backed sandbox operations.
-
-Run: uv run pytest tests/integration/live/sandbox/test_compose.py
-"""
-
 import asyncio
 import io
 import tarfile
@@ -181,16 +176,19 @@ async def compose_sandbox(
                 assert containers.stdout.strip() == ""
 
 
+@pytest.mark.description(
+    (
+        "Compose sandbox methods should work through the Daytona-created outer sandbox.\n"
+        "\n"
+        "Test cases:\n"
+        "- The benchmark-service retrieve-task response creates the Daytona outer DinD sandbox.\n"
+        "- Exec, streaming command, upload, download, file deletion, and temporary file cleanup work through compose.\n"
+        "- Runtime env vars, agent install, agent run, and a benchmark-style evaluation command run inside `main`."
+    )
+)
 async def test_compose_sandbox_methods_use_daytona_outer_from_retrieve_task(
     compose_sandbox: tuple[Sandbox, Sandbox, RetrieveTaskResponse],
 ) -> None:
-    """Compose sandbox methods should work through the Daytona-created outer sandbox.
-
-    Test cases:
-    - The benchmark-service retrieve-task response creates the Daytona outer DinD sandbox.
-    - Exec, streaming command, upload, download, file deletion, and temporary file cleanup work through compose.
-    - Runtime env vars, agent install, agent run, and a benchmark-style evaluation command run inside `main`.
-    """
     sandbox, outer_sandbox, task_data = compose_sandbox
 
     assert isinstance(task_data.source, ComposeSource)
@@ -255,7 +253,9 @@ async def test_compose_sandbox_methods_use_daytona_outer_from_retrieve_task(
 
     agent_sandbox = runtime_sandbox(outer_sandbox, task_data.source)
     await apply_egress_policy(agent_sandbox, contract.install_egress_policy)
-    await install_agent_dependencies(agent_sandbox, contract, logs.append)
+    await install_agent_dependencies(
+        agent_sandbox, contract, logs.append, log_line=lambda text: logs.append(text + "\n")
+    )
     await apply_egress_policy(
         agent_sandbox,
         combine_run_egress_policies(task_data.egress.run, contract.egress_allowlist),
@@ -271,6 +271,7 @@ async def test_compose_sandbox_methods_use_daytona_outer_from_retrieve_task(
         _unused_object_store(),
         plan,
         deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=plan.allowance_seconds),
+        log_line=lambda text: logs.append(text + "\n"),
     )
 
     assert exit_reason is None
@@ -291,6 +292,7 @@ async def test_compose_sandbox_methods_use_daytona_outer_from_retrieve_task(
     assert await sandbox.download_file("/workspace/evaluation.json") == b'{"score":1}'
 
 
+@pytest.mark.description("A compose sandbox runs the agent, keeps its output, and evaluates it.")
 async def test_controlled_compose_agent_output_and_evaluation(
     compose_sandbox: tuple[Sandbox, Sandbox, RetrieveTaskResponse],
 ) -> None:
@@ -325,6 +327,7 @@ async def test_controlled_compose_agent_output_and_evaluation(
         plan,
         deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=plan.allowance_seconds),
         agent_output_s3_key="controlled/normal",
+        log_line=lambda text: logs.append(text + "\n"),
     )
 
     assert exit_reason is None
@@ -347,6 +350,9 @@ async def test_controlled_compose_agent_output_and_evaluation(
     assert sidecar.stdout.strip() == "sidecar-alive"
 
 
+@pytest.mark.description(
+    "When the compose deadline passes, the agent processes stop while the sandbox can still run the evaluation."
+)
 async def test_controlled_compose_deadline_stops_only_agent_group(
     compose_sandbox: tuple[Sandbox, Sandbox, RetrieveTaskResponse],
 ) -> None:
@@ -389,6 +395,7 @@ async def test_controlled_compose_deadline_stops_only_agent_group(
             plan,
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=plan.allowance_seconds),
             agent_output_s3_key="controlled/deadline",
+            log_line=lambda text: record_output(text + "\n"),
         )
     )
     visible_while_running = False

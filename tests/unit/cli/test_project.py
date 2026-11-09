@@ -1,8 +1,3 @@
-"""Project CLI behavior through the real SDK and a mock Tracker.
-
-Run: uv run pytest tests/unit/cli/test_project.py
-"""
-
 import json
 from datetime import datetime, timezone
 
@@ -15,6 +10,7 @@ from valkyrie.cli.main import cli
 from tests.unit.cli.conftest import MockTracker
 
 _GOOGLE_REPORT = {
+    "id": "11111111-1111-4111-8111-111111111111",
     "handle": "google-report-xyz",
     "name": "Google Report XYZ",
     "spend_type": "customer",
@@ -26,6 +22,7 @@ _GOOGLE_REPORT = {
 }
 _ROUTER_BENCH = {
     **_GOOGLE_REPORT,
+    "id": "22222222-2222-4222-8222-222222222222",
     "handle": "router-bench",
     "name": "Router Bench",
     "spend_type": "development",
@@ -39,6 +36,7 @@ def _invoke(*arguments: str) -> Result:
     return CliRunner().invoke(cli, ["project", *arguments])
 
 
+@pytest.mark.description("`project create` sends the handle and spend fields and prints them back.")
 def test_create_sends_the_project_and_prints_its_spend_fields(tracker: MockTracker) -> None:
     tracker.reply("POST", "/projects", httpx.Response(200, json=_GOOGLE_REPORT))
 
@@ -57,6 +55,10 @@ def test_create_sends_the_project_and_prints_its_spend_fields(tracker: MockTrack
         "engagement=q4",
         "--tag",
         "owner=research",
+        "--budget",
+        "300",
+        "--budget-reason",
+        "3 runs, about 100 each",
     )
 
     assert result.exit_code == 0, result.output
@@ -68,6 +70,8 @@ def test_create_sends_the_project_and_prints_its_spend_fields(tracker: MockTrack
             "subcategory": "report",
             "customer": "google",
             "extra_tags": {"engagement": "q4", "owner": "research"},
+            "budget": "300",
+            "budget_reason": "3 runs, about 100 each",
         }
     ]
     assert "✓ Project created: customer · google-report-xyz · report · google · engagement=q4 · owner=research" in (
@@ -87,6 +91,7 @@ _INTERNAL = ("--name", "Blog", "--spend-type", "internal", "--subcategory", "blo
 _CUSTOMER = ("--name", "Google Report XYZ", "--spend-type", "customer", "--subcategory", "report")
 
 
+@pytest.mark.description("Create accepts each spend type's subcategories and handle forms.")
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -137,6 +142,7 @@ def test_create_accepts_each_spend_types_subcategories_and_handle_forms(
 _HANDLE_RULE = "must be lowercase letters, digits and hyphens, at most 64 characters, e.g. my-project"
 
 
+@pytest.mark.description("A missing or invalid `project create` option names the flag before any request.")
 @pytest.mark.parametrize(
     ("arguments", "messages"),
     [
@@ -231,6 +237,14 @@ _HANDLE_RULE = "must be lowercase letters, digits and hyphens, at most 64 charac
             ("blog", *_INTERNAL, "--tag", "customer=google"),
             ("'--tag'", "'customer' is a core project field and cannot be an extra tag"),
         ),
+        (
+            ("blog", *_INTERNAL, "--tag", "budget=5"),
+            ("'--tag'", "'budget' is a core project field and cannot be an extra tag"),
+        ),
+        (
+            ("blog", *_INTERNAL, "--tag", "budget_reason=x"),
+            ("'--tag'", "'budget_reason' is a core project field and cannot be an extra tag"),
+        ),
     ],
     ids=[
         "missing-spend-type",
@@ -254,6 +268,8 @@ _HANDLE_RULE = "must be lowercase letters, digits and hyphens, at most 64 charac
         "tag-key-shadows-name",
         "tag-key-shadows-handle",
         "tag-key-shadows-customer",
+        "tag-key-shadows-budget",
+        "tag-key-shadows-budget-reason",
     ],
 )
 def test_create_errors_name_the_flag_before_any_request(
@@ -267,6 +283,32 @@ def test_create_errors_name_the_flag_before_any_request(
     assert tracker.requests == []
 
 
+@pytest.mark.description("A `--budget` that is not a positive amount is quoted in the error and nothing is sent.")
+@pytest.mark.parametrize("budget", ["0", "-5", "abc", "NaN"])
+def test_create_refuses_a_budget_that_is_not_an_amount_above_zero(tracker: MockTracker, budget: str) -> None:
+    result = _invoke("create", "router-bench", *_DEVELOPMENT, "--budget", budget, "--budget-reason", "3 runs")
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--budget'" in result.output
+    assert f"'{budget}'" in result.output
+    assert tracker.requests == []
+
+
+@pytest.mark.description("Create shows the Tracker's budget refusal.")
+def test_create_shows_the_trackers_budget_refusal(tracker: MockTracker) -> None:
+    detail = (
+        "Project 'router-bench' needs --budget and --budget-reason: "
+        "creating it requests its main Gateway key, which carries that budget"
+    )
+    tracker.reply("POST", "/projects", httpx.Response(422, json={"detail": detail}))
+
+    result = _invoke("create", "router-bench", *_DEVELOPMENT)
+
+    assert result.exit_code == 1
+    assert detail in " ".join(result.output.split())
+
+
+@pytest.mark.description("Creating a project with a used handle exits 1 and says it already exists.")
 def test_create_reports_a_taken_id(tracker: MockTracker) -> None:
     tracker.reply("POST", "/projects", httpx.Response(409, json={"detail": "Project 'router-bench' already exists"}))
 
@@ -276,6 +318,7 @@ def test_create_reports_a_taken_id(tracker: MockTracker) -> None:
     assert "Project 'router-bench' already exists" in result.output
 
 
+@pytest.mark.description("`project list` prints one row per project with its spend fields.")
 def test_list_shows_handle_name_spend_type_subcategory_customer_and_tags(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_GOOGLE_REPORT, _ROUTER_BENCH]}))
 
@@ -298,6 +341,7 @@ def test_list_shows_handle_name_spend_type_subcategory_customer_and_tags(tracker
     assert ["router-bench", "Router", "Bench", "development", "new_benchmark_generation"] in rows
 
 
+@pytest.mark.description("`project list` shows escape characters in handles and names as visible text.")
 def test_list_prints_escape_codes_in_handle_and_name_as_text(tracker: MockTracker) -> None:
     hostile = {**_ROUTER_BENCH, "handle": "evil\x1b[2K", "name": "Evil\x1b[1A"}
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [hostile]}))
@@ -310,6 +354,7 @@ def test_list_prints_escape_codes_in_handle_and_name_as_text(tracker: MockTracke
     assert "Evil\\x1b[1A" in result.output
 
 
+@pytest.mark.description("JSON list prints the Tracker response.")
 def test_list_json_prints_the_tracker_response(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_ROUTER_BENCH]}))
 
@@ -321,6 +366,7 @@ def test_list_json_prints_the_tracker_response(tracker: MockTracker) -> None:
     ]
 
 
+@pytest.mark.description("Update keeps saved fields that were not given.")
 def test_update_preserves_unspecified_saved_fields(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_GOOGLE_REPORT]}))
     updated = {**_GOOGLE_REPORT, "name": "Google Report 2027"}
@@ -343,6 +389,20 @@ def test_update_preserves_unspecified_saved_fields(tracker: MockTracker) -> None
     }
 
 
+@pytest.mark.description("`project update` looks projects up with `include_archived` so archived ones can be changed.")
+def test_update_finds_an_archived_project(tracker: MockTracker) -> None:
+    archived = {**_GOOGLE_REPORT, "archived_at": "2026-11-02T18:00:00+00:00"}
+    tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [archived]}))
+    tracker.reply("PUT", "/projects/google-report-xyz", httpx.Response(200, json={**archived, "name": "Renamed"}))
+
+    result = _invoke("update", "google-report-xyz", "--name", "Renamed")
+
+    assert result.exit_code == 0, result.output
+    assert tracker.requests[0].url.params["include_archived"] == "true"
+    assert json.loads(tracker.requests[1].content)["name"] == "Renamed"
+
+
+@pytest.mark.description("`--tag` on update replaces all saved tags.")
 def test_update_tag_replaces_all_saved_tags(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_GOOGLE_REPORT]}))
     updated = {**_GOOGLE_REPORT, "extra_tags": {"team": "platform"}}
@@ -354,6 +414,7 @@ def test_update_tag_replaces_all_saved_tags(tracker: MockTracker) -> None:
     assert json.loads(tracker.requests[1].content)["extra_tags"] == {"team": "platform"}
 
 
+@pytest.mark.description("Update can clear the customer and tags.")
 def test_update_explicitly_clears_customer_and_tags(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_GOOGLE_REPORT]}))
     updated = {
@@ -387,6 +448,7 @@ def test_update_explicitly_clears_customer_and_tags(tracker: MockTracker) -> Non
     }
 
 
+@pytest.mark.description("Delete asks for confirmation and returns the deleted project.")
 def test_delete_requires_confirmation_and_returns_the_deleted_project(tracker: MockTracker) -> None:
     runner = CliRunner()
 
@@ -407,6 +469,7 @@ def test_delete_requires_confirmation_and_returns_the_deleted_project(tracker: M
     assert "✓ Project deleted: development · router-bench" in deleted.output
 
 
+@pytest.mark.description("An update with no changes reads without writing.")
 def test_update_no_op_reads_without_writing(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_ROUTER_BENCH]}))
 
@@ -417,6 +480,7 @@ def test_update_no_op_reads_without_writing(tracker: MockTracker) -> None:
     assert [(request.method, request.url.path) for request in tracker.requests] == [("GET", "/projects")]
 
 
+@pytest.mark.description("Updating an unknown project says it was not found after one lookup and writes nothing.")
 def test_update_reports_a_missing_project_without_writing(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_ROUTER_BENCH]}))
 
@@ -427,6 +491,7 @@ def test_update_reports_a_missing_project_without_writing(tracker: MockTracker) 
     assert [(request.method, request.url.path) for request in tracker.requests] == [("GET", "/projects")]
 
 
+@pytest.mark.description("`project update` with no changes or conflicting flags fails before any request.")
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -455,6 +520,7 @@ def test_update_rejects_ambiguous_or_empty_changes_before_any_request(
     assert tracker.requests == []
 
 
+@pytest.mark.description("Delete reports a conflict when the project has history.")
 def test_delete_reports_project_history_conflict(tracker: MockTracker) -> None:
     tracker.reply(
         "DELETE",

@@ -1,5 +1,3 @@
-"""Provides the small renderers and one-line bars every screen shares."""
-
 from __future__ import annotations
 
 import shlex
@@ -15,7 +13,7 @@ from textual.widget import Widget
 from textual.binding import Binding
 from textual.widgets import DataTable
 
-from valkyrie.cli.display import terminal_safe
+from valkyrie.display import terminal_safe
 from valkyrie.sdk.models import BenchmarkStatus, FailureCategory, TaskStatus
 from valkyrie.tui.theme import BRAND, palette
 from valkyrie.tui.source import Environment
@@ -25,16 +23,9 @@ if TYPE_CHECKING:
 
 
 def shown(text: str) -> str:
-    """Escape terminal control characters in text from the Tracker, at the point it's drawn.
-
-    Textual draws text as given, so an escape sequence in a run name or an error message would otherwise reach the
-    terminal, where it can move the cursor or set the clipboard (OSC 52). The models keep the Tracker's text, since
-    IDs go back to it in requests.
-    """
     return terminal_safe(text, preserve_newlines=True)
 
 
-# Each status's glyph and the palette role that colors it.
 RUN_STATUS = {
     BenchmarkStatus.IN_PROGRESS: ("●", "running"),
     BenchmarkStatus.STOPPING: ("◍", "warning"),
@@ -58,12 +49,11 @@ CATEGORY_LABEL = {
     FailureCategory.CANCELLED: "cancelled",
     FailureCategory.UNKNOWN: "unknown",
 }
-# Bar segments, left to right: what's done, what failed, what's running, then the empty track.
 BAR_SEGMENTS = [
-    (("FINISHED",), "finished"),
-    (("ERROR",), "error"),
-    (("EVALUATING", "IN_PROGRESS", "BUILDING"), "running"),
-    (("STOPPED",), "faint"),
+    ((TaskStatus.FINISHED,), "finished"),
+    ((TaskStatus.ERROR,), "error"),
+    ((TaskStatus.EVALUATING, TaskStatus.IN_PROGRESS, TaskStatus.BUILDING), "running"),
+    ((TaskStatus.STOPPED,), "faint"),
 ]
 
 
@@ -91,12 +81,11 @@ def status_label(status: BenchmarkStatus | TaskStatus) -> str:
 
 
 def progress_bar(counts: Mapping[str, int], total: int, width: int) -> Text:
-    """Render a bar split by task state, so failures show up in the bar and not only in a count."""
     bar = Text()
     used = 0
-    for names, role in BAR_SEGMENTS:
+    for statuses, role in BAR_SEGMENTS:
         color = getattr(palette(), role)
-        count = sum(counts.get(name, 0) for name in names)
+        count = sum(counts.get(status.value, 0) for status in statuses)
         cells = round(width * count / total) if total else 0
         cells = min(cells, width - used)
         bar.append("━" * cells, style=color)
@@ -127,13 +116,11 @@ def keys_text(*pairs: tuple[str, str]) -> Text:
 
 
 class TopBar(Widget):
-    """Shows the environment badge, where you are, and whether the data is live. `trail` and `status` hold (text, palette role) pairs."""
-
     trail: reactive[tuple[tuple[str, str], ...]] = reactive(())
     status: reactive[tuple[str, str]] = reactive(("", "muted"))
 
     class BadgeClicked(Message):
-        """Posted when the environment badge is clicked."""
+        pass
 
     def __init__(self, environment: Environment) -> None:
         super().__init__()
@@ -156,11 +143,6 @@ class TopBar(Widget):
 
 
 class Table(DataTable[Text]):
-    """Extends DataTable with a row cursor that vim keys (j, k, g, G) and the mouse wheel move.
-
-    The wheel moves the cursor rather than the view, since the highlighted row is what the rest of the screen shows.
-    """
-
     BINDINGS = [
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -182,17 +164,12 @@ class Table(DataTable[Text]):
         self.action_cursor_up()
 
     def highlighted_key(self) -> str | None:
-        """Return the key of the row under the cursor, or None when the table is empty."""
         if not self.row_count:
             return None
         row_key, _ = self.coordinate_to_cell_key(self.cursor_coordinate)
         return str(row_key.value)
 
     def show_rows(self, rows: Mapping[str, list[Text]]) -> None:
-        """Show these rows, keeping the cursor on the same key.
-
-        When the keys are unchanged the cells update in place, so the cursor doesn't move and no highlight event fires.
-        """
         with self.app.batch_update():
             if list(rows) == [row.value for row in self.rows]:
                 for key, cells in rows.items():
@@ -218,13 +195,10 @@ class KeyBar(Widget):
 
 
 class CommandLine(Widget):
-    """Shows the `valk` command for what's on screen, which `y` copies."""
-
     command: reactive[str] = reactive("")
     copied: reactive[bool] = reactive(False)
 
     def show(self, command: str) -> None:
-        """Show `command`, pointed at the Tracker on screen when it isn't the one the shell's `valk` reaches."""
         app = cast("ValkyrieApp", self.app)
         url = app.source.environment.url
         self.command = shown(command if url == app.launch_url else f"VALKYRIE_URL={shlex.quote(url)} {command}")

@@ -1,5 +1,3 @@
-"""Transfer validated local agent bundles through the sandbox provider."""
-
 import asyncio
 import io
 import shlex
@@ -11,7 +9,6 @@ from tracker.exceptions import SandboxError
 
 
 async def upload_local_agent_artifacts(sandbox: Sandbox, content: bytes) -> None:
-    """Transfer a frozen bundle already validated when admitted to the agent library."""
     archive = await asyncio.to_thread(zipfile.ZipFile, io.BytesIO(content))
     for member in archive.infolist():
         path = f"/bundle/{member.filename.rstrip('/')}"

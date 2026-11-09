@@ -10,7 +10,7 @@ from valkyrie.sdk.models import (
 )
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, paginate_cli_pages, progress_percent, short_local_time
+from valkyrie.cli.display import format_option, format_table, paginate_cli_pages, progress_percent, short_local_time
 from valkyrie.cli.run.progress import styled_status
 from valkyrie.cli.run.snapshot import format_run_list_json
 
@@ -19,52 +19,57 @@ _MACHINE_PAGE_LIMIT = 500
 
 @click.command(
     name="list",
-    help="List runs by providing filter values. \n\nExample:\nvalkyrie run list --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC",
+    help=(
+        "List runs that match the filters.\n"
+        "\n"
+        "Example:\n"
+        "    valkyrie run list --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC"
+    ),
 )
 @click.option(
     "--agent-name",
     type=str,
     required=False,
-    help="Agent name (e.g., claude_code)",
+    help="Agent name (e.g., claude_code).",
 )
 @click.option(
     "--benchmark-name",
     type=str,
     required=False,
-    help="Benchmark name (e.g., swebench)",
+    help="Benchmark name (e.g., swebench).",
 )
 @click.option(
     "--model",
     type=str,
     required=False,
-    help="Model name (e.g., anthropic/claude-sonnet-4-20250514)",
+    help="Model name (e.g., anthropic/claude-sonnet-4-20250514).",
 )
 @click.option(
     "--dataset",
     type=str,
     required=False,
-    help="Dataset name (e.g., default, terminal-bench-2.1)",
+    help="Dataset name (e.g., default, terminal-bench-2.1).",
 )
 @click.option(
     "--label",
     "-l",
     type=str,
     required=False,
-    help="Run label",
+    help="Run label.",
 )
 @click.option(
     "--status",
     type=click.Choice([option.value for option in BenchmarkStatus], case_sensitive=False),
     required=False,
     default=None,
-    help="Status of the benchmarks to fetch (e.g., in_progress, finished, error)",
+    help="Status of the benchmarks to fetch (e.g., in_progress, finished, error).",
 )
 @click.option(
     "--order-by",
     type=click.Choice([option.value for option in Order], case_sensitive=False),
     required=False,
     default=Order.DESC.value,
-    help="Order by the benchmarks to fetch (e.g., desc, asc)",
+    help="Order by the benchmarks to fetch (e.g., desc, asc).",
 )
 @click.option(
     "--started-by",
@@ -73,14 +78,7 @@ _MACHINE_PAGE_LIMIT = 500
     default=None,
     help="Comma-separated list of starter emails (e.g., alice@vals.ai,bob@vals.ai). Case-insensitive.",
 )
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format. Machine-readable JSON requires --all.",
-)
+@format_option("Output format. Machine-readable JSON requires --all.")
 @click.option(
     "--all",
     "all_runs",
@@ -94,19 +92,11 @@ def list_runs(
     dataset: str | None,
     label: str | None,
     status: str | None,
-    order_by: str = "desc",
-    started_by: str | None = None,
-    output_format: str = "text",
-    all_runs: bool = False,
-):
-    """
-    List runs based on the request parameters.
-
-    Use vim keys to navigate: [h] previous page, [l] next page, [q] quit.
-
-    Example:
-        valkyrie run list --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC
-    """
+    order_by: str,
+    started_by: str | None,
+    output_format: str,
+    all_runs: bool,
+) -> None:
     if output_format == "json" and not all_runs:
         raise click.UsageError("--format json requires --all.")
     if all_runs and output_format != "json":
@@ -124,7 +114,6 @@ def list_runs(
     )
 
     if output_format == "json":
-        # Every page is fetched before anything is written, so a failure never leaves partial JSON.
         machine_request = request.model_copy(update={"limit": _MACHINE_PAGE_LIMIT})
         runs = call(lambda client: _collect(client.runs.iter(machine_request)))
         click.echo(format_run_list_json(runs))
@@ -134,10 +123,9 @@ def list_runs(
 
 def format_fetch_benchmarks_response(
     fetch_benchmarks_response: FetchBenchmarksResponse,
-    current_page: int = 1,
-    total_pages: int = 1,
+    current_page: int,
+    total_pages: int,
 ) -> None:
-    """Format and display runs in a table format."""
     benchmarks = fetch_benchmarks_response.benchmarks
 
     if not benchmarks:
@@ -190,7 +178,6 @@ def format_fetch_benchmarks_response(
 
 
 def format_no_benchmarks_found(request: FetchBenchmarksRequest) -> None:
-    """Print the no-results message and active filters."""
     filters = {
         "Agent": request.agent_name,
         "Benchmark": request.benchmark_name,
@@ -214,7 +201,6 @@ async def _collect(rows: AsyncIterator[BenchmarkTableRow]) -> list[BenchmarkTabl
 
 
 def paginate_benchmarks(request: FetchBenchmarksRequest, limit: int = 5) -> None:
-    """Interactively page through runs."""
 
     def load_page(offset: int, page_limit: int) -> tuple[int, FetchBenchmarksResponse]:
         page_request = request.model_copy(update={"offset": offset, "limit": page_limit})

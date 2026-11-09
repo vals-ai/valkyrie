@@ -1,8 +1,3 @@
-"""Tests for the async SDK log resource.
-
-Run: uv run pytest tests/unit/sdk/test_logs_resource.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -18,8 +13,8 @@ import pytest  # pyright: ignore[reportMissingImports]
 from valkyrie.sdk.errors import ValkyrieRunError, ValkyrieStreamError  # pyright: ignore[reportMissingImports]
 
 
+@pytest.mark.description("The SDK must export log models and its resources package must export the namespace.")
 def test_log_types_and_resource_are_public() -> None:
-    """The SDK must export log models and its resources package must export the namespace."""
     sdk = import_module("valkyrie.sdk")
     resources = import_module("valkyrie.sdk.resources")
 
@@ -28,8 +23,8 @@ def test_log_types_and_resource_are_public() -> None:
     assert getattr(resources, "LogsResource").__name__ == "LogsResource"
 
 
+@pytest.mark.description("Aggregate fetches must follow changing cursors even when a page has no events.")
 async def test_fetch_run_follows_empty_pages_and_sorts_events(make_client) -> None:
-    """Aggregate fetches must follow changing cursors even when a page has no events."""
     requests: list[httpx.Request] = []
     run_id = uuid4()
 
@@ -63,8 +58,8 @@ async def test_fetch_run_follows_empty_pages_and_sorts_events(make_client) -> No
     assert requests[1].url.params["cursor"] == "page-2"
 
 
+@pytest.mark.description("Task reads must validate timestamps and send no CloudWatch location fields.")
 async def test_task_page_validates_bounds_and_builds_provider_neutral_request(make_client) -> None:
-    """Task reads must validate timestamps and send no CloudWatch location fields."""
     requests: list[httpx.Request] = []
     run_id = uuid4()
 
@@ -107,8 +102,8 @@ async def test_task_page_validates_bounds_and_builds_provider_neutral_request(ma
     assert "log_stream" not in params
 
 
+@pytest.mark.description("Task following must parse typed SSE records and surface provider errors.")
 async def test_stream_task_parses_log_and_error_events(make_client) -> None:
-    """Task following must parse typed SSE records and surface provider errors."""
     run_id = uuid4()
     payload: dict[str, Any] = {
         "timestamp": "2026-01-01T00:00:00Z",
@@ -144,8 +139,8 @@ async def test_stream_task_parses_log_and_error_events(make_client) -> None:
             _ = [event async for event in failing_client.logs.stream_task(run_id, "task-1")]
 
 
+@pytest.mark.description("A clean HTTP EOF must yield its buffered log but cannot replace the explicit end event.")
 async def test_stream_task_preserves_final_record_then_rejects_truncated_success(make_client) -> None:
-    """A clean HTTP EOF must yield its buffered log but cannot replace the explicit end event."""
     run_id = uuid4()
     payload = {
         "timestamp": "2026-01-01T00:00:00Z",

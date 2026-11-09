@@ -1,8 +1,3 @@
-"""Tests for parsing and validating agent contracts.
-
-Run: uv run pytest tests/unit/agent/test_contract.py
-"""
-
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, cast
@@ -25,13 +20,15 @@ def _make_contract(**overrides: Any) -> AgentContract:
 
 
 class TestValidateKwargs:
+    @pytest.mark.description(
+        (
+            "Defaults are applied when no value is provided.\n"
+            "\n"
+            "Test cases:\n"
+            "- Temperature has a default of 0.7 and the user provides no kwargs."
+        )
+    )
     def test_defaults_applied_when_no_values(self) -> None:
-        """
-        Validates that defaults are applied when no value is provided.
-
-        Test Cases:
-        - Temperature has a default of 0.7 and the user provides no kwargs
-        """
         contract = _make_contract(
             kwargs={
                 "temperature": Parameter(type="float", required=False, default=0.7),
@@ -42,13 +39,15 @@ class TestValidateKwargs:
 
         assert result == {"temperature": 0.7}
 
+    @pytest.mark.description(
+        (
+            "A user-provided value overrides the schema default.\n"
+            "\n"
+            "Test cases:\n"
+            "- Temperature defaults to 0.7 but user passes 1.0 via kwargs."
+        )
+    )
     def test_override_replaces_default(self) -> None:
-        """
-        Validates that a user-provided value overrides the schema default.
-
-        Test Cases:
-        - Temperature defaults to 0.7 but user passes 1.0 via kwargs
-        """
         contract = _make_contract(
             kwargs={
                 "temperature": Parameter(type="float", required=False, default=0.7),
@@ -59,13 +58,15 @@ class TestValidateKwargs:
 
         assert result == {"temperature": 1.0}
 
+    @pytest.mark.description(
+        (
+            "A missing required kwarg raises a ValidationError.\n"
+            "\n"
+            "Test cases:\n"
+            "- Model is required but the user provides no kwargs."
+        )
+    )
     def test_required_kwarg_missing_raises(self) -> None:
-        """
-        Validates that a missing required kwarg raises a ValidationError.
-
-        Test Cases:
-        - Model is required but the user provides no kwargs
-        """
         contract = _make_contract(
             kwargs={
                 "model": Parameter(type="str", required=True),
@@ -75,13 +76,15 @@ class TestValidateKwargs:
         with pytest.raises(ValueError):
             contract.validate_kwargs(contract.kwargs, {})
 
+    @pytest.mark.description(
+        (
+            "A required kwarg passes when the user provides it.\n"
+            "\n"
+            "Test cases:\n"
+            '- Model is required and the user provides "gpt-4o".'
+        )
+    )
     def test_required_kwarg_provided(self) -> None:
-        """
-        Validates that a required kwarg passes when the user provides it.
-
-        Test Cases:
-        - Model is required and the user provides "gpt-4o"
-        """
         contract = _make_contract(
             kwargs={
                 "model": Parameter(type="str", required=True),
@@ -92,13 +95,15 @@ class TestValidateKwargs:
 
         assert result == {"model": "gpt-4o"}
 
+    @pytest.mark.description(
+        (
+            "Passing a value with the wrong type raises a ValidationError.\n"
+            "\n"
+            "Test cases:\n"
+            "- Temperature expects a float but the user provides a string."
+        )
+    )
     def test_wrong_type_raises(self) -> None:
-        """
-        Validates that passing a value with the wrong type raises a ValidationError.
-
-        Test Cases:
-        - Temperature expects a float but the user provides a string
-        """
         contract = _make_contract(
             kwargs={
                 "temperature": Parameter(type="float", required=False, default=0.7),
@@ -108,26 +113,30 @@ class TestValidateKwargs:
         with pytest.raises(ValueError):
             contract.validate_kwargs(contract.kwargs, {"temperature": "not_a_float"})
 
+    @pytest.mark.description(
+        (
+            "An empty kwargs schema returns an empty dict.\n"
+            "\n"
+            "Test cases:\n"
+            "- Contract has no kwargs defined, values are ignored."
+        )
+    )
     def test_empty_schema_returns_empty(self) -> None:
-        """
-        Validates that an empty kwargs schema returns an empty dict.
-
-        Test Cases:
-        - Contract has no kwargs defined, values are ignored
-        """
         contract = _make_contract()
 
         result = contract.validate_kwargs({}, {"ignored": "value"})
 
         assert result == {}
 
+    @pytest.mark.description(
+        (
+            "Defaults, required values, and overrides work together.\n"
+            "\n"
+            "Test cases:\n"
+            "- Temperature and verbose have defaults, model is required and provided by the user."
+        )
+    )
     def test_multiple_kwargs_mixed(self) -> None:
-        """
-        Validates that defaults, required values, and overrides work together.
-
-        Test Cases:
-        - Temperature and verbose have defaults, model is required and provided by the user
-        """
         contract = _make_contract(
             kwargs={
                 "temperature": Parameter(type="float", required=False, default=0.7),
@@ -140,13 +149,15 @@ class TestValidateKwargs:
 
         assert result == {"temperature": 0.7, "model": "gpt-4o", "verbose": True}
 
+    @pytest.mark.description(
+        (
+            "An invalid choice raises a ValueError.\n"
+            "\n"
+            "Test cases:\n"
+            '- Mode has choices ["fast", "accurate"] and "invalid" is rejected.'
+        )
+    )
     def test_choices_enforced(self) -> None:
-        """
-        Validates that an invalid choice raises a ValueError.
-
-        Test Cases:
-        - Mode has choices ["fast", "accurate"] and "invalid" is rejected
-        """
         contract = _make_contract(
             kwargs={
                 "mode": Parameter(type="str", required=False, default="fast", choices=["fast", "accurate"]),
@@ -156,13 +167,10 @@ class TestValidateKwargs:
         with pytest.raises(ValueError):
             contract.validate_kwargs(contract.kwargs, {"mode": "invalid"})
 
+    @pytest.mark.description(
+        'A valid choice is accepted.\n\nTest cases:\n- Mode has choices ["fast", "accurate"] and "fast" is accepted.'
+    )
     def test_choices_valid(self) -> None:
-        """
-        Validates that a valid choice is accepted.
-
-        Test Cases:
-        - Mode has choices ["fast", "accurate"] and "fast" is accepted
-        """
         contract = _make_contract(
             kwargs={
                 "mode": Parameter(type="str", required=False, default="fast", choices=["fast", "accurate"]),
@@ -175,6 +183,7 @@ class TestValidateKwargs:
 
 
 class TestOutputArtifactValidation:
+    @pytest.mark.description("An output artifact accepts a relative destination path.")
     def test_accepts_relative_destination_path(self) -> None:
         request = AgentContractRequest(
             name="test-agent",
@@ -185,6 +194,7 @@ class TestOutputArtifactValidation:
 
         assert request.output_artifacts == ["metrics/result.json"]
 
+    @pytest.mark.description("An output artifact accepts a single name as its destination.")
     def test_accepts_single_component_relative_destination(self) -> None:
         request = AgentContractRequest(
             name="test-agent",
@@ -195,6 +205,7 @@ class TestOutputArtifactValidation:
 
         assert request.output_artifacts == ["result.json"]
 
+    @pytest.mark.description("An output artifact destination with path traversal is rejected.")
     def test_rejects_path_traversal(self) -> None:
         with pytest.raises(ValidationError, match="output_artifacts"):
             AgentContractRequest(
@@ -204,6 +215,7 @@ class TestOutputArtifactValidation:
                 output_artifacts=["artifacts/../secret.json"],
             )
 
+    @pytest.mark.description("An absolute output artifact destination is rejected.")
     def test_rejects_absolute_path(self) -> None:
         with pytest.raises(ValidationError, match="relative"):
             AgentContractRequest(
@@ -213,6 +225,7 @@ class TestOutputArtifactValidation:
                 output_artifacts=["/tmp/artifacts/result.json"],
             )
 
+    @pytest.mark.description("A contract with too many output artifacts is rejected.")
     def test_rejects_too_many_output_artifacts(self) -> None:
         with pytest.raises(ValidationError, match="output_artifacts"):
             AgentContractRequest(
@@ -222,19 +235,23 @@ class TestOutputArtifactValidation:
                 output_artifacts=["artifacts/result.json"] * 11,
             )
 
+    @pytest.mark.description("An empty artifact source means the default source.")
     def test_empty_source_is_treated_as_default_source(self) -> None:
         artifact = OutputArtifact(path="artifacts/result.json", source="")
 
         assert artifact.source is None
 
+    @pytest.mark.description("A relative artifact source path is rejected.")
     def test_rejects_relative_source_path(self) -> None:
         with pytest.raises(ValidationError, match="absolute sandbox paths"):
             OutputArtifact(path="artifacts/result.json", source="logs/result.json")
 
+    @pytest.mark.description("An artifact source that globs the root is rejected.")
     def test_rejects_root_glob_source_path(self) -> None:
         with pytest.raises(ValidationError, match="non-root directory prefix"):
             OutputArtifact(path="artifacts/result.json", source="/*.json")
 
+    @pytest.mark.description("An artifact with an explicit source and destination is accepted.")
     def test_accepts_explicit_source_and_destination(self) -> None:
         request = AgentContractRequest(
             name="test-agent",
@@ -255,37 +272,40 @@ class TestOutputArtifactValidation:
 
 
 class TestRunCmdValidation:
+    @pytest.mark.description(
+        (
+            "`run_cmd` without {problem_statement_path} raises a ValidationError.\n"
+            "\n"
+            "Test cases:\n"
+            "- run_cmd has no placeholder for the problem statement path."
+        )
+    )
     def test_missing_problem_statement_path_raises(self) -> None:
-        """
-        Validates that run_cmd without {problem_statement_path} raises a ValidationError.
-
-        Test Cases:
-        - run_cmd has no placeholder for the problem statement path
-        """
         with pytest.raises(ValidationError, match="problem_statement_path"):
             _make_contract(run_cmd="agent --no-placeholder")
 
+    @pytest.mark.description(
+        (
+            "A run_cmd containing {problem_statement_path} passes validation.\n"
+            "\n"
+            "Test cases:\n"
+            "- run_cmd includes the required placeholder."
+        )
+    )
     def test_valid_run_cmd(self) -> None:
-        """
-        Validates that a run_cmd containing {problem_statement_path} passes validation.
-
-        Test Cases:
-        - run_cmd includes the required placeholder
-        """
         contract = _make_contract(run_cmd="agent {problem_statement_path}")
         assert contract.run_cmd == "agent {problem_statement_path}"
 
 
+@pytest.mark.description("End-to-end: YAML file -> AgentContractRequest with kwargs resolved.")
 class TestParseYamlContract:
-    """End-to-end: YAML file -> AgentContractRequest with kwargs resolved."""
-
     def _write_yaml(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "contract.yaml"
         p.write_text(dedent(content))
         return p
 
+    @pytest.mark.description("YAML defaults are validated and retained for launch-time binding.")
     def test_defaults_applied(self, tmp_path: Path) -> None:
-        """YAML defaults are validated and retained for launch-time binding."""
         path = self._write_yaml(
             tmp_path,
             """\
@@ -305,8 +325,8 @@ class TestParseYamlContract:
         assert isinstance(result, AgentContractRequest)
         assert result.kwargs == {"temperature": "0.7"}
 
+    @pytest.mark.description("CLI kwargs override YAML defaults without changing the raw template.")
     def test_cli_kwargs_override_defaults(self, tmp_path: Path) -> None:
-        """CLI kwargs override YAML defaults without changing the raw template."""
         path = self._write_yaml(
             tmp_path,
             """\
@@ -325,13 +345,15 @@ class TestParseYamlContract:
 
         assert result.kwargs == {"temperature": "1.0"}
 
+    @pytest.mark.description(
+        (
+            "A missing required kwarg raises during YAML contract parsing.\n"
+            "\n"
+            "Test cases:\n"
+            "- Model is required in the YAML schema but not provided via AgentConfig."
+        )
+    )
     def test_required_kwarg_missing_raises(self, tmp_path: Path) -> None:
-        """
-        Validates that a missing required kwarg raises during YAML contract parsing.
-
-        Test Cases:
-        - Model is required in the YAML schema but not provided via AgentConfig
-        """
         path = self._write_yaml(
             tmp_path,
             """\
@@ -348,13 +370,15 @@ class TestParseYamlContract:
         with pytest.raises(ValueError, match="is required but was not provided"):
             _parse_yaml_contract(path, AgentConfig())
 
+    @pytest.mark.description(
+        (
+            "Secrets, final_output, and output_artifacts from YAML are carried to the request.\n"
+            "\n"
+            "Test cases:\n"
+            "- YAML defines API_KEY secret, /artifacts final_output, and one direct output artifact."
+        )
+    )
     def test_secrets_final_output_and_output_artifacts_passed_through(self, tmp_path: Path) -> None:
-        """
-        Validates that secrets, final_output, and output_artifacts from YAML are carried to the request.
-
-        Test Cases:
-        - YAML defines API_KEY secret, /artifacts final_output, and one direct output artifact
-        """
         path = self._write_yaml(
             tmp_path,
             """\
@@ -384,6 +408,7 @@ class TestParseYamlContract:
         assert result.egress_allowlist == ["https://api.openai.com", "https://github.com"]
         assert result.secrets == {"API_KEY": "MySecretName"}
 
+    @pytest.mark.description("The install egress policy passes through parsing unchanged.")
     def test_install_egress_policy_passed_through(self, tmp_path: Path) -> None:
         path = self._write_yaml(
             tmp_path,
@@ -402,6 +427,7 @@ class TestParseYamlContract:
         assert result.install_egress_policy == ["https://packages.example.com"]
         assert result.egress_allowlist == []
 
+    @pytest.mark.description("Legacy egress settings get defaults and map to the allowlist.")
     def test_legacy_egress_defaults_and_allowlist_mapping(self, tmp_path: Path) -> None:
         unrestricted = self._write_yaml(
             tmp_path,
@@ -433,6 +459,7 @@ class TestParseYamlContract:
         assert legacy_result.install_egress_policy == "*"
         assert legacy_result.egress_allowlist == ["https://api.openai.com"]
 
+    @pytest.mark.description("Install egress can sit alongside a legacy run allowlist.")
     def test_install_egress_can_coexist_with_legacy_run_allowlist(self, tmp_path: Path) -> None:
         path = self._write_yaml(
             tmp_path,
@@ -453,6 +480,7 @@ class TestParseYamlContract:
         assert result.install_egress_policy == ["https://packages.example.com"]
         assert result.egress_allowlist == ["https://api.openai.com"]
 
+    @pytest.mark.description("The obsolete agent egress field is rejected.")
     @pytest.mark.parametrize("egress_value", ["null", '{install: "*"}', "{run: []}"])
     def test_rejects_obsolete_agent_egress(self, tmp_path: Path, egress_value: str) -> None:
         path = self._write_yaml(
@@ -468,13 +496,15 @@ class TestParseYamlContract:
         with pytest.raises(ValueError, match="install_egress"):
             _parse_yaml_contract(path, AgentConfig())
 
+    @pytest.mark.description(
+        (
+            "The model comes from AgentConfig, not the YAML contract.\n"
+            "\n"
+            "Test cases:\n"
+            '- AgentConfig specifies "gpt-4o", YAML has no model field.'
+        )
+    )
     def test_model_from_agent_config(self, tmp_path: Path) -> None:
-        """
-        Validates that the model comes from AgentConfig, not the YAML contract.
-
-        Test Cases:
-        - AgentConfig specifies "gpt-4o", YAML has no model field
-        """
         path = self._write_yaml(
             tmp_path,
             """\
@@ -488,13 +518,15 @@ class TestParseYamlContract:
 
         assert result.model == "gpt-4o"
 
+    @pytest.mark.description(
+        (
+            "A YAML contract with no kwargs produces an unmodified run command.\n"
+            "\n"
+            "Test cases:\n"
+            "- YAML defines no kwargs, run_cmd passes through with only built-in placeholders."
+        )
+    )
     def test_no_kwargs_in_schema(self, tmp_path: Path) -> None:
-        """
-        Validates that a YAML contract with no kwargs produces an unmodified run command.
-
-        Test Cases:
-        - YAML defines no kwargs, run_cmd passes through with only built-in placeholders
-        """
         path = self._write_yaml(
             tmp_path,
             """\
@@ -508,8 +540,8 @@ class TestParseYamlContract:
 
         assert result.run_cmd == "agent --task {problem_statement_path}"
 
+    @pytest.mark.description("CLI --model is validated as a required default and retained for launch.")
     def test_defaults_model_from_cli(self, tmp_path: Path) -> None:
-        """CLI --model is validated as a required default and retained for launch."""
         path = self._write_yaml(
             tmp_path,
             """\
@@ -528,13 +560,15 @@ class TestParseYamlContract:
         assert result.model == "gpt-4o"
         assert result.kwargs == {"model": "gpt-4o"}
 
+    @pytest.mark.description(
+        (
+            "A required default raises when --model is not provided.\n"
+            "\n"
+            "Test cases:\n"
+            "- Model is required in defaults but no --model flag is passed."
+        )
+    )
     def test_defaults_model_required_missing_raises(self, tmp_path: Path) -> None:
-        """
-        Validates that a required default raises when --model is not provided.
-
-        Test Cases:
-        - Model is required in defaults but no --model flag is passed
-        """
         path = self._write_yaml(
             tmp_path,
             """\
@@ -551,8 +585,8 @@ class TestParseYamlContract:
         with pytest.raises(ValueError, match="is required but was not provided"):
             _parse_yaml_contract(path, AgentConfig())
 
+    @pytest.mark.description("Model defaults and kwargs are validated independently of command binding.")
     def test_defaults_merged_with_kwargs(self, tmp_path: Path) -> None:
-        """Model defaults and kwargs are validated independently of command binding."""
         path = self._write_yaml(
             tmp_path,
             """\
@@ -576,13 +610,15 @@ class TestParseYamlContract:
         assert result.model == "gpt-4o"
         assert result.kwargs == {"model": "gpt-4o", "temperature": "0.7"}
 
+    @pytest.mark.description(
+        (
+            "The provided section is stripped and does not cause a parse error.\n"
+            "\n"
+            "Test cases:\n"
+            "- YAML includes a provided section for documentation, it is silently ignored."
+        )
+    )
     def test_provided_section_ignored(self, tmp_path: Path) -> None:
-        """
-        Validates that the provided section is stripped and does not cause a parse error.
-
-        Test Cases:
-        - YAML includes a provided section for documentation, it is silently ignored
-        """
         path = self._write_yaml(
             tmp_path,
             """\

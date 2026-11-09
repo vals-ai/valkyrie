@@ -1,10 +1,3 @@
-"""Tracker-side Docent analyzer Lambda invocation.
-
-Used by the SSE endpoint behind `valk run analyze` (manual trigger).
-Sets docent_reading_status to RUNNING on entry, DONE on success (with
-the URL), ERROR on failure. Status writes are best-effort during cancellation.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -18,23 +11,23 @@ from sqlmodel import Session
 
 from tracker._lambda import invoke_lambda
 from tracker.aws.clients import AWSClientProvider
-from tracker.database.models import Benchmark, DocentReadingStatus
+from tracker.database.models import DocentReadingStatus
+from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.database.session import engine
 
-# Analyzer Lambdas can run up to 15 min (AWS Lambda's ceiling); retries
-# disabled because the Lambda is non-idempotent (a retry would re-ingest).
 _ANALYZER_CONFIG = Config(read_timeout=905, retries={"total_max_attempts": 1})
 
 
 def _set_analyzer_status(benchmark_id: UUID, status: DocentReadingStatus, reading_plan_url: str | None = None) -> None:
     with Session(engine) as session:
-        benchmark = session.get(Benchmark, benchmark_id)
+        repository = BenchmarkRepository(session)
+        benchmark = repository.get_by_id(benchmark_id)
         if benchmark is None:
             raise ValueError(f"benchmark {benchmark_id} not found")
         benchmark.docent_reading_status = status
         if reading_plan_url:
             benchmark.docent_reading_url = reading_plan_url
-        session.add(benchmark)
+        repository.save(benchmark)
         session.commit()
 
 
@@ -45,8 +38,6 @@ async def invoke_analyzer(
     payload: dict[str, Any],
     clients: AWSClientProvider,
 ) -> dict[str, Any]:
-    """Await the analyzer while keeping synchronous database sessions in worker threads."""
-    # Cancellation here must not race a late RUNNING write against an ERROR write.
     await asyncio.to_thread(_set_analyzer_status, benchmark_id, DocentReadingStatus.RUNNING)
     status = DocentReadingStatus.ERROR
     reading_plan_url = None
@@ -67,7 +58,6 @@ async def analyze_event_stream(
     payload: dict[str, Any],
     clients: AWSClientProvider,
 ) -> AsyncGenerator[str, None]:
-    """SSE event stream: started → heartbeats → done|error."""
     yield f"event: started\ndata: {json.dumps({'lambda_function': lambda_function})}\n\n"
 
     invoke_task = asyncio.create_task(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from valkyrie.sdk.errors import ValkyrieInputError
 from valkyrie.sdk.models import SecretEntry, SecretsResponse
 
 if TYPE_CHECKING:
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 def validate_secret_name(name: str) -> str:
     """Validate a stored secret's name before it becomes a request path segment."""
     if not re.fullmatch(r"[A-Za-z0-9_+=.@-]{1,128}", name) or name in {".", ".."}:
-        raise ValueError("Invalid secret name: use 1-128 letters, digits, or the characters _+=.@-")
+        raise ValkyrieInputError("Invalid secret name: use 1-128 letters, digits, or the characters _+=.@-")
     return name
 
 

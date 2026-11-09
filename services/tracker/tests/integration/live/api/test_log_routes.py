@@ -1,11 +1,5 @@
-"""Live integration tests for CloudWatch log routes.
-
-Run: cd services/tracker && uv run pytest tests/integration/live/api/test_log_routes.py
-
-Covers real CloudWatch writes followed by aggregate, task, time-filtered, and streaming reads.
-"""
-
 from __future__ import annotations
+import pytest
 
 import asyncio
 import time
@@ -23,6 +17,7 @@ from tracker.aws.cloudwatch_logs import (
     task_log_stream_name,
 )
 from tracker.aws.runtime import AWSRuntime
+from tracker.runtime.logs import TaskLogLine
 from tracker.database.models import AgentContractRequest, Benchmark, AWSBenchmarkArguments, Task
 
 
@@ -35,7 +30,6 @@ def _wait_for_events(
     expected_count: int,
     timeout_seconds: float = 30.0,
 ) -> list[dict[str, Any]]:
-    """Poll a live log route until CloudWatch exposes the expected events."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         response = client.get(path, headers=headers, params=params)
@@ -50,20 +44,23 @@ def _wait_for_events(
     raise AssertionError(f"CloudWatch did not expose {expected_count} event(s) within {timeout_seconds} seconds.")
 
 
+@pytest.mark.description(
+    (
+        "Aggregate, task, bounded, filtered, and streaming log reads work against CloudWatch.\n"
+        "\n"
+        "Test cases:\n"
+        "- Aggregate reads return events from two task streams with task attribution.\n"
+        "- A slash-containing task ID round-trips through the task query parameter.\n"
+        "- Literal queries and inclusive time bounds select the expected task event.\n"
+        "- The SSE route reads the same event through ``GetLogEvents`` and terminates cleanly."
+    )
+)
 def test_log_routes_round_trip_real_cloudwatch(
     live_api_client: TestClient,
     database_session: Session,
     live_aws_runtime: AWSRuntime,
     api_headers: dict[str, str],
 ) -> None:
-    """Exercise aggregate, task, bounded, filtered, and streaming reads against CloudWatch.
-
-    Test cases:
-    - Aggregate reads return events from two task streams with task attribution.
-    - A slash-containing task ID round-trips through the task query parameter.
-    - Literal queries and inclusive time bounds select the expected task event.
-    - The SSE route reads the same event through ``GetLogEvents`` and terminates cleanly.
-    """
     benchmark = Benchmark(
         org_id=TEST_ORG_ID,
         name="live-cloudwatch-logs",
@@ -94,11 +91,11 @@ def test_log_routes_round_trip_real_cloudwatch(
         log_group_created = True
         log_sink.write(
             f"{benchmark.id}:{task_log_stream_name(first_task.task_id, first_task.started_at)}",
-            first_message,
+            [TaskLogLine(received_at=time.time(), message=first_message, fields={})],
         )
         log_sink.write(
             f"{benchmark.id}:{task_log_stream_name(second_task.task_id, second_task.started_at)}",
-            second_message,
+            [TaskLogLine(received_at=time.time(), message=second_message, fields={"trace_id": marker})],
         )
         end_time = datetime.now(timezone.utc) + timedelta(seconds=5)
         bounds = {"start_time": start_time.isoformat(), "end_time": end_time.isoformat()}

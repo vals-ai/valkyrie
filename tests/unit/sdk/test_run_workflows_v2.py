@@ -1,8 +1,3 @@
-"""SDK V2 run workflow tests.
-
-Run: pytest tests/unit/sdk/test_run_workflows_v2.py
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -25,13 +20,12 @@ _STOP_RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
 class ChunkStream(httpx.AsyncByteStream):
-    """Deterministic streaming body for output archive tests."""
-
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield b"first-"
         yield b"second"
 
 
+@pytest.mark.description("`runs.metadata` returns the run's arguments as the model for its environment.")
 async def test_metadata_returns_typed_run_metadata(make_client) -> None:
     run_id = uuid4()
 
@@ -66,6 +60,7 @@ async def test_metadata_returns_typed_run_metadata(make_client) -> None:
     assert isinstance(result.benchmark_arguments, AWSBenchmarkArguments)
 
 
+@pytest.mark.description("`runs.metadata` raises when the resources do not fit the run's environment.")
 @pytest.mark.parametrize(
     ("environment", "properties", "valid"),
     [
@@ -107,6 +102,7 @@ async def test_metadata_validates_environment_resources(make_client, environment
                 await client.runs.metadata(run_id)
 
 
+@pytest.mark.description("`runs.results_exist` returns whether results are in S3 as a typed model.")
 async def test_results_exist_returns_typed_s3_state(make_client) -> None:
     run_id = uuid4()
 
@@ -122,6 +118,7 @@ async def test_results_exist_returns_typed_s3_state(make_client) -> None:
     assert result.exists is True
 
 
+@pytest.mark.description("A stop request sends a task selection only when task IDs are given.")
 @pytest.mark.parametrize(
     ("task_ids", "expected_body"),
     [
@@ -134,12 +131,6 @@ async def test_stop_sends_optional_task_scope(
     task_ids: list[str] | None,
     expected_body: dict[str, list[str]] | None,
 ) -> None:
-    """Check task-scoped stop bodies.
-
-    Test cases:
-    - No IDs omits the body.
-    - IDs send a task selection.
-    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -157,6 +148,7 @@ async def test_stop_sends_optional_task_scope(
     assert result.status == "success"
 
 
+@pytest.mark.description("Analyze turns cached JSON into a done event.")
 async def test_analyze_normalizes_cached_json_to_a_done_event(make_client) -> None:
     run_id = uuid4()
     captured_body: dict[str, object] = {}
@@ -180,6 +172,7 @@ async def test_analyze_normalizes_cached_json_to_a_done_event(make_client) -> No
     ]
 
 
+@pytest.mark.description("`runs.analyze` yields each progress event, ending with the reading plan URL.")
 async def test_analyze_parses_sse_progress_events(make_client) -> None:
     run_id = uuid4()
 
@@ -206,6 +199,7 @@ async def test_analyze_parses_sse_progress_events(make_client) -> None:
     assert events[-1].data == {"reading_plan_url": "https://analysis.test/plan"}
 
 
+@pytest.mark.description("Analyze stops after the final done event.")
 async def test_analyze_stops_after_the_terminal_done_event(make_client) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -223,6 +217,7 @@ async def test_analyze_stops_after_the_terminal_done_event(make_client) -> None:
     assert [event.event for event in events] == ["done"]
 
 
+@pytest.mark.description("`runs.analyze` raises when the stream sends an error event.")
 async def test_analyze_raises_for_an_sse_error_event(make_client) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -236,6 +231,7 @@ async def test_analyze_raises_for_an_sse_error_event(make_client) -> None:
             _ = [event async for event in client.runs.analyze(uuid4(), lambda_function="analyze-fn")]
 
 
+@pytest.mark.description("`runs.analyze` raises an error status before reading any events.")
 async def test_analyze_raises_api_errors_before_streaming(make_client) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"detail": "run must be FINISHED"})
@@ -245,6 +241,7 @@ async def test_analyze_raises_api_errors_before_streaming(make_client) -> None:
             _ = [event async for event in client.runs.analyze(uuid4())]
 
 
+@pytest.mark.description("Output streaming yields archive chunks and sends repeated task filters.")
 async def test_stream_outputs_yields_archive_chunks_and_repeated_task_filters(make_client) -> None:
     run_id = uuid4()
 
@@ -266,6 +263,7 @@ async def test_stream_outputs_yields_archive_chunks_and_repeated_task_filters(ma
     assert chunks == [b"first-", b"second"]
 
 
+@pytest.mark.description("Output streaming raises API errors before streaming.")
 async def test_stream_outputs_raises_api_errors_before_streaming(make_client) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"detail": "No outputs found"})
@@ -275,6 +273,7 @@ async def test_stream_outputs_raises_api_errors_before_streaming(make_client) ->
             _ = [chunk async for chunk in client.runs.stream_outputs(uuid4())]
 
 
+@pytest.mark.description("Updating concurrency sends the new value and returns the saved one.")
 async def test_update_concurrency(make_client) -> None:
     run_id = uuid4()
 
@@ -293,6 +292,7 @@ async def test_update_concurrency(make_client) -> None:
     assert result.concurrency == 7
 
 
+@pytest.mark.description("Shed sends its options and returns the typed result.")
 async def test_shed(make_client) -> None:
     run_id = uuid4()
 
@@ -311,6 +311,7 @@ async def test_shed(make_client) -> None:
     assert result.task_ids == ["task_newest"]
 
 
+@pytest.mark.description("`runs.iter` raises when the Tracker returns the same cursor twice, instead of looping.")
 async def test_run_iteration_rejects_repeated_cursor(make_client) -> None:
     from valkyrie.sdk import FetchBenchmarksRequest
 
@@ -323,6 +324,7 @@ async def test_run_iteration_rejects_repeated_cursor(make_client) -> None:
             _ = [run async for run in client.runs.iter(FetchBenchmarksRequest(offset=1))]
 
 
+@pytest.mark.description("Output download extracts nested archives.")
 @pytest.mark.parametrize("unsafe", [False, True])
 @pytest.mark.parametrize("task_id", ["task", "group/task"])
 async def test_download_outputs_extracts_nested_archives(
@@ -366,11 +368,14 @@ async def test_download_outputs_extracts_nested_archives(
             assert not (tmp_path / "limited").exists()
 
 
+@pytest.mark.description("Artifact download validates paths and leaves out credentials.")
 @pytest.mark.parametrize("path", ["task/result.json", "task:one/result.json", "../escape", "task/../../escape"])
-async def test_artifact_download_validates_paths_and_omits_credentials(
-    make_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
-) -> None:
+async def test_artifact_download_validates_paths_and_omits_credentials(make_client, tmp_path: Path, path: str) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "download.test":
+            assert not any(name.lower().startswith("x-") for name in request.headers)
+            assert "authorization" not in request.headers
+            return httpx.Response(200, content=b"{}")
         assert request.headers["X-Api-Key"] == "vals-key"
         if request.url.path.endswith("download-url"):
             return httpx.Response(
@@ -378,13 +383,6 @@ async def test_artifact_download_validates_paths_and_omits_credentials(
             )
         return httpx.Response(200, json={"artifacts": [{"path": path, "size": 2}]})
 
-    async def download(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "download.test"
-        assert not any(name.lower().startswith("x-") for name in request.headers)
-        assert "authorization" not in request.headers
-        return httpx.Response(200, content=b"{}")
-
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", download)
     destination = tmp_path / "outputs"
     async with make_client(handler) as client:
         if ".." in path:
@@ -401,8 +399,8 @@ async def test_artifact_download_validates_paths_and_omits_credentials(
             assert not (tmp_path / "limited").exists()
 
 
+@pytest.mark.description("A task moving to a later page must not hide the remaining tasks.")
 async def test_task_iteration_continues_when_tasks_move_between_pages(make_client) -> None:
-    """A task moving to a later page must not hide the remaining tasks."""
     first, second, third = uuid4(), uuid4(), uuid4()
     offsets = []
 
@@ -436,8 +434,8 @@ async def test_task_iteration_continues_when_tasks_move_between_pages(make_clien
     assert offsets == [0, 2]
 
 
+@pytest.mark.description("Cancellation must not close a worker's input or leave published output behind.")
 async def test_cancelled_output_extraction_finishes_before_cleanup(make_client, monkeypatch, tmp_path: Path) -> None:
-    """Cancellation must not close a worker's input or leave published output behind."""
     from valkyrie.sdk.resources import runs
 
     started = threading.Event()
@@ -472,6 +470,72 @@ async def test_cancelled_output_extraction_finishes_before_cleanup(make_client, 
     assert not destination.exists()
 
 
+@pytest.mark.description("A cancelled output download still ends cancelled when the extraction it waits for fails.")
+async def test_cancelled_output_download_stays_cancelled_when_extraction_fails(make_client, monkeypatch) -> None:
+    from valkyrie.sdk.resources import runs
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def extract(stream, output_dir, **limits):
+        started.set()
+        assert release.wait(5)
+        raise ValueError("Run outputs exceed extraction limits")
+
+    monkeypatch.setattr(runs, "extract_output_archive", extract)
+    async with make_client(lambda request: httpx.Response(200, content=b"archive")) as client:
+        download = asyncio.create_task(client.runs.download_outputs(uuid4(), Path("unused")))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            download.cancel()
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await download
+
+
+@pytest.mark.description(
+    "A download cancelled while it publishes its output ends cancelled once the output is in place."
+)
+async def test_output_download_cancelled_during_publish_stays_cancelled(make_client, monkeypatch, tmp_path) -> None:
+    from valkyrie.sdk.resources import runs
+
+    started = threading.Event()
+    release = threading.Event()
+    destination = tmp_path / "outputs"
+    rename = Path.rename
+
+    def extract(stream, output_dir, **limits):
+        output_dir.mkdir()
+        return output_dir
+
+    def publish(self, target):
+        if Path(target) == destination:
+            started.set()
+            assert release.wait(5)
+        return rename(self, target)
+
+    monkeypatch.setattr(runs, "extract_output_archive", extract)
+    monkeypatch.setattr(Path, "rename", publish)
+    async with make_client(lambda request: httpx.Response(200, content=b"archive")) as client:
+        download = asyncio.create_task(client.runs.download_outputs(uuid4(), destination))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            download.cancel()
+            await asyncio.sleep(0)
+            assert not download.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await download
+
+    assert destination.is_dir()
+
+
+@pytest.mark.description(
+    "Extracting run output into an existing folder adds new files and leaves existing ones unchanged."
+)
 @pytest.mark.parametrize("collision", [False, True])
 async def test_output_archive_merges_existing_directory_without_overwriting(make_client, tmp_path, collision):
     nested = io.BytesIO()
@@ -491,7 +555,7 @@ async def test_output_archive_merges_existing_directory_without_overwriting(make
     destination = tmp_path / "outputs"
     async with make_client(lambda request: httpx.Response(200, content=outer.getvalue())) as client:
         if collision:
-            with pytest.raises(FileExistsError):
+            with pytest.raises(ValueError, match="collides"):
                 await client.runs.download_outputs(uuid4(), destination)
             assert not destination.exists()
         else:
@@ -500,6 +564,64 @@ async def test_output_archive_merges_existing_directory_without_overwriting(make
             assert (destination / "task/agent_output/summary.json").read_text() == "{}"
 
 
+@pytest.mark.description("Output files extracted from mode-zero entries stay readable and writable by their owner.")
+async def test_output_archive_keeps_mode_zero_files_readable(make_client, tmp_path: Path) -> None:
+    nested = io.BytesIO()
+    with tarfile.open(fileobj=nested, mode="w:gz") as archive:
+        member = tarfile.TarInfo("result.txt")
+        member.size = 6
+        member.mode = 0
+        archive.addfile(member, io.BytesIO(b"result"))
+    outer = io.BytesIO()
+    with tarfile.open(fileobj=outer, mode="w") as archive:
+        for name, content in {"task/agent_output.tar.gz": nested.getvalue(), "task/script.sh": b"run"}.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(content)
+            member.mode = 0 if name.endswith(".gz") else 0o755
+            archive.addfile(member, io.BytesIO(content))
+    destination = tmp_path / "outputs"
+    async with make_client(lambda request: httpx.Response(200, content=outer.getvalue())) as client:
+        await client.runs.download_outputs(uuid4(), destination)
+    result = destination / "task/agent_output/result.txt"
+    assert result.read_text() == "result"
+    assert result.stat().st_mode & 0o777 == 0o600
+    assert (destination / "task/script.sh").stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.description("Output archive members whose paths collide as file and directory raise `ValueError`.")
+@pytest.mark.parametrize(
+    "members",
+    [
+        [("task", tarfile.REGTYPE), ("task/result.txt", tarfile.REGTYPE)],
+        [("task/result.txt", tarfile.REGTYPE), ("task", tarfile.REGTYPE)],
+        [("task/agent_output", tarfile.REGTYPE), ("task/agent_output.tar.gz", tarfile.REGTYPE)],
+        [("task", tarfile.REGTYPE), ("task/sub", tarfile.DIRTYPE)],
+        [("task/agent_output.tar.gz", tarfile.DIRTYPE)],
+    ],
+)
+async def test_output_archive_rejects_file_directory_collisions(
+    make_client, tmp_path: Path, members: list[tuple[str, bytes]]
+) -> None:
+    nested = io.BytesIO()
+    with tarfile.open(fileobj=nested, mode="w:gz"):
+        pass
+    outer = io.BytesIO()
+    with tarfile.open(fileobj=outer, mode="w") as archive:
+        for name, kind in members:
+            member = tarfile.TarInfo(name)
+            member.type = kind
+            content = nested.getvalue() if name.endswith(".tar.gz") else b"x"
+            if kind == tarfile.REGTYPE:
+                member.size = len(content)
+            archive.addfile(member, io.BytesIO(content) if kind == tarfile.REGTYPE else None)
+    destination = tmp_path / "outputs"
+    async with make_client(lambda request: httpx.Response(200, content=outer.getvalue())) as client:
+        with pytest.raises(ValueError, match="collides"):
+            await client.runs.download_outputs(uuid4(), destination)
+    assert not destination.exists()
+
+
+@pytest.mark.description("A cancelled output download leaves other callers' destinations alone.")
 async def test_cancelled_output_download_preserves_other_callers_destination(make_client, monkeypatch, tmp_path):
     from valkyrie.sdk.resources import runs
 
@@ -533,6 +655,7 @@ async def test_cancelled_output_download_preserves_other_callers_destination(mak
     assert list(tmp_path.iterdir()) == [destination]
 
 
+@pytest.mark.description("Artifact download on Windows rejects colons before writing.")
 async def test_windows_artifact_download_rejects_colons_before_writing(make_client, monkeypatch, tmp_path):
     from valkyrie.sdk.resources import artifacts
 
@@ -545,31 +668,29 @@ async def test_windows_artifact_download_rejects_colons_before_writing(make_clie
     assert not (tmp_path / "outputs").exists()
 
 
+@pytest.mark.description("Keep Tracker credentials on its origin and reject authenticated redirects.")
 @pytest.mark.parametrize(
     "url",
     ["https://tracker.test/file", "http://tracker.test/file", "https://tracker.test:8443/file"],
 )
-async def test_artifact_download_authenticates_only_tracker_origin(make_client, monkeypatch, tmp_path, url):
-    """Keep Tracker credentials on its origin and reject authenticated redirects."""
+async def test_artifact_download_authenticates_only_tracker_origin(make_client, tmp_path, url):
     redirect = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/file":
+            assert str(request.url) == url
+            if url == "https://tracker.test/file":
+                assert request.headers["x-api-key"] == "vals-key"
+            else:
+                assert not any(name.startswith("x-") for name in request.headers)
+                assert "authorization" not in request.headers
+            if redirect:
+                return httpx.Response(302, headers={"location": "https://other.test/file"})
+            return httpx.Response(200, content=b"{}")
         if request.url.path.endswith("download-url"):
             return httpx.Response(200, json={"path": "result", "download_url": url, "expires_in": 300, "size": 2})
         return httpx.Response(200, json={"artifacts": [{"path": "result", "size": 2}]})
 
-    async def download(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == url
-        if url == "https://tracker.test/file":
-            assert request.headers["x-api-key"] == "vals-key"
-        else:
-            assert not any(name.startswith("x-") for name in request.headers)
-            assert "authorization" not in request.headers
-        if redirect:
-            return httpx.Response(302, headers={"location": "https://other.test/file"})
-        return httpx.Response(200, content=b"{}")
-
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", download)
     async with make_client(handler) as client:
         result = await client.artifacts.download(uuid4(), tmp_path / "outputs")
         assert (result / "result").read_bytes() == b"{}"

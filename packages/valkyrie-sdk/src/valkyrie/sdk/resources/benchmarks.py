@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 from uuid import UUID
 
+from valkyrie.sdk.errors import ValkyrieInputError
 from valkyrie.sdk.models import (
     BenchmarkStatusResponse,
     FetchTasksRequest,
@@ -91,9 +92,9 @@ class BenchmarksResource:
     @staticmethod
     def _task_segment(task_id: str) -> str:
         if not task_id.strip():
-            raise ValueError("task_id must not be blank")
+            raise ValkyrieInputError("task_id must not be blank")
         if task_id in {".", ".."}:
-            raise ValueError("task_id must not be '.' or '..'")
+            raise ValkyrieInputError("task_id must not be '.' or '..'")
         if "/" in task_id:
-            raise ValueError("task_id must not contain '/'")
+            raise ValkyrieInputError("task_id must not contain '/'")
         return quote(task_id, safe="")

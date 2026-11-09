@@ -1,10 +1,3 @@
-"""Tests for CLI agent lifecycle commands.
-
-Run: uv run pytest tests/unit/cli/agent/test_lifecycle.py
-
-Push, download, removal and listing run end to end in tests/integration/local/cli/test_write_commands.py.
-"""
-
 import json
 
 import httpx
@@ -16,6 +9,7 @@ from valkyrie.cli.agent import agent
 from tests.unit.cli.conftest import MockTracker
 
 
+@pytest.mark.description("Agent list prints every agent without paging.")
 @pytest.mark.parametrize("count", [0, 12])
 @pytest.mark.parametrize("arguments", [["--all"], ["--format", "json"], ["--all", "--format", "JSON"]])
 def test_list_without_paging(tracker: MockTracker, cli_runner: CliRunner, count: int, arguments: list[str]) -> None:
@@ -38,6 +32,9 @@ def test_list_without_paging(tracker: MockTracker, cli_runner: CliRunner, count:
         assert "No agents found" in result.output
 
 
+@pytest.mark.description(
+    "`agent list` exits 1 with the bad timestamp in the message when a timestamp cannot be parsed."
+)
 def test_list_reports_a_malformed_timestamp_without_a_traceback(tracker: MockTracker, cli_runner: CliRunner) -> None:
     agents = [{"name": "agent", "last_modified": "yesterday"}]
     tracker.reply("GET", "/agents", httpx.Response(200, json={"agents": agents}))
@@ -46,3 +43,18 @@ def test_list_reports_a_malformed_timestamp_without_a_traceback(tracker: MockTra
 
     assert result.exit_code == 1
     assert "Invalid isoformat string: 'yesterday'" in result.output
+
+
+@pytest.mark.description("`agent remove` asks first, and `--yes` removes without a prompt so scripts can run it.")
+def test_remove_asks_unless_yes(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    tracker.reply("DELETE", "/agents/my-agent", httpx.Response(200, json={"name": "my-agent", "last_modified": None}))
+
+    declined = cli_runner.invoke(agent, ["remove", "my-agent"], input="n\n")
+    confirmed = cli_runner.invoke(agent, ["remove", "my-agent", "--yes"])
+
+    assert declined.exit_code == 0, declined.output
+    assert "Cancelled." in declined.output
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "?" not in confirmed.output
+    assert "removed successfully" in confirmed.output
+    assert len(tracker.requests) == 1

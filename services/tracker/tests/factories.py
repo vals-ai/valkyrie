@@ -1,5 +1,3 @@
-"""Typed database-model factories shared across tracker tests."""
-
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -37,26 +35,6 @@ def make_benchmark(
     label: str | None = None,
     session: Session | None = None,
 ) -> Benchmark:
-    """Build a benchmark with deterministic tracker defaults.
-
-    Arguments
-    - name: Benchmark catalog name.
-    - status: Initial benchmark status.
-    - org_id: Organization that owns the benchmark.
-    - contract: Optional agent contract; a deterministic contract is used by default.
-    - agent_name: Agent contract name stored with the benchmark.
-    - model: Optional agent contract model.
-    - dataset: Optional benchmark dataset.
-    - concurrency: Requested task concurrency.
-    - started_at: Optional fixed start time.
-    - started_by_id: Optional starter identifier.
-    - started_by_email: Optional starter identity.
-    - label: Optional benchmark label.
-    - session: Optional database session that persists the benchmark.
-
-    Returns
-    - A benchmark row, persisted when a session is provided.
-    """
     benchmark = Benchmark(
         org_id=org_id,
         name=name,
@@ -89,18 +67,6 @@ def make_task(
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
 ) -> Task:
-    """Build a task belonging to a benchmark.
-
-    Arguments
-    - benchmark: Parent benchmark row.
-    - task_id: Dataset task identifier.
-    - status: Initial task status.
-    - started_at: Optional fixed start time.
-    - finished_at: Optional fixed finish time.
-
-    Returns
-    - A task row ready to persist.
-    """
     task = Task(
         org_id=benchmark.org_id,
         benchmark=benchmark.id,
@@ -122,18 +88,6 @@ def make_evaluation_result(
     *,
     exit_reason: AgentCausedExitReason | None = None,
 ) -> EvaluationResult:
-    """Build an evaluation attempt for a task.
-
-    Arguments
-    - task: Task associated with the evaluation.
-    - instance_id: Benchmark-service instance identifier.
-    - result: Evaluation payload.
-    - created_at: Fixed ordering timestamp.
-    - exit_reason: Optional agent exit classification.
-
-    Returns
-    - An evaluation-result row ready to persist.
-    """
     return EvaluationResult(
         org_id=task.org_id,
         task=task.id,
@@ -157,23 +111,6 @@ def make_error_result(
     retry_scheduled: bool = False,
     failed_attempt_number: int | None = None,
 ) -> ErrorResult:
-    """Build an error attempt for a task.
-
-    Arguments
-    - task: Task associated with the error.
-    - error_message: Stored failure detail.
-    - created_at: Fixed ordering timestamp.
-    - producer: Optional component that produced the error.
-    - operation: Optional failed operation.
-    - error_type: Optional factual exception or error type.
-    - cause_code: Optional producer-owned cause code.
-    - category: Optional coarse failure classification.
-    - retry_scheduled: Whether this error caused a scheduled retry.
-    - failed_attempt_number: 1-indexed failed attempt that scheduled the next attempt.
-
-    Returns
-    - An error-result row ready to persist.
-    """
     return ErrorResult(
         org_id=task.org_id,
         task=task.id,

@@ -1,10 +1,4 @@
-"""Tests for putting a run in another project.
-
-Run: uv run pytest tests/unit/cli/run/test_retag.py
-
-Covers the project handle sent to Tracker and the checks made before any request.
-"""
-
+import pytest
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -18,6 +12,7 @@ from tests.unit.cli.conftest import MockTracker
 
 _RUN_ID = UUID("123e4567-e89b-12d3-a456-426614174000")
 _INTERNAL_BLOG = {
+    "id": "33333333-3333-4333-8333-333333333333",
     "handle": "internal-blog",
     "name": "Internal Blog",
     "spend_type": "internal",
@@ -29,6 +24,7 @@ _INTERNAL_BLOG = {
 }
 
 
+@pytest.mark.description("`run retag --project` sends the handle and prints the run's new project.")
 def test_retag_sends_the_project_handle_and_prints_it(cli_runner: CliRunner, tracker: MockTracker) -> None:
     tracker.reply("POST", f"/benchmarks/{_RUN_ID}/project", httpx.Response(200, json=_INTERNAL_BLOG))
 
@@ -39,6 +35,7 @@ def test_retag_sends_the_project_handle_and_prints_it(cli_runner: CliRunner, tra
     assert result.output == f"✓ Run {_RUN_ID} is now in project internal-blog.\n"
 
 
+@pytest.mark.description("`run retag` without `--project` exits 2 with an example handle and sends nothing.")
 def test_retag_without_project_names_the_flag_and_an_example(cli_runner: CliRunner, tracker: MockTracker) -> None:
     result = cli_runner.invoke(retag, [str(_RUN_ID)])
 
@@ -47,6 +44,9 @@ def test_retag_without_project_names_the_flag_and_an_example(cli_runner: CliRunn
     assert tracker.requests == []
 
 
+@pytest.mark.description(
+    "Retagging into an unknown project exits 1 and lists existing handles with escape characters shown as text."
+)
 def test_retag_into_an_unknown_project_shows_the_existing_ids_escaped(
     cli_runner: CliRunner, tracker: MockTracker
 ) -> None:
@@ -60,6 +60,7 @@ def test_retag_into_an_unknown_project_shows_the_existing_ids_escaped(
     assert "Existing projects: internal-blog, evil\\x1b[2K." in result.output
 
 
+@pytest.mark.description("Retag shows escape characters in the saved project name as visible text.")
 def test_retag_escapes_terminal_control_characters_in_the_saved_project(
     cli_runner: CliRunner, tracker: MockTracker
 ) -> None:

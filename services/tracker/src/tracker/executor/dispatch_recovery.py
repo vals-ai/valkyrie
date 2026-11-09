@@ -1,5 +1,3 @@
-"""Recover executor dispatches whose ECS task stopped before they finished."""
-
 from __future__ import annotations
 
 import logging
@@ -9,13 +7,15 @@ from threading import Event, Thread
 
 import boto3
 from botocore.config import Config
-from sqlalchemy import and_, delete, or_
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 
 from executor_protocol import ExecutorDispatchStatus
-from tracker.database.models import ExecutorDispatch, ExecutorDispatchPayload, FailureCategory
+from tracker.database.models import FailureCategory
 from tracker.database.session import engine
-from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW, dispatch_now, record_dispatch_failure
+from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW, record_dispatch_failure, unowned_pending_task_ids
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.egress_proxy.policy import PolicyStore
 from tracker.run_access_keys import delete_finished_run_keys
 
 _ECS_MISSING_GRACE = timedelta(minutes=10)
@@ -32,13 +32,9 @@ _STOPPED_TASK_FAILURES = {
 
 
 def _reconcile_stopped_tasks(session: Session) -> int:
-    """Fail queued or running dispatches whose ECS task is STOPPED or no longer known to ECS."""
-    cutoff = dispatch_now(session) - _ECS_MISSING_GRACE
-    candidates = session.exec(
-        select(ExecutorDispatch)
-        .where(col(ExecutorDispatch.status).in_((ExecutorDispatchStatus.QUEUED, ExecutorDispatchStatus.RUNNING)))
-        .where(col(ExecutorDispatch.ecs_task_arn).is_not(None))
-    ).all()
+    repository = ExecutorDispatchRepository(session)
+    cutoff = repository.now() - _ECS_MISSING_GRACE
+    candidates = repository.list_with_task_arn()
     if not candidates:
         return 0
     ecs = boto3.client("ecs", config=_ECS_CONFIG)
@@ -76,22 +72,9 @@ def _reconcile_stopped_tasks(session: Session) -> int:
 
 
 def _reconcile_expired_dispatches(session: Session) -> int:
-    now = dispatch_now(session)
-    cutoff = now - DISPATCH_CLAIM_WINDOW
-    expired = session.exec(
-        select(ExecutorDispatch).where(
-            or_(
-                and_(
-                    col(ExecutorDispatch.status) == ExecutorDispatchStatus.QUEUED,
-                    col(ExecutorDispatch.created_at) <= cutoff,
-                ),
-                and_(
-                    col(ExecutorDispatch.status) == ExecutorDispatchStatus.RUNNING,
-                    col(ExecutorDispatch.lease_expires_at) <= now,
-                ),
-            )
-        )
-    ).all()
+    repository = ExecutorDispatchRepository(session)
+    now = repository.now()
+    expired = repository.list_expired(now - DISPATCH_CLAIM_WINDOW, now)
     return sum(
         record_dispatch_failure(
             session,
@@ -116,19 +99,30 @@ def _reconcile_expired_dispatches(session: Session) -> int:
     )
 
 
-def reconcile_dispatches_once() -> int:
-    """Sweep payloads of non-queued dispatches, then fail dispatches whose ECS task stopped.
-
-    Each step commits on its own so the payload sweep lands even when ECS is unavailable.
-    """
+def report_unowned_pending_tasks() -> None:
     with Session(engine) as session:
-        session.exec(
-            delete(ExecutorDispatchPayload).where(
-                col(ExecutorDispatchPayload.dispatch_id).in_(
-                    select(ExecutorDispatch.id).where(col(ExecutorDispatch.status) != ExecutorDispatchStatus.QUEUED)
-                )
-            )
+        report_unowned_pending_tasks_in(session)
+
+
+def report_unowned_pending_tasks_in(session: Session) -> None:
+    unowned = {
+        benchmark.id: task_ids
+        for benchmark in BenchmarkRepository(session).list_in_progress_with_pending_tasks()
+        if (task_ids := unowned_pending_task_ids(session, benchmark))
+    }
+    for benchmark_id, task_ids in unowned.items():
+        _logger.warning(
+            "Run %s has %d PENDING task(s) that no active executor dispatch will run: %s",
+            benchmark_id,
+            len(task_ids),
+            ", ".join(task_ids),
+            extra={"event": "pending_tasks_without_executor", "benchmark_id": str(benchmark_id)},
         )
+
+
+def reconcile_dispatches_once() -> int:
+    with Session(engine) as session:
+        ExecutorDispatchRepository(session).delete_unqueued_payloads()
         session.commit()
         recovered = 0
         try:
@@ -146,7 +140,6 @@ def run_dispatch_recovery_loop(
     *,
     interval_seconds: float = _RECONCILIATION_INTERVAL_SECONDS,
 ) -> None:
-    """Reconcile immediately and keep retrying until shutdown."""
     while not stop_event.is_set():
         try:
             reconcile_dispatches_once()
@@ -156,15 +149,21 @@ def run_dispatch_recovery_loop(
                 extra={"event": "automatic_dispatch_recovery_failed"},
             )
         try:
+            report_unowned_pending_tasks()
+        except Exception:
+            _logger.exception("pending_tasks_without_executor_report_failed")
+        try:
             delete_finished_run_keys(engine)
         except Exception:
             _logger.exception("run_access_key_cleanup_failed")
+        try:
+            PolicyStore(engine).revoke_finished()
+        except Exception:
+            _logger.exception("egress_proxy_policy_cleanup_failed")
         stop_event.wait(interval_seconds)
 
 
 class AutomaticDispatchRecovery:
-    """Own the Tracker process's bounded dispatch-recovery thread lifecycle."""
-
     def __init__(
         self,
         *,

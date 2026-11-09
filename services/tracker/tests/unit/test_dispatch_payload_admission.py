@@ -1,23 +1,24 @@
-"""Tests for encrypted executor dispatch admission payloads."""
-
-import json
 import io
+import json
 import zipfile
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
-from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.schemas import VerifyTaskIdsResponse
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import main
-from main import app
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
+from main import app
 from tests.conftest import TEST_ORG_ID
 from tracker import config
+from tracker.auth import RequestIdentity, get_current_runner, get_current_starter
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -25,14 +26,19 @@ from tracker.database.models import (
     ExecutorDispatch,
     ExecutorDispatchPayload,
     ExecutorRelease,
+    Org,
+    Project,
+    RunMonitoringRules,
     Task,
     TaskStatus,
+    UserBenchmarkService,
 )
 from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.executor.release_control import promote_release
+from tracker.local import config as local_config
+from tracker.local.resources import LocalResources
 from tracker.runtime.storage import ObjectStore
 from tracker.types import StartBenchmarkRequest
-
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
 client = TestClient(app)
@@ -54,7 +60,6 @@ def _configure_managed_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_S3_BUCKET", "deployment-bucket")
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_GROUP", "deployment-log-group")
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "30")
-    monkeypatch.setattr(config, "AWS_MANAGED_SUBMISSIONS_ENABLED", True)
 
 
 def _capture_dispatch_payloads(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> list[dict[str, Any]]:
@@ -124,6 +129,7 @@ def _start_request(contract: AgentContractRequest) -> StartBenchmarkRequest:
     )
 
 
+@pytest.mark.description("Managed start and resume emit a v3 payload with no credentials.")
 def test_managed_start_and_resume_emit_credential_free_v3(
     contract: AgentContractRequest,
     database_session: Session,
@@ -158,7 +164,6 @@ def test_managed_start_and_resume_emit_credential_free_v3(
 
     _stop_benchmark(benchmark, database_session)
     payloads.clear()
-    monkeypatch.setattr(config, "AWS_MANAGED_SUBMISSIONS_ENABLED", False)
 
     response = client.post(
         f"/retry-or-resume-benchmark/{benchmark.id}",
@@ -190,10 +195,128 @@ def test_managed_start_and_resume_emit_credential_free_v3(
     assert payloads == []
 
 
+@pytest.mark.description("A managed run without a project keeps the gateway references it was given.")
+def test_projectless_managed_run_keeps_supplied_gateway_references(
+    contract: AgentContractRequest,
+    database_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+    org = database_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    org.name = "vals.ai"
+    database_session.add(org)
+    database_session.commit()
+    identity = RequestIdentity(org=org)
+    monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
+    monkeypatch.setitem(app.dependency_overrides, get_current_runner, lambda: identity)
+    monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_MACHINE_API_KEY", raising=False)
+    _configure_managed_runtime(monkeypatch)
+    _promote_test_release(database_session)
+    payloads = _capture_dispatch_payloads(monkeypatch, database_session)
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "verify_task_ids", AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["task-1"]))
+    )
+    request = _start_request(
+        contract.model_copy(
+            update={"secrets": {"MODEL_GATEWAY_URL": "caller-url", "MODEL_GATEWAY_API_KEY": "caller-key"}}
+        )
+    )
+
+    response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["project"] is None
+    assert len(payloads) == 1
+    assert payloads[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"] == {
+        "MODEL_GATEWAY_URL": "caller-url",
+        "MODEL_GATEWAY_API_KEY": "caller-key",
+    }
+
+
+@pytest.mark.description("A project selected only by file keeps its manual gateway references.")
+def test_file_only_selected_project_keeps_manual_gateway_references(
+    contract: AgentContractRequest,
+    database_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from tracker import project_gateway
+
+    monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+    monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("MODEL_GATEWAY_MACHINE_API_KEY", raising=False)
+    org = database_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    org.name = "vals.ai"
+    database_session.add(org)
+    database_session.commit()
+    identity = RequestIdentity(org=org)
+    monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
+    monkeypatch.setitem(app.dependency_overrides, get_current_runner, lambda: identity)
+
+    secrets_file = tmp_path / "credentials.env"
+    secrets_file.write_text("MODEL_GATEWAY_URL=https://manual.example\nMODEL_GATEWAY_API_KEY=manual-key\n")
+    monkeypatch.setattr(
+        local_config,
+        "resources",
+        LocalResources(data_root=tmp_path / "runs", secrets_file=secrets_file),
+    )
+    monkeypatch.setattr(main, "SANDBOX_QUEUE_ENABLED", False)
+    monkeypatch.setattr(
+        project_gateway,
+        "project_gateway_configuration",
+        lambda: (_ for _ in ()).throw(AssertionError("file-only execution must not configure Gateway")),
+    )
+    _promote_test_release(database_session)
+    payloads = _capture_dispatch_payloads(monkeypatch, database_session)
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "verify_task_ids", AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["task-1"]))
+    )
+    database_session.add(
+        UserBenchmarkService(
+            org_id=TEST_ORG_ID,
+            user_id="local",
+            benchmark="producer-contract-test",
+            url="http://localhost:8001",
+        )
+    )
+    database_session.commit()
+    local_client = TestClient(app, base_url="http://localhost")
+    created = local_client.post(
+        "/projects",
+        json={"handle": "manual", "name": "Manual Gateway", "spend_type": "internal", "subcategory": "blog"},
+    )
+    assert created.status_code == 200, created.text
+    (project,) = database_session.exec(select(Project)).all()
+    assert (project.gateway_request_id, project.gateway_key_id) == (None, None)
+    request = _start_request(
+        contract.model_copy(
+            update={"secrets": {"MODEL_GATEWAY_URL": "caller-url", "MODEL_GATEWAY_API_KEY": "caller-key"}}
+        )
+    ).model_copy(
+        update={
+            "sandbox_provider": "docker",
+            "sandbox_provider_secret_name": None,
+            "project": "manual",
+        }
+    )
+
+    response = local_client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+    assert response.status_code == 200, response.text
+    assert len(payloads) == 1
+    assert payloads[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"] == {
+        "MODEL_GATEWAY_URL": "caller-url",
+        "MODEL_GATEWAY_API_KEY": "caller-key",
+    }
+
+
+@pytest.mark.description("Rebuilding from the bundle is what makes the settings trustworthy.")
 async def test_resolving_a_contract_from_s3_attests_its_inference_settings(
     contract: AgentContractRequest,
 ) -> None:
-    """Rebuilding from the bundle is what makes the settings trustworthy."""
     contract = contract.model_copy(
         update={"model": "test-model", "kwargs": {"variant": "custom"}, "secrets": {"API_KEY": "override"}}
     )
@@ -224,12 +347,12 @@ async def test_resolving_a_contract_from_s3_attests_its_inference_settings(
     object_store.get_bytes.assert_awaited_once_with("agents/dummy.zip")
 
 
+@pytest.mark.description("A caller cannot mark its own inference settings tracker-attested.")
 def test_start_clears_a_caller_asserted_attestation(
     contract: AgentContractRequest,
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A caller cannot mark its own inference settings tracker-attested."""
     _configure_managed_runtime(monkeypatch)
     _promote_test_release(database_session)
     payloads = _capture_dispatch_payloads(monkeypatch, database_session)
@@ -269,6 +392,7 @@ def test_start_clears_a_caller_asserted_attestation(
     _stop_benchmark(benchmark, database_session)
 
 
+@pytest.mark.description("A managed start with AWS authority is rejected before anything is saved.")
 def test_managed_start_rejects_aws_authority_before_persistence(
     contract: AgentContractRequest,
     database_session: Session,
@@ -291,6 +415,7 @@ def test_managed_start_rejects_aws_authority_before_persistence(
     assert payloads == []
 
 
+@pytest.mark.description("A managed start whose contract adds AWS credentials is rejected and saves no run or payload.")
 def test_managed_start_rejects_aws_authority_from_resolved_contract(
     contract: AgentContractRequest,
     database_session: Session,
@@ -311,6 +436,7 @@ def test_managed_start_rejects_aws_authority_from_resolved_contract(
     assert payloads == []
 
 
+@pytest.mark.description("Short secret names in a managed contract are saved with the org's secret prefix.")
 def test_managed_start_and_resume_store_short_secret_names_under_the_org_prefix(
     contract: AgentContractRequest,
     database_session: Session,
@@ -350,6 +476,7 @@ def test_managed_start_and_resume_store_short_secret_names_under_the_org_prefix(
     assert benchmark.arguments.contract.secrets["EXTRA_KEY"] == f"{prefix}extra-key"
 
 
+@pytest.mark.description("A managed start cannot use another org's secret by its short name.")
 def test_managed_start_rejects_another_orgs_secret_by_its_short_name(
     contract: AgentContractRequest,
     database_session: Session,
@@ -373,6 +500,7 @@ def test_managed_start_rejects_another_orgs_secret_by_its_short_name(
     assert payloads == []
 
 
+@pytest.mark.description("A managed start needs a compatible executor release.")
 @pytest.mark.parametrize("protocol_version", ["1", "2"])
 def test_managed_start_requires_a_compatible_executor_release(
     protocol_version: str,
@@ -393,6 +521,9 @@ def test_managed_start_requires_a_compatible_executor_release(
     assert database_session.exec(select(Benchmark).where(Benchmark.name == "producer-contract-test")).all() == []
 
 
+@pytest.mark.description(
+    "A resume against an incompatible active release leaves the run `STOPPED` and writes no payload."
+)
 def test_managed_resume_rolls_back_when_the_active_release_is_incompatible(
     contract: AgentContractRequest,
     database_session: Session,
@@ -436,6 +567,7 @@ def test_managed_resume_rolls_back_when_the_active_release_is_incompatible(
     assert payloads == []
 
 
+@pytest.mark.description("A payload failure on managed resume rolls back the recovery state.")
 def test_managed_resume_payload_failure_rolls_back_recovery_state(
     contract: AgentContractRequest,
     database_session: Session,
@@ -496,3 +628,44 @@ def test_managed_resume_payload_failure_rolls_back_recovery_state(
         ).all()
     } == original_dispatch_ids
     assert payloads == []
+
+
+class _MonitoringClient:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def monitoring_requirements(self, task_ids, dataset=None):
+        self.calls.append((task_ids, dataset))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.asyncio
+@pytest.mark.description("Run start stores the monitor rules the benchmark declares for its tasks.")
+async def test_monitoring_rules_come_from_the_benchmark():
+    declared = RunMonitoringRules(policy="Range only", watcher_policy_pack="core+cyber-range", allowed_hosts=["local"])
+    client = _MonitoringClient(declared)
+
+    assert await main._monitoring_rules(client, ["task"], "ga") == declared
+    assert client.calls == [(["task"], "ga")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.description("A benchmark without the monitoring route starts with the monitor's default rules.")
+async def test_benchmark_without_monitoring_route_has_no_rules():
+    client = _MonitoringClient(BenchmarkServiceError("missing", status_code=404))
+
+    assert await main._monitoring_rules(client, ["task"], None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.description("A monitored run does not start when the benchmark cannot return its rules.")
+async def test_monitoring_rules_failure_blocks_the_run():
+    client = _MonitoringClient(BenchmarkServiceError("failed", status_code=500))
+
+    with pytest.raises(HTTPException) as error:
+        await main._monitoring_rules(client, ["task"], None)
+
+    assert error.value.status_code == 502

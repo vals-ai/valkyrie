@@ -1,8 +1,3 @@
-"""Cover benchmark-service catalog and health routes.
-
-Run with `uv run pytest tests/unit/api/test_benchmark_services.py`.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
@@ -22,7 +17,6 @@ _ResponseHandler = Callable[[httpx.Request], Coroutine[None, None, httpx.Respons
 
 
 def _install_http_transport(monkeypatch: pytest.MonkeyPatch, handler: _ResponseHandler) -> None:
-    """Route outbound HTTP requests through the supplied in-process handler."""
     transport = httpx.MockTransport(handler)
     original_client = httpx.AsyncClient
 
@@ -32,16 +26,18 @@ def _install_http_transport(monkeypatch: pytest.MonkeyPatch, handler: _ResponseH
     monkeypatch.setattr(httpx, "AsyncClient", build_client)
 
 
+@pytest.mark.description("Benchmark service catalog responses and errors.")
 class TestBenchmarkServicesCatalog:
-    """Benchmark service catalog responses and errors."""
-
+    @pytest.mark.description(
+        (
+            "Tracker should own catalog lookup so clients only need the tracker API.\n"
+            "\n"
+            "Test cases:\n"
+            "- The endpoint forwards the caller API key to the catalog API.\n"
+            "- Catalog responses are returned as benchmark service entries."
+        )
+    )
     def test_benchmark_services_endpoint_fetches_catalog(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Tracker should own catalog lookup so clients only need the tracker API.
-
-        Test cases:
-        - The endpoint forwards the caller API key to the catalog API.
-        - Catalog responses are returned as benchmark service entries.
-        """
         requests: list[httpx.Request] = []
 
         async def handle_request(request: httpx.Request) -> httpx.Response:
@@ -70,15 +66,18 @@ class TestBenchmarkServicesCatalog:
             ]
         }
 
+    @pytest.mark.description(
+        (
+            "A catalog payload without services must preserve the empty result contract.\n"
+            "\n"
+            "Test cases:\n"
+            "- A successful object with no services key returns an empty list."
+        )
+    )
     def test_benchmark_services_endpoint_defaults_missing_services_to_empty(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A catalog payload without services must preserve the empty result contract.
-
-        Test cases:
-        - A successful object with no services key returns an empty list.
-        """
 
         async def handle_request(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={})
@@ -91,14 +90,16 @@ class TestBenchmarkServicesCatalog:
         assert response.status_code == 200
         assert response.json() == {"services": []}
 
+    @pytest.mark.description(
+        (
+            "Downstream catalog failures retain only a stable public error.\n"
+            "\n"
+            "Test cases:\n"
+            "- The downstream status remains available to the caller.\n"
+            "- The downstream response body is not reflected."
+        )
+    )
     def test_benchmark_services_endpoint_hides_catalog_error_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """
-        Verify downstream catalog failures retain only a stable public error.
-
-        Test cases:
-        - The downstream status remains available to the caller.
-        - The downstream response body is not reflected.
-        """
         sensitive_detail = "sensitive-catalog-provider-detail"
 
         async def handle_request(_request: httpx.Request) -> httpx.Response:
@@ -113,15 +114,18 @@ class TestBenchmarkServicesCatalog:
         assert response.json() == {"detail": "Failed to list benchmark services"}
         assert sensitive_detail not in response.text
 
+    @pytest.mark.description(
+        (
+            "Catalog connection failures must not reflect provider exception text.\n"
+            "\n"
+            "Test cases:\n"
+            "- A transport failure returns a stable 502 and hides its sensitive detail."
+        )
+    )
     def test_benchmark_services_endpoint_hides_catalog_transport_error_detail(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Catalog connection failures must not reflect provider exception text.
-
-        Test cases:
-        - A transport failure returns a stable 502 and hides its sensitive detail.
-        """
         sensitive_detail = "sensitive-catalog-transport-detail"
 
         async def handle_request(request: httpx.Request) -> httpx.Response:
@@ -136,6 +140,14 @@ class TestBenchmarkServicesCatalog:
         assert response.json() == {"detail": "Failed to list benchmark services"}
         assert sensitive_detail not in response.text
 
+    @pytest.mark.description(
+        (
+            "Malformed successful catalog responses must map to one stable client error.\n"
+            "\n"
+            "Test cases:\n"
+            "- Invalid JSON, shape, service entries, and services values all return 502."
+        )
+    )
     @pytest.mark.parametrize(
         "catalog_response",
         [
@@ -153,11 +165,6 @@ class TestBenchmarkServicesCatalog:
         monkeypatch: pytest.MonkeyPatch,
         catalog_response: httpx.Response,
     ) -> None:
-        """Malformed successful catalog responses must map to one stable client error.
-
-        Test cases:
-        - Invalid JSON, shape, service entries, and services values all return 502.
-        """
 
         async def handle_request(_request: httpx.Request) -> httpx.Response:
             return catalog_response
@@ -171,15 +178,17 @@ class TestBenchmarkServicesCatalog:
         assert response.json() == {"detail": "Failed to list benchmark services"}
 
 
+@pytest.mark.description("Benchmark service health request behavior.")
 class TestPingService:
-    """Benchmark service health request behavior."""
-
+    @pytest.mark.description(
+        (
+            "Health checks must append the service contract's health path exactly once.\n"
+            "\n"
+            "Test cases:\n"
+            "- A healthy response records the expected URL and returns healthy status."
+        )
+    )
     async def test_ping_service_appends_health_path(self) -> None:
-        """Health checks must append the service contract's health path exactly once.
-
-        Test cases:
-        - A healthy response records the expected URL and returns healthy status.
-        """
         mock_client = SimpleNamespace(requested_url=None)
 
         async def mock_get(url: str) -> httpx.Response:
@@ -198,12 +207,15 @@ class TestPingService:
         assert result.healthy is True
         assert result.error is None
 
+    @pytest.mark.description(
+        (
+            "Health transport failures must stay useful in logs without leaking to API clients.\n"
+            "\n"
+            "Test cases:\n"
+            "- The public result is stable while the original exception is logged."
+        )
+    )
     async def test_ping_service_hides_request_errors_and_logs_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Health transport failures must stay useful in logs without leaking to API clients.
-
-        Test cases:
-        - The public result is stable while the original exception is logged.
-        """
         sensitive_detail = "sensitive-benchmark-service-transport-detail"
         error = httpx.ConnectError(
             sensitive_detail,
@@ -233,18 +245,20 @@ class TestPingService:
         )
 
 
+@pytest.mark.description("Benchmark service endpoint health aggregation.")
 class TestBenchmarkServicesHealth:
-    """Benchmark service endpoint health aggregation."""
-
+    @pytest.mark.description(
+        (
+            "The health route must hide provider transport details in its response.\n"
+            "\n"
+            "Test cases:\n"
+            "- A failed service ping returns an unhealthy entry with a stable error."
+        )
+    )
     def test_benchmark_services_endpoint_hides_health_transport_error_detail(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The health route must hide provider transport details in its response.
-
-        Test cases:
-        - A failed service ping returns an unhealthy entry with a stable error.
-        """
         sensitive_detail = "sensitive-benchmark-service-transport-detail"
 
         async def handle_request(request: httpx.Request) -> httpx.Response:
@@ -271,6 +285,7 @@ class TestBenchmarkServicesHealth:
         }
         assert sensitive_detail not in response.text
 
+    @pytest.mark.description("The benchmark services health route refuses an internal destination given from outside.")
     def test_benchmark_services_endpoint_blocks_external_internal_destination(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -293,6 +308,7 @@ class TestBenchmarkServicesHealth:
         assert response.json() == {"detail": "Custom benchmark destination is not allowed"}
         assert requests == []
 
+    @pytest.mark.description("The benchmark services health route allows a Vals catalog destination.")
     def test_benchmark_services_endpoint_allows_vals_catalog_destination(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -311,12 +327,15 @@ class TestBenchmarkServicesHealth:
         assert response.status_code == 200
         assert response.json()["services"][0]["healthy"]
 
+    @pytest.mark.description(
+        (
+            "An empty health-check request must preserve the successful empty contract.\n"
+            "\n"
+            "Test cases:\n"
+            "- Empty input returns an empty result."
+        )
+    )
     def test_benchmark_services_endpoint_returns_empty_services(self) -> None:
-        """An empty health-check request must preserve the successful empty contract.
-
-        Test cases:
-        - Empty input returns an empty result.
-        """
         response = _client.post("/benchmark-services", json={"services": []})
 
         assert response.status_code == 200

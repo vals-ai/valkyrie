@@ -19,7 +19,7 @@ _UNFINISHED_RUN_MESSAGES = {
 
 @click.command(
     name="analyze",
-    help="Trigger Docent ingestion + error analysis for a finished run.",
+    help="Analyze a finished run's errors with Docent.",
 )
 @click.argument("run_id", type=UUID)
 @click.option(
@@ -29,7 +29,6 @@ _UNFINISHED_RUN_MESSAGES = {
     help="Bypass the cached reading-plan URL and re-fire ingestion.",
 )
 def analyze(run_id: UUID, no_cache: bool) -> None:
-    """Trigger Docent ingestion + error analysis for a finished run."""
 
     async def run_analysis(client: ValkyrieClient) -> dict[str, Any] | None:
         metadata = await client.runs.metadata(run_id)
@@ -44,7 +43,6 @@ def analyze(run_id: UUID, no_cache: bool) -> None:
                 elif event.event == "done":
                     result = event.data
         except ValkyrieAPIError as error:
-            # Tracker refuses unfinished runs with "status is <STATUS> (must be FINISHED)"; that's "come back later".
             detail = str(error.detail)
             status = next((status for status in _UNFINISHED_RUN_MESSAGES if f"status is {status}" in detail), None)
             if "must be FINISHED" not in detail or status is None:
@@ -64,11 +62,6 @@ def analyze(run_id: UUID, no_cache: bool) -> None:
 
 
 async def _ingest_lambda(client: ValkyrieClient, agent_name: str) -> str:
-    """Read `ingest_lambda` from the agent's currently pushed contract, not the run's stored copy.
-
-    That lets past runs be analyzed once the agent's contract declares an analyzer Lambda. Only that field is
-    read, so a contract that current validation would reject in other fields still works.
-    """
     try:
         with tempfile.TemporaryDirectory() as directory:
             agent_path = Path(await client.agents.download(agent_name, directory))

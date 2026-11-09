@@ -1,28 +1,29 @@
-"""Store, list, and remove the tenant's own run secrets through Tracker."""
-
 import click
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table
+from valkyrie.cli.display import format_option, format_table
 
 
-@click.group()
+@click.group(help="Store secrets that your runs reference.")
 def secret() -> None:
-    """Store secrets that your runs reference"""
+    pass
 
 
-@secret.command(name="set")
+@secret.command(
+    name="set",
+    help=(
+        "Store a secret, replacing its value if it already exists.\n"
+        "\n"
+        "Reads one line from a hidden prompt, or all of stdin when piped, for multi-line values like JSON. The value is\n"
+        "never taken from the command line. Prints the reference to use as the secret name.\n"
+        "\n"
+        "Example:\n"
+        "    valkyrie secret set openai-key\n"
+        "    valkyrie secret set daytona < daytona.json"
+    ),
+)
 @click.argument("name", type=str)
 def set_secret(name: str) -> None:
-    """Store a secret, replacing its value if it already exists.
-
-    Reads one line from a hidden prompt, or the whole value from stdin when piped; pipe multi-line values such
-    as JSON. The value is never taken from the command line. Prints the reference to use as the secret name.
-
-    Example:
-        valkyrie secret set openai-key
-        valkyrie secret set daytona < daytona.json
-    """
     stdin = click.get_text_stream("stdin")
     value = (click.prompt("Value", hide_input=True) if stdin.isatty() else stdin.read()).strip()
     if not value:
@@ -32,20 +33,16 @@ def set_secret(name: str) -> None:
     click.echo(f"Use this reference as the secret name: {entry.reference}")
 
 
-@secret.command(name="list")
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
+@secret.command(
+    name="list",
+    help=(
+        "List stored secrets by name, without their values.\n"
+        "\n"
+        "Secrets set or removed in the last few minutes may not show up yet."
+    ),
 )
+@format_option()
 def list_secrets(output_format: str) -> None:
-    """List stored secrets by name, without their values.
-
-    Secrets set or removed in the last few minutes may not show up yet.
-    """
     response = call(lambda client: client.secrets.list())
     if output_format == "json":
         click.echo(response.model_dump_json())
@@ -57,11 +54,10 @@ def list_secrets(output_format: str) -> None:
     )
 
 
-@secret.command(name="remove")
+@secret.command(name="remove", help="Delete a stored secret. It cannot be recovered.")
 @click.argument("name", type=str)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 def remove_secret(name: str, yes: bool) -> None:
-    """Delete a stored secret. It cannot be recovered."""
     if not yes and not click.confirm(f"Delete secret '{name}'? Runs that reference it will fail."):
         click.echo("Cancelled.")
         return

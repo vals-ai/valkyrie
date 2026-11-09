@@ -4,8 +4,8 @@ description: "Follow a run's progress, find failed tasks, read logs, and search 
 ---
 
 Follow a run while it goes, find out why tasks failed, and look up earlier runs. Every
-command is in the [`valkyrie run` reference](/reference/cli/run). To do the same from Python,
-see [Manage runs with Python](/sdk/runs).
+command is in the [`valkyrie run` reference](/reference/cli/run). To do the same from
+Python, see [Manage runs with Python](/sdk/runs).
 
 In the commands on this page, replace *`RUN_ID`* with the run's ID, which
 `valkyrie run start` prints, and *`TASK_ID`* with a task's
@@ -31,9 +31,10 @@ valkyrie run fetch RUN_ID --connect --format jsonl
 ```
 
 Each line is a JSON record with an `event` field. The first record is a `snapshot`, then
-`update` records follow, and the last is one of `complete`, `error`, `stopped`, `disconnect`,
-or `interrupted`. If the stream ends without a final record, the command exits with 1. In
-these records, `finished_tasks` counts tasks that finished, failed, or stopped.
+`update` records follow, and the last is one of `complete`, `error`, `stopped`,
+`disconnect`, or `interrupted`. If the stream ends without a final record, the command
+exits with 1. In these records, `finished_tasks` counts tasks that finished, failed, or
+stopped.
 
 ## Check several runs at once
 
@@ -80,9 +81,9 @@ The output includes the task's exit reason and its time breakdown:
 | --- | --- |
 | `agent_caused_exit_reason` | `TIMEOUT` when the generation limit stopped the agent, or `OS_KILLED` when the operating system stopped it |
 | `base_generation_allowance_seconds` | The task's generation limit, or `null` for none |
-| `generation_elapsed_seconds` | Charged generation time; ordinary runs end at provider-confirmed agent absence, not later result or cleanup |
+| `generation_elapsed_seconds` | Generation time counted against the limit |
 | `sandbox_build_duration` | Seconds spent creating the sandbox |
-| `agent_run_duration` | Controlled-command duration; ordinary runs end at the same confirmed absence but use a separately recorded start from charged generation time |
+| `agent_run_duration` | Seconds the agent's command ran, timed from its own start, so it can differ from `generation_elapsed_seconds` |
 | `evaluation_run_duration` | Seconds spent grading |
 
 See [Task time limits](/runs/time-limits) for what counts toward each limit.
@@ -101,7 +102,8 @@ valkyrie run logs RUN_ID --task-id TASK_ID --query "rate limit" \
   --since 2026-01-01T00:00:00Z --until 2026-01-01T01:00:00Z
 ```
 
-To watch new log lines arrive, add `--follow` with `--task-id`. For scripts, add `--format jsonl`.
+To watch new log lines arrive, add `--follow` with `--task-id`. For scripts, add
+`--format jsonl`.
 
 ## Search your run history
 

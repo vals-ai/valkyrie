@@ -1,8 +1,3 @@
-"""Tests for run list output and pagination contracts.
-
-Run: uv run pytest tests/unit/cli/run/test_list.py
-"""
-
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -41,7 +36,6 @@ def make_row(index: int) -> BenchmarkTableRow:
 def invoke_with_pages(
     tracker: MockTracker, pages: dict[str, FetchBenchmarksResponse | Exception], args: list[str]
 ) -> Result:
-    """Serve run-list pages keyed by the request's cursor."""
 
     def page(request: httpx.Request) -> httpx.Response:
         response = pages[request.url.params.get("cursor", "")]
@@ -54,6 +48,7 @@ def invoke_with_pages(
     return CliRunner().invoke(list_runs, args)
 
 
+@pytest.mark.description("`--json --all` reads every page and keeps the filters.")
 def test_list_json_all_exhausts_cursor_pages_and_preserves_filters(tracker: MockTracker) -> None:
     first_page = [make_row(index) for index in range(500)]
     final_row = make_row(500)
@@ -115,6 +110,7 @@ def test_list_json_all_exhausts_cursor_pages_and_preserves_filters(tracker: Mock
         }
 
 
+@pytest.mark.description("`run list --json --all` prints `NaN` and infinite scores as `null`.")
 @pytest.mark.parametrize("final_score", [None, float("nan"), float("inf"), float("-inf")])
 def test_list_json_all_normalizes_non_finite_scores(tracker: MockTracker, final_score: float | None) -> None:
     rows = [] if final_score is None else [make_row(0).model_copy(update={"final_score": final_score})]
@@ -129,6 +125,7 @@ def test_list_json_all_normalizes_non_finite_scores(tracker: MockTracker, final_
     assert [run["final_score"] for run in payload["runs"]] == [None] * len(rows)
 
 
+@pytest.mark.description("`--json --all` prints nothing when a later page fails.")
 def test_list_json_all_does_not_emit_partial_output_after_later_page_failure(tracker: MockTracker) -> None:
     pages: dict[str, FetchBenchmarksResponse | Exception] = {
         "": FetchBenchmarksResponse(benchmarks=[make_row(0)], next_cursor="page-2"),
@@ -142,6 +139,7 @@ def test_list_json_all_does_not_emit_partial_output_after_later_page_failure(tra
     assert "second page failed" in result.stderr
 
 
+@pytest.mark.description("Machine output flags are validated before any request.")
 @pytest.mark.parametrize(
     ("args", "expected_error"),
     [
@@ -159,6 +157,7 @@ def test_list_machine_flags_validate_before_any_request(
     assert tracker.requests == []
 
 
+@pytest.mark.description("Text list shows one page or the active filters.")
 @pytest.mark.parametrize("count", [2, 0])
 def test_list_text_renders_one_page_or_the_active_filters(tracker: MockTracker, count: int) -> None:
     rows = [make_row(index) for index in range(count)]

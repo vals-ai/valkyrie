@@ -7,12 +7,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from .._sse import error_detail, server_sent_events
-from ..errors import ValkyrieRunError, ValkyrieStreamError
-from ..models.logs import LogEvent, LogPage
+from valkyrie.sdk._sse import error_detail, server_sent_events
+from valkyrie.sdk.errors import ValkyrieRunError, ValkyrieStreamError
+from valkyrie.sdk.models.logs import LogEvent, LogPage
 
 if TYPE_CHECKING:
-    from ..client import ValkyrieClient
+    from valkyrie.sdk.client import ValkyrieClient
 
 
 class LogsResource:

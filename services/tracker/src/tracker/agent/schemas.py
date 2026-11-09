@@ -1,5 +1,3 @@
-"""Agent contract schemas (declarative YAML contract + AgentConfig)."""
-
 import re
 from enum import Enum
 from pathlib import Path
@@ -26,27 +24,20 @@ _AGENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def validate_agent_name(name: str) -> str:
-    """Validate an agent name before it is used as an S3 key and bundle folder name."""
     if not name or not _AGENT_NAME_PATTERN.fullmatch(name) or name in {".", ".."}:
         raise ValueError(f"Invalid agent name {name!r}: use only letters, digits, dots, dashes, or underscores.")
     return name
 
 
 class Defaults(str, Enum):
-    """Task and problem-path command placeholders."""
-
     PROBLEM_STATEMENT_PATH = "problem_statement_path"
     TASK_ID = "task_id"
 
 
 class AgentConfig(BaseModel):
-    """Configuration for the agent."""
-
     model: str | None = None
-    """Model key (e.g., openai/gpt-4o)"""
 
     kwargs: dict[str, Any] = {}
-    """Additional arguments to pass into the agent"""
 
 
 ParameterType = Literal["float", "bool", "dict", "int", "str"]
@@ -61,14 +52,13 @@ class Parameter(BaseModel):
 
 
 class AgentContract(BaseModel):
-    """Declarative YAML agent contract."""
-
     name: str
     install_cmd: str
     final_output: Path | None = None
     output_artifacts: list[OutputArtifactSpec] = []
     egress_allowlist: list[str] = []
     install_egress: EgressPolicy | None = None
+    allow_provider_tools: bool = False
     secrets: dict[str, str] = {}
     ingest_lambda: str | None = None
     defaults: dict[str, Parameter] = {}

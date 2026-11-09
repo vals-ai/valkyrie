@@ -1,8 +1,3 @@
-"""Unit tests for the per-benchmark agent freeze helper.
-
-Run: uv run pytest tests/unit/agent/test_freeze.py
-"""
-
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,9 +7,17 @@ from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import S3ObjectCopy, copy_agent_to_benchmark
 
 
+@pytest.mark.description("Agent source copies into benchmark workspaces.")
 class TestCopyAgentToBenchmark:
-    """Agent source copies into benchmark workspaces."""
-
+    @pytest.mark.description(
+        (
+            "Copy an agent once so retries keep using the frozen benchmark version.\n"
+            "\n"
+            "Test cases:\n"
+            "- A missing destination receives the current agent archive.\n"
+            "- An existing destination is not overwritten during retry or resume."
+        )
+    )
     @pytest.mark.parametrize("destination_exists", [False, True])
     async def test_preserves_frozen_agent_copy(
         self,
@@ -22,12 +25,6 @@ class TestCopyAgentToBenchmark:
         monkeypatch: pytest.MonkeyPatch,
         destination_exists: bool,
     ) -> None:
-        """Copy an agent once so retries keep using the frozen benchmark version.
-
-        Test cases:
-        - A missing destination receives the current agent archive.
-        - An existing destination is not overwritten during retry or resume.
-        """
         exists_mock = AsyncMock(return_value=destination_exists)
         copy_mock = AsyncMock(return_value="version-1")
 

@@ -1,10 +1,10 @@
-"""AWS client providers for tracker runtimes."""
-
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from functools import lru_cache
+from threading import Lock
 from typing import Any, cast
 
 import aioboto3
@@ -21,10 +21,19 @@ _DEFAULT_CHAIN_MAXIMUM_PRESIGN_TTL_SECONDS = 3600
 _TENANT_ROLE_MAXIMUM_PRESIGN_TTL_SECONDS = 600
 
 
-@lru_cache(maxsize=32)
-def _task_session(region: str, loop: asyncio.AbstractEventLoop) -> aioboto3.Session:
-    """Share one task-role session per region and event loop, so loop-bound credential state never crosses loops."""
-    return aioboto3.Session(region_name=region)
+_loop_sessions_lock = Lock()
+_loop_sessions: dict[asyncio.AbstractEventLoop, dict[Hashable, aioboto3.Session]] = {}
+
+
+def _loop_session(key: Hashable, create: Callable[[], aioboto3.Session]) -> aioboto3.Session:
+    loop = asyncio.get_running_loop()
+    with _loop_sessions_lock:
+        for closed in [other for other in _loop_sessions if other.is_closed()]:
+            del _loop_sessions[closed]
+        sessions = _loop_sessions.setdefault(loop, {})
+        if key not in sessions:
+            sessions[key] = create()
+        return sessions[key]
 
 
 @lru_cache(maxsize=32)
@@ -35,12 +44,10 @@ def _logs_client(region: str) -> Any:
 
 @dataclass(frozen=True)
 class AWSClientProvider:
-    """Construct AWS clients: organization data through `_data_session`, everything else as the task role."""
-
     region: str
 
     def _task_session(self) -> aioboto3.Session:
-        return _task_session(self.region, asyncio.get_running_loop())
+        return _loop_session(self.region, lambda: aioboto3.Session(region_name=self.region))
 
     def _data_session(self) -> aioboto3.Session:
         return self._task_session()
@@ -66,21 +73,17 @@ class AWSClientProvider:
 
 @dataclass(frozen=True)
 class TenantRoleAWSClientProvider(AWSClientProvider):
-    """Reach organization data through an organization-tagged session of the tenant access role."""
-
     role_arn: str
     org_id: str
     shared_secrets: bool
 
     def _data_session(self) -> aioboto3.Session:
-        return self._tenant_session(asyncio.get_running_loop())
+        return _loop_session(self, self._tenant_session)
 
     def maximum_presign_ttl(self, requested_seconds: int) -> int:
-        """Refreshed role credentials keep at least 10 minutes of life, so links signed with them can't outlast that."""
         return min(requested_seconds, _TENANT_ROLE_MAXIMUM_PRESIGN_TTL_SECONDS)
 
-    @lru_cache(maxsize=256)
-    def _tenant_session(self, loop: asyncio.AbstractEventLoop) -> aioboto3.Session:
+    def _tenant_session(self) -> aioboto3.Session:
         botocore_session = AioSession()
         botocore_session._credentials = AioDeferredRefreshableCredentials(  # pyright: ignore[reportAttributeAccessIssue]
             refresh_using=self._assume_role, method="sts-assume-role"

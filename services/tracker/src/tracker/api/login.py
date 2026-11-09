@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from tracker.auth import (
+    READ_ONLY_KEY_CLAIM,
     USER_KEY_CLAIM,
     LoginIdentity,
     RequestIdentity,
@@ -42,6 +43,7 @@ class IdentityResponse(BaseModel):
 class CreateAccessKeyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     expires_in_days: int = Field(default=30, ge=1, le=90)
+    read_only: bool = Field(default=False, description="Refuse the key for anything but GET and HEAD requests.")
 
 
 class AccessKeyResponse(BaseModel):
@@ -50,9 +52,12 @@ class AccessKeyResponse(BaseModel):
     expires_at: datetime
 
 
-@router.get("/auth/cli", response_model=LoginSettingsResponse)
+@router.get(
+    "/auth/cli",
+    response_model=LoginSettingsResponse,
+    description="Tell the CLI where to sign in. Returns 404 when this Tracker has no CLI login.",
+)
 def login_settings() -> LoginSettingsResponse:
-    """Tell the CLI where to sign in; 404 when this Tracker has no CLI login."""
     if not (AUTH_REQUIRED and DESCOPE_PROJECT_ID and DESCOPE_CLI_CLIENT_ID):
         raise HTTPException(status_code=404, detail="This Tracker does not support `valkyrie login`")
     return LoginSettingsResponse(
@@ -64,9 +69,12 @@ def login_settings() -> LoginSettingsResponse:
     )
 
 
-@router.get("/auth/me", response_model=IdentityResponse)
+@router.get(
+    "/auth/me",
+    response_model=IdentityResponse,
+    description="Return the organization and user behind the request's credential.",
+)
 def current_identity(identity: RequestIdentity = Depends(get_current_starter)) -> IdentityResponse:
-    """Return the organization and user behind the request's credential."""
     return IdentityResponse(
         organization=identity.org.name,
         email=identity.email,
@@ -75,15 +83,23 @@ def current_identity(identity: RequestIdentity = Depends(get_current_starter)) -
     )
 
 
-@router.post("/access-keys", response_model=AccessKeyResponse)
+@router.post(
+    "/access-keys",
+    response_model=AccessKeyResponse,
+    description="Create an expiring access key for the logged-in user's organization, for CI and other headless use.",
+)
 async def create_access_key(
     request: CreateAccessKeyRequest, login: LoginIdentity = Depends(get_current_login)
 ) -> AccessKeyResponse:
-    """Create an expiring access key for the logged-in user's organization, for CI and other headless use."""
     organization = login.current_organization
     access_keys: Any = descope_access_keys()
     expires_at = int(time.time()) + request.expires_in_days * 86400
-    claims = {"user_id": login.user_id, USER_KEY_CLAIM: True, **({"email": login.email} if login.email else {})}
+    claims = {
+        "user_id": login.user_id,
+        USER_KEY_CLAIM: True,
+        **({"email": login.email} if login.email else {}),
+        **({READ_ONLY_KEY_CLAIM: True} if request.read_only else {}),
+    }
     with descope_call("create the access key"):
         response = await asyncio.to_thread(
             access_keys.create,
@@ -100,9 +116,12 @@ async def create_access_key(
     )
 
 
-@router.delete("/access-keys/{key_id}", status_code=204)
+@router.delete(
+    "/access-keys/{key_id}",
+    status_code=204,
+    description="Delete an access key the logged-in user created for this organization.",
+)
 async def revoke_access_key(key_id: str, login: LoginIdentity = Depends(get_current_login)) -> None:
-    """Delete an access key the logged-in user created for this organization."""
     organization = login.current_organization
     access_keys: Any = descope_access_keys()
     with descope_call("load the access key"):

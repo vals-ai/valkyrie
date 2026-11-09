@@ -1,5 +1,3 @@
-"""Dependencies scoped to one executor dispatch."""
-
 from asyncio import to_thread
 
 from tracker.aws.runtime import AWSResources

@@ -1,5 +1,3 @@
-"""Validate uploaded agent archives before publishing them to an organization's agent library."""
-
 import stat
 import zipfile
 from typing import BinaryIO
@@ -11,11 +9,10 @@ from tracker.agent.schemas import AgentContract
 
 
 class ArchiveLimitError(ValueError):
-    """An agent archive exceeds an operator-configured resource limit."""
+    pass
 
 
 def validate_agent_archive(stream: BinaryIO, name: str) -> None:
-    """Check metadata first, then paths, actual expanded bytes, CRCs, and the YAML contract."""
     with zipfile.ZipFile(stream) as archive:
         members = archive.infolist()
         if len(members) > config.AGENT_ARCHIVE_MAX_ENTRIES:

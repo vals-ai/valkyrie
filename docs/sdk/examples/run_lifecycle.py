@@ -1,10 +1,3 @@
-"""Start a Valkyrie run and follow it through result retrieval.
-
-After installing valkyrie-sdk, run:
-
-    python docs/sdk/examples/run_lifecycle.py AGENT BENCHMARK --model MODEL
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -15,20 +8,27 @@ from valkyrie.sdk import BenchmarkStatus, ValkyrieClient, ValkyrieSDKError
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse the values needed to start a run."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("agent", help="Uploaded agent name")
-    parser.add_argument("benchmark", help="Benchmark service name")
-    parser.add_argument("--model", help="Model override for the agent")
-    parser.add_argument("--dataset", help="Benchmark dataset name")
-    parser.add_argument("--label", help="Optional run label")
-    parser.add_argument("--provider", help="Configured sandbox provider")
-    parser.add_argument("--concurrency", type=int, default=5, help="Concurrent tasks (default: 5)")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Start a Valkyrie run and follow it through result retrieval.\n"
+            "\n"
+            "After installing valkyrie-sdk, run:\n"
+            "\n"
+            "    python docs/sdk/examples/run_lifecycle.py AGENT BENCHMARK --model MODEL\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("agent", help="Uploaded agent name.")
+    parser.add_argument("benchmark", help="Benchmark service name.")
+    parser.add_argument("--model", help="Model override for the agent.")
+    parser.add_argument("--dataset", help="Benchmark dataset name.")
+    parser.add_argument("--label", help="Optional run label.")
+    parser.add_argument("--provider", help="Configured sandbox provider.")
+    parser.add_argument("--concurrency", type=int, default=5, help="Concurrent tasks (default: 5).")
     return parser.parse_args()
 
 
 async def run_lifecycle(args: argparse.Namespace) -> None:
-    """Start, observe, and retrieve one run."""
     async with ValkyrieClient() as client:
         run = await client.runs.start(
             agent=args.agent,
@@ -59,7 +59,6 @@ async def run_lifecycle(args: argparse.Namespace) -> None:
 
 
 async def main(args: argparse.Namespace) -> int:
-    """Run the example and convert SDK errors into a concise CLI failure."""
     try:
         await run_lifecycle(args)
     except ValkyrieSDKError as exc:

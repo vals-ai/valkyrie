@@ -1,5 +1,3 @@
-"""Run with `uv run pytest tests/unit/executor/test_release_entrypoint.py`."""
-
 import builtins
 import json
 import os
@@ -18,6 +16,9 @@ from tracker.database import session as tracker_session
 from tracker.database.models import ExecutorAdmission, ExecutorRelease, ExecutorReleaseStatus
 
 
+@pytest.mark.description(
+    "The release entrypoint starts cleanly when the database config is only available after the sealed environment loads."
+)
 def test_release_entrypoint_loads_database_config_after_sealed_environment() -> None:
     environment = os.environ.copy()
     for name in ("DATABASE_URL", "DB_USERNAME", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_NAME"):
@@ -57,6 +58,7 @@ assert engine.url.database == "sealed-database"
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.description("The release database engine keeps no idle connections.")
 def test_release_engine_does_not_retain_idle_connections(tmp_path: os.PathLike[str]) -> None:
     environment = {**os.environ, "DATABASE_URL": f"sqlite:///{tmp_path}/release.sqlite3"}
     result = subprocess.run(
@@ -230,6 +232,7 @@ def _release_arguments(monkeypatch: MonkeyPatch, *, artifact_digest: str = "a" *
     )
 
 
+@pytest.mark.description("The release entrypoint uses the sealed configuration and saves the active release.")
 def test_release_entrypoint_uses_sealed_configuration_and_persists_active_release(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -300,6 +303,7 @@ def test_release_entrypoint_uses_sealed_configuration_and_persists_active_releas
     ]
 
 
+@pytest.mark.description("Running the release entrypoint again reuses the registered task definition.")
 def test_release_entrypoint_rerun_reuses_the_registered_task_definition(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -321,6 +325,7 @@ def test_release_entrypoint_rerun_reuses_the_registered_task_definition(
     assert len(ecs.registered) == 1
 
 
+@pytest.mark.description("Beginning maintenance drains every page of runner tasks before it finishes.")
 def test_maintenance_begin_drains_paginated_runner_tasks_before_finish(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -376,6 +381,7 @@ def test_maintenance_begin_drains_paginated_runner_tasks_before_finish(
     ]
 
 
+@pytest.mark.description("Beginning maintenance fails loudly when runners do not drain.")
 def test_maintenance_begin_fails_loudly_if_runners_do_not_drain(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -397,6 +403,7 @@ def test_maintenance_begin_fails_loudly_if_runners_do_not_drain(
     assert admission.maintenance_target_sha == "b" * 40
 
 
+@pytest.mark.description("Beginning maintenance waits for a runner that was already stopping.")
 def test_maintenance_begin_waits_for_previously_stopping_runner(
     monkeypatch: MonkeyPatch, database_session: Session
 ) -> None:
@@ -418,6 +425,7 @@ def test_maintenance_begin_waits_for_previously_stopping_runner(
     assert sum(call["desiredStatus"] == "STOPPED" for call in ecs.list_calls) == 2
 
 
+@pytest.mark.description("Beginning maintenance times out when a stopping runner never stops.")
 def test_maintenance_begin_times_out_for_previously_stopping_runner(
     monkeypatch: MonkeyPatch, database_session: Session
 ) -> None:
@@ -444,6 +452,7 @@ def test_maintenance_begin_times_out_for_previously_stopping_runner(
     assert ecs.stopped_tasks == []
 
 
+@pytest.mark.description("Beginning maintenance treats an expired stopped task as gone.")
 def test_maintenance_begin_treats_expired_historical_stopped_task_as_gone(
     monkeypatch: MonkeyPatch, database_session: Session
 ) -> None:
@@ -483,6 +492,7 @@ def test_maintenance_begin_treats_expired_historical_stopped_task_as_gone(
     assert sum(call["desiredStatus"] == "STOPPED" for call in ecs.list_calls) == 2
 
 
+@pytest.mark.description("Beginning maintenance waits for a listed runner that describe does not return.")
 def test_maintenance_begin_waits_for_listed_runner_missing_from_describe(
     monkeypatch: MonkeyPatch, database_session: Session
 ) -> None:
@@ -511,6 +521,7 @@ def test_maintenance_begin_waits_for_listed_runner_missing_from_describe(
     assert ecs.stopped_tasks == []
 
 
+@pytest.mark.description("Maintenance raises a drain timeout when ECS cannot describe a task it stopped.")
 def test_maintenance_begin_times_out_when_a_task_it_stopped_cannot_be_described(
     monkeypatch: MonkeyPatch, database_session: Session
 ) -> None:
@@ -528,6 +539,9 @@ def test_maintenance_begin_times_out_when_a_task_it_stopped_cannot_be_described(
     assert ecs.stopped_tasks
 
 
+@pytest.mark.description(
+    "An image that was never published registers no task definition and saves no `ExecutorRelease`."
+)
 def test_release_entrypoint_unpublished_image_registers_nothing_and_commits_no_release(
     monkeypatch: MonkeyPatch,
     database_session: Session,
@@ -548,6 +562,7 @@ def test_release_entrypoint_unpublished_image_registers_nothing_and_commits_no_r
     assert database_session.get(ExecutorRelease, "git-abc123-def456") is None
 
 
+@pytest.mark.description("An invalid release ID is rejected before any secret is read.")
 def test_release_entrypoint_rejects_invalid_release_id_before_reading_secret(monkeypatch: MonkeyPatch) -> None:
     _release_arguments(monkeypatch)
     sys.argv[12] = "invalid release"
@@ -561,6 +576,7 @@ def test_release_entrypoint_rejects_invalid_release_id_before_reading_secret(mon
         release_entrypoint.main()
 
 
+@pytest.mark.description("An invalid artifact identity is rejected before any secret is read.")
 @pytest.mark.parametrize(
     ("argument_index", "invalid_value", "error"),
     [
@@ -587,6 +603,9 @@ def test_release_entrypoint_rejects_invalid_artifact_identity_before_reading_sec
         release_entrypoint.main()
 
 
+@pytest.mark.description(
+    "Extra command line arguments make the release entrypoint exit with a sealed release task error."
+)
 def test_release_entrypoint_rejects_arbitrary_extra_command_arguments(monkeypatch: MonkeyPatch) -> None:
     _release_arguments(monkeypatch)
     sys.argv.append("python -c 'malicious'")

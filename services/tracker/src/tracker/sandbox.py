@@ -1,5 +1,3 @@
-"""Sandbox management utilities for the tracker service."""
-
 import asyncio
 import base64
 import binascii
@@ -12,7 +10,7 @@ import shlex
 import time
 import uuid
 from asyncio import Semaphore
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -22,6 +20,7 @@ from typing import Any, AsyncGenerator, Literal, Never, assert_never
 import logfire
 import sentry_sdk
 from benchmark_service import (
+    LINUX_CGROUP_V2_V1,
     ControlledWorkload,
     ControlledWorkloadResult,
     Episode,
@@ -72,9 +71,11 @@ from tracker.database.models import (
 )
 from tracker.exceptions import (
     AgentRunFailedError,
+    EpisodeOrchestratorFailedError,
     ControlledGenerationError,
     ControlledGenerationTerminationUnconfirmedError,
     DependencySetupExhaustedError,
+    GenerationContainmentUnavailableError,
     GenerationTerminationUnconfirmedError,
     InvalidSandboxConfigurationError,
     OutputArtifactError,
@@ -83,6 +84,7 @@ from tracker.exceptions import (
     SSLConnectionError,
 )
 from tracker.logging import get_logger
+from tracker.logging.events import LogEvent
 from tracker.sandbox_cost import SandboxLink, record_sandbox
 from tracker.observability import (
     distribution,
@@ -99,8 +101,6 @@ bundle_path = PurePosixPath("/bundle")
 SANDBOX_AUTO_STOP_INTERVAL = 10 * 60
 SANDBOX_CREATE_TIMEOUT = 360
 AGENT_INSTALL_TIMEOUT_SECONDS = 10 * 60
-# The 20-second post-deadline window includes at most 10 seconds for a counter refresh;
-# the rest permits either confirmed termination or predeadline agent result collection.
 GENERATION_CREDIT_REFRESH_GRACE_SECONDS = 10.0
 GENERATION_TERMINATION_GRACE_SECONDS = 20.0
 EPISODE_END_GRACE_SECONDS = 15.0
@@ -109,7 +109,6 @@ EXTERNAL_SERVICE_REFRESH_RETRY_SECONDS = 1.0
 CONTRACT_DOWNLOAD_URL_EXPIRES_SECONDS = 24 * 60 * 60
 _STAGE_DIR = "/run/valkyrie-stage"
 _STAGE_PREFIX = "VALKYRIE-STAGE/1 "
-# Compact JSON with a 255-character Docker name and a 20-digit sequence, base64url, and a 64-hex MAC fits.
 _STAGE_MAX_FRAME_LENGTH = 512
 _STAGE_FRAME = re.compile(r"VALKYRIE-STAGE/1 ([A-Za-z0-9_-]+) ([0-9a-f]{64})")
 
@@ -198,7 +197,6 @@ async def _confirm_inner_stopped(sandbox: Sandbox, container: str | None) -> Non
 
 
 def get_contract_path(contract_name: str) -> PurePosixPath:
-    """Get the path to a contract in the sandbox."""
     return bundle_path / contract_name
 
 
@@ -218,12 +216,11 @@ def audit_sandbox_delete(
     outcome: SandboxDeleteOutcome,
     error: str | None = None,
 ) -> None:
-    # Labels attached at sandbox creation (utils/task_execution.py):
-    # {"Benchmark": name, "Id": benchmark id, "Task": task id}.
     labels = sandbox.labels or {}
     logger.info(
         "sandbox.delete",
         extra={
+            "event": LogEvent.SANDBOX_DELETE,
             "sandbox_id": sandbox.id,
             "sandbox_name": sandbox.name,
             "benchmark_id": labels.get("Id"),
@@ -244,27 +241,54 @@ async def delete_sandbox(
     initiated_by: SandboxDeleteInitiator,
     org_id: str | None = None,
 ) -> bool:
-    """Delete sandbox through its provider and report acknowledged cleanup."""
     try:
         await provider.delete_sandbox(sandbox.id)
     except SandboxNotFoundError:
         audit_sandbox_delete(sandbox, initiated_by, org_id, "already_gone")
-        logger.warning(f"Sandbox `{sandbox.name}` has already been terminated")
+        logger.warning("Sandbox `%s` has already been terminated", sandbox.name)
         return True
     except ProviderSandboxError as e:
         audit_sandbox_delete(sandbox, initiated_by, org_id, "failed", f"{type(e).__name__}: {e}")
         raise
     except asyncio.CancelledError:
-        # Caught only to audit: a cancelled delete may still have reached the provider.
         audit_sandbox_delete(sandbox, initiated_by, org_id, "cancelled")
         raise
     except Exception as e:
         audit_sandbox_delete(sandbox, initiated_by, org_id, "failed", f"{type(e).__name__}: {e}")
-        logger.error(f"Unexpected error deleting sandbox {sandbox.name}: {e}")
+        logger.error("Unexpected error deleting sandbox %s: %s: %s", sandbox.name, type(e).__name__, e, exc_info=e)
         return False
     else:
         audit_sandbox_delete(sandbox, initiated_by, org_id, "deleted")
         return True
+
+
+def _shell_literal(value: str, quote: str | None) -> str:
+    if quote is None:
+        return shlex.quote(value)
+    if quote == "'":
+        return value.replace("'", "'\\''")
+    return re.sub(r'([\\$`"])', r"\\\1", value)
+
+
+def render_run_cmd(template: str, bindings: Mapping[str, str]) -> str:
+    placeholder = re.compile("|".join(re.escape("{" + name + "}") for name in bindings))
+    parts: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(template):
+        match = placeholder.match(template, index)
+        if match is not None:
+            parts.append(_shell_literal(bindings[match.group(0)[1:-1]], quote))
+            index = match.end()
+            continue
+        char = template[index]
+        escaped = template[index + 1 : index + 2]
+        step = 2 if char == "\\" and quote != "'" and escaped and escaped in "\\'\"`$" else 1
+        if char in "'\"" and quote in (None, char):
+            quote = None if quote else char
+        parts.append(template[index : index + step])
+        index += step
+    return "".join(parts)
 
 
 def _source_name(source: SandboxSource) -> str:
@@ -348,7 +372,6 @@ async def _create_sandbox(
     volumes: list[VolumeMount] | None = None,
     sandbox_secrets: dict[str, str] | None = None,
 ) -> Sandbox:
-    """Create a sandbox through its provider."""
     _reject_plaintext_secret_collisions(env_vars, sandbox_secrets)
     provider_source = _provider_source(source)
     _set_sandbox_create_span_attributes(sandbox_name, provider_source, resources)
@@ -386,33 +409,16 @@ async def create_sandbox(
     unique_name: bool = True,
     sandbox_link: SandboxLink | None = None,
 ) -> AsyncGenerator[Sandbox, Any]:
-    """
-    Yeild a sandbox to be used within a context manager.
-
-    Args:
-        provider: The sandbox provider
-        sandbox_name: The name of the sandbox
-        source: The sandbox source image or snapshot
-        resources: The resources to use for the sandbox
-        labels: The labels to use for the sandbox
-        env_vars: The environment variables to use for the sandbox
-        volumes: Persistent volumes to mount in the sandbox
-        sandbox_secrets: Provider-managed secret references keyed by environment variable name
-        creation_semaphore: Per-benchmark semaphore to limit concurrent sandbox creation.
-        creation_state: Shared attempt state tracking unacknowledged provider cleanup.
-        unique_name: Whether to append a random suffix to the supplied name.
-        sandbox_link: The attempt to save the sandbox against once the provider names it.
-
-    Returns:
-        A context manager that yields the sandbox
-    """
     if unique_name:
         sandbox_name = f"{sandbox_name}_{uuid.uuid4().hex[:6]}"
     source_name = _source_name(source)
-    logger.info(f"Creating sandbox {sandbox_name} with source {source_name}")
+    logger.info(
+        "Creating sandbox %s with source %s",
+        sandbox_name,
+        source_name,
+        extra={"event": LogEvent.SANDBOX_CREATE, "sandbox_name": sandbox_name},
+    )
 
-    # If we run too many at once it can cause hanging issues
-    # NOTE does not block how many context managers we can have open, just how many sandboxes we can create at once
     try:
         async with creation_semaphore:
             start = time.monotonic()
@@ -442,12 +448,25 @@ async def create_sandbox(
                 raise
             except ProviderSandboxError as e:
                 incr("valkyrie.sandbox.create.errors", tags={"error_class": type(e).__name__})
-                # Nothing has run yet, so a fresh creation attempt costs no model spend.
+                logger.warning(
+                    "Sandbox %s creation failed: %s: %s",
+                    sandbox_name,
+                    type(e).__name__,
+                    e,
+                    extra={"event": LogEvent.SANDBOX_CREATE_FAILED, "sandbox_name": sandbox_name},
+                )
                 raise SandboxSetupError(f"Failed to create sandbox {sandbox_name}: {e}") from e
     except SandboxSetupError:
         raise
     except Exception as e:
         incr("valkyrie.sandbox.create.errors", tags={"error_class": type(e).__name__})
+        logger.warning(
+            "Sandbox %s creation failed: %s: %s",
+            sandbox_name,
+            type(e).__name__,
+            e,
+            extra={"event": LogEvent.SANDBOX_CREATE_FAILED, "sandbox_name": sandbox_name},
+        )
         raise
 
     distribution(
@@ -467,14 +486,13 @@ async def create_sandbox(
                 raise
         yield sandbox
     except Exception as e:
-        logger.error(f"Error during sandbox execution {sandbox.name}: {e}")
+        logger.error("Error during sandbox execution %s: %s: %s", sandbox.name, type(e).__name__, e)
         raise
     finally:
         try:
             if await delete_sandbox(sandbox, provider, initiated_by="task_teardown"):
                 creation_state.cleanup_pending = False
         except ProviderSandboxError:
-            # The failed delete is audited by delete_sandbox and must not replace the task outcome.
             pass
 
 
@@ -491,21 +509,7 @@ async def upload_agent_artifacts(
     benchmark_id: str,
     object_store: ObjectStore,
 ) -> None:
-    """
-    Transfer the frozen agent bundle using a signed URL or local provider file upload.
-
-    Reads from benchmarks/<benchmark_id>/<name>.zip so edits to the shared agent don't affect runs in flight.
-
-    Args:
-        sandbox: The sandbox to download and extract files in
-        contract: The agent contract configuration
-        benchmark_id: The benchmark run id, used to locate the agent
-        object_store: storage provider for the already-resolved run authority
-
-    Raises:
-        SandboxError: If download or extraction fails inside the sandbox
-    """
-    logger.info(f"Uploading contract {contract.name} to sandbox {sandbox.name}")
+    logger.info("Uploading contract %s to sandbox %s", contract.name, sandbox.name)
 
     contract_s3_key = benchmark_agent_bundle_key(benchmark_id, contract.name)
     presigned_url = await object_store.temporary_download_url(
@@ -523,8 +527,6 @@ async def upload_agent_artifacts(
     bundle_dir = shlex.quote(str(bundle_path))
     quoted_url = shlex.quote(presigned_url)
 
-    # Install required dependencies inside of the instance
-    # Tracks if curl or unzip are missing and installs them if needed
     install_deps = (
         "NEED='';"
         " command -v curl >/dev/null 2>&1 || NEED='curl';"
@@ -553,10 +555,7 @@ async def upload_agent_artifacts(
 
     try:
         result = await _exec(sandbox, script)
-    except SandboxNotFoundError:
-        # Keep the provider type so the sandbox-loss recovery path can recognise it.
-        raise
-    except Exception as e:
+    except SandboxError as e:
         raise SandboxError(f"Failed to upload contract {contract.name} to sandbox {sandbox.name}: {e}") from e
 
     error_message: str = (
@@ -571,8 +570,6 @@ async def upload_agent_artifacts(
 
 
 class DependencySetupMode(str, Enum):
-    """Select whether dependency setup can retry inside the current sandbox."""
-
     IN_PLACE_RETRIES = "in_place_retries"
     FINAL_FRESH_SANDBOX = "final_fresh_sandbox"
 
@@ -582,17 +579,16 @@ async def _install_agent_dependencies_once(
     contract: AgentContractRequest,
     log_output: Callable[[str], None],
     *,
+    log_line: Callable[[str], None],
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
 ) -> None:
-    """Run one bounded dependency installation attempt."""
     if not contract.install_cmd:
         return
 
-    log_output(f"Installing dependencies for contract: {contract.name}")
+    log_line(f"Installing dependencies for contract: {contract.name}")
 
     contract_path = get_contract_path(contract.name)
-    # Reuse the provider shell's foreground process group so terminal setup cannot suspend the installer.
     install_cmd = f"exec timeout {AGENT_INSTALL_TIMEOUT_SECONDS:g} sh -c {shlex.quote(contract.install_cmd)}"
 
     exit_reason = await stream_command_output(
@@ -609,7 +605,7 @@ async def _install_agent_dependencies_once(
             f"{AGENT_INSTALL_TIMEOUT_SECONDS:g} seconds"
         )
 
-    log_output(f"Finished installing dependencies for contract: {contract.name}")
+    log_line(f"Finished installing dependencies for contract: {contract.name}")
 
 
 @retry(
@@ -624,11 +620,12 @@ async def _install_agent_dependencies_with_retries(
     contract: AgentContractRequest,
     log_output: Callable[[str], None],
     *,
+    log_line: Callable[[str], None],
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
 ) -> None:
     await _install_agent_dependencies_once(
-        sandbox, contract, log_output, redact_error=redact_error, secret_env_names=secret_env_names
+        sandbox, contract, log_output, log_line=log_line, redact_error=redact_error, secret_env_names=secret_env_names
     )
 
 
@@ -638,19 +635,29 @@ async def install_agent_dependencies(
     log_output: Callable[[str], None],
     mode: DependencySetupMode = DependencySetupMode.IN_PLACE_RETRIES,
     *,
+    log_line: Callable[[str], None],
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
 ) -> None:
-    """Install dependencies using the policy selected for this sandbox."""
     if mode is DependencySetupMode.FINAL_FRESH_SANDBOX:
         await _install_agent_dependencies_once(
-            sandbox, contract, log_output, redact_error=redact_error, secret_env_names=secret_env_names
+            sandbox,
+            contract,
+            log_output,
+            log_line=log_line,
+            redact_error=redact_error,
+            secret_env_names=secret_env_names,
         )
         return
 
     try:
         await _install_agent_dependencies_with_retries(
-            sandbox, contract, log_output, redact_error=redact_error, secret_env_names=secret_env_names
+            sandbox,
+            contract,
+            log_output,
+            log_line=log_line,
+            redact_error=redact_error,
+            secret_env_names=secret_env_names,
         )
     except SandboxError as error:
         raise DependencySetupExhaustedError(
@@ -658,8 +665,6 @@ async def install_agent_dependencies(
         ) from error
 
 
-# NOTE: If this gets too big move it into a mapping
-# these are decoupled since its just 2 exit codes we need to track
 _TIMEOUT_EXIT_CODE: int = 124
 _OS_KILL_EXIT_CODE: int = 137
 _SUCCESS_EXIT_CODE: int = 0
@@ -668,8 +673,7 @@ AGENT_ERROR_PATH_ENV = "VALKYRIE_ERROR_PATH"
 _AGENT_ERROR_MAX_BYTES = 2048
 _POST_EXIT_READ_TIMEOUT_SECONDS = 5
 _DNS_CHECK_TIMEOUT_SECONDS = 30
-# Provider network-settings updates race with the sandbox's own start-up (HTTP 409 on
-# Daytona), so give the conflict time to clear instead of retrying back-to-back.
+_CGROUP_PROBE_FAILURE = f"does not support {LINUX_CGROUP_V2_V1.type} v{LINUX_CGROUP_V2_V1.version}"
 _EGRESS_RETRY = retry(
     retry=retry_if_exception_type(ProviderSandboxError) & retry_if_not_exception_type(SandboxNotFoundError),
     reraise=True,
@@ -690,13 +694,16 @@ async def _exec(sandbox: Sandbox, command: str) -> ExecResult:
         raise SandboxError(str(e)) from e
 
 
-async def sandbox_resolves(sandbox: Sandbox, host: str) -> bool:
-    """Whether the sandbox resolves `host`, answered by the tracker rather than the agent.
+async def run_setup_command(sandbox: Sandbox, command: str, failure: str) -> None:
+    try:
+        result = await _exec(sandbox, command)
+    except (SandboxError, SandboxNotFoundError) as error:
+        raise SandboxSetupError(failure) from error
+    if result.exit_code != 0:
+        raise SandboxSetupError(failure)
 
-    Only getent's own "not found" exit (2) counts as a failure. A sandbox without
-    /usr/bin/getent, one that is gone, a check that times out, or any other exit counts as
-    resolving, so the check reports only a failure it observed.
-    """
+
+async def sandbox_resolves(sandbox: Sandbox, host: str) -> bool:
     command = f"[ -x /usr/bin/getent ] || exit 0; /usr/bin/getent ahosts {shlex.quote(host)}"
     try:
         result = await asyncio.wait_for(_exec(sandbox, command), timeout=_DNS_CHECK_TIMEOUT_SECONDS)
@@ -711,7 +718,6 @@ async def _run_egress_operation(operation: Callable[[], Awaitable[None]]) -> Non
 
 
 async def apply_egress_policy(sandbox: Sandbox, policy: EgressPolicy) -> None:
-    """Replace the sandbox egress policy, failing before the next lifecycle stage."""
     try:
         if policy == "*":
             await _run_egress_operation(sandbox.clear_egress_rules)
@@ -722,10 +728,8 @@ async def apply_egress_policy(sandbox: Sandbox, policy: EgressPolicy) -> None:
     except SandboxNotFoundError:
         raise
     except ValueError as error:
-        # The provider rejected the allowlist itself, so a fresh sandbox would fail the same way.
         raise InvalidSandboxConfigurationError(f"Failed to apply egress policy: {error}") from error
     except ProviderSandboxError as error:
-        # The sandbox still exists; only the provider's network API failed.
         raise SandboxError(str(error), transient=True) from error
 
 
@@ -780,19 +784,14 @@ async def stream_command_output(
                     timeout=_POST_EXIT_READ_TIMEOUT_SECONDS,
                 )
             except Exception:
-                pass
+                logger.warning("Agent error file cleanup failed", exc_info=True)
 
 
 async def _read_post_exit_file(sandbox: Sandbox, command: str) -> str | None:
-    """Best-effort read of a file the command wrote before exiting.
-
-    Runs after the command's exit code is already known, so nothing raised here may
-    replace the original outcome: any failure (sandbox gone, transport error, hang)
-    yields ``None``.
-    """
     try:
         result = await asyncio.wait_for(_exec(sandbox, command), timeout=_POST_EXIT_READ_TIMEOUT_SECONDS)
     except Exception:
+        logger.warning("Post-exit file read failed", exc_info=True)
         return None
     if result.exit_code != _SUCCESS_EXIT_CODE:
         return None
@@ -800,7 +799,6 @@ async def _read_post_exit_file(sandbox: Sandbox, command: str) -> str | None:
 
 
 def create_agent_error_redactor(secret_values: Iterable[str]) -> Callable[[str], str]:
-    """Mask literal configured values without putting them in caller-frame arguments."""
     values = sorted({value for value in secret_values if value}, key=len, reverse=True)
     pattern = re.compile("|".join(re.escape(value) for value in values)) if values else None
 
@@ -810,10 +808,6 @@ def create_agent_error_redactor(secret_values: Iterable[str]) -> Callable[[str],
     return redact
 
 
-# Provider secrets are references, not values, in Tracker. Read and mask the
-# values visible to the agent inside the sandbox; never return them separately.
-# Python is optional in arbitrary images: a missing interpreter retains the
-# exit-code fallback via _read_post_exit_file, just like any failed report read.
 _MASK_PROVIDER_ERROR_SCRIPT = """\
 import os, re, sys
 try:
@@ -840,10 +834,8 @@ async def _read_agent_error(
     *,
     secret_env_names: tuple[str, ...] = (),
 ) -> str:
-    """Read a bounded Type: message report only when configured-secret redaction is available."""
     if redact_error is None:
         return ""
-    # An extra byte detects oversized reports; do not truncate through a secret.
     command = f"head -c {_AGENT_ERROR_MAX_BYTES + 1} {shlex.quote(error_path)}"
     if secret_env_names:
         command = shlex.join(
@@ -881,8 +873,9 @@ def _controlled_result_outcome(
     if exit_code == _OS_KILL_EXIT_CODE:
         return AgentCausedExitReason.OS_KILLED, duration
     sentry_sdk.set_tag("agent_exit_code", str(exit_code))
-    command = "Episode orchestrator command" if episode else "Agent command"
-    raise AgentRunFailedError(f"{command} failed with exit code {exit_code}")
+    if episode:
+        raise EpisodeOrchestratorFailedError(f"Episode orchestrator command failed with exit code {exit_code}")
+    raise AgentRunFailedError(f"Agent command failed with exit code {exit_code}")
 
 
 async def _raise_controlled_failure_after_close(workload: ControlledWorkload, error: BaseException) -> Never:
@@ -893,7 +886,10 @@ async def _raise_controlled_failure_after_close(workload: ControlledWorkload, er
             await workload.kill()
     except SandboxNotFoundError:
         raise
-    except BaseException as kill_error:
+    except (asyncio.CancelledError, Exception) as kill_error:
+        task = asyncio.current_task()
+        if isinstance(kill_error, asyncio.CancelledError) and task is not None and task.cancelling():
+            raise
         raise ControlledGenerationTerminationUnconfirmedError(
             "Controlled generation failed and workload termination could not be confirmed"
         ) from kill_error
@@ -902,7 +898,6 @@ async def _raise_controlled_failure_after_close(workload: ControlledWorkload, er
 
 async def _finish_controlled_output(workload: ControlledWorkload, output_task: asyncio.Task[None]) -> None:
     try:
-        # A naturally completed producer has a finite buffered tail to drain.
         await output_task
     except Exception as error:
         await _raise_controlled_failure_after_close(workload, error)
@@ -936,6 +931,7 @@ async def _stream_controlled_output(
     stage_key: bytes | None = None,
     episode: Episode | None = None,
     generation_gateway_url: str | None = None,
+    extra_env: dict[str, str] | None = None,
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
 ) -> tuple[AgentCausedExitReason | None, float]:
@@ -944,7 +940,9 @@ async def _stream_controlled_output(
     stage = _StageOutput(stage_key, on_output) if stage_key is not None else None
     try:
         env_name = "MODEL_GATEWAY_URL" if episode is None and stage is None else "VALKYRIE_GENERATION_MODEL_GATEWAY_URL"
-        env_vars = {env_name: generation_gateway_url} if generation_gateway_url is not None else {}
+        env_vars = {**(extra_env or {})}
+        if generation_gateway_url is not None:
+            env_vars[env_name] = generation_gateway_url
         error_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.error" if redact_error is not None else None
         if error_path is not None:
             await _exec(sandbox, f"mkdir -p {shlex.quote(_STATUS_DIR)}")
@@ -1539,7 +1537,6 @@ async def _stream_controlled_output(
 
         cleanup_task = asyncio.create_task(failure_cleanup(error))
         await finish_cleanup(cleanup_task)
-        # A terminal accounting failure may collect only after both workloads are absent.
         if primary_accounting_failure and outer_stopped and (active_container is None or inner_stopped):
             task = asyncio.current_task()
             assert task is not None
@@ -1573,7 +1570,7 @@ async def _stream_controlled_output(
                             timeout=_POST_EXIT_READ_TIMEOUT_SECONDS,
                         )
                     except Exception:
-                        pass
+                        logger.warning("Agent error file cleanup failed", exc_info=True)
 
         await finish_cleanup(asyncio.create_task(finish_children()))
 
@@ -1592,7 +1589,6 @@ async def archive_and_upload_output(
     task_id: str | None = None,
     execution_is_current: Callable[[], bool] | None = None,
 ) -> None:
-    """Compress a file in the sandbox into a tar.gz and upload it to S3"""
     archive_path = f"/tmp/{uuid.uuid4().hex}.tar.gz"
     start = time.monotonic()
 
@@ -1621,11 +1617,10 @@ async def archive_and_upload_output(
             },
         )
     finally:
-        # `-f` exits silently if the file does not exist
         try:
             await _exec(sandbox, f"rm -f {shlex.quote(archive_path)}")
         except Exception:
-            pass
+            logger.warning("Output archive cleanup failed", exc_info=True)
 
 
 OUTPUT_ARTIFACTS_SANDBOX_ROOT = PurePosixPath("/tmp/valkyrie")
@@ -1680,9 +1675,13 @@ async def _resolve_output_artifact_sandbox_path(sandbox: Sandbox, artifact: Outp
         exists = await _exec(sandbox, exists_command)
         if exists.exit_code == _SUCCESS_EXIT_CODE:
             return source
+        if not _output_artifact_is_required(artifact):
+            present = await _exec(sandbox, f"test -e {quoted_source} || test -L {quoted_source}")
+            if present.exit_code == _SUCCESS_EXIT_CODE:
+                raise OutputArtifactError(f"Output artifact is a symlink or not a regular file: {source}")
 
     artifact_label = "Required output artifact" if _output_artifact_is_required(artifact) else "Output artifact"
-    raise OutputArtifactError(f"{artifact_label} missing: {source}")
+    raise OutputArtifactError(f"{artifact_label} missing: {source}", missing=True)
 
 
 async def upload_output_artifacts(
@@ -1693,7 +1692,6 @@ async def upload_output_artifacts(
     object_store: ObjectStore,
     execution_is_current: Callable[[], bool] | None = None,
 ) -> None:
-    """Upload declared small output artifacts from the sandbox directly to task S3 keys."""
     total_bytes = 0
     required_artifacts = [artifact for artifact in artifacts if _output_artifact_is_required(artifact)]
     optional_artifacts = [artifact for artifact in artifacts if not _output_artifact_is_required(artifact)]
@@ -1713,20 +1711,20 @@ async def upload_output_artifacts(
             if updated_total_bytes is None:
                 return
             total_bytes = updated_total_bytes
-        except Exception:
+        except Exception as exc:
             if _output_artifact_is_required(artifact):
                 raise
-            logger.warning(
-                "output_artifact.optional_skip",
-                extra={
-                    "sandbox_id": sandbox.id,
-                    "sandbox_name": sandbox.name,
-                    "artifact_path": artifact_path,
-                    "benchmark_id": benchmark_id,
-                    "task_id": task_id,
-                },
-                exc_info=True,
-            )
+            log_extra = {
+                "sandbox_id": sandbox.id,
+                "sandbox_name": sandbox.name,
+                "artifact_path": artifact_path,
+                "benchmark_id": benchmark_id,
+                "task_id": task_id,
+            }
+            if isinstance(exc, OutputArtifactError) and exc.missing:
+                logger.info("output_artifact.optional_skip", extra={**log_extra, "reason": "missing"})
+            else:
+                logger.warning("output_artifact.optional_skip", extra=log_extra, exc_info=True)
 
 
 async def _upload_output_artifact(
@@ -1768,7 +1766,6 @@ async def _upload_output_artifact(
         return None
 
     s3_key = task_artifact_key(benchmark_id, task_id, artifact_path)
-    # Providers may report an empty file as a failed transfer; Daytona raises "No file data received".
     chunks = _no_chunks() if artifact_bytes == 0 else sandbox.stream_download(sandbox_path)
     await object_store.put_stream(s3_key, chunks, should_continue=execution_is_current)
 
@@ -1808,32 +1805,12 @@ async def run_agent(
     on_external_service_finalized: (Callable[[GenerationAccountingSummary], Awaitable[None]] | None) = None,
     generation_gateway_url: str | None = None,
     *,
+    log_line: Callable[[str], None],
+    extra_env: dict[str, str] | None = None,
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
 ) -> tuple[AgentCausedExitReason | None, float]:
-    """
-    Run the agent or episode orchestrator inside the sandbox for a given task.
-
-    Args:
-        sandbox: The sandbox in which the workload runs
-        contract: The agent contract configuration
-        problem_path: Path inside the sandbox where the problem statement file was written during setup
-        log_output: Callback to log output
-        cwd: Working directory to run the agent in
-        agent_output_s3_key: S3 key to where we will upload the final output archive to
-        plan: Task generation execution plan
-        execution_is_current: Optional execution-authority check before output uploads
-        deadline_controller: Tracker-owned generation deadline controller
-        on_external_service_finalized: Awaited persistence callback after confirmed generation absence
-
-    Returns:
-        AgentCausedExitReason if the workload exits abnormally but recoverably
-        (timeout or OS kill), None on clean exit.
-
-    Raises:
-        SandboxError: If the workload fails to run or times out
-    """
-    log_output(
+    log_line(
         f"Running episode orchestrator for {contract.name}"
         if plan.episode is not None
         else f"Running agent {contract.name}"
@@ -1855,16 +1832,17 @@ async def run_agent(
         raise InvalidSandboxConfigurationError(
             "Effective sandbox does not support controlled generation containment v1"
         )
-    await sandbox.probe_generation_containment()
+    try:
+        await sandbox.probe_generation_containment()
+    except ProviderSandboxError as e:
+        if _CGROUP_PROBE_FAILURE not in str(e):
+            raise
+        raise GenerationContainmentUnavailableError(str(e)) from e
 
     static_bindings = {**contract.kwargs, "task_id": task_id}
     if plan.episode is None:
         bindings = {**static_bindings, "problem_statement_path": problem_path}
-        run_cmd = re.sub(
-            "|".join(re.escape("{" + name + "}") for name in bindings),
-            lambda match: bindings[match.group(0)[1:-1]],
-            contract.run_cmd,
-        )
+        run_cmd = render_run_cmd(contract.run_cmd, bindings)
     else:
         run_cmd = plan.episode.command
 
@@ -1949,8 +1927,6 @@ async def run_agent(
         if errors and not preserve_agent_error:
             raise errors[0]
 
-    # A nonzero exit is terminal evidence; collect declared outputs while the
-    # sandbox is still available.
     try:
         command = f"PYTHONSAFEPATH=1 {run_cmd}"
         if stage_key is not None:
@@ -1966,6 +1942,7 @@ async def run_agent(
             stage_key=stage_key,
             episode=plan.episode,
             generation_gateway_url=generation_gateway_url,
+            extra_env=extra_env,
             redact_error=redact_error if plan.episode is None else None,
             secret_env_names=secret_env_names,
         )
@@ -1979,15 +1956,14 @@ async def run_agent(
             if plan.episode is not None
             else "The process has been terminated and evaluation will proceed."
         )
-        log_output(
+        log_line(
             f"[WARNING]:`{contract.name}` has reached the designated generation allowance for this task: `{deadline_controller.effective_allowance_seconds()}`. {suffix}"
         )
     elif exit_reason == AgentCausedExitReason.OS_KILLED:
-        log_output(
+        log_line(
             f"[WARNING]:`{contract.name}` was killed by the OS (exit code {_OS_KILL_EXIT_CODE}, likely out-of-memory). The process has been terminated and evaluation will proceed."
         )
 
     await upload_outputs()
 
-    # Return why the agent terminated abnormally, or None on clean exit
     return exit_reason, agent_run_time

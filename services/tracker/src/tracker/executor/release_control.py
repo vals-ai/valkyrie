@@ -1,11 +1,9 @@
-"""Lifecycle operations for immutable executor releases in PostgreSQL."""
-
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 
 from tracker.database.models import (
     Benchmark,
@@ -13,20 +11,18 @@ from tracker.database.models import (
     ExecutorAdmission,
     ExecutorDispatch,
     ExecutorDispatchKind,
-    ExecutorDispatchStatus,
     ExecutorRelease,
     ExecutorReleaseStatus,
 )
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 from executor_protocol import (
     SUPPORTED_PROTOCOL_VERSIONS,
     validate_executor_digest,
 )
 
 _ACTIVE_BENCHMARK_STATUSES = (BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)
-_ACTIVE_DISPATCH_STATUSES = (
-    ExecutorDispatchStatus.QUEUED,
-    ExecutorDispatchStatus.RUNNING,
-)
 _ARTIFACT_RETENTION_DAYS = 30
 _logger = logging.getLogger(__name__)
 
@@ -48,22 +44,22 @@ class ActiveExecutorReleaseWork:
 
 
 class ReleaseControlError(ValueError):
-    """Raised when a release lifecycle transition violates ownership rules."""
+    pass
 
 
 class MaintenanceModeError(ReleaseControlError):
-    """Raised when executor admission is closed for deployment maintenance."""
+    pass
 
 
 def register_release(session: Session, release: ExecutorRelease) -> ExecutorRelease:
-    """Register a new immutable candidate release."""
-    if session.get(ExecutorRelease, release.id) is not None:
+    repository = ExecutorReleaseRepository(session)
+    if repository.get(release.id) is not None:
         raise ReleaseControlError(f"Executor release {release.id!r} already exists")
     if release.status != ExecutorReleaseStatus.CANDIDATE:
         raise ReleaseControlError("New executor releases must start as candidates")
     _validate_release_manifest(release)
 
-    session.add(release)
+    repository.save(release)
     session.flush()
     _logger.info(
         "executor_release_lifecycle",
@@ -73,11 +69,10 @@ def register_release(session: Session, release: ExecutorRelease) -> ExecutorRele
 
 
 def activate_release(session: Session, candidate: ExecutorRelease) -> ExecutorRelease:
-    """Create-or-match, promote, and assert one immutable release."""
     _validate_release_manifest(candidate)
 
     get_executor_admission(session, for_update=True)
-    release = session.get(ExecutorRelease, candidate.id)
+    release = ExecutorReleaseRepository(session).get(candidate.id)
     if release is None:
         release = register_release(session, candidate)
     elif (
@@ -97,7 +92,6 @@ def activate_release(session: Session, candidate: ExecutorRelease) -> ExecutorRe
 
 
 def pin_benchmark_to_release(benchmark: Benchmark, release: ExecutorRelease) -> None:
-    """Persist the initial executor identity for a benchmark exactly once."""
     if benchmark.executor_release_id is not None:
         raise ReleaseControlError(f"Benchmark {benchmark.id} already has executor release ownership")
 
@@ -116,7 +110,6 @@ def create_executor_dispatch(
     dispatch_id: UUID,
     task_ids: list[str] | None = None,
 ) -> ExecutorDispatch:
-    """Snapshot one release identity for queued execution."""
     created_at = datetime.now(UTC)
     return ExecutorDispatch(
         id=dispatch_id,
@@ -132,12 +125,7 @@ def create_executor_dispatch(
 
 
 def active_executor_release_work(session: Session) -> ActiveExecutorReleaseWork:
-    """Return active dispatch, current-owner, and unattributed retirement blockers."""
-    active_dispatches = session.exec(
-        select(ExecutorDispatch)
-        .where(col(ExecutorDispatch.status).in_(_ACTIVE_DISPATCH_STATUSES))
-        .order_by(col(ExecutorDispatch.created_at), col(ExecutorDispatch.id))
-    ).all()
+    active_dispatches = ExecutorDispatchRepository(session).list_active()
     dispatches_by_release: dict[str, list[ExecutorDispatch]] = {}
     active_dispatch_owners: set[tuple[UUID, str]] = set()
     for dispatch in active_dispatches:
@@ -146,11 +134,7 @@ def active_executor_release_work(session: Session) -> ActiveExecutorReleaseWork:
 
     executions_by_release: dict[str, list[Benchmark]] = {}
     unattributed_executions: list[Benchmark] = []
-    active_benchmarks = session.exec(
-        select(Benchmark)
-        .where(col(Benchmark.status).in_(_ACTIVE_BENCHMARK_STATUSES))
-        .order_by(col(Benchmark.started_at), col(Benchmark.id))
-    ).all()
+    active_benchmarks = BenchmarkRepository(session).list_by_status(_ACTIVE_BENCHMARK_STATUSES)
     for benchmark in active_benchmarks:
         release_id = benchmark.current_execution_release_id
         if release_id is None:
@@ -166,7 +150,7 @@ def active_executor_release_work(session: Session) -> ActiveExecutorReleaseWork:
 
 
 def _get_open_executor_admission(session: Session, *, for_update: bool) -> ExecutorAdmission:
-    admission = _get_admission(session, for_update=for_update)
+    admission = ExecutorReleaseRepository(session).admission(for_update=for_update)
     if admission is None:
         raise ReleaseControlError("No active executor release is configured")
     if admission.maintenance_target_sha is not None:
@@ -175,17 +159,15 @@ def _get_open_executor_admission(session: Session, *, for_update: bool) -> Execu
 
 
 def lock_executor_admission(session: Session) -> ExecutorAdmission:
-    """Lock executor admission and reject new work during maintenance."""
     return _get_open_executor_admission(session, for_update=True)
 
 
 def select_active_release(session: Session, *, for_update: bool = False) -> ExecutorRelease:
-    """Return the healthy release currently admitted for new benchmarks."""
     admission = _get_open_executor_admission(session, for_update=for_update)
     if admission.release_id is None:
         raise ReleaseControlError("No active executor release is configured")
 
-    release = session.get(ExecutorRelease, admission.release_id)
+    release = ExecutorReleaseRepository(session).get(admission.release_id)
     if release is None or release.status != ExecutorReleaseStatus.ACTIVE:
         raise ReleaseControlError("No active executor release is configured")
     return release
@@ -197,24 +179,17 @@ def resolve_current_execution_release(
     *,
     for_update: bool = False,
 ) -> ExecutorRelease:
-    """Resolve the ACTIVE or DRAINING release owned by an active benchmark."""
     release_id = benchmark.current_execution_release_id
     if release_id is None:
         raise ReleaseControlError(f"Benchmark {benchmark.id} has no current executor release")
 
-    release = session.get(
-        ExecutorRelease,
-        release_id,
-        populate_existing=for_update,
-        with_for_update=for_update or None,
-    )
+    release = ExecutorReleaseRepository(session).get(release_id, for_update=for_update)
     if release is None or release.status not in (ExecutorReleaseStatus.ACTIVE, ExecutorReleaseStatus.DRAINING):
         raise ReleaseControlError(f"Current executor release {release_id!r} is unavailable")
     return release
 
 
 def promote_release(session: Session, release_id: str) -> ExecutorRelease:
-    """Promote a candidate for new benchmarks."""
     admission = get_executor_admission(session, for_update=True)
     release = _get_release(session, release_id, populate_existing=True, for_update=True)
 
@@ -230,7 +205,6 @@ def promote_release(session: Session, release_id: str) -> ExecutorRelease:
         if previous.status == ExecutorReleaseStatus.ACTIVE:
             previous.status = ExecutorReleaseStatus.DRAINING
             previous.draining_at = previous.draining_at or datetime.now(UTC)
-            session.add(previous)
             _logger.info(
                 "executor_release_lifecycle",
                 extra={"event": "draining", "release_id": previous.id, "status": previous.status.value},
@@ -240,11 +214,9 @@ def promote_release(session: Session, release_id: str) -> ExecutorRelease:
     release.activated_at = release.activated_at or datetime.now(UTC)
     release.draining_at = None
     release.retired_at = None
-    session.add(release)
 
     admission.release_id = release_id
     admission.updated_at = datetime.now(UTC)
-    session.add(admission)
     session.flush()
     _logger.info(
         "executor_release_lifecycle",
@@ -254,14 +226,8 @@ def promote_release(session: Session, release_id: str) -> ExecutorRelease:
 
 
 def retire_drained_releases(session: Session) -> list[str]:
-    """Retire every draining release that owns no active executor work."""
     admission = get_executor_admission(session, for_update=True)
-    draining_releases = session.exec(
-        select(ExecutorRelease)
-        .where(ExecutorRelease.status == ExecutorReleaseStatus.DRAINING)
-        .order_by(ExecutorRelease.id)
-        .with_for_update()
-    ).all()
+    draining_releases = ExecutorReleaseRepository(session).lock_draining()
     if admission.release_id in {release.id for release in draining_releases}:
         raise ReleaseControlError("The active admission target cannot be draining")
 
@@ -278,7 +244,6 @@ def retire_drained_releases(session: Session) -> list[str]:
         release.status = ExecutorReleaseStatus.RETIRED
         release.retired_at = retired_at
         release.artifact_retention_until = retired_at + timedelta(days=_ARTIFACT_RETENTION_DAYS)
-        session.add(release)
         retired_ids.append(release.id)
         _logger.info(
             "executor_release_lifecycle",
@@ -294,7 +259,6 @@ def retire_drained_releases(session: Session) -> list[str]:
 
 
 def artifact_deletion_allowed(session: Session, release_id: str, *, now: datetime | None = None) -> bool:
-    """Return true only after retirement retention expires and no active run owns the release."""
     release = _get_release(session, release_id)
     if release.status != ExecutorReleaseStatus.RETIRED or release.artifact_retention_until is None:
         return False
@@ -309,18 +273,8 @@ def artifact_deletion_allowed(session: Session, release_id: str, *, now: datetim
     )
 
 
-def _get_admission(session: Session, *, for_update: bool = False) -> ExecutorAdmission | None:
-    statement = (
-        select(ExecutorAdmission).where(col(ExecutorAdmission.id) == 1).execution_options(populate_existing=True)
-    )
-    if for_update:
-        statement = statement.with_for_update()
-    return session.exec(statement).one_or_none()
-
-
 def get_executor_admission(session: Session, *, for_update: bool = False) -> ExecutorAdmission:
-    """Return the singleton executor admission row."""
-    admission = _get_admission(session, for_update=for_update)
+    admission = ExecutorReleaseRepository(session).admission(for_update=for_update)
     if admission is None:
         raise ReleaseControlError("Executor admission state is not initialized")
     return admission
@@ -344,11 +298,8 @@ def _get_release(
     populate_existing: bool = False,
     for_update: bool = False,
 ) -> ExecutorRelease:
-    release = session.get(
-        ExecutorRelease,
-        release_id,
-        populate_existing=populate_existing or for_update,
-        with_for_update=for_update or None,
+    release = ExecutorReleaseRepository(session).get(
+        release_id, populate_existing=populate_existing, for_update=for_update
     )
     if release is None:
         raise ReleaseControlError(f"Executor release {release_id!r} does not exist")

@@ -1,5 +1,3 @@
-"""Tests for benchmark-service discovery and task ID workflows."""
-
 from __future__ import annotations
 
 import json
@@ -8,6 +6,7 @@ import httpx
 import pytest
 
 
+@pytest.mark.description("`services.catalog` returns typed services with trailing slashes removed from URLs.")
 async def test_catalog_returns_typed_services_and_normalizes_urls(make_client) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -33,6 +32,7 @@ async def test_catalog_returns_typed_services_and_normalizes_urls(make_client) -
     assert result.services[0].url == "https://swebench.test"
 
 
+@pytest.mark.description("Service list reads the catalog, then checks each service.")
 async def test_list_catalogs_then_checks_services(make_client) -> None:
     methods: list[str] = []
 
@@ -72,6 +72,7 @@ async def test_list_catalogs_then_checks_services(make_client) -> None:
     assert result.services[0].error == "timeout"
 
 
+@pytest.mark.description("Service list skips health checks for an empty catalog.")
 async def test_list_skips_health_check_for_an_empty_catalog(make_client) -> None:
     request_count = 0
 
@@ -88,6 +89,7 @@ async def test_list_skips_health_check_for_an_empty_catalog(make_client) -> None
     assert result.services == []
 
 
+@pytest.mark.description("`services.task_ids` sends the benchmark, service URL, and headers from the config.")
 async def test_task_ids_builds_configured_service_request(make_client) -> None:
     captured_body: dict[str, object] = {}
 
@@ -112,6 +114,7 @@ async def test_task_ids_builds_configured_service_request(make_client) -> None:
     }
 
 
+@pytest.mark.description("`services.task_ids` sends `ignore_custom_services` when asked.")
 async def test_task_ids_can_ignore_custom_service_configuration(make_client) -> None:
     captured_body: dict[str, object] = {}
 
@@ -125,6 +128,7 @@ async def test_task_ids_can_ignore_custom_service_configuration(make_client) -> 
     assert captured_body["ignore_custom_services"] is True
 
 
+@pytest.mark.description("`services.task_ids` raises for a blank benchmark name.")
 async def test_task_ids_rejects_blank_benchmark_name(make_client) -> None:
     async with make_client(lambda _request: pytest.fail("request should not be sent")) as client:
         with pytest.raises(ValueError, match="benchmark must not be blank"):

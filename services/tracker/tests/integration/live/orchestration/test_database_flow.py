@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/integration/live/orchestration/test_database_flow.py`.
-
-Exercise the live database flow through the benchmark service and sandbox provider.
-"""
-
 import uuid
 from asyncio import Semaphore, gather
 from typing import Any
@@ -22,7 +17,6 @@ pytestmark = pytest.mark.usefixtures("tracker_database")
 
 
 def create_task_row(database_session: Session, task_id: str, benchmark_id: UUID) -> Task:
-    """Persist a pending task for the live database flow."""
     task_row = Task(org_id=TEST_ORG_ID, task_id=task_id, benchmark=benchmark_id)
     database_session.add(task_row)
     database_session.flush()
@@ -34,7 +28,6 @@ def create_evaluation_result(
     task_row: Task,
     evaluation_result: dict[str, Any],
 ) -> EvaluationResult:
-    """Persist a successful evaluation and finish its task."""
     evaluation_result_row = EvaluationResult(
         org_id=TEST_ORG_ID,
         task=task_row.id,
@@ -53,7 +46,6 @@ def create_final_evaluation(
     benchmark_row: Benchmark,
     final_score_response: FinalScoreResponse,
 ) -> FinalEvaluation:
-    """Persist the service's final score for the benchmark."""
     final_evaluation_row = FinalEvaluation(
         org_id=TEST_ORG_ID,
         benchmark=benchmark_row.id,
@@ -75,7 +67,6 @@ async def evaluate_instance(
     task_data: RetrieveTaskResponse,
     creation_semaphore: Semaphore,
 ) -> dict[str, Any]:
-    """Set up and evaluate one service task in a live sandbox."""
     task_row.status = TaskStatus.EVALUATING
     database_session.add(task_row)
     database_session.flush()
@@ -102,6 +93,15 @@ async def evaluate_instance(
         )
 
 
+@pytest.mark.description(
+    (
+        "Live evaluation results must round-trip through tracker rows without loss.\n"
+        "\n"
+        "Test cases:\n"
+        "- Three service tasks run concurrently in real sandboxes and persist successful evaluations.\n"
+        "- Final score metadata and fetched result payloads match the stored rows."
+    )
+)
 async def test_live_results_round_trip_through_tracker_database(
     database_session: Session,
     benchmark_service: BenchmarkServiceClient,
@@ -110,12 +110,6 @@ async def test_live_results_round_trip_through_tracker_database(
     example_benchmark_object: Benchmark,
     creation_semaphore: Semaphore,
 ) -> None:
-    """Live evaluation results must round-trip through tracker rows without loss.
-
-    Test cases:
-    - Three service tasks run concurrently in real sandboxes and persist successful evaluations.
-    - Final score metadata and fetched result payloads match the stored rows.
-    """
     health = await benchmark_service.health_check()
     assert health.status == "ok"
 

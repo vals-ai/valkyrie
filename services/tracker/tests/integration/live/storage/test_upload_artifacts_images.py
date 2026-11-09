@@ -1,7 +1,4 @@
-"""Live artifact image upload tests.
-
-Run: uv run pytest tests/integration/live/storage/test_upload_artifacts_images.py
-"""
+import pytest
 
 import asyncio
 from uuid import uuid4
@@ -16,7 +13,6 @@ from tracker.runtime.artifacts import agent_bundle_key
 from tracker.database.models import AgentContractRequest
 from tracker.sandbox import SandboxCreationState, create_sandbox, upload_agent_artifacts
 
-# Images covering the major package families
 _IMAGES = [
     ("python:3.11-slim", "python-slim-apt"),
     ("python:3.11-alpine3.20", "python-alpine-apk"),
@@ -29,20 +25,25 @@ _IMAGES = [
     ("archlinux:base", "archlinux-pacman"),
 ]
 
-# 9 sandboxes are pulled and warmed up concurrently; slower images (e.g. fedora)
-# occasionally exceed a 60s budget under image-pull contention on CI runners.
 _PER_IMAGE_TIMEOUT_SECONDS = 120
 
 
 def _format_failure(exc: BaseException) -> str:
-    """Render an exception so that bare ``TimeoutError()`` doesn't show up empty."""
     text = str(exc)
     return text if text else f"{type(exc).__name__}()"
 
 
+@pytest.mark.description("Live artifact uploads across supported sandbox images.")
 class TestUploadArtifactsAcrossImages:
-    """Live artifact uploads across supported sandbox images."""
-
+    @pytest.mark.description(
+        (
+            "Agent artifact upload works across the supported Linux image families.\n"
+            "\n"
+            "Test cases:\n"
+            "- The frozen benchmark contract zip is downloaded and extracted into each sandbox image.\n"
+            "- The temporary zip is not left behind after extraction."
+        )
+    )
     async def test_upload_all_images(
         self,
         sandbox_provider: SandboxProvider,
@@ -51,18 +52,11 @@ class TestUploadArtifactsAcrossImages:
         live_aws_runtime: AWSRuntime,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify agent artifact upload works across the supported Linux image families.
-
-        Test cases:
-        - The frozen benchmark contract zip is downloaded and extracted into each sandbox image.
-        - The temporary zip is not left behind after extraction.
-        """
 
         benchmark_id = f"test-benchmark-{uuid4().hex[:5]}"
         aws_runtime = live_aws_runtime
         object_store = S3ObjectStore(aws_runtime)
 
-        # Stage the per-benchmark frozen copy that upload_agent_artifacts will now read from.
         s3 = create_s3_client(live_aws_runtime)
         agent_key = agent_bundle_key(contract.name)
         frozen_key = get_benchmark_contract_s3_key(benchmark_id, contract.name)

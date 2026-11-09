@@ -1,8 +1,3 @@
-"""PostgreSQL tests for operational Alembic migration contracts.
-
-Run: pytest tests/integration/local/database/test_migrations.py
-"""
-
 import subprocess
 import traceback
 from collections.abc import Generator
@@ -44,6 +39,7 @@ from tracker.database.models import (
     TaskStatus,
 )
 from tracker.local.resources import LocalResources
+from tracker.repositories.project import ProjectRepository
 
 _TRACKER_ROOT = Path(__file__).resolve().parents[4]
 _ALEMBIC_INI = _TRACKER_ROOT / "alembic.ini"
@@ -64,13 +60,17 @@ _SANDBOX_BUILD_RESERVATION_REVISION = "4f5a6b7c8d9e"
 _SANDBOX_BUILD_RESERVATION_PREDECESSOR = "3e4f5a6b7c8d"
 _RESERVED_ADMISSION_REVISION = "d9e0f1a2b3c4"
 _RESERVED_ADMISSION_PREDECESSOR = "c1d2e3f4a5b6"
+_SHARED_POOL_REVISION = "c82e1f7a9d03"
+_SHARED_POOL_PREDECESSOR = "5a6b7c8d9e0f"
 _ORG_BUCKET_REVISION = "a7b8c9d0e1f2"
 _ORG_BUCKET_PREDECESSOR = "b3c4d5e6f7a8"
 _DROP_AWS_MANAGED_REVISION = "c4d5e6f7a8b9"
-_PROJECT_REVISION = "7b1e4c9d2a60"
 _PROJECT_PREDECESSOR = "b7e4c1a9d2f0"
+_UNIQUE_PROJECT_NAME_REVISION = "4c9d2e7f1a3b"
+_UNIQUE_PROJECT_NAME_PREDECESSOR = "3222f9e0a6ce"
 
 
+@pytest.mark.description("Alembic migrations resolve to exactly one head revision.")
 def test_migration_graph_has_single_head() -> None:
     scripts = ScriptDirectory.from_config(Config(str(_ALEMBIC_INI)))
     heads = scripts.get_heads()
@@ -78,6 +78,7 @@ def test_migration_graph_has_single_head() -> None:
     assert len(heads) == 1, f"Expected one Alembic head, found {heads}"
 
 
+@pytest.mark.description("The dispatch lease migration adds the lease columns and the status and lease expiry index.")
 def test_dispatch_lease_migration_adds_recovery_state(migration_database_url: str) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", _DISPATCH_LEASE_REVISION)
     assert upgrade.returncode == 0, upgrade.stderr
@@ -99,6 +100,9 @@ def test_dispatch_lease_migration_adds_recovery_state(migration_database_url: st
     engine.dispose()
 
 
+@pytest.mark.description(
+    "Upgrading keeps only `lease_expires_at` and drops release readiness columns. Downgrading restores both."
+)
 def test_dispatch_migration_retains_only_local_lease_state_and_drops_release_readiness(
     migration_database_url: str,
 ) -> None:
@@ -155,7 +159,6 @@ def migration_postgres() -> Generator[PostgresContainer, None, None]:
 
 @pytest.fixture
 def migration_database_url(migration_postgres: PostgresContainer) -> Generator[str, None, None]:
-    """Give each migration test an empty database in the module's shared Postgres."""
     name = f"migration_{uuid4().hex}"
     admin = create_engine(migration_postgres.get_connection_url(), isolation_level="AUTOCOMMIT")
     with admin.connect() as connection:
@@ -167,7 +170,6 @@ def migration_database_url(migration_postgres: PostgresContainer) -> Generator[s
 
 
 def _run_alembic(database_url: str, action: str, revision: str) -> subprocess.CompletedProcess[str]:
-    """Run an Alembic command in-process, reporting failure the way the CLI would."""
     try:
         with patch.object(tracker_config, "DATABASE_URL", database_url), patch("logging.config.fileConfig"):
             getattr(command, action)(Config(str(_ALEMBIC_INI)), revision)
@@ -176,6 +178,7 @@ def _run_alembic(database_url: str, action: str, revision: str) -> subprocess.Co
     return subprocess.CompletedProcess([action, revision], 0, "", "")
 
 
+@pytest.mark.description("The failure category migration gives up on a busy table and retries.")
 def test_failure_category_migration_aborts_on_busy_table_and_retries(
     migration_database_url: str,
 ) -> None:
@@ -190,7 +193,6 @@ def test_failure_category_migration_aborts_on_busy_table_and_retries(
                 try:
                     blocked = future.result(timeout=10)
                 finally:
-                    # Release even on assertion failure so the subprocess can exit.
                     blocker.rollback()
             assert blocked.returncode != 0
             assert "lock timeout" in blocked.stderr
@@ -217,6 +219,9 @@ def test_failure_category_migration_aborts_on_busy_table_and_retries(
         engine.dispose()
 
 
+@pytest.mark.description(
+    "Upgrading through both branches creates `executor_dispatch_payload` and a nullable `errorresult.category`."
+)
 @pytest.mark.parametrize("predecessor", ["3e4f5a6b7c8d", "b4c5d6e7f8a9"])
 def test_dispatch_and_failure_category_heads_upgrade_together(migration_database_url: str, predecessor: str) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", predecessor)
@@ -275,6 +280,7 @@ def _assert_canonical_task_listing_index(index: _TaskListingIndexRow) -> int:
     return index.index_oid
 
 
+@pytest.mark.description("The task listing index migration can be retried safely.")
 def test_task_listing_index_migration_is_retry_safe(migration_database_url: str) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", _TASK_LISTING_PREDECESSOR)
     assert upgrade.returncode == 0, upgrade.stderr
@@ -437,6 +443,7 @@ def test_task_listing_index_migration_is_retry_safe(migration_database_url: str)
     engine.dispose()
 
 
+@pytest.mark.description("Downgrading executor release ownership restores the previous schema.")
 def test_executor_release_ownership_downgrade_restores_predecessor_schema(
     migration_database_url: str,
 ) -> None:
@@ -470,6 +477,9 @@ def test_executor_release_ownership_downgrade_restores_predecessor_schema(
     engine.dispose()
 
 
+@pytest.mark.description(
+    "The error result provenance migration upgrades existing error rows to the maintenance revision without losing them."
+)
 def test_error_result_provenance_migration_preserves_legacy_rows(
     migration_database_url: str,
 ) -> None:
@@ -660,6 +670,7 @@ def test_error_result_provenance_migration_preserves_legacy_rows(
     engine.dispose()
 
 
+@pytest.mark.description("The maintenance fence migration only adds schema.")
 def test_maintenance_fence_migration_is_additive(migration_database_url: str) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", _MAINTENANCE_REVISION)
     assert upgrade.returncode == 0, upgrade.stderr
@@ -673,6 +684,9 @@ def test_maintenance_fence_migration_is_additive(migration_database_url: str) ->
     engine.dispose()
 
 
+@pytest.mark.description(
+    "A second upgrade blocks on the migration advisory lock and then completes at the head revision."
+)
 def test_upgrade_waits_for_the_migration_advisory_lock(migration_database_url: str) -> None:
     engine = create_engine(migration_database_url)
     with engine.connect() as lock_holder, ThreadPoolExecutor(max_workers=1) as executor:
@@ -714,6 +728,7 @@ def test_upgrade_waits_for_the_migration_advisory_lock(migration_database_url: s
     engine.dispose()
 
 
+@pytest.mark.description("The current execution ownership migration refuses to downgrade.")
 def test_current_execution_ownership_migration_rejects_downgrade(
     migration_database_url: str,
 ) -> None:
@@ -729,8 +744,6 @@ def test_current_execution_ownership_migration_rejects_downgrade(
             {"id": org_id, "name": "migration-test-org"},
         )
         session.commit()
-        # Insert with explicit columns: the schema is pinned at the ownership
-        # revision, which predates columns the current ORM model would include.
         session.execute(
             text(
                 "INSERT INTO executorrelease"
@@ -793,6 +806,7 @@ def test_current_execution_ownership_migration_rejects_downgrade(
     engine.dispose()
 
 
+@pytest.mark.description("The sandbox build reservation migration upgrades and downgrades cleanly.")
 def test_sandbox_build_reservation_upgrade_and_downgrade(
     migration_database_url: str,
 ) -> None:
@@ -873,9 +887,8 @@ def test_sandbox_build_reservation_upgrade_and_downgrade(
     engine.dispose()
 
 
+@pytest.mark.description("The combined migration preserves the head revision and supports admission writes.")
 class TestReservedAdmissionMigration:
-    """The combined migration preserves the head revision and supports admission writes."""
-
     @pytest.fixture
     def database(self, migration_database_url: str) -> Generator[Engine, None, None]:
         predecessor = _run_alembic(migration_database_url, "upgrade", _RESERVED_ADMISSION_PREDECESSOR)
@@ -910,7 +923,6 @@ class TestReservedAdmissionMigration:
                     queue_pool_id="pool_migration",
                 ),
             )
-            # This historical schema predates the release task-definition column.
             session.execute(
                 text(
                     "INSERT INTO executorrelease"
@@ -973,6 +985,7 @@ class TestReservedAdmissionMigration:
 
             return tasks, dispatch
 
+    @pytest.mark.description("The reserved admission migration upgrades and downgrades cleanly.")
     @pytest.mark.parametrize("populated", [False, True], ids=["empty-ledger", "pre-domain-ledger"])
     def test_upgrade_and_downgrade(
         self,
@@ -1009,54 +1022,51 @@ class TestReservedAdmissionMigration:
                 (building.started_at - timedelta(minutes=1), building.started_at),
                 (building.started_at, None),
             ):
-                session.add(
-                    SandboxBuildReservation(
-                        task_row_id=building.id,
-                        attempt_started_at=attempt,
-                        reserved_at=attempt,
-                        released_at=released_at,
-                        pool_id="pool_migration",
-                        target_id="region-a",
-                        sandbox_class="sysbox",
-                        requested_vcpu=1.25,
-                        requested_memory=2.25,
-                        requested_disk=20.25,
-                        requested_gpu=0,
-                    )
+                session.execute(
+                    text(
+                        "INSERT INTO sandboxbuildreservation "
+                        "(task_row_id, attempt_started_at, reserved_at, released_at, pool_id, "
+                        "target_id, sandbox_class, requested_vcpu, requested_memory, requested_disk, requested_gpu) "
+                        "VALUES (:id, :attempt, :attempt, :released_at, 'pool_migration', "
+                        "'region-a', 'sysbox', 1.25, 2.25, 20.25, 0)"
+                    ),
+                    {"id": building.id, "attempt": attempt, "released_at": released_at},
                 )
-            session.add_all(
+            session.execute(
+                text(
+                    "INSERT INTO sandboxadmissioncandidate "
+                    "(task_row_id, attempt_started_at, executor_dispatch_id, admission_ready, pool_id, "
+                    "target_id, sandbox_class, requested_vcpu, requested_memory, requested_disk, requested_gpu) "
+                    "VALUES (:id, :attempt, :dispatch, :ready, 'pool_migration', "
+                    ":target, 'sysbox', :cpu, :memory, :disk, :gpu)"
+                ),
                 [
-                    SandboxAdmissionCandidate(
-                        task_row_id=ready.id,
-                        attempt_started_at=ready.started_at,
-                        executor_dispatch_id=dispatch.id,
-                        admission_ready=True,
-                        pool_id="pool_migration",
-                        target_id="region-a",
-                        sandbox_class="sysbox",
-                        requested_vcpu=1.25,
-                        requested_memory=2.25,
-                        requested_disk=20.25,
-                        requested_gpu=0,
-                    ),
-                    SandboxAdmissionCandidate(
-                        task_row_id=rejected.id,
-                        attempt_started_at=rejected.started_at,
-                        executor_dispatch_id=dispatch.id,
-                        admission_ready=False,
-                        pool_id="pool_migration",
-                        target_id="region-b",
-                        sandbox_class="sysbox",
-                        requested_vcpu=0,
-                        requested_memory=0,
-                        requested_disk=0,
-                        requested_gpu=1,
-                    ),
-                ]
+                    {
+                        "id": ready.id,
+                        "attempt": ready.started_at,
+                        "dispatch": dispatch.id,
+                        "ready": True,
+                        "target": "region-a",
+                        "cpu": 1.25,
+                        "memory": 2.25,
+                        "disk": 20.25,
+                        "gpu": 0,
+                    },
+                    {
+                        "id": rejected.id,
+                        "attempt": rejected.started_at,
+                        "dispatch": dispatch.id,
+                        "ready": False,
+                        "target": "region-b",
+                        "cpu": 0,
+                        "memory": 0,
+                        "disk": 0,
+                        "gpu": 1,
+                    },
+                ],
             )
             session.commit()
 
-        # Rows written after the reserved-admission upgrade survive later head migrations.
         current_head = _run_alembic(migration_database_url, "upgrade", "head")
         assert current_head.returncode == 0, current_head.stderr
 
@@ -1077,6 +1087,15 @@ class TestReservedAdmissionMigration:
                     "FROM sandboxadmissioncandidate"
                 )
             ).all()
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT bool_and(readiness_checked_at IS NOT NULL AND readiness_requested_at IS NULL) "
+                        "FROM sandboxadmissioncandidate"
+                    )
+                ).scalar_one()
+                is True
+            )
 
         assert [tuple(row) for row in reservations] == [
             (building.started_at - timedelta(minutes=1), building.started_at, 1.25, 2.25, 20.25),
@@ -1122,11 +1141,128 @@ class TestReservedAdmissionMigration:
             rejected.id: TaskStatus.PENDING,
         }
 
+    @pytest.mark.description(
+        "The shared grant handoff migration keeps grant history and leaves no open build reservations."
+    )
+    def test_shared_grant_handoff_preserves_history_and_records_new_offers(
+        self,
+        migration_database_url: str,
+        database: Engine,
+        admission_rows: tuple[list[Task], ExecutorDispatch],
+    ) -> None:
+        tasks, dispatch = admission_rows
+        building, ready, rejected = tasks
+        upgrade = _run_alembic(migration_database_url, "upgrade", _SHARED_POOL_PREDECESSOR)
+        assert upgrade.returncode == 0, upgrade.stderr
+        with database.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sandboxbuildreservation "
+                    "(task_row_id, attempt_started_at, reserved_at, pool_id, target_id, sandbox_class, "
+                    "requested_vcpu, requested_memory, requested_disk, requested_gpu) "
+                    "VALUES (:id, :attempt, :attempt, 'pool_migration', 'region-a', 'sysbox', 1, 2, 3, 0)"
+                ),
+                {"id": building.id, "attempt": building.started_at},
+            )
 
+        upgrade = _run_alembic(migration_database_url, "upgrade", _SHARED_POOL_REVISION)
+        assert upgrade.returncode == 0, upgrade.stderr
+        inspector = inspect(database)
+        columns = {column["name"]: column for column in inspector.get_columns("sandboxbuildreservation")}
+        assert columns["executor_dispatch_id"]["nullable"]
+        assert columns["accepted_at"]["nullable"]
+        candidate_columns = {column["name"]: column for column in inspector.get_columns("sandboxadmissioncandidate")}
+        assert not candidate_columns["readiness_checked_at"]["nullable"]
+        assert candidate_columns["readiness_requested_at"]["nullable"]
+        assert inspector.get_pk_constraint("sandboxbuildreservation")["constrained_columns"] == [
+            "task_row_id",
+            "attempt_started_at",
+        ]
+        assert any(
+            key["constrained_columns"] == ["executor_dispatch_id"] and key["referred_table"] == "executordispatch"
+            for key in inspector.get_foreign_keys("sandboxbuildreservation")
+        )
+        with Session(database) as session:
+            historical = session.get(SandboxBuildReservation, (building.id, building.started_at))
+            assert historical is not None
+            assert historical.accepted_at == historical.reserved_at
+            assert historical.executor_dispatch_id is None
+            row = session.get(Task, ready.id)
+            assert row is not None
+            row.status = TaskStatus.BUILDING
+            grant = SandboxBuildReservation(
+                task_row_id=ready.id,
+                attempt_started_at=ready.started_at,
+                executor_dispatch_id=dispatch.id,
+                pool_id="pool_migration",
+                target_id="region-a",
+                sandbox_class="sysbox",
+                requested_vcpu=1,
+                requested_memory=2,
+                requested_disk=3,
+                requested_gpu=0,
+            )
+            session.add(grant)
+            session.commit()
+            session.refresh(grant)
+            assert grant.accepted_at is None
+            assert grant.executor_dispatch_id == dispatch.id
+            candidate = SandboxAdmissionCandidate(
+                task_row_id=rejected.id,
+                attempt_started_at=rejected.started_at,
+                executor_dispatch_id=dispatch.id,
+                admission_ready=False,
+                readiness_requested_at=datetime.now(UTC),
+                pool_id="pool_migration",
+                target_id="region-a",
+                sandbox_class="sysbox",
+                requested_vcpu=1,
+                requested_memory=2,
+                requested_disk=3,
+                requested_gpu=0,
+            )
+            session.add(candidate)
+            session.commit()
+            session.refresh(candidate)
+            assert candidate.readiness_requested_at is not None
+
+            session.delete(candidate)
+            rejected_row = session.get(Task, rejected.id)
+            assert rejected_row is not None
+            rejected_row.status = TaskStatus.STOPPED
+            historical.released_at = datetime.now(UTC)
+            grant.released_at = datetime.now(UTC)
+            row.status = TaskStatus.STOPPED
+            building_row = session.get(Task, building.id)
+            assert building_row is not None
+            building_row.status = TaskStatus.STOPPED
+            session.commit()
+        downgrade = _run_alembic(migration_database_url, "downgrade", _SHARED_POOL_PREDECESSOR)
+        assert downgrade.returncode == 0, downgrade.stderr
+        columns_after = {column["name"] for column in inspect(database).get_columns("sandboxbuildreservation")}
+        assert "accepted_at" not in columns_after
+        assert "executor_dispatch_id" not in columns_after
+        candidate_columns_after = {
+            column["name"] for column in inspect(database).get_columns("sandboxadmissioncandidate")
+        }
+        assert "readiness_checked_at" not in candidate_columns_after
+        assert "readiness_requested_at" not in candidate_columns_after
+        with database.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM sandboxbuildreservation")).scalar_one() == 2
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM sandboxbuildreservation WHERE released_at IS NULL")
+                ).scalar_one()
+                == 0
+            )
+
+
+@pytest.mark.description(
+    "Vals keeps the bucket it already uses. Tracker creates every other organization's bucket later."
+)
 def test_org_bucket_migration_records_the_deployment_bucket_for_vals_only(
     migration_database_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vals keeps the bucket it already uses; Tracker creates every other organization's bucket later."""
     monkeypatch.setattr(tracker_config, "AWS_DEPLOYMENT_S3_BUCKET", "agentic-harness-test")
     upgrade = _run_alembic(migration_database_url, "upgrade", _ORG_BUCKET_PREDECESSOR)
     assert upgrade.returncode == 0, upgrade.stderr
@@ -1149,8 +1285,10 @@ def test_org_bucket_migration_records_the_deployment_bucket_for_vals_only(
     engine.dispose()
 
 
+@pytest.mark.description(
+    "The flag is gone after upgrade. Downgrade restores it so the previous Tracker can still resume AWS runs."
+)
 def test_dropping_aws_managed_downgrades_with_every_aws_run_marked_managed(migration_database_url: str) -> None:
-    """The flag is gone after upgrade; downgrade restores it so the previous Tracker can still resume AWS runs."""
     upgrade = _run_alembic(migration_database_url, "upgrade", _ORG_BUCKET_REVISION)
     assert upgrade.returncode == 0, upgrade.stderr
     engine = create_engine(migration_database_url)
@@ -1196,9 +1334,11 @@ def test_dropping_aws_managed_downgrades_with_every_aws_run_marked_managed(migra
     engine.dispose()
 
 
+@pytest.mark.description(
+    "Project handles are unique per org while names may repeat, a run's last-appended link is its project even when link timestamps tie, and downgrade removes both tables."
+)
 def test_project_migration_matches_the_models_and_downgrades(migration_database_url: str) -> None:
-    """Project handles are unique per org while names may repeat, a run's last-appended link is its project even when link timestamps tie, and downgrade removes both tables."""
-    upgrade = _run_alembic(migration_database_url, "upgrade", _PROJECT_REVISION)
+    upgrade = _run_alembic(migration_database_url, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
     engine = create_engine(migration_database_url)
     inspector = inspect(engine)
@@ -1264,10 +1404,10 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
             ]
         )
         session.commit()
-        reversed_current = reversed_run.fetch_project(session)
+        reversed_current = ProjectRepository(session).get_for_run(reversed_run.id)
         assert reversed_current is not None
         assert reversed_current.handle == "router-bench"
-        newest = run.fetch_project(session)
+        newest = ProjectRepository(session).get_for_run(run.id)
         assert newest is not None
         assert (newest.handle, newest.name, newest.spend_type, newest.extra_tags) == (
             "google-report-xyz",
@@ -1279,7 +1419,7 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
             Project(
                 org_id=org_id,
                 handle="router-bench-2",
-                name="Router Bench",
+                name="Router Bench 2",
                 spend_type=SpendType.INTERNAL,
                 subcategory="blog",
             )
@@ -1302,4 +1442,127 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
     assert {"project", "run_project"}.isdisjoint(inspect(engine).get_table_names())
     with engine.connect() as connection:
         assert connection.execute(text("SELECT 1 FROM pg_type WHERE typname = 'spendtype'")).first() is None
+    engine.dispose()
+
+
+@pytest.mark.description(
+    "Projects saved before the column exists read as unarchived, and downgrade drops only the column."
+)
+def test_project_archived_at_migration_keeps_existing_projects_unarchived_and_downgrades(
+    migration_database_url: str,
+) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "265bacf0f12a")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    org_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO org (id, name) VALUES (:id, :name)"), {"id": org_id, "name": "archive-org"}
+        )
+        connection.execute(
+            text(
+                "INSERT INTO project (id, org_id, handle, name, spend_type, extra_tags, created_at) "
+                "VALUES (:id, :org_id, 'kept', 'Kept', 'INTERNAL', '{}', now())"
+            ),
+            {"id": uuid4(), "org_id": org_id},
+        )
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "3f8b2c6d1e4a")
+    assert upgrade.returncode == 0, upgrade.stderr
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT archived_at FROM project WHERE handle = 'kept'")).scalar_one() is None
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "265bacf0f12a")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert "archived_at" not in {column["name"] for column in inspect(engine).get_columns("project")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM project")).scalar_one() == 1
+    engine.dispose()
+
+
+@pytest.mark.description(
+    "Organizations saved before the column exists, vals.ai included, require no project. Downgrade drops only the column."
+)
+def test_org_requires_project_migration_leaves_every_org_off_and_downgrades(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "3f8b2c6d1e4a")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    with engine.begin() as connection:
+        for name in ("vals.ai", "other-org"):
+            connection.execute(text("INSERT INTO org (id, name) VALUES (:id, :name)"), {"id": uuid4(), "name": name})
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "3222f9e0a6ce")
+    assert upgrade.returncode == 0, upgrade.stderr
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT name, requires_project FROM org ORDER BY name")).all()
+    assert [tuple(row) for row in rows] == [("default", False), ("other-org", False), ("vals.ai", False)]
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "3f8b2c6d1e4a")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert "requires_project" not in {column["name"] for column in inspect(engine).get_columns("org")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM org")).scalar_one() == 3
+    engine.dispose()
+
+
+def _insert_projects(engine: Engine, org_name: str, projects: list[tuple[str, str, bool]]) -> None:
+    org_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO org (id, name) VALUES (:id, :name)"), {"id": org_id, "name": org_name})
+        for handle, name, archived in projects:
+            connection.execute(
+                text(
+                    "INSERT INTO project (id, org_id, handle, name, spend_type, extra_tags, created_at, archived_at) "
+                    "VALUES (:id, :org_id, :handle, :name, 'INTERNAL', '{}', now(), "
+                    "CASE WHEN :archived THEN now() END)"
+                ),
+                {"id": uuid4(), "org_id": org_id, "handle": handle, "name": name, "archived": archived},
+            )
+
+
+@pytest.mark.description(
+    "Duplicate project names, archived ones included, stop the migration with a list of what to rename."
+)
+def test_unique_project_name_migration_lists_duplicates_and_adds_nothing(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", _UNIQUE_PROJECT_NAME_PREDECESSOR)
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    _insert_projects(
+        engine,
+        "vals.ai",
+        [("hy4", "Hy4", False), ("hy4-b", "hy4 ", False), ("swarms", "Swarms", True), ("swarms-2", "Swarms", True)],
+    )
+    _insert_projects(engine, "other-org", [("hy4", "Hy4", False)])
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", _UNIQUE_PROJECT_NAME_REVISION)
+
+    assert upgrade.returncode == 1
+    assert (
+        "Rename these projects so each name is used once per organization, then rerun: "
+        "org 'vals.ai' name 'hy4' held by hy4, hy4-b; "
+        "org 'vals.ai' name 'swarms' held by swarms, swarms-2"
+    ) in upgrade.stderr
+    assert "uq_project_org_name" not in {index["name"] for index in inspect(engine).get_indexes("project")}
+    engine.dispose()
+
+
+@pytest.mark.description(
+    "On distinct names the migration adds the per-org name index, which then refuses a case variant."
+)
+def test_unique_project_name_migration_adds_the_index_and_downgrades(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", _UNIQUE_PROJECT_NAME_PREDECESSOR)
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    _insert_projects(engine, "vals.ai", [("hy4", "Hy4", False), ("swarms", "Swarms", True)])
+    _insert_projects(engine, "other-org", [("hy4", "Hy4", False)])
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", _UNIQUE_PROJECT_NAME_REVISION)
+
+    assert upgrade.returncode == 0, upgrade.stderr
+    assert "uq_project_org_name" in {index["name"] for index in inspect(engine).get_indexes("project")}
+    with pytest.raises(IntegrityError):
+        _insert_projects(engine, "third-org", [("a", "Same", False), ("b", " same", False)])
+    downgrade = _run_alembic(migration_database_url, "downgrade", _UNIQUE_PROJECT_NAME_PREDECESSOR)
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert "uq_project_org_name" not in {index["name"] for index in inspect(engine).get_indexes("project")}
     engine.dispose()

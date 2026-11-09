@@ -26,10 +26,12 @@ def lambda_handler(event, context):
 ## Name the function when you start a run
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --lambda my-post-run-handler --project my-project
+valkyrie run start --agent my-agent --benchmark swebench \
+  --lambda my-post-run-handler --project my-project
 ```
 
-To call another function when a rerun finishes, pass `--lambda` to `valkyrie run resume` or `valkyrie run retry`.
+To call another function when a rerun finishes, pass `--lambda` to `valkyrie run resume`
+or `valkyrie run retry`.
 
 ## When the function runs
 

@@ -1,5 +1,3 @@
-"""Execute the sandbox report reader with synthetic provider environment values."""
-
 import asyncio
 import shlex
 import sys
@@ -12,6 +10,7 @@ from benchmark_service import ExecResult
 from tracker import sandbox as sandbox_module
 
 
+@pytest.mark.description("Provider values are masked before agent errors leave the sandbox.")
 @pytest.mark.parametrize(
     ("report", "environment", "expected"),
     [
@@ -71,7 +70,6 @@ async def test_provider_values_are_masked_before_returning_from_sandbox(
         commands.append(command)
         argv = shlex.split(command)
         assert argv[:4] == ["python3", "-I", "-S", "-c"]
-        # Use the test interpreter, but run the exact generated script and arguments.
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             *argv[1:],
@@ -99,11 +97,11 @@ async def test_provider_values_are_masked_before_returning_from_sandbox(
     for value in environment.values():
         if value:
             assert value not in "".join(outputs)
-            # Short values may occur in Python source; realistic tokens must not be arguments.
             if len(value) > 8:
                 assert value not in "".join(commands)
 
 
+@pytest.mark.description("A sandbox without Python keeps the fallback provider reader.")
 async def test_provider_reader_without_python_retains_fallback(tmp_path: Path) -> None:
     async def execute(command: str) -> ExecResult:
         process = await asyncio.create_subprocess_exec(

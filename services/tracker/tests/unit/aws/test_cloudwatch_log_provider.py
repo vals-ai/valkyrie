@@ -1,8 +1,3 @@
-"""Tests for CloudWatch benchmark log reads.
-
-Run: uv run pytest services/tracker/tests/unit/aws/test_cloudwatch_log_provider.py
-"""
-
 from __future__ import annotations
 
 from collections import deque
@@ -17,14 +12,19 @@ from botocore.exceptions import ClientError, EndpointConnectionError  # pyright:
 from tracker.aws import cloudwatch_logs
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchLogProvider, task_log_stream_name
-from tracker.runtime.logs import LogEvent, LogProviderError, RunLogReference, RunTaskLogReference, TaskLogReference
+from tracker.runtime.logs import (
+    LogEvent,
+    LogProviderError,
+    RunLogReference,
+    RunTaskLogReference,
+    TaskLogLine,
+    TaskLogReference,
+)
 
 _legacy_task_log_stream_name = getattr(cloudwatch_logs, "_legacy_task_log_stream_name")
 
 
 class MockLogsClient:
-    """Return queued CloudWatch responses and retain request parameters."""
-
     def __init__(self, responses: list[dict[str, Any] | BaseException]) -> None:
         self.responses = deque(responses)
         self.filter_requests: list[dict[str, Any]] = []
@@ -46,8 +46,6 @@ class MockLogsClient:
 
 
 class MockClients:
-    """Expose one mock CloudWatch Logs client through the provider seam."""
-
     def __init__(self, logs_client: MockLogsClient) -> None:
         self.logs_client = logs_client
 
@@ -56,8 +54,6 @@ class MockClients:
 
 
 class FailingClients:
-    """Raise while constructing a CloudWatch Logs client."""
-
     def __init__(self, error: BaseException) -> None:
         self.error = error
 
@@ -69,6 +65,7 @@ def _provider(logs_client: MockLogsClient) -> CloudWatchLogProvider:
     return CloudWatchLogProvider(cast(AWSClientProvider, MockClients(logs_client)), "benchmarks")
 
 
+@pytest.mark.description("Snapshot reads must translate client construction failures and retain their cause.")
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -80,7 +77,6 @@ def _provider(logs_client: MockLogsClient) -> CloudWatchLogProvider:
     ],
 )
 async def test_snapshot_translates_client_construction_errors(failure: BaseException, message: str) -> None:
-    """Snapshot reads must translate client construction failures and retain their cause."""
     provider = CloudWatchLogProvider(cast(AWSClientProvider, FailingClients(failure)), "benchmarks")
 
     with pytest.raises(LogProviderError, match=message) as error:
@@ -89,8 +85,10 @@ async def test_snapshot_translates_client_construction_errors(failure: BaseExcep
     assert error.value.__cause__ is failure
 
 
+@pytest.mark.description(
+    "Run reads must use exact stream identities, deterministic order, and unchanged end milliseconds."
+)
 async def test_run_fetch_uses_exact_stream_metadata_and_inclusive_millisecond_bound() -> None:
-    """Run reads must use exact stream identities, deterministic order, and unchanged end milliseconds."""
     run_id = uuid4()
     first_started = datetime(2026, 1, 1, 11, 59, tzinfo=timezone.utc)
     second_started = datetime(2026, 1, 1, 11, 58, tzinfo=timezone.utc)
@@ -103,7 +101,7 @@ async def test_run_fetch_uses_exact_stream_metadata_and_inclusive_millisecond_bo
                     {
                         "timestamp": 2_000,
                         "ingestionTime": 2_100,
-                        "message": "second",
+                        "message": '{"message": "second", "trace_id": "abc"}',
                         "logStreamName": task_log_stream_name("task_two", second_started),
                         "eventId": "event-2",
                     },
@@ -146,8 +144,8 @@ async def test_run_fetch_uses_exact_stream_metadata_and_inclusive_millisecond_bo
     assert page.next_cursor == "next-page"
 
 
+@pytest.mark.description("Queries must be applied locally so CloudWatch cannot interpret filter metacharacters.")
 async def test_run_fetch_filters_cloudwatch_metacharacters_as_literal_substrings() -> None:
-    """Queries must be applied locally so CloudWatch cannot interpret filter metacharacters."""
     run_id = uuid4()
     query = '* "quoted" \\'
     logs_client = MockLogsClient(
@@ -169,8 +167,8 @@ async def test_run_fetch_filters_cloudwatch_metacharacters_as_literal_substrings
     assert page.next_cursor == "next-page"
 
 
+@pytest.mark.description("Colliding legacy names must remain aggregate-only while canonical names stay distinct.")
 async def test_collision_resistant_names_do_not_attribute_ambiguous_legacy_stream() -> None:
-    """Colliding legacy names must remain aggregate-only while canonical names stay distinct."""
     run_id = uuid4()
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     first = RunTaskLogReference(task_id="task:one", started_at=started_at)
@@ -189,8 +187,8 @@ async def test_collision_resistant_names_do_not_attribute_ambiguous_legacy_strea
     assert page.events[0].task_id is None
 
 
+@pytest.mark.description("A selected task must not read a canonical name used by a sibling's legacy stream.")
 async def test_task_fetch_excludes_canonical_name_shared_with_sibling_legacy_stream() -> None:
-    """A selected task must not read a canonical name used by a sibling's legacy stream."""
     run_id = uuid4()
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     task_id = "task:one"
@@ -212,8 +210,8 @@ async def test_task_fetch_excludes_canonical_name_shared_with_sibling_legacy_str
     ]
 
 
+@pytest.mark.description("A task read must fail instead of selecting a stream shared with a sibling.")
 async def test_task_fetch_rejects_when_all_names_are_ambiguous() -> None:
-    """A task read must fail instead of selecting a stream shared with a sibling."""
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     reference = TaskLogReference(
         run_id=uuid4(),
@@ -229,8 +227,8 @@ async def test_task_fetch_rejects_when_all_names_are_ambiguous() -> None:
     assert logs_client.filter_requests == []
 
 
+@pytest.mark.description("A selected task must not read a legacy stream shared by a sibling task.")
 async def test_task_fetch_excludes_ambiguous_legacy_stream() -> None:
-    """A selected task must not read a legacy stream shared by a sibling task."""
     run_id = uuid4()
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     sibling = RunTaskLogReference(task_id="task*one", started_at=started_at)
@@ -247,8 +245,28 @@ async def test_task_fetch_excludes_ambiguous_legacy_stream() -> None:
     assert logs_client.filter_requests[0]["logStreamNames"] == [task_log_stream_name(reference.task_id, started_at)]
 
 
-async def test_task_fetch_keeps_empty_changing_page_and_stops_on_stable_cursor() -> None:
-    """An empty page only terminates when CloudWatch stops advancing its token."""
+@pytest.mark.description(
+    "A page with logs behind empty CloudWatch pages returns those logs instead of an empty page with a cursor."
+)
+async def test_run_fetch_skips_empty_pages_to_the_next_events() -> None:
+    reference = RunLogReference(run_id=uuid4(), tasks=())
+    logs_client = MockLogsClient(
+        [
+            {"events": [], "nextToken": "page-2"},
+            {"events": [], "nextToken": "page-3"},
+            {"events": [{"timestamp": 1_000, "message": "agent output"}], "nextToken": "page-4"},
+        ]
+    )
+
+    page = await _provider(logs_client).fetch(reference)
+
+    assert [event.message for event in page.events] == ["agent output"]
+    assert page.next_cursor == "page-4"
+    assert [request.get("nextToken") for request in logs_client.filter_requests] == [None, "page-2", "page-3"]
+
+
+@pytest.mark.description("Empty CloudWatch pages are followed until the token stops advancing.")
+async def test_task_fetch_follows_empty_pages_until_the_cursor_is_stable() -> None:
     run_id = uuid4()
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     reference = TaskLogReference(
@@ -265,17 +283,18 @@ async def test_task_fetch_keeps_empty_changing_page_and_stops_on_stable_cursor()
     )
     provider = _provider(logs_client)
 
-    first_page = await provider.fetch(reference)
-    final_page = await provider.fetch(reference, cursor=first_page.next_cursor)
+    page = await provider.fetch(reference)
 
-    assert first_page.next_cursor == "advanced"
-    assert final_page.next_cursor is None
+    assert page.events == []
+    assert page.next_cursor is None
+    assert [request.get("nextToken") for request in logs_client.filter_requests] == [None, "advanced"]
     assert logs_client.filter_requests[0]["logStreamNames"] == [
         task_log_stream_name(reference.task_id, started_at),
         _legacy_task_log_stream_name(reference.task_id, started_at),
     ]
 
 
+@pytest.mark.description("A task log fetch reads whichever stream name exists.")
 @pytest.mark.parametrize("available_stream", ["canonical", "legacy", None])
 async def test_task_fetch_reads_existing_stream_when_other_name_is_absent(available_stream: str | None) -> None:
     reference = TaskLogReference(
@@ -305,8 +324,8 @@ async def test_task_fetch_reads_existing_stream_when_other_name_is_absent(availa
         ]
 
 
+@pytest.mark.description("Follow mode must emit a repeated event once and retain AWS failures as provider causes.")
 async def test_follow_deduplicates_poll_results_and_translates_aws_errors() -> None:
-    """Follow mode must emit a repeated event once and retain AWS failures as provider causes."""
     run_id = uuid4()
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     reference = TaskLogReference(run_id=run_id, task_id="task", started_at=started_at)
@@ -341,8 +360,27 @@ async def test_follow_deduplicates_poll_results_and_translates_aws_errors() -> N
     assert error.value.__cause__ is denied
 
 
+@pytest.mark.description("Follow mode keeps CloudWatch order for lines written in one chunk with the same timestamp.")
+async def test_follow_keeps_write_order_for_same_timestamp_lines() -> None:
+    reference = TaskLogReference(run_id=uuid4(), task_id="task", started_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    messages = [f"step {number}" for number in range(1, 11)]
+    lines = [TaskLogLine(received_at=1.0, message=message, fields={"trace_id": "trace"}) for message in messages]
+    [batch] = cloudwatch_logs._log_event_batches(lines)  # pyright: ignore[reportPrivateUsage]
+    page = {"events": [{**event, "ingestionTime": 2_000} for event in batch], "nextForwardToken": "tail"}
+    logs_client = MockLogsClient([page, page])
+
+    events = [
+        event
+        async for event in _provider(logs_client).stream_task(
+            reference, end_time=datetime(2020, 1, 1, tzinfo=timezone.utc), poll_interval=0
+        )
+    ]
+
+    assert [event.message for event in events] == messages
+
+
+@pytest.mark.description("Follow mode may select a unique legacy stream only after the canonical stream is missing.")
 async def test_follow_falls_back_to_unique_legacy_stream_when_canonical_is_absent() -> None:
-    """Follow mode may select a unique legacy stream only after the canonical stream is missing."""
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     reference = TaskLogReference(
         run_id=uuid4(),
@@ -382,13 +420,16 @@ async def test_follow_falls_back_to_unique_legacy_stream_when_canonical_is_absen
     ]
 
 
+@pytest.mark.description(
+    (
+        "Following before the first write must discover the new canonical stream.\n"
+        "\n"
+        "Test cases:\n"
+        "- Both canonical and legacy streams are initially absent.\n"
+        "- The next poll reads the canonical stream without a stale cursor."
+    )
+)
 async def test_follow_rechecks_canonical_stream_when_both_names_are_missing() -> None:
-    """Following before the first write must discover the new canonical stream.
-
-    Test cases:
-    - Both canonical and legacy streams are initially absent.
-    - The next poll reads the canonical stream without a stale cursor.
-    """
     reference = TaskLogReference(
         run_id=uuid4(),
         task_id="task:one",
@@ -411,8 +452,8 @@ async def test_follow_rechecks_canonical_stream_when_both_names_are_missing() ->
     assert "nextToken" not in logs_client.get_requests[-1]
 
 
+@pytest.mark.description("A missing canonical stream must not select a legacy stream shared by a sibling.")
 async def test_follow_does_not_fall_back_to_ambiguous_legacy_stream() -> None:
-    """A missing canonical stream must not select a legacy stream shared by a sibling."""
     started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     reference = TaskLogReference(
         run_id=uuid4(),
@@ -441,8 +482,8 @@ async def test_follow_does_not_fall_back_to_ambiguous_legacy_stream() -> None:
     ]
 
 
+@pytest.mark.description("Follow mode must suppress recent duplicates without retaining every emitted identity.")
 async def test_follow_deduplication_retains_only_a_recent_identity_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Follow mode must suppress recent duplicates without retaining every emitted identity."""
     monkeypatch.setattr("tracker.aws.cloudwatch_logs._FOLLOW_DEDUPLICATION_WINDOW", 2)
     reference = TaskLogReference(
         run_id=uuid4(),
@@ -473,11 +514,81 @@ async def test_follow_deduplication_retains_only_a_recent_identity_window(monkey
     assert messages == ["a", "b", "c", "a"]
 
 
+@pytest.mark.description("Persisted naive timestamps must name the same stream as their UTC instant.")
 def test_task_stream_name_treats_naive_started_at_as_utc() -> None:
-    """Persisted naive timestamps must name the same stream as their UTC instant."""
     naive = datetime(2026, 1, 1, 12, 30, 45, 123_456)
     utc = naive.replace(tzinfo=timezone.utc)
     offset = utc.astimezone(timezone(timedelta(hours=-7)))
 
     assert task_log_stream_name("task", naive) == task_log_stream_name("task", utc)
     assert task_log_stream_name("task", offset) == task_log_stream_name("task", utc)
+
+
+@pytest.mark.description("A strict attempt reads only the canonical stream and marks a missing one unavailable.")
+async def test_strict_attempt_uses_only_canonical_stream_and_marks_missing_unavailable() -> None:
+    started = datetime.now(timezone.utc)
+    reference = TaskLogReference(uuid4(), "task:legacy", started, siblings=(), strict_attempt=True)
+    missing = ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "FilterLogEvents")
+    client = MockLogsClient([missing, {"events": [{"timestamp": 1, "message": "legacy"}]}])
+    page = await _provider(client).fetch(reference)
+    assert page.available is False
+    assert not page.events
+    assert len(client.filter_requests) == 1
+    assert client.filter_requests[0]["logStreamNames"] == [task_log_stream_name(reference.task_id, started)]
+    stream_client = MockLogsClient([missing])
+    with pytest.raises(LogProviderError, match="unavailable"):
+        await anext(_provider(stream_client).stream_task(reference))
+    assert len(stream_client.get_requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"message": "step 1", "trace_id": "abc", "sandbox_id": "sb-1"}', "step 1"),
+        ('{"message": "connected", "level": "warning"}', '{"message": "connected", "level": "warning"}'),
+        ('{"msg": "connected"}', '{"msg": "connected"}'),
+        ("plain line", "plain line"),
+    ],
+)
+@pytest.mark.description(
+    "Only Tracker's own JSON task log bodies are unwrapped, so older lines that happen to be JSON keep their fields."
+)
+def test_event_message_unwraps_only_tracker_bodies(raw: str, expected: str) -> None:
+    assert cloudwatch_logs._event_message(raw) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.description(
+    "Following empty pages stops at the request cap and returns the last token without an extra call."
+)
+async def test_fetch_stops_following_empty_pages_at_the_request_cap() -> None:
+    logs_client = MockLogsClient([{"events": [], "nextToken": f"page-{number}"} for number in range(2, 14)])
+
+    page = await _provider(logs_client).fetch(RunLogReference(run_id=uuid4()))
+
+    assert page.events == []
+    assert page.next_cursor == "page-11"
+    assert len(logs_client.filter_requests) == 10
+
+
+@pytest.mark.description("Pages followed after the single-stream fallback stay on the stream that was found.")
+async def test_task_fetch_follows_empty_pages_on_the_fallback_stream() -> None:
+    reference = TaskLogReference(
+        run_id=uuid4(), task_id="task:one", started_at=datetime(2026, 1, 1, tzinfo=timezone.utc), siblings=()
+    )
+    missing = ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "FilterLogEvents")
+    logs_client = MockLogsClient(
+        [
+            missing,
+            missing,
+            {"events": [], "nextToken": "page-2"},
+            {"events": [{"timestamp": 1_000, "message": "agent output"}]},
+        ]
+    )
+
+    page = await _provider(logs_client).fetch(reference)
+
+    legacy = [_legacy_task_log_stream_name(reference.task_id, reference.started_at)]
+    assert [event.message for event in page.events] == ["agent output"]
+    assert logs_client.filter_requests[2]["logStreamNames"] == legacy
+    assert logs_client.filter_requests[3]["logStreamNames"] == legacy
+    assert logs_client.filter_requests[3]["nextToken"] == "page-2"

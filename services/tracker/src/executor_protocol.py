@@ -1,13 +1,14 @@
-"""Shared executor payload protocol."""
-
 from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
 from typing import TypedDict, cast
 
 RESERVED_QUEUE_PROTOCOL_VERSION = "5"
-SUPPORTED_PROTOCOL_VERSION = RESERVED_QUEUE_PROTOCOL_VERSION
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"1", "2", "3", "4", SUPPORTED_PROTOCOL_VERSION})
+SHARED_POOL_QUEUE_PROTOCOL_VERSION = "6"
+SUPPORTED_PROTOCOL_VERSION = SHARED_POOL_QUEUE_PROTOCOL_VERSION
+SUPPORTED_PROTOCOL_VERSIONS = frozenset(
+    {"1", "2", "3", "4", RESERVED_QUEUE_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION}
+)
 MANAGED_EXECUTION_PROTOCOL_VERSION = "3"
 DATASET_VERSION_PROTOCOL_VERSION = "4"
 
@@ -25,7 +26,6 @@ class ExecutorTelemetryContext(TypedDict):
 
 
 def normalize_executor_telemetry_context(value: object) -> ExecutorTelemetryContext:
-    """Normalize optional telemetry fields at the executor wire boundary."""
     if not isinstance(value, Mapping):
         return {"request_id": "", "trace_headers": {}}
 
@@ -52,7 +52,6 @@ def validate_executor_digest(digest: str) -> str:
 
 
 def validate_executor_image_uri(uri: str, expected_repository: str) -> str:
-    """Require an image release to pin the configured ECR repository by digest; return the digest."""
     repository, separator, digest = uri.partition("@sha256:")
     if not separator or repository != expected_repository:
         raise ValueError("Executor image must pin the configured ECR repository by digest")
@@ -60,5 +59,4 @@ def validate_executor_image_uri(uri: str, expected_repository: str) -> str:
 
 
 def source_executor_artifact_uri(root: Path) -> str:
-    """Name a checkout's executor source tree as a release artifact."""
     return root.as_uri().replace("file://", "source://", 1)

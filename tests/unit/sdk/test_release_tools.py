@@ -1,5 +1,3 @@
-"""Tests for SDK version and release-manifest tooling."""
-
 from __future__ import annotations
 
 import hashlib
@@ -25,6 +23,7 @@ from scripts.sdk.prepare_sdk_release import (
 )
 
 
+@pytest.mark.description("The first package release must be 0.1.0.")
 def test_initial_package_must_start_at_0_1_0() -> None:
     validate_version_change(base=None, current=Version("0.1.0"), distribution_changed=True)
 
@@ -32,6 +31,7 @@ def test_initial_package_must_start_at_0_1_0() -> None:
         validate_version_change(base=None, current=Version("0.2.0"), distribution_changed=True)
 
 
+@pytest.mark.description("Distribution changes need a higher version.")
 def test_distribution_changes_require_a_higher_version() -> None:
     with pytest.raises(VersionError, match="must be greater"):
         validate_version_change(base=Version("0.1.0"), current=Version("0.1.0"), distribution_changed=True)
@@ -54,6 +54,9 @@ def write_artifacts(dist: Path) -> tuple[Path, Path]:
     return wheel, sdist
 
 
+@pytest.mark.description(
+    "The release manifest lists the wheel and sdist with the package name, version, and SHA-256 of each."
+)
 def test_release_manifest_binds_two_files_to_name_version_and_hash(tmp_path: Path) -> None:
     wheel, sdist = write_artifacts(tmp_path)
 
@@ -67,6 +70,7 @@ def test_release_manifest_binds_two_files_to_name_version_and_hash(tmp_path: Pat
     }
 
 
+@pytest.mark.description("Checksum lines use paths relative to the manifest folder.")
 def test_checksums_are_relative_to_manifest_directory(tmp_path: Path) -> None:
     packages = tmp_path / "packages"
     packages.mkdir()
@@ -81,6 +85,7 @@ def test_checksums_are_relative_to_manifest_directory(tmp_path: Path) -> None:
     assert all("  packages/valkyrie_sdk-0.1.0" in line for line in lines)
 
 
+@pytest.mark.description("GitHub output and step summary files get real newlines, not escaped ones.")
 def test_github_metadata_uses_real_lines(tmp_path: Path) -> None:
     packages = tmp_path / "packages"
     packages.mkdir()
@@ -100,6 +105,7 @@ def test_github_metadata_uses_real_lines(tmp_path: Path) -> None:
     assert summary.read_text(encoding="utf-8").splitlines()[0] == "## Valkyrie SDK release"
 
 
+@pytest.mark.description("A 404 from the package index means the version can be published.")
 def test_index_404_means_version_is_available() -> None:
     def not_found(_request: object) -> Never:
         raise HTTPError("https://pypi.test", 404, "Not Found", Message(), None)
@@ -107,6 +113,7 @@ def test_index_404_means_version_is_available() -> None:
     ensure_index_version_available("pypi", "valkyrie-sdk", "0.1.0", opener=not_found)
 
 
+@pytest.mark.description("A network error checking the index raises an error naming the index, package, and version.")
 @pytest.mark.parametrize(
     "error",
     [
@@ -122,6 +129,7 @@ def test_index_network_errors_fail_with_release_context(error: URLError) -> None
         ensure_index_version_available("pypi", "valkyrie-sdk", "0.1.0", opener=unavailable)
 
 
+@pytest.mark.description("A version that already exists on the index stops the release with an error.")
 def test_existing_index_version_fails_loudly() -> None:
     class Response:
         def __enter__(self) -> Response:

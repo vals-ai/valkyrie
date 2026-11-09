@@ -1,7 +1,4 @@
-"""Run with `uv run pytest tests/integration/local/database/test_schema.py`.
-
-Exercise schema and model events against disposable Postgres.
-"""
+import pytest
 
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.engine import Engine
@@ -19,6 +16,7 @@ from tracker.database.models import (
 )
 
 
+@pytest.mark.description("The migrated `errorresult` provenance columns and foreign keys match the SQLModel metadata.")
 def test_error_result_provenance_schema_matches_metadata(postgres_engine: Engine) -> None:
     inspector = inspect(postgres_engine)
     table_names = set(inspector.get_table_names())
@@ -87,20 +85,23 @@ def test_error_result_provenance_schema_matches_metadata(postgres_engine: Engine
     assert actual_foreign_keys == expected_foreign_keys
 
 
+@pytest.mark.description("Tracker schema tables and database status hooks.")
 class TestTrackerSchema:
-    """Tracker schema tables and database status hooks."""
-
+    @pytest.mark.description(
+        (
+            "Migrations and models must create the tracker persistence boundary.\n"
+            "\n"
+            "Test cases:\n"
+            "- Disposable Postgres contains the benchmark and task tables.\n"
+            "- Evaluation and final-score tables are also present."
+        )
+    )
     def test_tracker_schema_contains_core_tables(self, postgres_engine: Engine) -> None:
-        """Migrations and models must create the tracker persistence boundary.
-
-        Test cases:
-        - Disposable Postgres contains the benchmark and task tables.
-        - Evaluation and final-score tables are also present.
-        """
         tables = set(inspect(postgres_engine).get_table_names())
 
         assert {"benchmark", "task", "evaluationresult", "finalevaluation"} <= tables
 
+    @pytest.mark.description("The current execution release column is a nullable, indexed foreign key.")
     def test_current_execution_release_is_nullable_indexed_foreign_key(self, postgres_engine: Engine) -> None:
         inspector = inspect(postgres_engine)
         columns = {column["name"]: column for column in inspector.get_columns("benchmark")}
@@ -116,13 +117,16 @@ class TestTrackerSchema:
         indexes = inspector.get_indexes("benchmark")
         assert any(index["column_names"] == ["current_execution_release_id"] for index in indexes)
 
+    @pytest.mark.description(
+        (
+            "Terminal state transitions must persist completion timestamps in production Postgres.\n"
+            "\n"
+            "Test cases:\n"
+            "- Finishing a benchmark sets its completion timestamp.\n"
+            "- Marking a task as errored sets its completion timestamp."
+        )
+    )
     def test_terminal_statuses_set_finished_timestamps_in_postgres(self, postgres_session: Session) -> None:
-        """Terminal state transitions must persist completion timestamps in production Postgres.
-
-        Test cases:
-        - Finishing a benchmark sets its completion timestamp.
-        - Marking a task as errored sets its completion timestamp.
-        """
         postgres_session.add(Org(id=TEST_ORG_ID, name="postgres-status-org"))
         postgres_session.flush()
 

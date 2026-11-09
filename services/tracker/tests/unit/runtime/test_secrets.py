@@ -1,5 +1,3 @@
-"""Provider-neutral secret-reference resolution tests."""
-
 from collections.abc import Mapping
 
 import pytest
@@ -18,6 +16,7 @@ class RecordingSecretStore:
         return self._values[name]
 
 
+@pytest.mark.description("An empty secret mapping never touches the secret store.")
 async def test_resolve_secrets_skips_store_for_empty_mapping() -> None:
     store = RecordingSecretStore({})
 
@@ -25,6 +24,7 @@ async def test_resolve_secrets_skips_store_for_empty_mapping() -> None:
     assert store.calls == []
 
 
+@pytest.mark.description("Object secret members are required and turned into strings.")
 async def test_resolve_secrets_requires_and_stringifies_object_members() -> None:
     store = RecordingSecretStore({"shared": {"TOKEN": "value", "COUNT": 7, "EMPTY": None}})
 
@@ -35,6 +35,7 @@ async def test_resolve_secrets_requires_and_stringifies_object_members() -> None
     }
 
 
+@pytest.mark.description("A missing key in an object secret keeps its error.")
 async def test_resolve_secrets_preserves_missing_object_key_error() -> None:
     store = RecordingSecretStore({"shared": {"OTHER": "value"}})
 
@@ -42,6 +43,7 @@ async def test_resolve_secrets_preserves_missing_object_key_error() -> None:
         await resolve_secrets({"TOKEN": "shared"}, store)
 
 
+@pytest.mark.description("Secret values that are not objects are turned into strings.")
 @pytest.mark.parametrize("value", [["array"], 7, 3.5, True, None, "plain"])
 async def test_resolve_secrets_stringifies_non_object_values(value: SecretValue) -> None:
     store = RecordingSecretStore({"shared": value})

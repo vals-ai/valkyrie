@@ -1,13 +1,9 @@
-"""Tests for tracker sandbox orchestration.
-
-Run: pytest services/tracker/tests/unit/test_sandbox.py
-"""
-
 import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shlex
@@ -19,6 +15,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Never, cast
 from unittest.mock import AsyncMock, Mock, call
 
@@ -41,6 +38,7 @@ from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxComm
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
 from tenacity import wait_none
 
+from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.external_service_gateway import (
     AccountingSnapshot,
     GenerationAccountingSummary,
@@ -60,9 +58,11 @@ from tracker.database.models import (
 from tracker.egress import EgressPolicy
 from tracker.exceptions import (
     AgentRunFailedError,
+    EpisodeOrchestratorFailedError,
     ControlledGenerationError,
     ControlledGenerationTerminationUnconfirmedError,
     DependencySetupExhaustedError,
+    GenerationContainmentUnavailableError,
     GenerationTerminationUnconfirmedError,
     InvalidSandboxConfigurationError,
     OutputArtifactError,
@@ -71,7 +71,9 @@ from tracker.exceptions import (
     SandboxSetupError,
 )
 from tracker.sandbox import (
+    render_run_cmd,
     sandbox_resolves,
+    _read_post_exit_file,  # pyright: ignore[reportPrivateUsage]
     OUTPUT_ARTIFACTS_MAX_TOTAL_BYTES,
     _stream_controlled_output,  # pyright: ignore[reportPrivateUsage]
     SandboxCreationState,
@@ -143,21 +145,23 @@ _upload_agent_artifacts = getattr(sandbox_module, "upload_agent_artifacts")
 _upload_output_artifact = getattr(sandbox_module, "_upload_output_artifact")
 
 
+@pytest.mark.description("Declared output artifact collection and size validation.")
 class TestOutputArtifacts:
-    """Declared output artifact collection and size validation."""
-
+    @pytest.mark.description(
+        (
+            "Artifact contents stream through the sandbox file-transfer API, never command output.\n"
+            "\n"
+            "Test cases:\n"
+            "- A 288,928-byte sidecar is streamed without a base64 exec call.\n"
+            "- The exact bytes are uploaded to the task-scoped S3 key.\n"
+            "- The authority check is handed to the store so a revoked run aborts mid-upload."
+        )
+    )
     async def test_upload_output_artifacts_streams_file_without_exec_output(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """Artifact contents stream through the sandbox file-transfer API, never command output.
-
-        Test cases:
-        - A 288,928-byte sidecar is streamed without a base64 exec call.
-        - The exact bytes are uploaded to the task-scoped S3 key.
-        - The authority check is handed to the store so a revoked run aborts mid-upload.
-        """
         store = _mock_object_store()
         artifact = "artifacts/turns.jsonl"
         artifact_content = b"x" * 288_928
@@ -191,16 +195,19 @@ class TestOutputArtifacts:
         assert uploaded == [(artifact_content, "benchmarks/benchmark-123/task_0/artifacts/turns.jsonl")]
         assert store.put_stream.await_args.kwargs["should_continue"] is execution_is_current
 
+    @pytest.mark.description(
+        (
+            "A zero-byte required artifact lands as an empty object under the same authority check.\n"
+            "\n"
+            'Daytona\'s streaming download raises "No file data received" on an empty file,\n'
+            "which used to fail the required artifact and leave it missing from S3."
+        )
+    )
     async def test_upload_output_artifacts_uploads_empty_file_without_streaming(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """A zero-byte required artifact lands as an empty object under the same authority check.
-
-        Daytona's streaming download raises "No file data received" on an empty file,
-        which used to fail the required artifact and leave it missing from S3.
-        """
         store = _mock_object_store()
         artifact = "artifacts/turns.jsonl"
         uploaded: list[tuple[bytes, str]] = []
@@ -240,12 +247,12 @@ class TestOutputArtifacts:
         assert uploaded == [(b"", "benchmarks/benchmark-123/task_0/artifacts/turns.jsonl")]
         assert store.put_stream.await_args.kwargs["should_continue"] is execution_is_current
 
+    @pytest.mark.description("A run that lost authority before transfer uploads nothing.")
     async def test_upload_output_artifacts_skips_upload_when_authority_revoked(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """A run that lost authority before transfer uploads nothing."""
         store = _mock_object_store()
         artifact = "artifacts/turns.jsonl"
 
@@ -270,6 +277,7 @@ class TestOutputArtifacts:
 
         store.put_stream.assert_not_awaited()
 
+    @pytest.mark.description("Output upload accepts explicit glob sources.")
     async def test_upload_output_artifacts_can_upload_explicit_glob_sources(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -317,6 +325,7 @@ class TestOutputArtifacts:
             (b'{"turns":[]}\n', "benchmarks/benchmark-123/task_0/artifacts/result.json"),
         ]
 
+    @pytest.mark.description("Output upload uses the result paired with the model library config.")
     async def test_upload_output_artifacts_uses_result_paired_with_model_library_config(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -350,6 +359,7 @@ class TestOutputArtifacts:
 
         assert uploaded == [(b'{"turns":[]}\n', "benchmarks/benchmark-123/task_0/artifacts/result.json")]
 
+    @pytest.mark.description("Output upload fails when a declared file is missing.")
     async def test_upload_output_artifacts_fails_when_declared_file_is_missing(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -367,10 +377,12 @@ class TestOutputArtifacts:
         with pytest.raises(OutputArtifactError, match="Required output artifact missing"):
             await upload_output_artifacts(Mock(), [artifact], "benchmark-123", "task_0", store)
 
+    @pytest.mark.description("Output upload skips a missing optional model patch with one INFO line and no traceback.")
     async def test_upload_output_artifacts_skips_missing_optional_model_patch(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         store = _mock_object_store()
         artifact = OutputArtifact(
@@ -383,20 +395,30 @@ class TestOutputArtifacts:
         exec_mock = AsyncMock(return_value=ExecResult(exit_code=1, output=""))
         monkeypatch.setattr(sandbox_module, "_exec", exec_mock)
 
-        await upload_output_artifacts(
-            sandbox,
-            [artifact],
-            "benchmark-123",
-            "task_0",
-            store,
-        )
+        sandbox_module.logger.addHandler(caplog.handler)
+        try:
+            await upload_output_artifacts(
+                sandbox,
+                [artifact],
+                "benchmark-123",
+                "task_0",
+                store,
+            )
+        finally:
+            sandbox_module.logger.removeHandler(caplog.handler)
 
-        exec_mock.assert_awaited_once_with(
-            sandbox,
-            "test -f /logs/artifacts/model.patch && ! test -L /logs/artifacts/model.patch",
-        )
+        (record,) = [record for record in caplog.records if record.getMessage() == "output_artifact.optional_skip"]
+        assert record.levelno == logging.INFO
+        assert record.exc_info is None
+        assert getattr(record, "reason") == "missing"
+
+        assert exec_mock.await_args_list == [
+            call(sandbox, "test -f /logs/artifacts/model.patch && ! test -L /logs/artifacts/model.patch"),
+            call(sandbox, "test -e /logs/artifacts/model.patch || test -L /logs/artifacts/model.patch"),
+        ]
         store.put_stream.assert_not_awaited()
 
+    @pytest.mark.description("Output upload handles plain symlinks by whether the artifact is required.")
     @pytest.mark.parametrize(
         ("required", "expected_uploads"),
         [(True, [b"secret"]), (False, [])],
@@ -405,6 +427,7 @@ class TestOutputArtifacts:
     async def test_upload_output_artifacts_handles_non_glob_symlinks_by_requiredness(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
         aws_runtime: AWSRuntime,
         required: bool,
         expected_uploads: list[bytes],
@@ -418,6 +441,8 @@ class TestOutputArtifacts:
                 return ExecResult(exit_code=0, output="")
             if command == "test -f '/logs/symlink result.json' && ! test -L '/logs/symlink result.json'":
                 return ExecResult(exit_code=1, output="")
+            if command == "test -e '/logs/symlink result.json' || test -L '/logs/symlink result.json'":
+                return ExecResult(exit_code=0, output="")
             if command == "stat -c%s '/logs/symlink result.json'":
                 return ExecResult(exit_code=0, output="6")
             raise AssertionError(f"unexpected command: {command}")
@@ -431,16 +456,25 @@ class TestOutputArtifacts:
         sandbox.stream_download = _fake_stream_download(lambda _path: b"secret")
         artifact = OutputArtifact(path="artifacts/result.json", source=source, required=required)
 
-        await upload_output_artifacts(
-            sandbox,
-            [artifact],
-            "benchmark-123",
-            "task_0",
-            store,
-        )
+        sandbox_module.logger.addHandler(caplog.handler)
+        try:
+            await upload_output_artifacts(
+                sandbox,
+                [artifact],
+                "benchmark-123",
+                "task_0",
+                store,
+            )
+        finally:
+            sandbox_module.logger.removeHandler(caplog.handler)
 
         assert [content for content, _key in uploaded] == expected_uploads
+        skips = [record for record in caplog.records if record.getMessage() == "output_artifact.optional_skip"]
+        assert [(record.levelno, getattr(record, "reason", None)) for record in skips] == (
+            [] if required else [(logging.WARNING, None)]
+        )
 
+    @pytest.mark.description("Required artifacts come first under the total size limit.")
     async def test_upload_output_artifacts_prioritizes_required_artifacts_for_total_size_limit(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -489,6 +523,7 @@ class TestOutputArtifacts:
             )
         ]
 
+    @pytest.mark.description("Output upload fails when a file exceeds the Tracker limit.")
     async def test_upload_output_artifacts_fails_when_file_exceeds_tracker_limit(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -511,6 +546,7 @@ class TestOutputArtifacts:
 
         store.put_stream.assert_not_awaited()
 
+    @pytest.mark.description("Output upload rejects invalid sizes.")
     @pytest.mark.parametrize(
         ("stat_result", "total_bytes", "error"),
         (
@@ -553,10 +589,12 @@ class TestOutputArtifacts:
 
         store.put_stream.assert_not_awaited()
 
+    @pytest.mark.description("Output upload skips an invalid optional file with a WARNING and its traceback.")
     async def test_upload_output_artifacts_skips_invalid_optional_file(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         store = _mock_object_store()
         artifact = OutputArtifact(
@@ -574,14 +612,21 @@ class TestOutputArtifacts:
         )
         monkeypatch.setattr(sandbox_module, "_exec", exec_mock)
 
-        await upload_output_artifacts(
-            sandbox,
-            [artifact],
-            "benchmark-123",
-            "task_0",
-            store,
-        )
+        sandbox_module.logger.addHandler(caplog.handler)
+        try:
+            await upload_output_artifacts(
+                sandbox,
+                [artifact],
+                "benchmark-123",
+                "task_0",
+                store,
+            )
+        finally:
+            sandbox_module.logger.removeHandler(caplog.handler)
 
+        (record,) = [record for record in caplog.records if record.getMessage() == "output_artifact.optional_skip"]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is not None
         assert exec_mock.await_args_list == [
             call(
                 sandbox,
@@ -592,20 +637,15 @@ class TestOutputArtifacts:
         store.put_stream.assert_not_awaited()
 
 
+@pytest.mark.description("Streaming of the agent output archive from the sandbox to S3.")
 class TestArchiveAndUploadOutput:
-    """Streaming of the agent output archive from the sandbox to S3."""
-
+    @pytest.mark.description("The output archive streams to S3.")
     async def test_archive_and_upload_output_streams_archive_to_s3(
         self,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
     ) -> None:
         store = _mock_object_store()
-        """
-        Test cases:
-        - The tar.gz archive is streamed chunk-by-chunk to S3 without a full in-memory download.
-        - The temporary archive is removed from the sandbox afterwards.
-        """
         exec_commands: list[str] = []
         uploaded: list[tuple[bytes, str]] = []
 
@@ -803,9 +843,9 @@ def _controlled_contract() -> AgentContractRequest:
     )
 
 
+@pytest.mark.description("Agent execution, output collection, and runtime command construction.")
 class TestRunAgent:
-    """Agent execution, output collection, and runtime command construction."""
-
+    @pytest.mark.description("An agent run collects outputs before it raises the agent error again.")
     async def test_run_agent_collects_outputs_before_reraising_agent_error(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -851,11 +891,62 @@ class TestRunAgent:
                 agent_output_s3_key="benchmarks/benchmark-123/task_0/agent_output.tar.gz",
                 benchmark_id="benchmark-123",
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+                log_line=_ignore_output,
             )
 
         archive_output.assert_awaited_once()
         upload_artifacts.assert_awaited_once()
 
+    @pytest.mark.description("An agent run retries only the cgroup probe that failed.")
+    @pytest.mark.parametrize(
+        ("containment", "probe_error", "expected_error"),
+        [
+            pytest.param(
+                "linux_process_group",
+                ProviderSandboxError("Daytona sandbox does not support linux_cgroup_v2 v1: name=T-119_38847c"),
+                GenerationContainmentUnavailableError,
+                id="compose-on-daytona-cgroup-probe",
+            ),
+            pytest.param("linux_cgroup_v2", SandboxNotFoundError("gone"), SandboxNotFoundError, id="sandbox-gone"),
+            pytest.param(
+                "linux_cgroup_v2",
+                ProviderSandboxError("Sandbox connection error for name=T-119_38847c"),
+                ProviderSandboxError,
+                id="cgroup-probe-transport",
+            ),
+            pytest.param(
+                "linux_process_group",
+                ProviderSandboxError("Compose service does not support process groups: no setsid"),
+                ProviderSandboxError,
+                id="process-group-probe",
+            ),
+        ],
+    )
+    async def test_run_agent_reruns_only_the_failed_cgroup_probe(
+        self, containment: str, probe_error: Exception, expected_error: type[Exception]
+    ) -> None:
+        store = _mock_object_store()
+        contract = AgentContractRequest(name="test-agent", install_cmd="", run_cmd="true")
+        sandbox = Mock(id="sandbox-123", name="task-alias")
+        sandbox.generation_containment = GenerationContainment(type=containment, version=1)
+        sandbox.probe_generation_containment = AsyncMock(side_effect=probe_error)
+
+        with pytest.raises(expected_error):
+            await run_agent(
+                sandbox,
+                contract,
+                "/tmp/problem.txt",
+                "task_0",
+                _ignore_output,
+                "/testbed",
+                object_store=store,
+                plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
+                benchmark_id="benchmark-123",
+                deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+                log_line=_ignore_output,
+            )
+
+    @pytest.mark.description("An agent error survives a failed final upload.")
     async def test_run_agent_preserves_agent_error_when_terminal_upload_fails(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -904,10 +995,12 @@ class TestRunAgent:
                 agent_output_s3_key="benchmarks/benchmark-123/task_0/agent_output.tar.gz",
                 benchmark_id="benchmark-123",
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+                log_line=_ignore_output,
             )
 
         upload_artifacts.assert_awaited_once()
 
+    @pytest.mark.description("An agent run with revoked authority skips the archive.")
     async def test_run_agent_revoked_authority_skips_archive(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -953,9 +1046,11 @@ class TestRunAgent:
             benchmark_id="benchmark-123",
             execution_is_current=lambda: False,
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            log_line=lambda _msg: None,
         )
         archive_output.assert_not_awaited()
 
+    @pytest.mark.description("An agent run without a deadline uses the controlled wait, output, and finalize steps.")
     async def test_run_agent_without_deadline_uses_controlled_wait_output_and_finalize(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -990,12 +1085,13 @@ class TestRunAgent:
             plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
             deadline_controller=controller,
             on_external_service_finalized=finalized,
+            log_line=lambda text: output.append(text + "\n"),
         )
 
         await release_task
         assert reason is None
         assert duration >= 0.02
-        assert output == ["Running agent test-agent", "agent output"]
+        assert output == ["Running agent test-agent\n", "agent output"]
         assert workload.kill_calls == 0
         assert workload.closed.is_set() and workload.output_finished.is_set()
         assert controller.deadline(asyncio.get_running_loop().time()) is None
@@ -1008,6 +1104,9 @@ class TestRunAgent:
             )
         ]
 
+    @pytest.mark.description(
+        "A normal generation opens SSP connections only inside the controlled child and closes them after."
+    )
     async def test_ordinary_generation_uses_ssp_only_in_controlled_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
         requests: list[str] = []
 
@@ -1030,11 +1129,14 @@ class TestRunAgent:
         native_url = f"http://127.0.0.1:{native.sockets[0].getsockname()[1]}"
         ssp_url = f"http://127.0.0.1:{ssp.sockets[0].getsockname()[1]}"
         monkeypatch.setenv("MODEL_GATEWAY_URL", native_url)
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            monkeypatch.delenv(name, raising=False)
         child_code = (
             "import os, urllib.request; print(urllib.request.urlopen(os.environ['MODEL_GATEWAY_URL']).read().decode())"
         )
         command = f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}"
         messages: list[str] = []
+        captured_env_vars: list[dict[str, str]] = []
 
         class LocalWorkload:
             def __init__(self, env_vars: Mapping[str, str]) -> None:
@@ -1065,6 +1167,7 @@ class TestRunAgent:
             def controlled_workload(
                 self, _command: str, *, cwd: str | None = None, env_vars: Mapping[str, str]
             ) -> LocalWorkload:
+                captured_env_vars.append(dict(env_vars))
                 return LocalWorkload(env_vars)
 
         try:
@@ -1075,10 +1178,17 @@ class TestRunAgent:
                 messages.append,
                 ExternalServiceDeadlineController(base_allowance_seconds=None),
                 generation_gateway_url=ssp_url,
+                extra_env={
+                    "HTTP_PROXY": "http://run-key:token@proxy.example:3128",
+                    "NO_PROXY": "localhost,127.0.0.1,::1",
+                },
                 on_accounting_failure=AsyncMock(),
             )
             assert reason is None
             assert messages == ["ssp\n"]
+            assert captured_env_vars[0]["HTTP_PROXY"] == "http://run-key:token@proxy.example:3128"
+            assert captured_env_vars[0]["NO_PROXY"] == "localhost,127.0.0.1,::1"
+            assert "HTTP_PROXY" not in os.environ
             evaluation = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-c",
@@ -1095,6 +1205,7 @@ class TestRunAgent:
             await native.wait_closed()
             await ssp.wait_closed()
 
+    @pytest.mark.description("A timed out agent run collects outputs only after the kill is confirmed.")
     async def test_run_agent_timeout_collects_only_after_confirmed_kill(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1137,6 +1248,7 @@ class TestRunAgent:
                 episode=None,
             ),
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=0.001),
+            log_line=_ignore_output,
         )
 
         assert reason == AgentCausedExitReason.TIMEOUT
@@ -1144,6 +1256,7 @@ class TestRunAgent:
         controlled_sandbox.modify_egress_rules.assert_awaited_once_with(staged_policy)
         controlled_sandbox.clear_egress_rules.assert_not_awaited()
 
+    @pytest.mark.description("An unconfirmed timeout keeps the run policy and skips collection.")
     async def test_run_agent_unconfirmed_timeout_preserves_run_policy_and_suppresses_collection(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1180,12 +1293,16 @@ class TestRunAgent:
                     episode=None,
                 ),
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=0.001),
+                log_line=_ignore_output,
             )
 
         archive.assert_not_awaited()
         controlled_sandbox.modify_egress_rules.assert_awaited_once_with(staged_policy)
         controlled_sandbox.clear_egress_rules.assert_not_awaited()
 
+    @pytest.mark.description(
+        "When the agent exits nonzero, finalize runs once and then the archive and artifacts are collected."
+    )
     async def test_controlled_nonzero_exit_collects_outputs_after_finalize(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1242,12 +1359,14 @@ class TestRunAgent:
                 ),
                 deadline_controller=controller,
                 on_external_service_finalized=save_summary,
+                log_line=_ignore_output,
             )
 
         assert len(finalized) == 1
         archive.assert_awaited_once()
         artifacts.assert_awaited_once()
 
+    @pytest.mark.description("An accounting save failure still collects the available output.")
     async def test_accounting_persistence_failure_collects_available_output(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1299,12 +1418,14 @@ class TestRunAgent:
                 ),
                 deadline_controller=controller,
                 on_external_service_finalized=fail_persistence,
+                log_line=_ignore_output,
             )
 
         assert raised.value is persistence_error
         archive.assert_awaited_once()
         artifacts.assert_awaited_once()
 
+    @pytest.mark.description("An unsupported sandbox is rejected before it is built.")
     async def test_run_agent_rejects_unsupported_effective_sandbox_before_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1327,10 +1448,12 @@ class TestRunAgent:
                     episode=None,
                 ),
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=10.0),
+                log_line=_ignore_output,
             )
 
         assert sandbox.controlled_calls == []
 
+    @pytest.mark.description("A parallel episode contract is rejected before provisioning.")
     @pytest.mark.parametrize(
         ("updates", "message"),
         [
@@ -1368,6 +1491,7 @@ class TestRunAgent:
                     episode=Episode(command="stage", parallel_agents=2),
                 ),
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=10.0),
+                log_line=_ignore_output,
             )
 
         assert str(captured.value) == f"Sandbox error: {message}"
@@ -1375,6 +1499,7 @@ class TestRunAgent:
         assert sandbox.controlled_calls == []
         upload.assert_not_awaited()
 
+    @pytest.mark.description("An agent run uses two CBS slots and resumes one.")
     async def test_run_agent_runs_two_cbs_slots_and_resumes_one(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1383,6 +1508,7 @@ class TestRunAgent:
         stage.mkdir()
         orchestrator = """
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -1456,7 +1582,6 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 if target.name == "agent.json":
                     config = json.loads(content)
                     assert config["slots_root"] == "/workspace/.valkyrie/slots"
-                    # Translate the sandbox's slot root into this task-owned host directory.
                     config["slots_root"] = str(slots)
                     content = json.dumps(config).encode()
                 target.write_bytes(content)
@@ -1503,6 +1628,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                     ),
                     deadline_controller=controller,
                     on_external_service_finalized=persisted,
+                    log_line=lambda text: output.append(text + "\n"),
                 )
                 completed = True
         finally:
@@ -1530,15 +1656,18 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         archive.assert_awaited_once()
         assert archive.await_args.args[1] == "/workspace/.valkyrie/slots"
 
+    @pytest.mark.description("A probe failure stops the controlled sandbox from being built.")
     async def test_run_agent_probe_failure_prevents_controlled_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         sandbox = _FakeControlledSandbox(_FakeControlledWorkload())
-        probe = AsyncMock(side_effect=ProviderSandboxError("probe failed"))
+        probe = AsyncMock(
+            side_effect=ProviderSandboxError("Daytona sandbox does not support linux_cgroup_v2 v1: probe")
+        )
         monkeypatch.setattr(sandbox, "probe_generation_containment", probe)
         monkeypatch.setattr(sandbox_module, "install_agent_dependencies", AsyncMock())
 
-        with pytest.raises(ProviderSandboxError, match="probe failed"):
+        with pytest.raises(GenerationContainmentUnavailableError, match="linux_cgroup_v2"):
             await run_agent(
                 cast(Any, sandbox),
                 _controlled_contract(),
@@ -1553,10 +1682,12 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                     episode=None,
                 ),
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=10.0),
+                log_line=_ignore_output,
             )
 
         assert sandbox.controlled_calls == []
 
+    @pytest.mark.description("A controlled run that finishes at the deadline takes the timeout path.")
     async def test_controlled_completion_at_deadline_runs_timeout_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         real_loop = asyncio.get_running_loop()
         started_at = real_loop.time()
@@ -1585,6 +1716,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert duration == 1.0
         assert persisted[0].generation_elapsed_seconds == duration
 
+    @pytest.mark.description("A controlled timeout keeps its cause over a late OS kill.")
     async def test_controlled_timeout_freezes_cause_over_losing_os_kill(self) -> None:
         workload = _FakeControlledWorkload(exit_code=137, wait_release=asyncio.Event(), natural=False)
         sandbox = _FakeControlledSandbox(workload)
@@ -1602,6 +1734,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert duration > 0
         assert workload.kill_calls == 1
 
+    @pytest.mark.description("A controlled exit before the deadline is classified by its result.")
     @pytest.mark.parametrize(
         ("exit_code", "expected"),
         [(0, None), (137, AgentCausedExitReason.OS_KILLED)],
@@ -1624,6 +1757,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert reason == expected
         assert workload.kill_calls == 0
 
+    @pytest.mark.description("A natural exit code 124 is not a timeout.")
     async def test_controlled_natural_exit_124_is_not_timeout(self) -> None:
         workload = _FakeControlledWorkload(exit_code=124)
         sandbox = _FakeControlledSandbox(workload)
@@ -1638,6 +1772,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 on_accounting_failure=AsyncMock(),
             )
 
+    @pytest.mark.description("Report preparation does not use the generation allowance.")
     async def test_controlled_report_preparation_does_not_consume_generation_allowance(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1687,6 +1822,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         finalized.assert_awaited_once()
         assert controller.active_since is None
 
+    @pytest.mark.description("Controlled creation uses the generation allowance.")
     async def test_controlled_creation_consumes_generation_allowance(self) -> None:
         workload = _FakeControlledWorkload()
         sandbox = _FakeControlledSandbox(workload)
@@ -1711,6 +1847,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
 
         assert reason == AgentCausedExitReason.TIMEOUT
 
+    @pytest.mark.description("An agent gone before the deadline still collects a delayed real result.")
     @pytest.mark.parametrize("exit_code", [0, 23], ids=["success", "agent-error"])
     async def test_predeadline_agent_absence_collects_delayed_real_result(
         self, monkeypatch: pytest.MonkeyPatch, exit_code: int
@@ -1744,6 +1881,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 plan=GenerationPlan(allowance_seconds=0.08, staged=False, episode=None),
                 deadline_controller=controller,
                 on_external_service_finalized=persist,
+                log_line=_ignore_output,
             )
         )
         try:
@@ -1777,6 +1915,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A credit refresh notices the agent is gone during the counter read.")
     @pytest.mark.parametrize("overhead_ms", [100, 0], ids=["extended", "late-after-cutoff"])
     async def test_credit_refresh_observes_agent_absence_during_counter_read(self, overhead_ms: int) -> None:
         refresh_started = asyncio.Event()
@@ -1840,6 +1979,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description(
+        "An agent that disappears before the deadline without a full result fails once the collection cap passes."
+    )
     async def test_predeadline_absence_without_full_result_fails_at_collection_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1874,6 +2016,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("Cancelling during result collection waits for owned work.")
     async def test_cancellation_during_result_collection_joins_owned_work(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1925,6 +2068,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A natural finish drains buffered tail output.")
     async def test_natural_completion_drains_buffered_tail_output(self) -> None:
         class CompletedProducerWithTail(_FakeControlledWorkload):
             def __init__(self) -> None:
@@ -1956,6 +2100,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert messages == ["already-buffered tail"]
         assert workload.kill_calls == 0
 
+    @pytest.mark.description("After a confirmed timeout, buffered output is read in full before finalize runs once.")
     async def test_confirmed_timeout_drains_buffered_output_before_finalize(self) -> None:
         class BufferedOutputAfterKill(_FakeControlledWorkload):
             def __init__(self) -> None:
@@ -2007,6 +2152,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.output_finished.is_set()
         assert len(finalized) == 1
 
+    @pytest.mark.description("A deadline kill starts before the absolute deadline and drains the agent's output.")
     async def test_controlled_deadline_kill_succeeds_within_absolute_grace(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2046,6 +2192,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set()
         assert workload.output_finished.is_set()
 
+    @pytest.mark.description("A deadline kill must be confirmed within the grace period.")
     async def test_controlled_deadline_requires_kill_confirmation_within_grace(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2087,6 +2234,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set()
         assert workload.output_finished.is_set()
 
+    @pytest.mark.description("A credit refresh extends from the fixed start time.")
     async def test_refresh_credit_extends_from_immutable_start(self) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
         client = _FakeAccountingClient(overhead_ms=20)
@@ -2111,6 +2259,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert duration > 0.02
         assert client.read_calls >= 1
 
+    @pytest.mark.description("A timeout saves the external service counter read at stop and ignores later growth.")
     async def test_timeout_persists_cutoff_counter_even_if_ssp_grows_after_stop(self) -> None:
         client = _FakeAccountingClient()
         reads_at_stop: list[int] = []
@@ -2149,6 +2298,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert persisted[0].external_service_credit_applied_seconds == 0.0
         assert persisted[0].external_service_credit_revision == reads_at_stop[0]
 
+    @pytest.mark.description("A transient counter refresh error is retried, and the agent still ends with `TIMEOUT`.")
     async def test_transient_refresh_error_retries_within_lead_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
 
@@ -2181,6 +2331,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert reason == AgentCausedExitReason.TIMEOUT
         assert client.read_calls >= 2
 
+    @pytest.mark.description("A failed refresh task cannot override a natural finish.")
     async def test_failed_refresh_task_cannot_defeat_natural_completion(self) -> None:
         workload = _FakeControlledWorkload()
 
@@ -2214,6 +2365,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.kill_calls == 0
         persisted.assert_awaited_once()
 
+    @pytest.mark.description(
+        "An unconfirmed termination during accounting stays the cause of the raised error after cleanup."
+    )
     async def test_accounting_termination_error_is_not_masked_by_cleanup(self) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
         workload.kill_error = ProviderSandboxError("kill failed")
@@ -2238,6 +2392,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
 
         assert isinstance(raised.value.__cause__, GenerationTerminationUnconfirmedError)
 
+    @pytest.mark.description("A natural finish finalizes before returning.")
     async def test_natural_completion_finalizes_before_return(self) -> None:
         workload = _FakeControlledWorkload()
         sandbox = _FakeControlledSandbox(workload)
@@ -2270,6 +2425,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.kill_calls == 0
         assert persisted[0].external_service_overhead_seconds == 0.005
 
+    @pytest.mark.description("A deadline control error kills the agent and then raises the raw error.")
     async def test_deadline_control_error_kills_then_propagates_raw_error(self) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
         sandbox = _FakeControlledSandbox(workload)
@@ -2303,6 +2459,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set()
         assert workload.output_finished.is_set()
 
+    @pytest.mark.description("Staged frames are handled and the normal tail is kept.")
     @pytest.mark.parametrize("frame_case", ["begin", "end", "invalid", "success"])
     async def test_staged_frame_handling_and_normal_tail(
         self,
@@ -2429,6 +2586,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             task.cancel()
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
 
+    @pytest.mark.description(
+        "When the staged end deadline passes while the wait is still pending, the agent is stopped without waiting for it."
+    )
     @pytest.mark.parametrize("late_end", [False, True], ids=["exhausted-end", "late-end"])
     async def test_staged_end_deadline_while_wait_pending(
         self, monkeypatch: pytest.MonkeyPatch, late_end: bool
@@ -2530,7 +2690,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                     assert controller.active_elapsed_seconds > base_allowance
                 else:
                     assert controller.end_receipt_before_kill == end_fed_at
-                    assert controller.active_elapsed_seconds == base_allowance
+                    assert controller.active_elapsed_seconds == pytest.approx(base_allowance)
                     assert workload.active_at_kill is False
                 assert workload.kill_calls == 1
                 assert acknowledgements == ["/run/valkyrie-stage/ack/1"]
@@ -2547,6 +2707,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
                 await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
 
+    @pytest.mark.description(
+        "At a staged deadline the agent is killed once, its remaining output is read, and finalize runs once."
+    )
     async def test_staged_deadline_drains_output_after_confirmed_stop(self) -> None:
         key = b"stage-test-key"
         messages: list[str] = []
@@ -2586,6 +2749,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.kill_calls == 1
         finalized.assert_awaited_once()
 
+    @pytest.mark.description(
+        "A confirmed sandbox loss saves the generation time and counter revision once and clears the active accounting window."
+    )
     @pytest.mark.parametrize("failure", ["wait", "output", "kill"])
     async def test_confirmed_sandbox_loss_finalizes_once_and_reaches_task_handler(
         self, failure: Literal["wait", "output", "kill"]
@@ -2635,6 +2801,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert persisted.await_args_list[0].args[0].generation_elapsed_seconds > 0
         assert controller.active_since is None
 
+    @pytest.mark.description(
+        "An unexpected wait error stops the agent, reads its remaining output, and finalizes once."
+    )
     async def test_staged_generic_wait_error_stops_drains_and_finalizes(self) -> None:
         workload = _FakeControlledWorkload(wait_error=RuntimeError("wait transport failed"), natural=False)
         sandbox = _FakeControlledSandbox(workload)
@@ -2663,6 +2832,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert messages == ["agent output"]
         finalized.assert_awaited_once()
 
+    @pytest.mark.description("A confirmed sandbox loss finalizes even while the output stream is stalled.")
     @pytest.mark.parametrize("failure", ["wait", "kill"])
     async def test_confirmed_loss_finalizes_without_waiting_for_stalled_output(
         self, failure: Literal["wait", "kill"]
@@ -2709,6 +2879,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             workload.closed.set()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A loss during out of order stage cleanup finalizes without draining output.")
     async def test_out_of_order_stage_cleanup_loss_finalizes_without_draining_output(self) -> None:
         key = b"stage-key"
         wait_release = asyncio.Event()
@@ -2788,6 +2959,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
                 await asyncio.wait_for(joined, 1)
 
+    @pytest.mark.description("A confirmed loss during a staged wait finalizes with pending output.")
     async def test_staged_confirmed_wait_loss_finalizes_with_pending_output(self) -> None:
         loss = SandboxNotFoundError("sandbox disappeared during wait")
         workload = _FakeControlledWorkload(wait_error=loss, natural=False)
@@ -2825,6 +2997,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             workload.closed.set()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A confirmed loss during a staged wait accounts for a buffered end.")
     async def test_staged_confirmed_wait_loss_accounts_for_buffered_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loss = SandboxNotFoundError("sandbox disappeared during wait")
         key = b"stage-key"
@@ -2932,6 +3105,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             workload.closed.set()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A deadline stop raises a confirmed sandbox loss.")
     async def test_deadline_stop_propagates_confirmed_sandbox_loss(self) -> None:
         loss = SandboxNotFoundError("sandbox disappeared during stop")
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
@@ -2956,6 +3130,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         persisted.assert_awaited_once()
         assert controller.active_since is None
 
+    @pytest.mark.description("Unrelated observation and kill failures stay unconfirmed.")
     async def test_unrelated_observation_and_kill_failures_remain_unconfirmed(self) -> None:
         workload = _FakeControlledWorkload(wait_error=ProviderSandboxError("wait failed"), natural=False)
         workload.kill_error = ProviderSandboxError("kill unavailable")
@@ -2977,6 +3152,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.output_finished.is_set()
         finalized.assert_not_awaited()
 
+    @pytest.mark.description(
+        "When a failure is not confirmed, a blocked kill gives up after a bounded wait and finalize does not run."
+    )
     @pytest.mark.parametrize("failure", ["wait", "output"])
     async def test_unconfirmed_failure_bounds_blocked_kill_without_finalizing(
         self, monkeypatch: pytest.MonkeyPatch, failure: Literal["wait", "output"]
@@ -3008,6 +3186,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             assert not workload.closed.is_set()
         finalized.assert_not_awaited()
 
+    @pytest.mark.description("Controlled cancellation kills the agent before it propagates.")
     async def test_controlled_cancellation_kills_before_propagation(self) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
         sandbox = _FakeControlledSandbox(workload)
@@ -3032,6 +3211,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set()
         assert workload.output_finished.is_set()
 
+    @pytest.mark.description("Controlled cancellation waits for children when the kill fails.")
     async def test_controlled_cancellation_joins_children_when_kill_fails(self) -> None:
         workload = _FakeControlledWorkload(wait_release=asyncio.Event(), natural=False)
         workload.kill_error = ProviderSandboxError("kill unavailable")
@@ -3056,6 +3236,68 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set()
         assert workload.output_finished.is_set()
 
+    @pytest.mark.description(
+        "Cancellation during the kill after a failed wait retries the stop, finalizes, and raises `CancelledError`."
+    )
+    async def test_cancellation_during_failure_kill_propagates_after_confirmed_stop(self) -> None:
+        workload = _FakeControlledWorkload(
+            wait_error=ProviderSandboxError("wait failed"),
+            kill_release=asyncio.Event(),
+            natural=False,
+        )
+        finalized = AsyncMock()
+        task = asyncio.create_task(
+            _stream_controlled_output(
+                cast(Any, _FakeControlledSandbox(workload)),
+                "echo done",
+                "/workspace",
+                _ignore_output,
+                ExternalServiceDeadlineController(base_allowance_seconds=10.0),
+                finalized,
+                on_accounting_failure=AsyncMock(),
+            )
+        )
+        await asyncio.wait_for(workload.kill_started.wait(), 1)
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert workload.kill_release is not None
+        workload.kill_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+
+        assert workload.kill_calls == 2
+        assert workload.output_finished.is_set()
+        finalized.assert_awaited_once()
+
+    @pytest.mark.description(
+        "A `CancelledError` raised by the kill itself without cancelling the task stays an unconfirmed termination."
+    )
+    async def test_kill_raised_cancellation_without_task_cancel_stays_unconfirmed(self) -> None:
+        workload = _FakeControlledWorkload(wait_error=ProviderSandboxError("wait failed"), natural=False)
+        workload.kill_error = asyncio.CancelledError()
+        finalized = AsyncMock()
+        task = asyncio.create_task(
+            _stream_controlled_output(
+                cast(Any, _FakeControlledSandbox(workload)),
+                "echo done",
+                "/workspace",
+                _ignore_output,
+                ExternalServiceDeadlineController(base_allowance_seconds=10.0),
+                finalized,
+                on_accounting_failure=AsyncMock(),
+            )
+        )
+
+        with pytest.raises(ControlledGenerationTerminationUnconfirmedError) as raised:
+            await asyncio.wait_for(task, 1)
+
+        assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+        assert not task.cancelled()
+        assert workload.kill_calls == 1
+        finalized.assert_not_awaited()
+
+    @pytest.mark.description("An active deadline stops and finalizes before a cancelled upload is cleaned up.")
     async def test_active_deadline_stops_and_finalizes_before_canceled_upload_cleanup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3127,6 +3369,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         reason, _duration = task.result()
         assert reason == AgentCausedExitReason.TIMEOUT
 
+    @pytest.mark.description("An upload error during an active deadline is not a deadline expiry.")
     async def test_active_deadline_upload_error_is_not_deadline_expiry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loop = asyncio.get_running_loop()
         real_time = loop.time
@@ -3175,6 +3418,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         persisted.assert_awaited_once()
         assert uploads == [f"{sandbox_module._STAGE_DIR}/ack/1", f"{sandbox_module._STAGE_DIR}/exhausted"]
 
+    @pytest.mark.description("A completion notice sent before the cutoff still counts when the waiter reads it late.")
     @pytest.mark.parametrize("upload_error", [False, True])
     async def test_notification_completion_before_cutoff_survives_delayed_waiter(
         self, monkeypatch: pytest.MonkeyPatch, upload_error: bool
@@ -3248,6 +3492,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("An exhausted notice at or after the cutoff stops without another ack.")
     @pytest.mark.parametrize("after_cutoff", [0.0, 1.0])
     async def test_exhausted_notification_at_or_after_cutoff_stops_without_further_ack(
         self, monkeypatch: pytest.MonkeyPatch, after_cutoff: float
@@ -3330,6 +3575,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert reason == AgentCausedExitReason.TIMEOUT
         persisted.assert_awaited_once()
 
+    @pytest.mark.description("Repeated cancellation still owns the final counter read after stop.")
     async def test_repeated_cancellation_owns_terminal_counter_read_after_stop(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3389,6 +3635,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.wait_finished.is_set() and workload.output_finished.is_set()
         persisted.assert_awaited_once()
 
+    @pytest.mark.description("Episode duration leaves out async factory preparation.")
     async def test_episode_duration_excludes_async_factory_preparation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loop = asyncio.get_running_loop()
         clock = 100.0
@@ -3418,6 +3665,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert reason is None
         assert duration == 0.0
 
+    @pytest.mark.description(
+        "An episode with several back to back accounting intervals runs to the end without a kill and saves once."
+    )
     async def test_episode_accepts_successive_aggregate_intervals(self) -> None:
         key = b"k" * 32
         acknowledgements: list[str] = []
@@ -3472,6 +3722,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert workload.kill_calls == 0
         persisted.assert_awaited_once()
 
+    @pytest.mark.description(
+        "A notice that arrives in time but is never followed by an end finalizes once the second grace period runs out."
+    )
     async def test_timely_notice_without_end_expires_second_grace_and_finalizes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3532,6 +3785,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description("A notice followed by a nonzero exit returns a timeout and archives.")
     async def test_run_agent_notice_then_nonzero_returns_timeout_and_archives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3595,6 +3849,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 ),
                 deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=1.0),
                 on_external_service_finalized=finalized,
+                log_line=lambda text: messages.append(text + "\n"),
             )
         )
         try:
@@ -3620,6 +3875,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description(
+        "A notice and end that both arrive in time let evaluation keep running past the generation window."
+    )
     async def test_timely_notification_and_end_allow_evaluation_past_window(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3704,6 +3962,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description(
+        "When end retries run out, the nested container is checked before the end is acknowledged and sealed."
+    )
     async def test_exhausted_end_checks_nested_container_before_ack_and_seal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3811,6 +4072,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    @pytest.mark.description(
+        "An outside cancel keeps the notice until the agent is stopped and finalized, then raises `CancelledError`."
+    )
     async def test_external_cancellation_owns_notification_until_after_stop_and_finalize(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3885,9 +4149,11 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             await asyncio.wait_for(task, 1)
 
 
+@pytest.mark.description("Sandbox retry callbacks and dependency-install retries.")
 class TestSandboxRetry:
-    """Sandbox retry callbacks and dependency-install retries."""
-
+    @pytest.mark.description(
+        "The upload and dependency retry decorators log each retry through the observability `before_sleep` callbacks."
+    )
     def test_sandbox_retry_decorators_use_observability_retry_callbacks(self) -> None:
         upload_before_sleep = _upload_agent_artifacts.retry.before_sleep
         deps_before_sleep = _install_agent_dependencies_with_retries.retry.before_sleep
@@ -3897,16 +4163,19 @@ class TestSandboxRetry:
         assert deps_before_sleep is not None
         assert callable(deps_before_sleep)
 
+    @pytest.mark.description(
+        (
+            "Dependency setup should be bounded and retried when it hangs.\n"
+            "\n"
+            "Test cases:\n"
+            "- The install command is wrapped in the 10 minute shell timeout.\n"
+            "- A timed out setup attempt is retried by the existing dependency retry policy."
+        )
+    )
     async def test_install_agent_dependencies_retries_after_setup_timeout(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Dependency setup should be bounded and retried when it hangs.
-
-        Test cases:
-        - The install command is wrapped in the 10 minute shell timeout.
-        - A timed out setup attempt is retried by the existing dependency retry policy.
-        """
         contract = AgentContractRequest(
             name="test-agent",
             install_cmd="apt-get update -qq && echo done",
@@ -3930,11 +4199,45 @@ class TestSandboxRetry:
 
         monkeypatch.setattr(sandbox_module, "stream_command_output", fake_stream_command_output)
 
-        await _install_agent_dependencies(Mock(), contract, log_output)
+        await _install_agent_dependencies(Mock(), contract, log_output, log_line=lambda text: log_output(text + "\n"))
 
         expected_command = "cd /bundle/test-agent && exec timeout 600 sh -c 'apt-get update -qq && echo done'"
         assert observed_commands == [expected_command, expected_command]
 
+    @pytest.mark.description("A dependency install retry starts its status line on a new line after partial output.")
+    async def test_install_agent_dependencies_retry_status_starts_new_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        contract = AgentContractRequest(name="test-agent", install_cmd="make install", run_cmd="echo done")
+        setup_results: deque[AgentCausedExitReason | None] = deque([AgentCausedExitReason.TIMEOUT, None])
+
+        async def fake_stream_command_output(
+            _sandbox: Any,
+            _command: str,
+            log_output: Any,
+            **_kwargs: Any,
+        ) -> AgentCausedExitReason | None:
+            result = setup_results.popleft()
+            if result is not None:
+                log_output("partial output")
+            return result
+
+        monkeypatch.setattr(sandbox_module, "stream_command_output", fake_stream_command_output)
+        sink = Mock()
+
+        async with TaskLogBuffer(sink, "run:stream") as logs:
+            await _install_agent_dependencies(Mock(), contract, logs.write, log_line=logs.write_line)
+
+        messages = [line.message for call in sink.write.call_args_list for line in call.args[1]]
+        assert messages == [
+            "Installing dependencies for contract: test-agent",
+            "partial output",
+            "Installing dependencies for contract: test-agent",
+            "Finished installing dependencies for contract: test-agent",
+        ]
+
+    @pytest.mark.description("Agent dependency install uses a fixed retry schedule.")
     async def test_install_agent_dependencies_uses_fixed_retry_schedule(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -3957,12 +4260,15 @@ class TestSandboxRetry:
         monkeypatch.setattr(asyncio, "sleep", sleep)
 
         redact_error = sandbox_module.create_agent_error_redactor(("fake-install-secret",))
-        await _install_agent_dependencies(Mock(), contract, _ignore_output, redact_error=redact_error)
+        await _install_agent_dependencies(
+            Mock(), contract, _ignore_output, redact_error=redact_error, log_line=_ignore_output
+        )
 
         assert stream_command.await_count == 4
         assert [call.args[0] for call in sleep.await_args_list] == [0.0, 10.0, 60.0]
         assert all(call.kwargs["redact_error"] is redact_error for call in stream_command.await_args_list)
 
+    @pytest.mark.description("Exhausted install retries raise, and the final mode runs once.")
     async def test_install_agent_dependencies_exhaustion_raises_and_final_mode_runs_once(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -3978,7 +4284,7 @@ class TestSandboxRetry:
         monkeypatch.setattr(asyncio, "sleep", sleep)
 
         with pytest.raises(DependencySetupExhaustedError) as exc_info:
-            await _install_agent_dependencies(Mock(), contract, _ignore_output)
+            await _install_agent_dependencies(Mock(), contract, _ignore_output, log_line=_ignore_output)
 
         assert isinstance(exc_info.value.__cause__, AgentRunFailedError)
         assert stream_command.await_count == 4
@@ -3997,6 +4303,7 @@ class TestSandboxRetry:
                 mode=mode.FINAL_FRESH_SANDBOX,
                 redact_error=redact_error,
                 secret_env_names=("PROVIDER_TOKEN",),
+                log_line=_ignore_output,
             )
 
         assert stream_command.await_count == 1
@@ -4005,9 +4312,9 @@ class TestSandboxRetry:
         sleep.assert_not_awaited()
 
 
+@pytest.mark.description("Sandbox creation, execution, deletion, and telemetry behavior.")
 class TestSandboxLifecycle:
-    """Sandbox creation, execution, deletion, and telemetry behavior."""
-
+    @pytest.mark.description("Metric source names drop high cardinality tags and digests.")
     def test_metric_source_name_drops_high_cardinality_tag_and_digest(self) -> None:
         metric_source_name = getattr(sandbox_module, "_metric_source_name")
 
@@ -4029,13 +4336,16 @@ class TestSandboxLifecycle:
         with pytest.raises(AssertionError, match="Expected code to be unreachable"):
             metric_source_name(cast(SandboxSource, object()))
 
+    @pytest.mark.description(
+        (
+            "Compose sources should adapt only the runtime sandbox surface.\n"
+            "\n"
+            "Test cases:\n"
+            "- ComposeSource returns a ComposeSandbox wrapper around the outer sandbox.\n"
+            "- ImageSource returns the original sandbox unchanged."
+        )
+    )
     def test_compose_runtime_sandbox_wraps_only_compose_sources(self) -> None:
-        """Compose sources should adapt only the runtime sandbox surface.
-
-        Test cases:
-        - ComposeSource returns a ComposeSandbox wrapper around the outer sandbox.
-        - ImageSource returns the original sandbox unchanged.
-        """
         runtime_sandbox = getattr(sandbox_module, "runtime_sandbox")
         outer_sandbox = Mock()
         compose_source = ComposeSource(
@@ -4049,6 +4359,7 @@ class TestSandboxLifecycle:
         assert isinstance(wrapped, ComposeSandbox)
         assert unwrapped is outer_sandbox
 
+    @pytest.mark.description("Sandbox spans record only the sandbox ID and state.")
     def test_sandbox_span_helpers_set_safe_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         span_attributes: dict[str, str | int] = {}
 
@@ -4082,6 +4393,9 @@ class TestSandboxLifecycle:
             "valkyrie.sandbox_state": "started",
         }
 
+    @pytest.mark.description(
+        "Sandbox creation sends the volumes, auto stop interval, and create timeout to the provider."
+    )
     async def test_create_sandbox_passes_request_and_records_returned_identity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4141,6 +4455,7 @@ class TestSandboxLifecycle:
         assert request.auto_stop_interval == sandbox_module.SANDBOX_AUTO_STOP_INTERVAL
         assert request.create_timeout == sandbox_module.SANDBOX_CREATE_TIMEOUT
 
+    @pytest.mark.description("Sandbox creation rejects a name in both plain and secret environments.")
     async def test_create_sandbox_rejects_plaintext_and_secret_environment_collision(self) -> None:
         provider = AsyncMock()
 
@@ -4156,15 +4471,18 @@ class TestSandboxLifecycle:
 
         provider.create_sandbox.assert_not_awaited()
 
+    @pytest.mark.description(
+        (
+            "Compose sources should create the outer sandbox through the provider.\n"
+            "\n"
+            "Test cases:\n"
+            "- Provider receives the compose outer image source instead of ComposeSource.\n"
+            "- Sandbox create span attributes use the provider source."
+        )
+    )
     async def test_create_sandbox_unwraps_compose_source_before_provider_create(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Compose sources should create the outer sandbox through the provider.
-
-        Test cases:
-        - Provider receives the compose outer image source instead of ComposeSource.
-        - Sandbox create span attributes use the provider source.
-        """
         span_calls: list[tuple[str, str, int]] = []
 
         def fake_create_span_attrs(sandbox_name: str, source: Any, resources: Any) -> None:
@@ -4189,6 +4507,7 @@ class TestSandboxLifecycle:
         assert request.source == compose_source.outer
         assert request.resources == resources
 
+    @pytest.mark.description("Sandbox deletion raises provider errors.")
     async def test_delete_sandbox_raises_provider_errors(self) -> None:
         mock_sandbox = AsyncMock()
         mock_sandbox.id = "sandbox-123"
@@ -4203,6 +4522,7 @@ class TestSandboxLifecycle:
 
         provider.delete_sandbox.assert_awaited_once_with("sandbox-123")
 
+    @pytest.mark.description("A provider exec error is raised as `SandboxError` with the same message.")
     async def test_exec_wraps_provider_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sandbox_module, "_set_sandbox_span_attributes", Mock(), raising=False)
 
@@ -4212,6 +4532,7 @@ class TestSandboxLifecycle:
         with pytest.raises(SandboxError, match="exec failed"):
             await _exec(mock_sandbox, "echo hi")
 
+    @pytest.mark.description("Sandbox creation emits its duration and context.")
     async def test_create_sandbox_emits_create_duration_and_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_sandbox = AsyncMock()
         mock_sandbox.id = "sandbox-123"
@@ -4241,6 +4562,8 @@ class TestSandboxLifecycle:
         monkeypatch.setattr(sandbox_module, "distribution", fake_distribution, raising=False)
         monkeypatch.setattr(sandbox_module, "set_sandbox_context", fake_set_sandbox_context, raising=False)
         monkeypatch.setattr("tracker.sandbox.time.monotonic", fake_monotonic)
+        info_log = Mock()
+        monkeypatch.setattr(sandbox_module.logger, "info", info_log)
 
         resources = Resources(vcpu=2, memory=4, disk=5)
         async with create_sandbox(
@@ -4261,7 +4584,11 @@ class TestSandboxLifecycle:
             )
         ]
         assert context_calls == [("sandbox-123", "ghcr.io/vals/swebench:latest")]
+        assert [call.kwargs["extra"]["event"] for call in info_log.call_args_list if "extra" in call.kwargs] == [
+            "sandbox.create"
+        ]
 
+    @pytest.mark.description("Sandbox creation randomizes only direct names.")
     async def test_create_sandbox_randomizes_only_direct_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
         created_names: list[str] = []
         mock_sandbox = AsyncMock(id="sandbox-123", name="task-alias")
@@ -4297,6 +4624,9 @@ class TestSandboxLifecycle:
         assert created_names[0] != "task-alias"
         assert created_names[1] == "task-alias"
 
+    @pytest.mark.description(
+        "A sandbox from a targeted snapshot reports timing tagged with the snapshot image and is deleted at the end."
+    )
     async def test_targeted_snapshot_is_measured_and_deleted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_sandbox = AsyncMock()
         mock_sandbox.id = "sandbox-123"
@@ -4326,6 +4656,9 @@ class TestSandboxLifecycle:
         set_sandbox_context.assert_called_once_with(mock_sandbox, image="snapshot")
         provider.delete_sandbox.assert_awaited_once_with(mock_sandbox.id)
 
+    @pytest.mark.description(
+        "Provider creation failures become a fresh-sandbox retry. The metric still names the provider error."
+    )
     @pytest.mark.parametrize(
         ("create_error", "expected_error", "metric_class"),
         [
@@ -4340,7 +4673,6 @@ class TestSandboxLifecycle:
         expected_error: type[Exception],
         metric_class: str,
     ) -> None:
-        """Provider creation failures become a fresh-sandbox retry; the metric still names the provider error."""
         increments: list[tuple[str, dict[str, str]]] = []
 
         async def mock_create_sandbox(*_args: Any, **_kwargs: Any) -> Never:
@@ -4351,6 +4683,8 @@ class TestSandboxLifecycle:
 
         monkeypatch.setattr(sandbox_module, "_create_sandbox", mock_create_sandbox)
         monkeypatch.setattr(sandbox_module, "incr", fake_incr, raising=False)
+        warning_log = Mock()
+        monkeypatch.setattr(sandbox_module.logger, "warning", warning_log)
 
         resources = Resources(vcpu=2, memory=4, disk=5)
         with pytest.raises(expected_error):
@@ -4365,17 +4699,21 @@ class TestSandboxLifecycle:
                 pass
 
         assert increments == [("valkyrie.sandbox.create.errors", {"error_class": metric_class})]
+        assert [call.kwargs["extra"]["event"] for call in warning_log.call_args_list] == ["sandbox.create.failed"]
 
+    @pytest.mark.description(
+        (
+            "Cancellation during remote creation must not leave a sandbox running.\n"
+            "\n"
+            "Test cases:\n"
+            "- Remote creation completes after the caller is cancelled.\n"
+            "- The completed sandbox is deleted before cancellation reaches the caller."
+        )
+    )
     async def test_create_sandbox_deletes_resource_when_cancelled_during_creation(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Cancellation during remote creation must not leave a sandbox running.
-
-        Test cases:
-        - Remote creation completes after the caller is cancelled.
-        - The completed sandbox is deleted before cancellation reaches the caller.
-        """
         mock_sandbox = AsyncMock()
         mock_sandbox.id = "sandbox-123"
         mock_sandbox.name = "task-alias"
@@ -4432,8 +4770,8 @@ class TestSandboxLifecycle:
         assert active_sandbox_ids == set()
         assert deletion_initiators == ["create_cancelled"]
 
+    @pytest.mark.description("Normal context-manager exit attributes the deletion to task_teardown in the audit trail.")
     async def test_create_sandbox_teardown_names_initiator(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Normal context-manager exit attributes the deletion to task_teardown in the audit trail."""
         mock_sandbox = Mock()
 
         async def mock_create_sandbox(*_args: Any, **_kwargs: Any) -> Mock:
@@ -4458,6 +4796,7 @@ class TestSandboxLifecycle:
 
         delete_mock.assert_awaited_once_with(mock_sandbox, provider, initiated_by="task_teardown")
 
+    @pytest.mark.description("Sandbox creation keeps its success when task teardown fails.")
     async def test_create_sandbox_preserves_success_when_task_teardown_fails(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4491,6 +4830,7 @@ class TestSandboxLifecycle:
         audit_call = logger_mock.info.call_args_list[-1]
         assert audit_call.args == ("sandbox.delete",)
         assert audit_call.kwargs["extra"] == {
+            "event": "sandbox.delete",
             "sandbox_id": "sandbox-123",
             "sandbox_name": "task-alias",
             "benchmark_id": "bench-1",
@@ -4502,6 +4842,7 @@ class TestSandboxLifecycle:
             "error": "SandboxError: cleanup failed",
         }
 
+    @pytest.mark.description("Sandbox creation keeps the body failure when task teardown fails.")
     async def test_create_sandbox_preserves_body_failure_when_task_teardown_fails(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4534,6 +4875,7 @@ class TestSandboxLifecycle:
 
         assert exc_info.value is primary_error
 
+    @pytest.mark.description("A provider error during cancelled creation cleanup is raised.")
     async def test_create_sandbox_propagates_provider_error_during_cancelled_creation_cleanup(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4573,6 +4915,7 @@ class TestSandboxLifecycle:
         with pytest.raises(ProviderSandboxError, match="cleanup failed"):
             await context_task
 
+    @pytest.mark.description("A cancelled task teardown is raised and audited.")
     async def test_create_sandbox_propagates_cancelled_task_teardown_and_audits(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4607,6 +4950,7 @@ class TestSandboxLifecycle:
         audit_call = logger_mock.info.call_args_list[-1]
         assert audit_call.args == ("sandbox.delete",)
         assert audit_call.kwargs["extra"] == {
+            "event": "sandbox.delete",
             "sandbox_id": "sandbox-123",
             "sandbox_name": "task-alias",
             "benchmark_id": "bench-1",
@@ -4620,6 +4964,7 @@ class TestSandboxLifecycle:
 
 
 class TestSandboxCreationState:
+    @pytest.mark.description("Pending cleanup clears only after the delete is acknowledged.")
     @pytest.mark.parametrize("cancel_creation", [False, True], ids=["teardown", "cancelled-create"])
     @pytest.mark.parametrize(
         ("delete_error", "pending", "propagates"),
@@ -4691,6 +5036,7 @@ class TestSandboxCreationState:
         assert state.cleanup_pending is pending
         provider.delete_sandbox.assert_awaited_once_with(sandbox.id)
 
+    @pytest.mark.description("A cancel before the provider call leaves no cleanup pending.")
     async def test_cancel_before_provider_entry_has_no_cleanup_pending(self) -> None:
         waiting = asyncio.Event()
 
@@ -4722,6 +5068,7 @@ class TestSandboxCreationState:
         provider.create_sandbox.assert_not_awaited()
         provider.delete_sandbox.assert_not_awaited()
 
+    @pytest.mark.description("A create call with an unknown result leaves cleanup pending and deletes nothing.")
     async def test_unknown_creation_keeps_cleanup_pending_without_a_handle(self) -> None:
         state = SandboxCreationState(cleanup_pending=False)
         error = ProviderSandboxError("creation unknown")
@@ -4742,9 +5089,8 @@ class TestSandboxCreationState:
         provider.delete_sandbox.assert_not_awaited()
 
 
+@pytest.mark.description("Structured `sandbox.delete` audit records.")
 class TestDeleteSandboxAudit:
-    """Structured `sandbox.delete` audit records."""
-
     @staticmethod
     def _sandbox() -> AsyncMock:
         sandbox = AsyncMock()
@@ -4753,6 +5099,9 @@ class TestDeleteSandboxAudit:
         sandbox.labels = {"Benchmark": "swebench", "Id": "bench-1", "Task": "task_0"}
         return sandbox
 
+    @pytest.mark.description(
+        "Every attempt emits one record naming the initiator, the sandbox, and what happened to it."
+    )
     @pytest.mark.parametrize(
         ("provider_error", "outcome", "error"),
         [
@@ -4770,13 +5119,11 @@ class TestDeleteSandboxAudit:
         outcome: str,
         error: str | None,
     ) -> None:
-        """Every attempt emits one record naming the initiator, the sandbox, and what happened to it."""
         logger_mock = Mock()
         monkeypatch.setattr(sandbox_module, "logger", logger_mock)
         provider = AsyncMock()
         provider.delete_sandbox = AsyncMock(side_effect=provider_error)
 
-        # Of these outcomes only ProviderSandboxError propagates; test_delete_sandbox_raises_provider_errors pins that.
         with suppress(ProviderSandboxError):
             acknowledged = await _delete_sandbox(self._sandbox(), provider, initiated_by="force_stop", org_id="org-1")
             assert acknowledged is (outcome in ("deleted", "already_gone"))
@@ -4784,6 +5131,7 @@ class TestDeleteSandboxAudit:
         logger_mock.info.assert_called_once_with(
             "sandbox.delete",
             extra={
+                "event": "sandbox.delete",
                 "sandbox_id": "sandbox-123",
                 "sandbox_name": "task-alias",
                 "benchmark_id": "bench-1",
@@ -4796,8 +5144,10 @@ class TestDeleteSandboxAudit:
             },
         )
 
+    @pytest.mark.description(
+        "Unlabelled sandboxes still audit. The other fields are pinned by the `deleted` case above."
+    )
     async def test_delete_sandbox_audits_unlabelled_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Unlabelled sandboxes still audit; the other fields are pinned by the `deleted` case above."""
         logger_mock = Mock()
         monkeypatch.setattr(sandbox_module, "logger", logger_mock)
         sandbox = self._sandbox()
@@ -4809,8 +5159,8 @@ class TestDeleteSandboxAudit:
         extra = logger_mock.info.call_args.kwargs["extra"]
         assert (extra["benchmark_id"], extra["benchmark_name"], extra["task_id"]) == (None, None, None)
 
+    @pytest.mark.description("A delete cancelled mid-flight still leaves a record: the provider may have acted on it.")
     async def test_delete_sandbox_audits_cancelled_delete(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A delete cancelled mid-flight still leaves a record: the provider may have acted on it."""
         logger_mock = Mock()
         monkeypatch.setattr(sandbox_module, "logger", logger_mock)
         provider = AsyncMock()
@@ -4822,6 +5172,7 @@ class TestDeleteSandboxAudit:
         logger_mock.info.assert_called_once_with(
             "sandbox.delete",
             extra={
+                "event": "sandbox.delete",
                 "sandbox_id": "sandbox-123",
                 "sandbox_name": "task-alias",
                 "benchmark_id": "bench-1",
@@ -4835,15 +5186,13 @@ class TestDeleteSandboxAudit:
         )
 
 
+@pytest.mark.description("Agent artifact upload failure classification.")
 class TestUploadAgentArtifacts:
-    """Agent artifact upload failure classification."""
-
+    @pytest.mark.description("Only retryable upload exit codes raise `SandboxSetupError`.")
     @pytest.mark.parametrize(
         "exit_code,retryable",
         [
-            # Curl SSL failures are transient and need a new sandbox.
             (35, True),
-            # Generic failures are deterministic and fail the task.
             (1, False),
         ],
     )
@@ -4856,14 +5205,6 @@ class TestUploadAgentArtifacts:
         retryable: bool,
     ) -> None:
         store = _mock_object_store()
-        """Exit code 35 (curl SSL/TLS) raises SandboxSetupError so process_task retries
-        with a fresh sandbox. All other non-zero exit codes raise the base SandboxError,
-        which marks the task as failed without a sandbox retry.
-
-        Test Cases:
-            - Exit code 35 raises SandboxSetupError (retryable — triggers a new sandbox)
-            - Other non-zero exit codes raise SandboxError but not SandboxSetupError (non-retryable)
-        """
         monkeypatch.setattr(upload_agent_artifacts.retry, "wait", wait_none())
         mock_sandbox = AsyncMock()
         mock_sandbox.name = "test-sandbox"
@@ -4882,13 +5223,15 @@ class TestUploadAgentArtifacts:
         if not retryable:
             assert not isinstance(exc_info.value, SandboxSetupError)
 
+    @pytest.mark.description(
+        "A vanished sandbox must reach the sandbox-loss recovery path, not become a generic SandboxError."
+    )
     async def test_upload_agent_artifacts_keeps_sandbox_not_found_type(
         self,
         contract: AgentContractRequest,
         monkeypatch: pytest.MonkeyPatch,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """A vanished sandbox must reach the sandbox-loss recovery path, not become a generic SandboxError."""
         store = _mock_object_store()
         store.temporary_download_url = AsyncMock(return_value="https://example.com/presigned")
         monkeypatch.setattr(sandbox_module, "_exec", AsyncMock(side_effect=SandboxNotFoundError("gone")))
@@ -4897,9 +5240,9 @@ class TestUploadAgentArtifacts:
             await upload_agent_artifacts(AsyncMock(), contract, "bench-123", store)
 
 
+@pytest.mark.description("Tracker-side replacement of the sandbox egress policy.")
 class TestEgressPolicy:
-    """Tracker-side replacement of the sandbox egress policy."""
-
+    @pytest.mark.description("Applying an egress policy replaces the provider policy.")
     @pytest.mark.parametrize(
         ("policy", "expected_event"),
         [
@@ -4933,6 +5276,9 @@ class TestEgressPolicy:
 
         assert events == [expected_event]
 
+    @pytest.mark.description(
+        "Provider network failures are retried and stay transient. A rejected allowlist fails the same way anywhere."
+    )
     @pytest.mark.parametrize(
         ("provider_error", "expected_error", "message", "attempts", "transient"),
         [
@@ -4955,7 +5301,6 @@ class TestEgressPolicy:
         attempts: int,
         transient: bool,
     ) -> None:
-        """Provider network failures are retried and stay transient; a rejected allowlist fails the same way anywhere."""
         monkeypatch.setattr(_run_egress_operation.retry, "wait", wait_none())
         sandbox = Mock()
         sandbox.modify_egress_rules = AsyncMock(side_effect=provider_error)
@@ -4967,9 +5312,8 @@ class TestEgressPolicy:
         assert sandbox.modify_egress_rules.await_count == attempts
 
 
+@pytest.mark.description("Agent command output and error classification.")
 class TestStreamCommandOutputAgentFailure:
-    """Agent command output and error classification."""
-
     async def _reported_failure(self, content: str, secret_values: tuple[str, ...] | None) -> tuple[str, list[str]]:
         commands: list[str] = []
 
@@ -5002,6 +5346,7 @@ class TestStreamCommandOutputAgentFailure:
 
         return str(error.value), commands
 
+    @pytest.mark.description("Opaque secrets turn off the optional error read.")
     @pytest.mark.parametrize("content", ["test-secret-value", "ValueError: test-secret-value"])
     async def test_opaque_secrets_disable_optional_error_read(self, content: str) -> None:
         message, commands = await self._reported_failure(content, None)
@@ -5009,6 +5354,9 @@ class TestStreamCommandOutputAgentFailure:
         assert message == "Sandbox error: Agent command failed with exit code 1"
         assert not any(command.startswith("head -c ") for command in commands)
 
+    @pytest.mark.description(
+        "Secret values in an agent error report become `[REDACTED]`, and other raw output is dropped."
+    )
     async def test_known_secret_values_are_masked_before_error_is_raised(self) -> None:
         message, _ = await self._reported_failure(
             "ValueError: rejected test-secret-long and test-secret",
@@ -5019,11 +5367,13 @@ class TestStreamCommandOutputAgentFailure:
         assert "test-secret" not in message
         assert "unrelated raw output" not in message
 
+    @pytest.mark.description("A multiline secret is masked before whitespace is normalized.")
     async def test_multiline_secret_is_masked_before_whitespace_normalization(self) -> None:
         message, _ = await self._reported_failure("ValueError: rejected line-one\nline-two", ("line-one\nline-two",))
 
         assert message.endswith("ValueError: rejected [REDACTED]")
 
+    @pytest.mark.description("Masking that grows the text keeps a bounded summary.")
     @pytest.mark.parametrize(("padding", "retained_characters"), [("x", 2025), ("é", 1012)])
     async def test_masking_expansion_preserves_a_bounded_summary(self, padding: str, retained_characters: int) -> None:
         prefix = "ValueError: API_KEY "
@@ -5041,12 +5391,14 @@ class TestStreamCommandOutputAgentFailure:
         assert len(summary.encode()) <= 2048
         assert "\ufffd" not in summary
 
+    @pytest.mark.description("An unparseable agent error report gives only the exit code message.")
     @pytest.mark.parametrize("content", ["raw prompt or model output", "", "ValueError:", "ValueError: bad\x00text"])
     async def test_malformed_report_keeps_only_exit_code(self, content: str) -> None:
         message, _ = await self._reported_failure(content, ())
 
         assert message == "Sandbox error: Agent command failed with exit code 1"
 
+    @pytest.mark.description("An oversized report is never cut in the middle of a secret.")
     async def test_oversized_report_is_not_truncated_through_a_secret(self) -> None:
         content = "ValueError: " + "x" * 2030 + "test-secret-value"
 
@@ -5055,11 +5407,13 @@ class TestStreamCommandOutputAgentFailure:
         assert message == "Sandbox error: Agent command failed with exit code 1"
         assert any(command.startswith("head -c 2049 ") for command in commands)
 
+    @pytest.mark.description("A small error is kept as is when no secrets are declared.")
     async def test_small_original_error_is_preserved_with_no_declared_secrets(self) -> None:
         message, _ = await self._reported_failure("ValueError: no patch\n", ())
 
         assert message.endswith("ValueError: no patch")
 
+    @pytest.mark.description("Streamed command output is forwarded and the reason is returned.")
     async def test_stream_command_output_forwards_output_and_returns_reason(self) -> None:
         observed_commands: list[str] = []
         output: list[str] = []
@@ -5077,6 +5431,7 @@ class TestStreamCommandOutputAgentFailure:
         assert observed_commands == ["run-agent.sh"]
         assert output == ["done\n"]
 
+    @pytest.mark.description("A nonzero exit raises an agent error without the prompt and tags the exit code.")
     @pytest.mark.parametrize("exit_code", [1, 2, 127])
     async def test_non_zero_exit_raises_prompt_free_agent_error_and_tags_exit_code(
         self, monkeypatch: pytest.MonkeyPatch, exit_code: int
@@ -5111,6 +5466,9 @@ class TestStreamCommandOutputAgentFailure:
         assert "run-agent.sh" not in str(exc_info.value)
         assert tagged == {"agent_exit_code": str(exit_code)}
 
+    @pytest.mark.description(
+        "The agent failure error contains no prompt, secret, or script text from the agent's output."
+    )
     async def test_arbitrary_agent_output_is_not_persisted_in_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def stream_command(_command: str) -> AsyncIterator[str]:
             yield "prompt secret and attacker-controlled output\n"
@@ -5138,8 +5496,8 @@ class TestStreamCommandOutputAgentFailure:
         assert "secret" not in str(exc_info.value)
         assert "run-agent.sh" not in str(exc_info.value)
 
+    @pytest.mark.description("The agent's own error, written to $VALKYRIE_ERROR_PATH, becomes the persisted message.")
     async def test_agent_reported_error_is_surfaced_and_file_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The agent's own error, written to $VALKYRIE_ERROR_PATH, becomes the persisted message."""
         observed_commands: list[str] = []
         exec_commands: list[str] = []
         error_files: dict[str, str] = {}
@@ -5187,6 +5545,9 @@ class TestStreamCommandOutputAgentFailure:
         assert error_files == {}
         assert exec_commands[-1].startswith("rm -f ") and ".error" in exec_commands[-1]
 
+    @pytest.mark.description(
+        "When the agent error file cannot be read, the error says only which exit code the command returned."
+    )
     async def test_unreadable_agent_error_file_keeps_exit_code_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def stream_command(_command: str) -> AsyncIterator[str]:
             yield ""
@@ -5214,11 +5575,11 @@ class TestStreamCommandOutputAgentFailure:
 
         assert str(exc_info.value) == "Sandbox error: Agent command failed with exit code 3"
 
+    @pytest.mark.description("Sandbox disappearing after the agent exited must not replace the agent's failure.")
     @pytest.mark.parametrize("read_prefix", ["head -c ", "cat "])
     async def test_sandbox_lost_during_post_exit_read_keeps_exit_code_error(
         self, monkeypatch: pytest.MonkeyPatch, read_prefix: str
     ) -> None:
-        """Sandbox disappearing after the agent exited must not replace the agent's failure."""
 
         async def stream_command(_command: str) -> AsyncIterator[str]:
             yield ""
@@ -5246,6 +5607,7 @@ class TestStreamCommandOutputAgentFailure:
 
         assert str(exc_info.value) == "Sandbox error: Agent command failed with exit code 4"
 
+    @pytest.mark.description("A hanging read after exit times out and keeps the exit code error.")
     async def test_hanging_post_exit_read_times_out_and_keeps_exit_code_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -5276,6 +5638,7 @@ class TestStreamCommandOutputAgentFailure:
 
         assert str(exc_info.value) == "Sandbox error: Agent command failed with exit code 5"
 
+    @pytest.mark.description("A hanging cleanup keeps the original reported error.")
     async def test_hanging_cleanup_preserves_reported_original_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def stream_command(_command: str) -> AsyncIterator[str]:
             yield "raw model output must not enter the task error"
@@ -5306,6 +5669,9 @@ class TestStreamCommandOutputAgentFailure:
         )
         assert "raw model output" not in str(error.value)
 
+    @pytest.mark.description(
+        "A failed dependency install names the contract, the exit code, and the installer's last error line."
+    )
     async def test_install_failure_names_the_install_phase(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def stream_command(_command: str) -> AsyncIterator[str]:
             yield ""
@@ -5330,6 +5696,7 @@ class TestStreamCommandOutputAgentFailure:
                 contract,
                 _ignore_output,
                 redact_error=sandbox_module.create_agent_error_redactor(()),
+                log_line=_ignore_output,
             )
 
         assert str(exc_info.value) == (
@@ -5338,6 +5705,7 @@ class TestStreamCommandOutputAgentFailure:
         )
 
 
+@pytest.mark.description("The DNS check reports only a failure it observed.")
 @pytest.mark.parametrize(
     ("exec_outcome", "expected"),
     [
@@ -5363,6 +5731,7 @@ async def test_sandbox_resolves_reports_only_an_observed_dns_failure(
     assert command == "[ -x /usr/bin/getent ] || exit 0; /usr/bin/getent ahosts gateway.example.com"
 
 
+@pytest.mark.description("The DNS check gives up when it hangs.")
 async def test_sandbox_resolves_gives_up_on_a_hung_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("tracker.sandbox._DNS_CHECK_TIMEOUT_SECONDS", 0.01)
     sandbox = AsyncMock()
@@ -5374,3 +5743,110 @@ async def test_sandbox_resolves_gives_up_on_a_hung_check(monkeypatch: pytest.Mon
     sandbox.exec.side_effect = _hang
 
     assert await sandbox_resolves(sandbox, "gateway.example.com") is True
+
+
+@pytest.mark.description(
+    "A failed episode orchestrator command raises its own error, while a failed agent command does not."
+)
+@pytest.mark.parametrize(
+    ("episode", "expected"), [(True, EpisodeOrchestratorFailedError), (False, AgentRunFailedError)]
+)
+def test_controlled_result_outcome_separates_orchestrator_failures(episode: bool, expected: type[Exception]) -> None:
+    completed = cast(Any, Mock(result=ExecResult(exit_code=1)))
+    with pytest.raises(AgentRunFailedError) as error:
+        sandbox_module._controlled_result_outcome(completed, 0.0, 1.0, episode=episode)  # pyright: ignore[reportPrivateUsage]
+    assert type(error.value) is expected
+
+
+@pytest.mark.description(
+    "A post-exit file read that fails for any reason returns nothing and logs the cause with its traceback."
+)
+@pytest.mark.parametrize(
+    "raised",
+    [
+        ProviderSandboxError("provider down"),
+        SandboxNotFoundError("sandbox gone"),
+        TimeoutError(),
+        RuntimeError("stream reset"),
+    ],
+    ids=["provider", "not-found", "timeout", "untranslated"],
+)
+async def test_read_post_exit_file_logs_failures(raised: Exception, caplog: pytest.LogCaptureFixture) -> None:
+    sandbox = SimpleNamespace(id="sandbox-1", name="sandbox-1", state="running", exec=AsyncMock(side_effect=raised))
+    sandbox_module.logger.addHandler(caplog.handler)
+    try:
+        assert await _read_post_exit_file(cast(Any, sandbox), "cat /tmp/error") is None
+    finally:
+        sandbox_module.logger.removeHandler(caplog.handler)
+
+    (record,) = [record for record in caplog.records if record.getMessage() == "Post-exit file read failed"]
+    assert record.exc_info is not None
+
+
+@pytest.mark.description(
+    "A setup command that the provider fails raises `SandboxSetupError`, while an untranslated error propagates unchanged."
+)
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (ProviderSandboxError("provider down"), sandbox_module.SandboxSetupError),
+        (SandboxNotFoundError("sandbox gone"), sandbox_module.SandboxSetupError),
+        (RuntimeError("tracker bug"), RuntimeError),
+    ],
+    ids=["provider", "not-found", "untranslated"],
+)
+async def test_run_setup_command_wraps_only_sandbox_errors(raised: Exception, expected: type[Exception]) -> None:
+    sandbox = SimpleNamespace(id="sandbox-1", name="sandbox-1", state="running", exec=AsyncMock(side_effect=raised))
+
+    with pytest.raises(expected) as error:
+        await sandbox_module.run_setup_command(cast(Any, sandbox), "true", "Setup failed")
+
+    assert type(error.value) is expected
+
+
+@pytest.mark.description(
+    "A contract upload that the provider fails raises `SandboxError`, while an untranslated error propagates unchanged."
+)
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (ProviderSandboxError("provider down"), sandbox_module.SandboxError),
+        (SandboxNotFoundError("sandbox gone"), SandboxNotFoundError),
+        (RuntimeError("tracker bug"), RuntimeError),
+    ],
+    ids=["provider", "not-found", "untranslated"],
+)
+async def test_upload_agent_artifacts_wraps_only_sandbox_errors(raised: Exception, expected: type[Exception]) -> None:
+    sandbox = SimpleNamespace(id="sandbox-1", name="sandbox-1", state="running", exec=AsyncMock(side_effect=raised))
+    object_store = SimpleNamespace(temporary_download_url=AsyncMock(return_value="https://example.com/agent.zip"))
+
+    with pytest.raises(expected) as error:
+        await sandbox_module.upload_agent_artifacts(
+            cast(Any, sandbox), cast(Any, SimpleNamespace(name="agent")), "run-1", cast(Any, object_store)
+        )
+
+    assert type(error.value) is expected
+
+
+@pytest.mark.description(
+    "Each `run_cmd` placeholder reaches the shell as one literal value, whether it sits bare, in double quotes, in single quotes, or after `NAME=`."
+)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "printf '%s\\n' {task_id}",
+        "printf '%s\\n' \"{task_id}\"",
+        "printf '%s\\n' '{task_id}'",
+        'TASK={task_id} sh -c \'printf "%s\\n" "$TASK"\'',
+        'printf \'%s\\n\' "id: {task_id}" | sed "s/^id: //"',
+    ],
+)
+def test_render_run_cmd_passes_placeholder_values_literally(template: str, tmp_path: Path) -> None:
+    marker = tmp_path / "pwned"
+    task_id = f"a b$(touch {marker}) `touch {marker}` 'q' \"d\" \\ ; echo x"
+
+    command = render_run_cmd(template, {"task_id": task_id, "problem_statement_path": "/tmp/problem.txt"})
+    result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True)
+
+    assert result.stdout == f"{task_id}\n"
+    assert not marker.exists()

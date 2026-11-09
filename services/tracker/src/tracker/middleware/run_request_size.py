@@ -1,5 +1,3 @@
-"""ASGI middleware that rejects oversized start, retry and resume request bodies."""
-
 import re
 from typing import TYPE_CHECKING
 
@@ -15,8 +13,6 @@ _TOO_LARGE_DETAIL = f"Request body exceeds {MAX_RUN_REQUEST_BYTES} bytes"
 
 
 class RunRequestSizeLimitMiddleware:
-    """Return 413 before parsing when a run request body exceeds MAX_RUN_REQUEST_BYTES."""
-
     def __init__(self, app: "ASGIApp"):
         self.app = app
 
@@ -38,7 +34,6 @@ class RunRequestSizeLimitMiddleware:
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > MAX_RUN_REQUEST_BYTES:
-                    # FastAPI re-raises HTTPException from body reads, so this becomes a 413 response.
                     raise HTTPException(status_code=413, detail=_TOO_LARGE_DETAIL)
             return message
 

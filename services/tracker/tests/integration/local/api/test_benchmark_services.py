@@ -1,22 +1,19 @@
-"""Run with `uv run pytest tests/integration/local/api/test_benchmark_services.py`.
-
-Exercise benchmark-service routes through the real app and outbound HTTP boundary.
-"""
-
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.mark.description("Benchmark service endpoint responses and authentication.")
 class TestBenchmarkServices:
-    """Benchmark service endpoint responses and authentication."""
-
+    @pytest.mark.description(
+        (
+            "Service health aggregation must keep healthy and failed entries distinct.\n"
+            "\n"
+            "Test cases:\n"
+            "- A reachable service reports healthy while a failing service retains its HTTP status."
+        )
+    )
     def test_benchmark_services_returns_pings(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Service health aggregation must keep healthy and failed entries distinct.
-
-        Test cases:
-        - A reachable service reports healthy while a failing service retains its HTTP status.
-        """
 
         async def handle_request(request: httpx.Request) -> httpx.Response:
             status_code = 200 if request.url.host == "up" else 503
@@ -47,12 +44,15 @@ class TestBenchmarkServices:
         assert services_by_name["fab"]["healthy"] is False
         assert services_by_name["fab"]["error"] == "HTTP 503"
 
+    @pytest.mark.description(
+        (
+            "Benchmark-service health data must require authentication.\n"
+            "\n"
+            "Test cases:\n"
+            "- A request without a bearer session receives 401."
+        )
+    )
     def test_benchmark_services_unauth_401(self, client: TestClient) -> None:
-        """Benchmark-service health data must require authentication.
-
-        Test cases:
-        - A request without a bearer session receives 401.
-        """
         response = client.post("/benchmark-services", json={"services": []})
 
         assert response.status_code == 401

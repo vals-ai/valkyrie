@@ -1,12 +1,3 @@
-"""Integration tests for live sandbox operations.
-
-Run: uv run pytest tests/integration/live/sandbox/test_sandbox.py
-
-Covers real provider sandbox creation, artifact movement, command streaming,
-and agent execution. Add cases here when behavior must be proven against a live
-sandbox rather than tracker-owned mocks.
-"""
-
 import asyncio
 import io
 import shlex
@@ -48,12 +39,6 @@ async def test_sandbox(
     random_sandbox_name: str,
     creation_semaphore: asyncio.Semaphore,
 ) -> AsyncGenerator[Sandbox, None]:
-    """Create a real provider sandbox for sandbox-operation tests.
-
-    Test cases:
-    - The fixture yields a sandbox created from the configured test image.
-    - Context cleanup deletes the sandbox after the dependent test completes.
-    """
 
     async with create_sandbox(
         sandbox_provider,
@@ -71,7 +56,6 @@ async def test_sandbox(
 
 @pytest.fixture
 def egress_allowlist_probe_command() -> str:
-    """Command that requests an allowlisted host and a blocked host during run_agent."""
     script = """
 import urllib.error
 import urllib.request
@@ -99,7 +83,6 @@ raise SystemExit(0 if allowed and not blocked else 1)
 
 @pytest.fixture
 def restored_egress_probe_command() -> str:
-    """Command that verifies unrestricted egress returns after run_agent cleanup."""
     script = """
 import urllib.request
 
@@ -116,11 +99,10 @@ with urllib.request.urlopen(request, timeout=5) as response:
     return f"python -c {shlex.quote(script)}"
 
 
+@pytest.mark.description("Integration tests for sandbox operations.")
 class TestSandboxOperations:
-    """Integration tests for sandbox operations."""
-
+    @pytest.mark.description("Preserve a report while excluding stdout and masking a configured secret.")
     async def test_reported_error_survives_live_command(self, test_sandbox: Sandbox) -> None:
-        """Preserve a report while excluding stdout and masking a configured secret."""
         output: list[str] = []
         command = 'sh -c \'printf "AgentError: failed with fixture-secret\\n" > "$VALKYRIE_ERROR_PATH"; echo stdout-only-sentinel; exit 1\''
 
@@ -142,6 +124,7 @@ class TestSandboxOperations:
         assert remaining.exit_code == 0
         assert not remaining.stdout.strip()
 
+    @pytest.mark.description("An unusable report retains the exit code and does not substitute stdout.")
     @pytest.mark.parametrize(
         "report_command",
         [
@@ -152,7 +135,6 @@ class TestSandboxOperations:
         ids=["missing", "empty", "oversized"],
     )
     async def test_unusable_report_keeps_exit_code(self, test_sandbox: Sandbox, report_command: str) -> None:
-        """An unusable report retains the exit code and does not substitute stdout."""
         output: list[str] = []
         command = f"sh -c {shlex.quote(report_command + '; echo stdout-only-sentinel; exit 41')}"
 
@@ -167,8 +149,8 @@ class TestSandboxOperations:
         assert remaining.exit_code == 0
         assert not remaining.stdout.strip()
 
+    @pytest.mark.description("The final install attempt retains the report and masks the configured value.")
     async def test_install_preserves_reported_error(self, test_sandbox: Sandbox) -> None:
-        """The final install attempt retains the report and masks the configured value."""
         contract = AgentContractRequest(
             name="test_agent",
             install_cmd='printf "InstallError: fixture-secret\\n" > "$VALKYRIE_ERROR_PATH"; exit 42',
@@ -184,6 +166,7 @@ class TestSandboxOperations:
                 lambda _message: None,
                 mode=DependencySetupMode.FINAL_FRESH_SANDBOX,
                 redact_error=create_agent_error_redactor(["fixture-secret"]),
+                log_line=lambda _message: None,
             )
 
         assert str(failure.value) == (
@@ -191,13 +174,13 @@ class TestSandboxOperations:
             "InstallError: [REDACTED]"
         )
 
+    @pytest.mark.description("Retain the agent failure and log the secondary collection failure with its context.")
     async def test_run_preserves_error_when_required_artifact_is_missing(
         self,
         test_sandbox: Sandbox,
         live_aws_runtime: AWSRuntime,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Retain the agent failure and log the secondary collection failure with its context."""
         contract = AgentContractRequest(
             name="test_agent",
             install_cmd="true",
@@ -207,7 +190,6 @@ class TestSandboxOperations:
         object_store = S3ObjectStore(live_aws_runtime)
         task_id = random_task_id()
 
-        # Tracker's logger does not propagate to pytest's root capture handler.
         sandbox_module.logger.addHandler(caplog.handler)
         try:
             with pytest.raises(AgentRunFailedError) as failure:
@@ -223,6 +205,7 @@ class TestSandboxOperations:
                     deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
                     benchmark_id="live-error-preservation",
                     redact_error=create_agent_error_redactor([]),
+                    log_line=lambda _message: None,
                 )
         finally:
             sandbox_module.logger.removeHandler(caplog.handler)
@@ -242,6 +225,15 @@ class TestSandboxOperations:
         assert record.exc_info[1].__context__ is failure.value
         assert getattr(record, "task_id") == task_id
 
+    @pytest.mark.description(
+        (
+            "A sandbox context is created and cleaned up through the real provider.\n"
+            "\n"
+            "Test cases:\n"
+            "- The created sandbox can execute a simple command and uses the requested name prefix.\n"
+            "- Exiting the context deletes the sandbox so provider lookup raises SandboxNotFoundError."
+        )
+    )
     async def test_create_and_cleanup_sandbox(
         self,
         sandbox_provider: SandboxProvider,
@@ -250,12 +242,6 @@ class TestSandboxOperations:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify sandbox context creation and cleanup through the real provider.
-
-        Test cases:
-        - The created sandbox can execute a simple command and uses the requested name prefix.
-        - Exiting the context deletes the sandbox so provider lookup raises SandboxNotFoundError.
-        """
 
         async with create_sandbox(
             sandbox_provider,
@@ -273,17 +259,20 @@ class TestSandboxOperations:
         with pytest.raises(SandboxNotFoundError):
             await sandbox_provider.get_sandbox(actual_name)
 
+    @pytest.mark.description(
+        (
+            "Benchmark-scoped agent artifacts are downloaded from S3 into the sandbox.\n"
+            "\n"
+            "Test cases:\n"
+            "- The frozen benchmark contract zip is extracted into /bundle.\n"
+            "- Setup and agent source files are readable from their expected sandbox paths."
+        )
+    )
     async def test_upload_agent_artifacts(
         self,
         test_sandbox: Sandbox,
         live_aws_runtime: AWSRuntime,
     ) -> None:
-        """Verify benchmark-scoped agent artifacts are downloaded from S3 into the sandbox.
-
-        Test cases:
-        - The frozen benchmark contract zip is extracted into /bundle.
-        - Setup and agent source files are readable from their expected sandbox paths.
-        """
         contract_name = "test_contract"
         benchmark_id = "test-benchmark-id-abc"
         contract = AgentContractRequest(
@@ -297,14 +286,12 @@ class TestSandboxOperations:
         agent_file = f"{contract_name}/{contract_name}/file.txt"
         setup_file = f"{contract_name}/setup.sh"
 
-        # Create a test zip with the expected structure
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
             zf.writestr(setup_file, "#!/bin/bash\necho 'setup'")
             zf.writestr(agent_file, "hello world")
         zip_buffer.seek(0)
 
-        # Upload zip to real S3
         s3 = create_s3_client(live_aws_runtime)
         agent_key = agent_bundle_key(contract_name)
         frozen_key = get_benchmark_contract_s3_key(benchmark_id, contract_name)
@@ -313,7 +300,6 @@ class TestSandboxOperations:
             Key=agent_key,
             Body=zip_buffer.getvalue(),
         )
-        # Stage the per-benchmark frozen copy that upload_agent_artifacts will now read from.
         s3.put_object(
             Bucket=live_aws_runtime.resources.s3_bucket,
             Key=frozen_key,
@@ -323,7 +309,6 @@ class TestSandboxOperations:
         try:
             await upload_agent_artifacts(test_sandbox, contract, benchmark_id, object_store)
 
-            # Verify files exist in sandbox
             result = await test_sandbox.exec(f"cat /bundle/{setup_file}")
             assert result.exit_code == 0
             assert "echo 'setup'" in result.stdout
@@ -335,13 +320,16 @@ class TestSandboxOperations:
             s3.delete_object(Bucket=live_aws_runtime.resources.s3_bucket, Key=agent_key)
             s3.delete_object(Bucket=live_aws_runtime.resources.s3_bucket, Key=frozen_key)
 
+    @pytest.mark.description(
+        (
+            "The contract install command runs from the sandbox bundle.\n"
+            "\n"
+            "Test cases:\n"
+            "- install_agent_dependencies logs its installation banner.\n"
+            "- Output from the setup script is streamed through the provided log callback."
+        )
+    )
     async def test_install_agent_dependencies(self, test_sandbox: Sandbox) -> None:
-        """Verify the contract install command runs from the sandbox bundle.
-
-        Test cases:
-        - install_agent_dependencies logs its installation banner.
-        - Output from the setup script is streamed through the provided log callback.
-        """
         logged_messages: list[str] = []
 
         def log_callback(message: str) -> None:
@@ -354,28 +342,31 @@ class TestSandboxOperations:
             run_cmd="echo hello",
         )
 
-        # Create the contract directory and setup.sh directly in sandbox
         await test_sandbox.exec(f"mkdir -p /bundle/{contract_name}")
         await test_sandbox.exec(f"echo '#!/bin/bash\necho hello world' > /bundle/{contract_name}/setup.sh")
 
-        await install_agent_dependencies(test_sandbox, contract, log_callback)
+        await install_agent_dependencies(
+            test_sandbox, contract, log_callback, log_line=lambda text: log_callback(text + "\n")
+        )
 
-        # Verify messages were logged
         output = "\n".join(logged_messages)
         assert "Installing dependencies" in output
         assert "hello world" in output
 
+    @pytest.mark.description(
+        (
+            "`run_agent` streams output while executing a contract command.\n"
+            "\n"
+            "Test cases:\n"
+            "- The contract run command executes from the sandbox and writes its final output artifact.\n"
+            "- All emitted output lines are passed to the log callback."
+        )
+    )
     async def test_run_agent(
         self,
         test_sandbox: Sandbox,
         live_aws_runtime: AWSRuntime,
     ) -> None:
-        """Verify run_agent streams output while executing a contract command.
-
-        Test cases:
-        - The contract run command executes from the sandbox and writes its final output artifact.
-        - All emitted output lines are passed to the log callback.
-        """
         logged_messages: list[str] = []
 
         def log_callback(message: str) -> None:
@@ -392,7 +383,6 @@ class TestSandboxOperations:
         aws_runtime = live_aws_runtime
         object_store = S3ObjectStore(aws_runtime)
 
-        # Expecting bundle directory to exist
         await test_sandbox.exec("mkdir -p /bundle/test_agent")
 
         await run_agent(
@@ -405,6 +395,7 @@ class TestSandboxOperations:
             object_store=object_store,
             plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            log_line=lambda text: log_callback(text + "\n"),
         )
 
         output = "\n".join(logged_messages)
@@ -412,6 +403,7 @@ class TestSandboxOperations:
         assert "line2" in output
         assert "line3" in output
 
+    @pytest.mark.description("The real provider moves between allowlisted and unrestricted network stages.")
     async def test_run_policy_allowlist_then_unrestricted_transition(
         self,
         test_sandbox: Sandbox,
@@ -419,7 +411,6 @@ class TestSandboxOperations:
         egress_allowlist_probe_command: str,
         restored_egress_probe_command: str,
     ) -> None:
-        """Verify real provider allowlist and unrestricted stage transitions."""
         logged_messages: list[str] = []
 
         def log_callback(message: str) -> None:
@@ -450,6 +441,7 @@ class TestSandboxOperations:
             object_store=object_store,
             plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            log_line=lambda text: log_callback(text + "\n"),
         )
 
         output = "\n".join(logged_messages)
@@ -460,6 +452,15 @@ class TestSandboxOperations:
         assert restored_result.exit_code == 0
         assert "restored=True" in restored_result.stdout
 
+    @pytest.mark.description(
+        (
+            "`stream_command_output` classifies timeout exits without raising.\n"
+            "\n"
+            "Test cases:\n"
+            "- A command killed by the shell timeout returns AgentCausedExitReason.TIMEOUT.\n"
+            "- A command that completes before the timeout returns no agent-caused exit reason."
+        )
+    )
     async def test_deterministic_timeout_behavior(
         self,
         sandbox_provider: SandboxProvider,
@@ -468,12 +469,6 @@ class TestSandboxOperations:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify stream_command_output classifies timeout exits without raising.
-
-        Test cases:
-        - A command killed by the shell timeout returns AgentCausedExitReason.TIMEOUT.
-        - A command that completes before the timeout returns no agent-caused exit reason.
-        """
 
         async with create_sandbox(
             sandbox_provider,
@@ -503,6 +498,15 @@ class TestSandboxOperations:
 
             assert exit_reason is None
 
+    @pytest.mark.description(
+        (
+            "PTY streaming captures output across multiple command stages.\n"
+            "\n"
+            "Test cases:\n"
+            "- stream_command_output does not report a timeout for a successful multi-stage command.\n"
+            "- Output before, between, and after sleeps is delivered to the log callback."
+        )
+    )
     async def test_pty_streaming_captures_all_output(
         self,
         sandbox_provider: SandboxProvider,
@@ -511,12 +515,6 @@ class TestSandboxOperations:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify PTY streaming captures output across multiple command stages.
-
-        Test cases:
-        - stream_command_output does not report a timeout for a successful multi-stage command.
-        - Output before, between, and after sleeps is delivered to the log callback.
-        """
         logged_messages: list[str] = []
 
         def log_callback(message: str) -> None:
@@ -540,6 +538,15 @@ class TestSandboxOperations:
             assert "STAGE_2" in output
             assert "STAGE_3" in output
 
+    @pytest.mark.description(
+        (
+            "`stream_command_output` preserves deleted-sandbox errors.\n"
+            "\n"
+            "Test cases:\n"
+            "- A command is running while the sandbox is deleted through the provider.\n"
+            "- The wrapper raises SandboxNotFoundError instead of converting it to tracker SandboxError."
+        )
+    )
     async def test_stream_command_raises_not_found_when_sandbox_is_deleted(
         self,
         sandbox_provider: SandboxProvider,
@@ -548,12 +555,6 @@ class TestSandboxOperations:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify stream_command_output preserves deleted-sandbox errors.
-
-        Test cases:
-        - A command is running while the sandbox is deleted through the provider.
-        - The wrapper raises SandboxNotFoundError instead of converting it to tracker SandboxError.
-        """
 
         async with create_sandbox(
             sandbox_provider,
@@ -583,6 +584,15 @@ class TestSandboxOperations:
                     destroy_sandbox_after_stream_starts(),
                 )
 
+    @pytest.mark.description(
+        (
+            "Non-zero command exits are surfaced as tracker sandbox failures.\n"
+            "\n"
+            "Test cases:\n"
+            "- A command returning exit code 1 raises SandboxError.\n"
+            "- The error message includes the command exit code for user-facing diagnostics."
+        )
+    )
     async def test_stream_command_raises_on_nonzero_exit(
         self,
         sandbox_provider: SandboxProvider,
@@ -591,12 +601,6 @@ class TestSandboxOperations:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify non-zero command exits are surfaced as tracker sandbox failures.
-
-        Test cases:
-        - A command returning exit code 1 raises SandboxError.
-        - The error message includes the command exit code for user-facing diagnostics.
-        """
         async with create_sandbox(
             sandbox_provider,
             random_sandbox_name,

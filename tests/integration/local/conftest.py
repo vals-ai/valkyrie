@@ -1,5 +1,3 @@
-"""Fixtures for local CLI-to-tracker integration tests."""
-
 from collections.abc import Generator
 from functools import partial
 from datetime import datetime, timezone
@@ -9,9 +7,11 @@ import httpx
 import pytest
 from click.testing import CliRunner
 from fastapi import FastAPI
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, StaticPool, create_engine
 
 from services.tracker import main as tracker_main
+from services.tracker.tests.utils import add_sqlite_btrim
 from tracker.auth import get_current_org
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tracker.database.models import (
@@ -39,14 +39,13 @@ TEST_ORG_ID = UUID("c15649d2-6ec4-4b4a-974a-cc00ea80bbf7")
 
 @pytest.fixture
 def cli_runner() -> CliRunner:
-    """Provide an isolated Click command runner."""
     return CliRunner()
 
 
 @pytest.fixture
 def database_session() -> Generator[Session, None, None]:
-    """Provide a disposable SQLite tracker database."""
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    event.listen(engine, "connect", add_sqlite_btrim)
     SQLModel.metadata.create_all(engine)
 
     try:
@@ -73,7 +72,6 @@ def local_tracker_app(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[FastAPI, None, None]:
-    """Connect the production tracker app to local test dependencies."""
 
     def get_test_session() -> Generator[Session, None, None]:
         yield database_session
@@ -87,7 +85,6 @@ def local_tracker_app(
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_GROUP", "test-log-group")
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "1")
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_ACCOUNT_ID", "123456789012")
-    monkeypatch.setattr("tracker.config.AWS_MANAGED_SUBMISSIONS_ENABLED", True)
     monkeypatch.setattr(tracker_main, "check_database_connection", lambda: True)
 
     try:
@@ -101,7 +98,6 @@ def route_cli_to_local_tracker(
     local_tracker_app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Send the CLI's real SDK requests through the local FastAPI app."""
     monkeypatch.setenv("VALKYRIE_URL", "http://tracker.test")
     monkeypatch.setattr(
         cli_client, "ValkyrieClient", partial(ValkyrieClient, transport=httpx.ASGITransport(app=local_tracker_app))
@@ -110,7 +106,6 @@ def route_cli_to_local_tracker(
 
 @pytest.fixture
 def seeded_runs(database_session: Session) -> tuple[Benchmark, Benchmark]:
-    """Persist runs and tasks with distinct user-visible states."""
     running = Benchmark(
         org_id=TEST_ORG_ID,
         name="swebench",

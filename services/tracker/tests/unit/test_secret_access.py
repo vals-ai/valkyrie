@@ -15,6 +15,9 @@ def shared_secret_tenants(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "internal.example, partner-*")
 
 
+@pytest.mark.description(
+    "Orgs on the shared tenant list or a matching prefix, and self-hosted Trackers without auth, may name shared secrets such as `SharedDaytonaSecrets`."
+)
 @pytest.mark.parametrize(
     ("org_name", "auth_required"),
     [("internal.example", True), ("partner-acme", True), ("acme.example", False)],
@@ -29,6 +32,7 @@ def test_trusted_callers_may_use_shared_secrets(org_name: str, auth_required: bo
     )
 
 
+@pytest.mark.description("An org off the shared list may name secrets under `valkyrie/tenants/<org ID>/`.")
 def test_other_orgs_may_use_secrets_under_their_own_prefix() -> None:
     validate_secret_names(
         [f"valkyrie/tenants/{_ORG_ID}/daytona", f"valkyrie/tenants/{_ORG_ID}/model-keys"],
@@ -38,6 +42,9 @@ def test_other_orgs_may_use_secrets_under_their_own_prefix() -> None:
     )
 
 
+@pytest.mark.description(
+    "An org off the shared list that names a shared secret, another org's secret, or a full ARN gets a not found error."
+)
 @pytest.mark.parametrize(
     ("org_name", "secret_name"),
     [
@@ -67,6 +74,7 @@ def test_other_orgs_cannot_name_secrets_outside_their_prefix(org_name: str, secr
     assert str(error.value) == f"Secret '{shown}' does not exist"
 
 
+@pytest.mark.description("With no trusted list set, every org is limited to its own prefix.")
 def test_unset_list_limits_every_org_to_its_own_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "")
 
@@ -74,6 +82,9 @@ def test_unset_list_limits_every_org_to_its_own_prefix(monkeypatch: pytest.Monke
         validate_secret_names(["SharedDaytonaSecrets"], org_id=_ORG_ID, org_name="internal.example", auth_required=True)
 
 
+@pytest.mark.description(
+    "`secret_display_name` drops the `valkyrie/tenants/<org ID>/` prefix and leaves other names alone."
+)
 @pytest.mark.parametrize(
     ("secret_name", "shown"),
     [
@@ -89,6 +100,7 @@ def test_tenant_secrets_are_shown_without_the_tenant_prefix(secret_name: str, sh
     assert secret_display_name(secret_name) == shown
 
 
+@pytest.mark.description("A customer's short secret name resolves to the full name under its tenant prefix.")
 @pytest.mark.parametrize(
     ("org_name", "auth_required", "name", "resolved"),
     [
@@ -111,6 +123,9 @@ def test_customers_name_their_own_secrets_without_the_prefix(
     assert resolve_secret_name(name, org_id=_ORG_ID, org_name=org_name, auth_required=auth_required) == resolved
 
 
+@pytest.mark.description(
+    "A dedicated ValSmith org's secret names resolve under its own tenant prefix, even when a wildcard shared tenant pattern matches it."
+)
 @pytest.mark.parametrize("org_name", ["vals-smith-dev-gh-52346350", "vals-smith-prod-gh-52346350"])
 @pytest.mark.parametrize(
     "shared_tenants", ["vals.ai,vals-smith-*", "vals-smith-dev-gh-52346350,vals-smith-prod-gh-52346350"]
@@ -134,6 +149,7 @@ def test_dedicated_customer_secret_names_stay_in_their_tenant(
         )
 
 
+@pytest.mark.description("`vals.ai` and the research ValSmith orgs still resolve `SharedDaytonaSecrets` to itself.")
 @pytest.mark.parametrize("org_name", ["vals.ai", "vals-smith-research", "vals-smith-dev-gh-research"])
 def test_legacy_research_tenants_keep_explicit_shared_secret_access(
     monkeypatch: pytest.MonkeyPatch, org_name: str
@@ -144,3 +160,21 @@ def test_legacy_research_tenants_keep_explicit_shared_secret_access(
         resolve_secret_name("SharedDaytonaSecrets", org_id=_ORG_ID, org_name=org_name, auth_required=True)
         == "SharedDaytonaSecrets"
     )
+
+
+@pytest.mark.description("Shared tenants cannot name another org's gateway key.")
+def test_shared_tenants_cannot_name_another_orgs_gateway_key() -> None:
+    key = "model-gateway-00000000-0000-0000-0000-0000000000aa"
+    validate_secret_names(
+        [f"valkyrie/tenants/{_ORG_ID}/{key}"], org_id=_ORG_ID, org_name="internal.example", auth_required=True
+    )
+
+    with pytest.raises(ValueError) as error:
+        validate_secret_names(
+            [f"valkyrie/tenants/{_OTHER_ORG_ID}/{key}"],
+            org_id=_ORG_ID,
+            org_name="internal.example",
+            auth_required=True,
+        )
+
+    assert str(error.value) == f"Secret '{key}' does not exist"

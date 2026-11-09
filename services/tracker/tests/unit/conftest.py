@@ -1,5 +1,3 @@
-"""Shared fixtures for tracker unit tests."""
-
 import base64
 import os
 from collections.abc import AsyncGenerator, Callable, Generator
@@ -18,10 +16,15 @@ from benchmark_service.schemas import (
     VersionResponse,
 )
 import pytest
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 
-from tests.unit.utils.task_execution_support import MockLauncher, finalize_agent_generation, make_retrieve_task_response
-from tests.utils import TEST_ORG_ID
+from tests.unit.services.task_execution_support import (
+    MockLauncher,
+    finalize_agent_generation,
+    make_retrieve_task_response,
+)
+from tests.utils import TEST_ORG_ID, add_sqlite_btrim, inline_database_calls_in
 from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
 from tracker.database.models import ExecutorDispatch, ExecutorDispatchPayload, Org, OrgProviderSecret
 from tracker.database.session import get_session
@@ -29,21 +32,19 @@ from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
-from tracker.utils import TaskMonitor
+from tracker.services.tasks.monitor import TaskMonitor
 
-# Set the default AWS credentials before importing modules that create clients.
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 
-# Import the app after configuring the AWS environment.
 from main import app
 
 
 @pytest.fixture
 def empty_database_session() -> Generator[Session, None, None]:
-    """Provide an isolated database without the default organization seed."""
     engine = create_engine("sqlite://")
+    event.listen(engine, "connect", add_sqlite_btrim)
     SQLModel.metadata.create_all(engine)
 
     try:
@@ -56,7 +57,6 @@ def empty_database_session() -> Generator[Session, None, None]:
 
 @pytest.fixture(autouse=True)
 def mock_s3(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace S3 operations with deterministic in-process behavior."""
 
     async def _mock_get_bytes(*_args: Any, **_kwargs: Any) -> bytes:
         return b"mock-contract-content"
@@ -75,7 +75,6 @@ def mock_s3(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def managed_deployment_config(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, value in {
-        "AWS_MANAGED_SUBMISSIONS_ENABLED": True,
         "AWS_DEPLOYMENT_ACCOUNT_ID": "123456789012",
         "AWS_DEPLOYMENT_REGION": "us-east-1",
         "AWS_DEPLOYMENT_S3_BUCKET": "test-bucket",
@@ -88,7 +87,6 @@ def managed_deployment_config(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def override_database_session(database_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route FastAPI database dependencies through the in-memory test session."""
 
     def get_test_session() -> Generator[Session, None, None]:
         with Session(database_session.get_bind(), expire_on_commit=False) as request_session:
@@ -97,18 +95,22 @@ def override_database_session(database_session: Session, monkeypatch: pytest.Mon
 
     monkeypatch.setitem(app.dependency_overrides, get_session, get_test_session)
     monkeypatch.setattr("tracker.sandbox_cost.engine", database_session.get_bind())
+    monkeypatch.setattr("tracker.services.sandboxes.engine", database_session.get_bind())
+
+
+@pytest.fixture(autouse=True)
+def inline_database_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    inline_database_calls_in(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
 def override_org(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Override get_current_org to return a test org."""
     test_org = Org(id=TEST_ORG_ID, name="default", storage_key="test-bucket")
     monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: test_org)
 
 
 @pytest.fixture(autouse=True)
 def override_starter_and_runner(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub run identity for route tests; authorization tests remove the runner override."""
     test_org = Org(id=TEST_ORG_ID, name="default", storage_key="test-bucket")
     identity = RequestIdentity(org=test_org)
     monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
@@ -117,7 +119,6 @@ def override_starter_and_runner(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def mapped_providers(database_session: Session) -> None:
-    """Map the test organization's sandbox providers to the secrets its runs use."""
     database_session.add_all(
         OrgProviderSecret(org_id=TEST_ORG_ID, provider=provider, secret_name=secret)
         for provider, secret in {"daytona": "provider-secret", "modal": "ModalSecrets"}.items()
@@ -127,7 +128,6 @@ def mapped_providers(database_session: Session) -> None:
 
 @pytest.fixture(autouse=True)
 def mock_benchmark_service(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace benchmark-service calls used by tracker unit tests."""
 
     async def _mock_health_check(*_args: Any, **_kwargs: Any) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
@@ -182,8 +182,12 @@ def mock_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def mock_lambda_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("main.dry_run_lambda", AsyncMock())
+
+
+@pytest.fixture(autouse=True)
 def mock_sandbox_operations(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mocks sandbox operations so unit tests never run real sandbox commands"""
 
     async def _noop(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -195,15 +199,15 @@ def mock_sandbox_operations(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         return None, 0.0
 
-    monkeypatch.setattr("tracker.utils.task_execution.upload_agent_artifacts", _noop)
-    monkeypatch.setattr("tracker.utils.task_execution.apply_egress_policy", _noop)
-    monkeypatch.setattr("tracker.utils.task_execution.install_agent_dependencies", _noop)
-    monkeypatch.setattr("tracker.utils.task_execution.run_agent", _noop_run_agent)
+    monkeypatch.setattr("tracker.services.tasks.execute.upload_agent_artifacts", _noop)
+    monkeypatch.setattr("tracker.services.tasks.execute.apply_egress_policy", _noop)
+    monkeypatch.setattr("tracker.runtime.run_egress.apply_egress_policy", _noop)
+    monkeypatch.setattr("tracker.services.tasks.execute.install_agent_dependencies", _noop)
+    monkeypatch.setattr("tracker.services.tasks.execute.run_agent", _noop_run_agent)
 
 
 @pytest.fixture(autouse=True)
 def mock_launcher(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> MockLauncher:
-    """Capture committed dispatch inputs without starting a runner."""
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
     monkeypatch.setenv("EXECUTOR_PAYLOAD_LOCAL_KEY", base64.b64encode(b"k" * 32).decode())
     monkeypatch.delenv("EXECUTOR_PAYLOAD_KMS_KEY_ID", raising=False)
@@ -232,12 +236,10 @@ def mock_launcher(monkeypatch: pytest.MonkeyPatch, database_session: Session) ->
 
 @pytest.fixture
 def process_benchmark_env(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> None:
-    """Use deterministic local dependencies for run-orchestration behavior tests."""
 
     sandbox_count = 0
 
     async def inline_admission(function: Callable[..., Any], *args: Any) -> Any:
-        # SQLite's StaticPool shares one connection, so admission must not race the monitor on another thread.
         return function(*args)
 
     @asynccontextmanager
@@ -265,15 +267,13 @@ def process_benchmark_env(monkeypatch: pytest.MonkeyPatch, database_session: Ses
     async def _mock_verify_task_ids(*_args: Any, task_ids: list[str], **_kwargs: Any) -> VerifyTaskIdsResponse:
         return VerifyTaskIdsResponse(task_ids=task_ids)
 
-    async def _mock_recover_queued_pool(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr("tracker.utils.task_execution.engine", database_session.bind)
-    monkeypatch.setattr("tracker.utils.task_execution.to_thread", inline_admission)
-    monkeypatch.setattr("tracker.utils.run_orchestration.engine", database_session.bind)
+    monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
+    monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
+    monkeypatch.setattr("tracker.services.tasks.execute.to_thread", inline_admission)
+    monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
+    monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
     monkeypatch.setattr(TaskMonitor, "_TRACK_INTERVAL", 0)
-    monkeypatch.setattr("tracker.utils.run_orchestration.recover_queued_pool", _mock_recover_queued_pool)
-    monkeypatch.setattr("tracker.utils.task_execution.create_sandbox", _mock_create_sandbox)
+    monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
     monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
     monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
     monkeypatch.setattr(BenchmarkServiceClient, "final_score", _mock_final_score)
@@ -283,7 +283,6 @@ def process_benchmark_env(monkeypatch: pytest.MonkeyPatch, database_session: Ses
 
 @pytest.fixture
 async def runtime_services(aws_runtime: AWSRuntime) -> AsyncGenerator[RuntimeServices, None]:
-    """Compose the task runtime using the shared deterministic AWS configuration."""
     runtime = CloudRuntimeFactory.create_runtime(
         aws_runtime,
         sandbox_provider_secret_name="test-daytona-secret",

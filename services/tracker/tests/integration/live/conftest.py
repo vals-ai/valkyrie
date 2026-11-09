@@ -1,5 +1,3 @@
-"""Shared live-integration fixtures."""
-
 from collections.abc import Generator
 
 import pytest
@@ -7,7 +5,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from main import app
-from tests.utils import TEST_ORG_ID
+from tests.utils import TEST_ORG_ID, inline_database_calls_in
 from tracker.auth import get_current_org
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.database.session import get_session
@@ -15,6 +13,15 @@ from tracker import config
 from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import AWSBenchmarkArguments, AgentContractRequest, Benchmark
 from tests.factories import make_benchmark
+
+
+@pytest.fixture
+def tracker_database(tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> Session:
+    monkeypatch.setattr("tracker.sandbox_cost.engine", tracker_database.bind)
+    monkeypatch.setattr("tracker.services.sandboxes.engine", tracker_database.bind)
+    monkeypatch.setattr("tracker.sandbox_cost.run_sandbox_cost_loop", lambda stop_event, **_: stop_event.wait())
+    inline_database_calls_in(monkeypatch)
+    return tracker_database
 
 
 @pytest.fixture
@@ -36,7 +43,6 @@ def database_session(database_session: Session, live_aws_runtime: AWSRuntime) ->
 def live_deployment(live_aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
     resources = live_aws_runtime.resources
     for name, value in {
-        "AWS_MANAGED_SUBMISSIONS_ENABLED": True,
         "AWS_DEPLOYMENT_ACCOUNT_ID": live_aws_runtime.expected_bucket_owner,
         "AWS_DEPLOYMENT_REGION": resources.region,
         "AWS_DEPLOYMENT_S3_BUCKET": resources.s3_bucket,

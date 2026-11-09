@@ -1,8 +1,3 @@
-"""Unit tests for tracker metrics, tracing, and retry observability.
-
-Run: uv run pytest tests/unit/observability/test_observability.py
-"""
-
 import logging
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -20,8 +15,10 @@ import tracker.observability.retry as retry_module
 import tracker.observability.sentry as sentry_module
 import tracker.observability.tracing as tracing_module
 import tracker.observability as observability_module
+from tracker.logging.context import sandbox_provider_scope
 
 
+@pytest.mark.description("An observability setup failure does not escape.")
 @pytest.mark.parametrize("failing_component", ["sentry", "tracing"])
 def test_observability_initialization_failure_does_not_escape(
     monkeypatch: pytest.MonkeyPatch,
@@ -42,19 +39,50 @@ def test_observability_initialization_failure_does_not_escape(
     assert error in warning.call_args.args
 
 
+@pytest.mark.description("Metric emission and failure handling.")
 class TestMetrics:
-    """Metric emission and failure handling."""
+    @pytest.mark.description(
+        "Task outcome counts carry the outcome and the bound sandbox provider, and omit the provider when none is bound."
+    )
+    def test_record_task_outcome_tags_outcome_and_sandbox_provider(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[str, float, dict[str, str]]] = []
 
+        def fake_count(name: str, value: float, *, attributes: dict[str, str]) -> None:
+            calls.append((name, value, attributes))
+
+        monkeypatch.setattr(sentry_metrics, "count", fake_count)
+
+        with sandbox_provider_scope("modal"):
+            metrics_module.record_task_outcome(
+                metrics_module.TaskOutcome.FAILED, {"failure_category": "infrastructure", "task_id": "task-1"}
+            )
+        metrics_module.record_task_outcome(metrics_module.TaskOutcome.COMPLETED)
+
+        assert calls == [
+            (
+                "valkyrie.task.outcome",
+                1,
+                {"outcome": "failed", "sandbox_provider": "modal", "failure_category": "infrastructure"},
+            ),
+            ("valkyrie.task.outcome", 1, {"outcome": "completed"}),
+        ]
+
+    @pytest.mark.description(
+        (
+            "Counters must exclude identifiers that create one time series per request.\n"
+            "\n"
+            "Test cases:\n"
+            "- Low-cardinality values are normalized and sent to Sentry.\n"
+            "- Task, session, and null values are excluded from metric attributes."
+        )
+    )
     def test_incr_uses_sentry_count_attributes_and_drops_high_cardinality_tags(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Counters must exclude identifiers that create one time series per request.
-
-        Test cases:
-        - Low-cardinality values are normalized and sent to Sentry.
-        - Task, session, and null values are excluded from metric attributes.
-        """
         calls: list[tuple[str, float, dict[str, str]]] = []
 
         def fake_count(name: str, value: float, *, attributes: dict[str, str]) -> None:
@@ -85,12 +113,15 @@ class TestMetrics:
             )
         ]
 
+    @pytest.mark.description(
+        (
+            "Distribution and gauge helpers must preserve normalized attributes.\n"
+            "\n"
+            "Test cases:\n"
+            "- Distribution and gauge values reach the matching Sentry APIs."
+        )
+    )
     def test_distribution_and_gauge_use_sentry_attributes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Distribution and gauge helpers must preserve normalized attributes.
-
-        Test cases:
-        - Distribution and gauge values reach the matching Sentry APIs.
-        """
         distribution_calls: list[tuple[str, float, dict[str, str]]] = []
         gauge_calls: list[tuple[str, float, dict[str, str]]] = []
 
@@ -109,12 +140,15 @@ class TestMetrics:
         assert distribution_calls == [("valkyrie.test.duration", 1.5, {"outcome": "success"})]
         assert gauge_calls == [("valkyrie.test.in_flight", 4, {"worker": "worker-1"})]
 
+    @pytest.mark.description(
+        (
+            "Counter failures must not interrupt tracker work.\n"
+            "\n"
+            "Test cases:\n"
+            "- A Sentry error is converted into a warning with useful context."
+        )
+    )
     def test_metric_failures_are_logged_without_propagating(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Counter failures must not interrupt tracker work.
-
-        Test cases:
-        - A Sentry error is converted into a warning with useful context.
-        """
         warnings: list[tuple[str, tuple[object, ...]]] = []
 
         def fake_warning(message: str, *args: object) -> None:
@@ -130,14 +164,17 @@ class TestMetrics:
         assert warnings[0][1][:2] == ("valkyrie.test.count", "RuntimeError")
         assert str(warnings[0][1][2]) == "boom"
 
+    @pytest.mark.description(
+        (
+            "Distribution and gauge failures must not interrupt tracker work.\n"
+            "\n"
+            "Test cases:\n"
+            "- Each Sentry failure produces a warning and the next metric still runs."
+        )
+    )
     def test_distribution_and_gauge_failures_are_logged_without_propagating(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Distribution and gauge failures must not interrupt tracker work.
-
-        Test cases:
-        - Each Sentry failure produces a warning and the next metric still runs.
-        """
         warnings: list[tuple[str, tuple[object, ...]]] = []
 
         def fake_warning(message: str, *args: object) -> None:
@@ -158,15 +195,17 @@ class TestMetrics:
         assert str(warnings[1][1][2]) == "gauge boom"
 
 
+@pytest.mark.description("Sandbox tags and diagnostic context.")
 class TestSandboxContext:
-    """Sandbox tags and diagnostic context."""
-
+    @pytest.mark.description(
+        (
+            "Sandbox failures must carry identifiers and runtime details in Sentry.\n"
+            "\n"
+            "Test cases:\n"
+            "- Sandbox tags and context include the ID, name, state, and image."
+        )
+    )
     def test_set_sandbox_context_sets_tags_and_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Sandbox failures must carry identifiers and runtime details in Sentry.
-
-        Test cases:
-        - Sandbox tags and context include the ID, name, state, and image.
-        """
         tags: dict[str, str] = {}
         contexts: dict[str, dict[str, Any]] = {}
 
@@ -196,12 +235,15 @@ class TestSandboxContext:
             }
         }
 
+    @pytest.mark.description(
+        (
+            "Partial sandbox objects must still produce useful Sentry context.\n"
+            "\n"
+            "Test cases:\n"
+            "- Missing state is recorded as null and an absent image is omitted."
+        )
+    )
     def test_set_sandbox_context_omits_optional_image_and_missing_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Partial sandbox objects must still produce useful Sentry context.
-
-        Test cases:
-        - Missing state is recorded as null and an absent image is omitted.
-        """
         contexts: dict[str, dict[str, Any]] = {}
 
         def fake_set_context(key: str, value: dict[str, Any]) -> None:
@@ -222,12 +264,15 @@ class TestSandboxContext:
             }
         }
 
+    @pytest.mark.description(
+        (
+            "Sentry context failures must not block sandbox execution.\n"
+            "\n"
+            "Test cases:\n"
+            "- A closed Sentry scope produces a warning instead of escaping."
+        )
+    )
     def test_set_sandbox_context_failures_are_logged_without_propagating(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Sentry context failures must not block sandbox execution.
-
-        Test cases:
-        - A closed Sentry scope produces a warning instead of escaping.
-        """
         warnings: list[tuple[str, tuple[object, ...]]] = []
 
         def fake_warning(message: str, *args: object) -> None:
@@ -243,12 +288,15 @@ class TestSandboxContext:
         assert str(warnings[0][1][1]) == "scope closed"
 
 
+@pytest.mark.description(
+    (
+        "Retry callbacks must emit both operator context and a low-cardinality metric.\n"
+        "\n"
+        "Test cases:\n"
+        "- A timed-out retry records its function, attempt, delay, and error class."
+    )
+)
 def test_retry_callback_logs_attempt_and_emits_retry_metric(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Retry callbacks must emit both operator context and a low-cardinality metric.
-
-    Test cases:
-    - A timed-out retry records its function, attempt, delay, and error class.
-    """
     increments: list[tuple[str, dict[str, str]]] = []
     log_records: list[dict[str, Any]] = []
 
@@ -299,6 +347,9 @@ def test_retry_callback_logs_attempt_and_emits_retry_metric(monkeypatch: pytest.
     ]
 
 
+@pytest.mark.description(
+    "Polling spans and their children are not forwarded to Sentry, while the root and meaningful spans are."
+)
 def test_sentry_span_processor_drops_noisy_polling_subtrees(monkeypatch: pytest.MonkeyPatch) -> None:
     delegate = Mock()
     delegate.force_flush.return_value = True
@@ -335,6 +386,7 @@ def test_sentry_span_processor_drops_noisy_polling_subtrees(monkeypatch: pytest.
     assert [call.args[0] for call in delegate.on_end.call_args_list] == [meaningful, root]
 
 
+@pytest.mark.description("A handled error is recorded on the span, and the span status is set to `ERROR`.")
 def test_handled_error_span_records_exception_and_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
     span = Mock()
     error = RuntimeError("handled failure")
@@ -354,6 +406,7 @@ def test_handled_error_span_records_exception_and_error_status(monkeypatch: pyte
     assert status.status_code is StatusCode.ERROR
 
 
+@pytest.mark.description("A span failure does not skip the work it wraps.")
 def test_observability_span_failure_does_not_skip_wrapped_work(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tracing_module.logfire, "span", Mock(side_effect=RuntimeError("tracing unavailable")))
     warning = Mock()
@@ -367,6 +420,7 @@ def test_observability_span_failure_does_not_skip_wrapped_work(monkeypatch: pyte
     warning.assert_called_once()
 
 
+@pytest.mark.description("A span close failure keeps the work's outcome.")
 @pytest.mark.parametrize("work_error", [None, RuntimeError("work failed")], ids=["success", "error"])
 def test_observability_span_close_failure_preserves_work_outcome(
     monkeypatch: pytest.MonkeyPatch,
@@ -391,3 +445,36 @@ def test_observability_span_close_failure_preserves_work_outcome(
         assert completed == []
 
     warning.assert_called_once()
+
+
+@pytest.mark.description(
+    "Tracker's trace context reaches aiohttp requests, which is how Daytona toolbox spans join it."
+)
+async def test_configure_tracing_propagates_trace_context_on_aiohttp_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aiohttp import ClientSession, web
+    from aiohttp.test_utils import TestServer
+    from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+    from opentelemetry.sdk.trace import TracerProvider
+
+    monkeypatch.setattr(tracing_module.logfire, "configure", lambda **_: None)
+    monkeypatch.setattr(tracing_module.logfire, "instrument_httpx", lambda: None)
+    monkeypatch.setattr(tracing_module, "set_global_textmap", lambda _: None)
+    received: list[str | None] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        received.append(request.headers.get("traceparent"))
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    tracing_module.configure_tracing("tracker", "test")
+    try:
+        async with TestServer(app) as server, ClientSession() as session:
+            with TracerProvider().get_tracer(__name__).start_as_current_span("task") as span:
+                async with session.get(server.make_url("/")):
+                    pass
+    finally:
+        AioHttpClientInstrumentor().uninstrument()
+
+    assert received[0] is not None
+    assert received[0].split("-")[1] == format(span.get_span_context().trace_id, "032x")

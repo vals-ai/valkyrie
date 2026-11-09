@@ -1,5 +1,3 @@
-"""Envelope-encrypted execution inputs for a single executor dispatch."""
-
 from __future__ import annotations
 
 import base64
@@ -48,7 +46,6 @@ def _key_configuration() -> tuple[str, bytes | str]:
 
 
 def generate_payload_key(dispatch_id: UUID) -> PayloadKey:
-    """Create the data key for one dispatch; call it before taking admission locks."""
     provider, key = _key_configuration()
     if provider == "kms":
         response = boto3.client("kms", config=_KMS_CONFIG).generate_data_key(

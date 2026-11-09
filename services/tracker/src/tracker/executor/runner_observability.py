@@ -1,5 +1,3 @@
-"""Dispatch log context and Sentry correlation for the executor task."""
-
 from __future__ import annotations
 
 import logging
@@ -30,7 +28,6 @@ def dispatch_observability_context(
     release_id: str,
     telemetry_context: ExecutorTelemetryContext,
 ) -> Generator[ExecutorTelemetryContext, None, None]:
-    """Bind one dispatch to the log context, the parent trace, and a Sentry scope; yield the child trace context."""
     tokens = [
         request_id_var.set(telemetry_context["request_id"]),
         benchmark_id_var.set(benchmark_id),
@@ -146,7 +143,6 @@ def _record_terminal_transaction(
 
 
 def record_dispatch_completion(telemetry_context: ExecutorTelemetryContext) -> None:
-    """Record the terminal runner signal without holding a transaction across execution."""
     _record_terminal_transaction(
         telemetry_context,
         name="executor_runner.dispatch.completed",
@@ -154,7 +150,6 @@ def record_dispatch_completion(telemetry_context: ExecutorTelemetryContext) -> N
 
 
 def record_dispatch_cancellation(telemetry_context: ExecutorTelemetryContext) -> None:
-    """Record a cancelled runner dispatch without creating an error issue."""
     logger.info("Executor dispatch cancelled")
     _record_terminal_transaction(
         telemetry_context,
@@ -164,7 +159,6 @@ def record_dispatch_cancellation(telemetry_context: ExecutorTelemetryContext) ->
 
 
 def capture_dispatch_error(error: BaseException, telemetry_context: ExecutorTelemetryContext) -> None:
-    """Capture a runner dispatch error on a bounded trace segment."""
     global _captured_dispatch_error
     logger.error(
         "Executor dispatch failed",
@@ -180,7 +174,6 @@ def capture_dispatch_error(error: BaseException, telemetry_context: ExecutorTele
 
 
 def capture_runner_failure(error: BaseException, dispatch_id: str) -> None:
-    """Capture a runner failure that the dispatch context has not already reported."""
     if error is _captured_dispatch_error:
         return
     with sentry_sdk.new_scope() as scope:

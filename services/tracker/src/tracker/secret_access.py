@@ -24,17 +24,20 @@ def may_use_shared_secrets(org_name: str) -> bool:
 
 
 def resolve_secret_name(name: str, *, org_id: UUID, org_name: str, auth_required: bool) -> str:
-    """Return the stored name; an organization names its own secrets without the tenant prefix."""
     if not auth_required or may_use_shared_secrets(org_name) or name.startswith(TENANT_SECRET_ROOT):
         return name
     return f"{tenant_secret_prefix(org_id)}{name}"
 
 
 def validate_secret_names(names: Iterable[str], *, org_id: UUID, org_name: str, auth_required: bool) -> None:
-    if not auth_required or may_use_shared_secrets(org_name):
+    if not auth_required:
         return
+    from tracker.project_gateway import is_generated_project_gateway_secret_name
 
     prefix = tenant_secret_prefix(org_id)
+    shared = may_use_shared_secrets(org_name)
     for name in names:
-        if not name.startswith(prefix):
+        if not name.startswith(prefix) and (
+            not shared or is_generated_project_gateway_secret_name(name.split("/")[-1])
+        ):
             raise ValueError(f"Secret '{secret_display_name(name)}' does not exist")

@@ -1,8 +1,3 @@
-"""Integration tests for read-only CLI commands against the tracker app.
-
-Run: uv run pytest tests/integration/local/cli/test_read_commands.py
-"""
-
 import json
 
 import httpx
@@ -16,17 +11,20 @@ from valkyrie.sdk import ValkyrieClient
 from valkyrie.cli.main import cli
 
 
+@pytest.mark.description(
+    (
+        "CLI JSON output matches real Tracker routes and database queries.\n"
+        "\n"
+        "Test cases:\n"
+        "- Run list preserves database ordering, identity, score, and task counts.\n"
+        "- Run status aggregates terminal task states through the batch endpoint.\n"
+        "- Run fetch combines status and metadata without exposing contract secrets."
+    )
+)
 def test_cli_reads_persisted_tracker_state(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
 ) -> None:
-    """Verify CLI JSON contracts using real tracker routes and database queries.
-
-    Test cases:
-    - Run list preserves database ordering, identity, score, and task counts.
-    - Run status aggregates terminal task states through the batch endpoint.
-    - Run fetch combines status and metadata without exposing contract secrets.
-    """
     running, finished = seeded_runs
 
     list_result = cli_runner.invoke(cli, ["run", "list", "--format", "json", "--all"])
@@ -64,12 +62,12 @@ def test_cli_reads_persisted_tracker_state(
     assert "must-not-leak" not in fetch_result.output
 
 
+@pytest.mark.description("Read a queued task through CLI, SDK, real tracker routing, and database queries.")
 def test_queue_status_reads_persisted_scheduler_state(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
     database_session: Session,
 ) -> None:
-    """Read a queued task through CLI, SDK, real tracker routing, and database queries."""
     running, _ = seeded_runs
     running.arguments = running.arguments.model_copy(update={"priority": 1, "queue_pool_id": "shared"})
     database_session.add(running)
@@ -101,6 +99,7 @@ def test_queue_status_reads_persisted_scheduler_state(
         assert page["waiting_next_offset"] is page["active_next_offset"] is None
 
 
+@pytest.mark.description("An out of range page parameter on `/scheduler/overview` returns 422 naming that parameter.")
 @pytest.mark.parametrize(
     ("parameter", "value"),
     [(name, value) for name in ("waiting_limit", "active_limit") for value in ("0", "201")]
@@ -116,6 +115,7 @@ async def test_queue_api_rejects_invalid_page_bounds(local_tracker_app: FastAPI,
     assert response.json()["detail"][0]["loc"] == ["query", parameter]
 
 
+@pytest.mark.description("CLI task commands show a run's tasks and their details.")
 def test_cli_task_inspection(cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark]) -> None:
     running, finished = seeded_runs
     result = cli_runner.invoke(
@@ -150,6 +150,7 @@ def test_cli_task_inspection(cli_runner: CliRunner, seeded_runs: tuple[Benchmark
     assert text.exit_code == 0, text.output
 
 
+@pytest.mark.description("CLI task commands return working artifact links.")
 def test_cli_task_artifact_links(
     cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark], agent_library: dict[str, bytes]
 ) -> None:
@@ -162,6 +163,7 @@ def test_cli_task_artifact_links(
     assert '"score": 1' in text.output
 
 
+@pytest.mark.description("The SDK iterates every page of runs and tasks.")
 async def test_sdk_iterates_run_and_task_pages(
     seeded_runs: tuple[Benchmark, Benchmark], local_tracker_app: FastAPI
 ) -> None:
@@ -187,6 +189,7 @@ async def test_sdk_iterates_run_and_task_pages(
     assert request.cursor is None
 
 
+@pytest.mark.description("The CLI lists the filters available for runs.")
 def test_cli_discovers_run_filters(cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark]) -> None:
     result = cli_runner.invoke(cli, ["run", "filter-options", "--format", "json"])
     assert result.exit_code == 0, result.output

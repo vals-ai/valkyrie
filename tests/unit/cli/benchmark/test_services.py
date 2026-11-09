@@ -1,8 +1,3 @@
-"""Benchmark service list against fake and mock Trackers.
-
-Run: uv run pytest tests/unit/cli/benchmark/test_services.py
-"""
-
 import json
 from importlib import import_module
 
@@ -15,19 +10,19 @@ from valkyrie.cli.benchmark.services import paginate_services
 from valkyrie.cli.main import cli
 
 from tests.unit.cli.conftest import MockTracker
-from tests.unit.cli.fake_tracker import FakeTracker
 
 services_module = import_module("valkyrie.cli.benchmark.services")
 
 
-def test_list_merges_hosted_services_with_the_saved_urls(
-    tracker: MockTracker, fake_tracker: FakeTracker, cli_runner: CliRunner
-) -> None:
-    """A saved URL replaces the hosted service of the same name, others are added, and each row shows its latency."""
-    fake_tracker.benchmark_services = {
-        "swebench": {"url": "http://localhost:9000"},
-        "custombench": {"url": "http://custombench"},
+@pytest.mark.description(
+    "A saved URL replaces the hosted service of the same name, others are added, and each row shows its latency."
+)
+def test_list_merges_hosted_services_with_the_saved_urls(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    saved = {
+        "swebench": {"url": "http://localhost:9000", "auth_header_name": None, "auth_secret_name": None},
+        "custombench": {"url": "http://custombench", "auth_header_name": None, "auth_secret_name": None},
     }
+    tracker.reply("GET", "/settings", httpx.Response(200, json={"default_provider": None, "benchmark_services": saved}))
     catalog = [
         {"name": "swebench", "url": "https://swebench.benchmarks.vals.ai"},
         {"name": "fab", "url": "https://fab.benchmarks.vals.ai"},
@@ -58,7 +53,9 @@ def test_list_merges_hosted_services_with_the_saved_urls(
     assert rows["fab"] == ["benchmarks.vals.ai", "23", "ms"]
 
 
-def test_list_without_any_services(tracker: MockTracker, fake_tracker: FakeTracker, cli_runner: CliRunner) -> None:
+@pytest.mark.description("Service list says when there are no services.")
+def test_list_without_any_services(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    tracker.reply("GET", "/settings", httpx.Response(200, json={"default_provider": None, "benchmark_services": {}}))
     tracker.reply("GET", "/benchmark-services", httpx.Response(200, json={"services": []}))
 
     result = cli_runner.invoke(cli, ["benchmark", "service", "list"])
@@ -67,13 +64,16 @@ def test_list_without_any_services(tracker: MockTracker, fake_tracker: FakeTrack
     assert result.output == "No benchmark services configured.\n"
 
 
+@pytest.mark.description(
+    (
+        "Service list should show response latency when available and dash when not.\n"
+        "\n"
+        "Test cases:\n"
+        "- Responding services render measured latency.\n"
+        "- Non-responding services render a dash without healthy/error columns."
+    )
+)
 def test_paginate_services_renders_latency_as_response_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Service list should show response latency when available and dash when not.
-
-    Test cases:
-    - Responding services render measured latency.
-    - Non-responding services render a dash without healthy/error columns.
-    """
     captured_rows: list[dict[str, str]] = []
     captured_headers: list[str] = []
 
@@ -90,22 +90,25 @@ def test_paginate_services_renders_latency_as_response_status(monkeypatch: pytes
 
     monkeypatch.setattr(services_module, "format_table", mock_format_table)
 
+    health = [
+        BenchmarkServiceHealth(
+            name="swebench",
+            url="https://swebench.benchmarks.vals.ai",
+            healthy=True,
+            latency_ms=23,
+        ),
+        BenchmarkServiceHealth(
+            name="vcb",
+            url="http://localhost:9000",
+            healthy=False,
+            latency_ms=None,
+            error="[Errno -2] Name or service not known",
+        ),
+    ]
+
     paginate_services(
-        [
-            BenchmarkServiceHealth(
-                name="swebench",
-                url="https://swebench.benchmarks.vals.ai",
-                healthy=True,
-                latency_ms=23,
-            ),
-            BenchmarkServiceHealth(
-                name="vcb",
-                url="http://localhost:9000",
-                healthy=False,
-                latency_ms=None,
-                error="[Errno -2] Name or service not known",
-            ),
-        ]
+        [BenchmarkServiceEntry(name=service.name, url=service.url) for service in health],
+        check_services=lambda _entries: health,
     )
 
     assert captured_headers == ["Benchmark", "Service URL", "Source", "Latency"]
@@ -113,17 +116,20 @@ def test_paginate_services_renders_latency_as_response_status(monkeypatch: pytes
     assert [row["Latency"] for row in captured_rows] == ["23 ms", "-"]
 
 
+@pytest.mark.description(
+    (
+        "Service pagination should defer health checks until a page is visible.\n"
+        "\n"
+        "Test cases:\n"
+        "- The first page is health-checked before rendering.\n"
+        "- Moving forward checks only the next page, and moving back reuses cached results.\n"
+        "- Each page render clears the previous table output."
+    )
+)
 def test_paginate_services_health_checks_visible_pages_only(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Service pagination should defer health checks until a page is visible.
-
-    Test cases:
-    - The first page is health-checked before rendering.
-    - Moving forward checks only the next page, and moving back reuses cached results.
-    - Each page render clears the previous table output.
-    """
     service_entries = [
         BenchmarkServiceEntry(name="one", url="https://one.example"),
         BenchmarkServiceEntry(name="two", url="https://two.example"),
@@ -155,6 +161,7 @@ def test_paginate_services_health_checks_visible_pages_only(
     ) -> None:
         rendered_pages.append([row["Benchmark"] for row in rows])
 
+    monkeypatch.setattr("valkyrie.cli.display._interactive_terminal", lambda: True)
     monkeypatch.setattr(services_module.click, "getchar", lambda: next(keys))
     monkeypatch.setattr(services_module, "format_table", mock_format_table)
 

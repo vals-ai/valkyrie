@@ -13,19 +13,17 @@ from descope.management.access_key import AccessKey
 from descope.management.common import AssociatedTenant
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import Connection, Engine
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 
-from executor_protocol import ExecutorDispatchStatus
 from tracker.auth import BENCHMARK_SERVICE_API_KEY_HEADER, RUN_KEY_CLAIM, descope_access_keys
 from tracker.config import AUTH_REQUIRED, RUN_ACCESS_KEY_TTL_SECONDS, BenchmarkServiceDestination
-from tracker.database.models import Benchmark, BenchmarkStatus, ExecutorDispatch, Org, RunAccessKey
+from tracker.database.models import Org
 from tracker.database.session import get_session
 from tracker.logging import get_logger
+from tracker.repositories.run_access_key import RunAccessKeyRepository
 
 logger = get_logger(__name__)
 
-_FINISHED_RUN_STATUSES = (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED)
-_ACTIVE_DISPATCH_STATUSES = (ExecutorDispatchStatus.QUEUED, ExecutorDispatchStatus.RUNNING)
 _SWEEP_BATCH_SIZE = 20
 _CALL_KEY_TTL_SECONDS = 600
 
@@ -103,7 +101,7 @@ def _create(access_keys: AccessKey, org: Org, issued: list[IssuedRunKey], *, ttl
         )
         issued_key = IssuedRunKey(key_id=str(response["key"]["id"]), secret=str(response["cleartext"]))
     except Exception as exc:
-        logger.warning("Failed to create a run access key", extra={"org_id": str(org.id)})
+        logger.warning("Failed to create a run access key", extra={"org_id": str(org.id)}, exc_info=True)
         raise HTTPException(status_code=503, detail="Could not create credentials for this run; try again") from exc
     issued.append(issued_key)
     return issued_key
@@ -122,11 +120,7 @@ def _delete(access_keys: AccessKey, key_id: str) -> bool:
 
 def _discard_unrecorded(access_keys: AccessKey, bind: Engine | Connection, issued: Sequence[IssuedRunKey]) -> None:
     with Session(bind) as session:
-        recorded = set(
-            session.exec(
-                select(RunAccessKey.key_id).where(col(RunAccessKey.key_id).in_([key.key_id for key in issued]))
-            ).all()
-        )
+        recorded = RunAccessKeyRepository(session).recorded_key_ids([key.key_id for key in issued])
     for key in issued:
         if key.key_id not in recorded:
             _delete(access_keys, key.key_id)
@@ -137,25 +131,12 @@ def delete_finished_run_keys(bind: Engine | Connection) -> None:
     if access_keys is None:
         return
     now = datetime.now(ZoneInfo("UTC"))
-    active_dispatch = (
-        select(ExecutorDispatch.id)
-        .where(col(ExecutorDispatch.benchmark_id) == col(Benchmark.id))
-        .where(col(ExecutorDispatch.status).in_(_ACTIVE_DISPATCH_STATUSES))
-    )
     with Session(bind) as session:
-        keys = session.exec(
-            select(RunAccessKey)
-            .join(Benchmark, col(Benchmark.id) == col(RunAccessKey.benchmark_id))
-            .where(col(Benchmark.status).in_(_FINISHED_RUN_STATUSES))
-            .where(~active_dispatch.exists())
-            .order_by(col(RunAccessKey.last_attempt_at).asc().nulls_first())
-            .limit(_SWEEP_BATCH_SIZE)
-            .with_for_update(of=RunAccessKey, skip_locked=True)
-        ).all()
-        for key in keys:
+        repository = RunAccessKeyRepository(session)
+        for key in repository.lock_finished(_SWEEP_BATCH_SIZE):
             if _delete(access_keys, key.key_id):
-                session.delete(key)
+                repository.delete(key)
             else:
                 key.last_attempt_at = now
-                session.add(key)
+                repository.save(key)
         session.commit()

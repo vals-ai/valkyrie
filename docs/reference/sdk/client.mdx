@@ -11,12 +11,16 @@ description: "Construct and close the async Valkyrie SDK client."
 
 Async client for Valkyrie API resources; without a config it uses `ValkyrieConfig()`.
 
+`auth` replaces the credential the config picks, for example `SessionAuth` to act as a saved login while
+`VALKYRIE_API_KEY` is set.
+
 ```python Signature
 ValkyrieClient(
     config: ValkyrieConfig | None = None,
     *,
     timeout: float | httpx.Timeout = 120,
     transport: httpx.AsyncBaseTransport | None = None,
+    auth: httpx.Auth | None = None,
 ) -> ValkyrieClient
 ```
 
@@ -32,6 +36,10 @@ ValkyrieClient(
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"transport"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · httpx.AsyncBaseTransport | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"auth"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · httpx.Auth | None · default: <code>{"None"}</code></span></div>
 </div>
 
 ### Returns

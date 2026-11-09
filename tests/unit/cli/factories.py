@@ -1,5 +1,4 @@
-"""Factories for Tracker responses with deterministic defaults."""
-
+import copy
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -32,7 +31,6 @@ def make_fetch_response(
     final_score: float | None = None,
     error_message: str | None = None,
 ) -> FetchBenchmarkResponse:
-    """Build a run response with configurable progress and terminal state."""
     return FetchBenchmarkResponse(
         benchmark_name="swebench",
         benchmark_id=run_id,
@@ -57,7 +55,6 @@ def make_fetch_response(
 
 
 def make_fetch_metadata(run_id: UUID) -> FetchBenchmarkMetadataResponse:
-    """Build run metadata with private contract values used by redaction tests."""
     return FetchBenchmarkMetadataResponse(
         benchmark_id=run_id,
         benchmark_name="swebench",
@@ -84,7 +81,6 @@ def make_final_view(
     task_failure_categories: dict[str, FailureCategory] | None = None,
     evaluation_results: dict[str, dict[str, object]] | None = None,
 ) -> FinalViewResponse:
-    """Build a complete final-view response for CLI behavior tests."""
     return FinalViewResponse(
         benchmark_id=run_id,
         benchmark_name="demo-bench",
@@ -110,14 +106,12 @@ def make_final_view(
 
 
 def ok(model: BaseModel) -> httpx.Response:
-    """A 200 response carrying `model` as JSON; non-finite floats go out as NaN/Infinity."""
     return httpx.Response(
         200, content=json.dumps(model.model_dump(mode="json")), headers={"content-type": "application/json"}
     )
 
 
 def run_stream(*updates: FetchBenchmarkResponse, end: str | None = "complete") -> httpx.Response:
-    """A run update stream: one `data:` event per update, then `event: <end>` unless `end` is None."""
     body = "".join(f"data: {json.dumps(update.model_dump(mode='json'))}\n\n" for update in updates)
     if end is not None:
         body += f"event: {end}\n\n"
@@ -132,13 +126,12 @@ def serve_run(
     stream: httpx.Response | BaseException | None = None,
     metadata: FetchBenchmarkMetadataResponse | None = None,
 ) -> None:
-    """Answer fetches of `run`, its update stream, and its metadata (404 when `metadata` is None)."""
 
     def fetch(request: httpx.Request) -> httpx.Response:
         if request.url.params.get("connect") != "true":
             return ok(run)
         if isinstance(stream, BaseException):
-            raise stream
+            raise copy.copy(stream)
 
         return stream or run_stream()
 

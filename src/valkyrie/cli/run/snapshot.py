@@ -1,6 +1,3 @@
-"""Safe machine-readable snapshots for benchmark runs."""
-
-import json
 from collections.abc import Mapping
 from datetime import datetime
 from math import isfinite
@@ -17,13 +14,12 @@ from valkyrie.sdk.models import (
     TaskStatus,
 )
 
-from valkyrie.cli.display import progress_percent, utc_isoformat
+from valkyrie.cli.display import compact_json, progress_percent, utc_isoformat
 
 RunEvent = Literal["snapshot", "update", "complete", "error", "stopped", "disconnect", "interrupted"]
 
 
 async def fetch_run_metadata(client: ValkyrieClient, run_id: UUID) -> FetchBenchmarkMetadataResponse | None:
-    """Fetch optional identity metadata without making status monitoring fail."""
     try:
         return await client.runs.metadata(run_id)
     except ValkyrieSDKError:
@@ -43,11 +39,6 @@ def _progress_fields(finished_tasks: int, total_tasks: int, task_counts: Mapping
     }
 
 
-def _format_json(payload: Mapping[str, object]) -> str:
-    """Serialize strict compact JSON; NaN and Infinity are never valid machine output."""
-    return json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
-
-
 def build_run_snapshot(
     response: FetchBenchmarkResponse,
     metadata: FetchBenchmarkMetadataResponse | None,
@@ -55,7 +46,6 @@ def build_run_snapshot(
     event: RunEvent,
     observed_at: datetime | None = None,
 ) -> dict[str, object]:
-    """Build a versioned allowlisted view that excludes stored contract secrets and kwargs."""
     details = response.details
     arguments = metadata.benchmark_arguments if metadata is not None else None
     contract = arguments.contract if arguments is not None else None
@@ -93,13 +83,11 @@ def format_run_snapshot_json(
     *,
     event: RunEvent,
 ) -> str:
-    """Serialize one compact JSON or JSONL record."""
-    return _format_json(build_run_snapshot(response, metadata, event=event))
+    return compact_json(build_run_snapshot(response, metadata, event=event))
 
 
 def format_run_list_json(runs: list[BenchmarkTableRow], *, observed_at: datetime | None = None) -> str:
-    """Serialize a complete set of matching runs as one compact JSON document."""
-    return _format_json(
+    return compact_json(
         {
             "schema_version": 1,
             "kind": "run_list",
@@ -133,8 +121,7 @@ def format_run_status_json(
     requested_count: int,
     observed_at: datetime | None = None,
 ) -> str:
-    """Serialize deterministic multi-run status output as one compact JSON document."""
-    return _format_json(
+    return compact_json(
         {
             "schema_version": 1,
             "kind": "run_status",

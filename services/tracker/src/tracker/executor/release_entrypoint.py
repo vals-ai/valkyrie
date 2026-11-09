@@ -1,5 +1,3 @@
-"""Sealed ECS entrypoint for executor release and deployment control."""
-
 from __future__ import annotations
 
 import json
@@ -138,7 +136,6 @@ def _configure_database(task: ReleaseTaskConfig) -> None:
     )
 
 
-# Read-only fields in a described task definition that RegisterTaskDefinition rejects.
 _TASK_DEFINITION_OUTPUT_FIELDS = (
     "taskDefinitionArn",
     "revision",
@@ -152,7 +149,6 @@ _TASK_DEFINITION_OUTPUT_FIELDS = (
 
 
 def _register_release_task_definition(client: EcsClient, task: ReleaseTaskConfig, release: ReleaseInput) -> str:
-    """Register one runner revision that differs from the deployed runner only by its pinned image."""
     described = client.describe_task_definition(taskDefinition=task.runner_task_family)
     template = dict(cast(Mapping[str, object], described["taskDefinition"]))
     for field in _TASK_DEFINITION_OUTPUT_FIELDS:
@@ -180,10 +176,11 @@ def _activate_sealed_release(release: ReleaseInput, ecs: EcsClient, task: Releas
     from tracker.database.models import ExecutorRelease
     from tracker.database.session import engine
     from tracker.executor.release_control import ReleaseControlError, activate_release
+    from tracker.repositories.executor_release import ExecutorReleaseRepository
 
     try:
         with Session(engine) as session:
-            existing = session.get(ExecutorRelease, release.release_id)
+            existing = ExecutorReleaseRepository(session).get(release.release_id)
             task_definition_arn = existing.task_definition_arn if existing is not None else None
             if task_definition_arn is None:
                 task_definition_arn = _register_release_task_definition(ecs, task, release)
@@ -239,9 +236,6 @@ def _wait_for_maintenance_drain(client: EcsClient, task: ReleaseTaskConfig, stop
         pending = _runner_tasks(client, task, "PENDING")
         _stop_runner_tasks(client, task, [*running, *pending], stopped)
         active_stopped_tasks = False
-        # Desired-STOPPED tasks include ones still shutting down, stopped before this call, so wait for them too.
-        # That list also has older finished tasks, which ECS can expire between list and describe. A task missing
-        # from describe keeps the drain polling; an expired one is gone from the next list.
         stopped_arns = sorted(stopped | set(_runner_tasks(client, task, "STOPPED")))
         for start in range(0, len(stopped_arns), 100):
             batch = stopped_arns[start : start + 100]

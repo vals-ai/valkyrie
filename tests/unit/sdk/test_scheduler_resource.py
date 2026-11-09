@@ -1,8 +1,3 @@
-"""Scheduler SDK request validation and typed snapshots.
-
-Run: uv run pytest tests/unit/sdk/test_scheduler_resource.py
-"""
-
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -13,6 +8,7 @@ import pytest
 from valkyrie.sdk import SchedulerOverviewResponse, ValkyrieClient
 
 
+@pytest.mark.description("Fetch scheduler state with typed capacity and server-compatible query options.")
 @pytest.mark.parametrize(
     ("waiting_limit", "active_limit", "waiting_offset", "active_offset", "include_capacity"),
     [(100, 100, 0, 0, False), (1, 200, 200, 10, True)],
@@ -25,7 +21,6 @@ async def test_overview_uses_typed_snapshot_and_query_options(
     active_offset: int,
     include_capacity: bool,
 ) -> None:
-    """Fetch scheduler state with typed capacity and server-compatible query options."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -119,6 +114,7 @@ async def test_overview_uses_typed_snapshot_and_query_options(
     assert result.active_next_offset is None
 
 
+@pytest.mark.description("Reject non-integer or out-of-range limits before sending a request.")
 @pytest.mark.parametrize(
     ("name", "value"),
     [(name, value) for name in ("waiting_limit", "active_limit") for value in (0, 201, True, 1.5)]
@@ -127,7 +123,6 @@ async def test_overview_uses_typed_snapshot_and_query_options(
 async def test_overview_rejects_invalid_limits(
     make_client: Callable[..., ValkyrieClient], name: str, value: object
 ) -> None:
-    """Reject non-integer or out-of-range limits before sending a request."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         pytest.fail("unexpected request")
@@ -137,11 +132,11 @@ async def test_overview_rejects_invalid_limits(
             await client.scheduler.overview(**cast(Any, {name: value}))
 
 
+@pytest.mark.description("Reject non-boolean capacity options before sending a request.")
 @pytest.mark.parametrize("value", [0, 1, None, "true"])
 async def test_overview_rejects_non_boolean_capacity_option(
     make_client: Callable[..., ValkyrieClient], value: object
 ) -> None:
-    """Reject non-boolean capacity options before sending a request."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         pytest.fail("unexpected request")

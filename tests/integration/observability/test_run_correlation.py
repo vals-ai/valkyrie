@@ -1,10 +1,6 @@
-"""Credential-free cross-process transport smoke for run telemetry correlation.
-
-Run: uv run pytest tests/integration/observability/test_run_correlation.py
-"""
-
 from __future__ import annotations
 
+import pytest
 import gzip
 import json
 import logging
@@ -227,6 +223,7 @@ def _breadcrumbs(event: Mapping[str, Any]) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], values) if isinstance(values, list) else []
 
 
+@pytest.mark.description("The run ID ties logs, errors, and traces together across processes.")
 def test_run_id_correlates_logs_errors_and_traces_across_processes(tmp_path: Path) -> None:
     tracker_context = tmp_path / "tracker-context.json"
 

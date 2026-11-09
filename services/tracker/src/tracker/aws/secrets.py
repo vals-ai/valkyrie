@@ -1,5 +1,3 @@
-"""AWS Secrets Manager adapters."""
-
 import json
 from typing import Any
 
@@ -15,17 +13,14 @@ def _error_code(error: ClientError) -> str:
 
 
 class SecretBeingDeletedError(SecretsError):
-    """A secret with this name was just deleted and AWS hasn't finished removing it."""
+    pass
 
 
 class SecretsManagerStore:
-    """Read and manage named values through an already-selected AWS client provider."""
-
     def __init__(self, clients: AWSClientProvider) -> None:
         self._clients = clients
 
     async def get(self, name: str) -> SecretValue:
-        """Fetch and decode one value through a cancellable async client."""
         async with self._clients.secretsmanager_async_client() as client:
             try:
                 response: dict[str, Any] = await client.get_secret_value(  # pyright: ignore[reportUnknownMemberType]
@@ -44,7 +39,6 @@ class SecretsManagerStore:
             return secret_string
 
     async def put(self, name: str, value: str, *, tags: dict[str, str]) -> None:
-        """Create the secret with its tags, or replace the value of the one already there."""
         async with self._clients.secretsmanager_async_client() as client:
             try:
                 try:
@@ -65,7 +59,6 @@ class SecretsManagerStore:
                 ) from error
 
     async def list_names(self, prefix: str) -> list[str]:
-        """Return the names of secrets that start with the prefix."""
         async with self._clients.secretsmanager_async_client() as client:
             pages = client.get_paginator("list_secrets").paginate(Filters=[{"Key": "name", "Values": [prefix]}])  # pyright: ignore[reportUnknownMemberType]
             try:
@@ -75,10 +68,6 @@ class SecretsManagerStore:
         return sorted(name for name in names if name.startswith(prefix))
 
     async def delete(self, name: str) -> bool:
-        """Delete the secret immediately, returning False when there is no secret this caller may delete.
-
-        A forced delete never reports a missing secret; under the tenant role, a missing one is denied.
-        """
         async with self._clients.secretsmanager_async_client() as client:
             try:
                 await client.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)  # pyright: ignore[reportUnknownMemberType]

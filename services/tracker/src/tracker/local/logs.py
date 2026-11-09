@@ -1,8 +1,6 @@
-"""Persistent local task logs stored as JSON lines per run."""
-
 import asyncio
 import fcntl
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,8 +13,10 @@ from tracker.runtime.logs import (
     LogProviderError,
     RunLogReference,
     RunTaskLogReference,
+    TaskLogLine,
     TaskLogReference,
     sanitize_log_stream_name,
+    task_log_stream_name,
 )
 
 
@@ -24,11 +24,10 @@ class _LogRecord(BaseModel):
     stream: str
     timestamp: float
     message: str
+    fields: dict[str, str] = {}
 
 
 class FilesystemLogs:
-    """Store each run's append-only logs in a local JSONL file."""
-
     def __init__(self, root: Path) -> None:
         if not root.is_absolute():
             raise ValueError("Local log root must be absolute")
@@ -42,13 +41,18 @@ class FilesystemLogs:
         await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(path.touch, exist_ok=True)
 
-    def write(self, stream_key: str, message: str) -> None:
+    def write(self, stream_key: str, lines: Sequence[TaskLogLine]) -> None:
         benchmark_id, stream = stream_key.split(":", 1)
-        record = _LogRecord(stream=stream, timestamp=datetime.now(UTC).timestamp(), message=message)
+        records = b"".join(
+            _LogRecord(stream=stream, timestamp=line.received_at, message=line.message, fields=line.fields)
+            .model_dump_json()
+            .encode()
+            + b"\n"
+            for line in lines
+        )
         with self._path(benchmark_id).open("ab") as output:
-            # Separate executor processes can append to the same run.
             fcntl.flock(output, fcntl.LOCK_EX)
-            output.write(record.model_dump_json().encode() + b"\n")
+            output.write(records)
 
     def benchmark_location(self, benchmark_id: str) -> str:
         return str(self._path(benchmark_id))
@@ -81,15 +85,20 @@ class FilesystemLogs:
         def read() -> LogPage:
             path = self._path(str(reference.run_id))
             if not path.exists():
-                return LogPage(events=[])
+                return LogPage(events=[], available=False)
             events: list[LogEvent] = []
             with path.open("rb") as source:
                 source.seek(offset)
                 while line := source.readline():
-                    # A concurrent writer may not have appended the newline yet.
                     if not line.endswith(b"\n"):
                         break
                     record = _LogRecord.model_validate_json(line)
+                    if (
+                        isinstance(reference, TaskLogReference)
+                        and reference.strict_attempt
+                        and record.stream != task_log_stream_name(reference.task_id, reference.started_at)
+                    ):
+                        continue
                     task = record.stream.rsplit("_", 1)[0]
                     if isinstance(reference, TaskLogReference) and task not in task_names:
                         continue
@@ -130,7 +139,9 @@ class FilesystemLogs:
         start = start_time.timestamp() if start_time is not None else None
         end = end_time.timestamp() if end_time is not None else None
         while True:
-            page = await self.fetch(run, cursor=cursor)
+            page = await self.fetch(reference if reference.strict_attempt else run, cursor=cursor)
+            if reference.strict_attempt and not page.available:
+                raise LogProviderError("Task log source is unavailable")
             for event in page.events:
                 cursor = event.event_id
                 if event.task_id != reference.task_id or (query and query not in event.message):

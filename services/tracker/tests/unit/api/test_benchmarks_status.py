@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/unit/api/test_benchmarks_status.py`.
-
-Cover lightweight benchmark status and result-existence routes.
-"""
-
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -27,15 +22,17 @@ _client = TestClient(app)
 _RESULTS_RUN_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
+@pytest.mark.description("Benchmark status polling and result-existence queries.")
 class TestBenchmarkStatusQueries:
-    """Benchmark status polling and result-existence queries."""
-
+    @pytest.mark.description(
+        (
+            "An empty status filter must be a successful no-op for polling clients.\n"
+            "\n"
+            "Test cases:\n"
+            "- Empty CSV input and the route both return empty results."
+        )
+    )
     def test_benchmarks_status_empty_ids_returns_empty_entries(self) -> None:
-        """An empty status filter must be a successful no-op for polling clients.
-
-        Test cases:
-        - Empty CSV input and the route both return empty results.
-        """
         assert parse_csv(" , ", UUID) == []
 
         response = _client.get("/benchmarks/status?ids=")
@@ -43,24 +40,42 @@ class TestBenchmarkStatusQueries:
         assert response.status_code == 200
         assert response.json() == {"entries": []}
 
+    @pytest.mark.description(
+        (
+            "Unknown run IDs must not create placeholder status entries.\n"
+            "\n"
+            "Test cases:\n"
+            "- A valid but missing UUID returns an empty list."
+        )
+    )
     def test_benchmarks_status_unknown_id_returns_empty_entries(self) -> None:
-        """Unknown run IDs must not create placeholder status entries.
-
-        Test cases:
-        - A valid but missing UUID returns an empty list.
-        """
         response = _client.get(f"/benchmarks/status?ids={uuid4()}")
 
         assert response.status_code == 200
         assert response.json() == {"entries": []}
 
+    @pytest.mark.description(
+        (
+            "Malformed run IDs must be rejected instead of silently dropped.\n"
+            "\n"
+            "Test cases:\n"
+            "- A non-UUID entry, alone or next to a valid UUID, returns 422."
+        )
+    )
+    def test_benchmarks_status_malformed_id_returns_422(self) -> None:
+        for ids in ("not-a-uuid", f"{uuid4()},not-a-uuid"):
+            response = _client.get(f"/benchmarks/status?ids={ids}")
+
+            assert response.status_code == 422
+            assert response.json() == {"detail": "ids must be a comma-separated list of run UUIDs"}
+
+    @pytest.mark.description("Result existence must check the canonical results S3 key.")
     def test_results_exist_checks_results_key(
         self,
         database_session: Session,
         example_benchmark_object: Benchmark,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Result existence must check the canonical results S3 key."""
         example_benchmark_object.id = _RESULTS_RUN_ID
         database_session.add(example_benchmark_object)
         database_session.commit()
@@ -74,17 +89,20 @@ class TestBenchmarkStatusQueries:
         assert exists_mock.await_args is not None
         assert exists_mock.await_args.args[0] == f"benchmarks/{_RESULTS_RUN_ID}/{example_benchmark_object.name}.json"
 
+    @pytest.mark.description(
+        (
+            "Status polling must count stopped tasks as complete alongside finished and errored tasks.\n"
+            "\n"
+            "Test cases:\n"
+            "- Three terminal states contribute to finished progress while an active task does not.\n"
+            "- Invalid UUID tokens are ignored without hiding the valid benchmark."
+        )
+    )
     def test_benchmarks_status_counts_all_terminal_tasks(
         self,
         database_session: Session,
         contract: AgentContractRequest,
     ) -> None:
-        """Status polling must count stopped tasks as complete alongside finished and errored tasks.
-
-        Test cases:
-        - Three terminal states contribute to finished progress while an active task does not.
-        - Invalid UUID tokens are ignored without hiding the valid benchmark.
-        """
         benchmark_id = uuid4()
         database_session.add(
             Benchmark(
@@ -105,7 +123,7 @@ class TestBenchmarkStatusQueries:
         )
         database_session.commit()
 
-        response = _client.get(f"/benchmarks/status?ids={benchmark_id},not-a-uuid")
+        response = _client.get(f"/benchmarks/status?ids={benchmark_id}")
 
         assert response.status_code == 200
         assert response.json()["entries"] == [

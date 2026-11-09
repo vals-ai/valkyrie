@@ -1,7 +1,4 @@
-"""Exercise live concurrency updates through the authenticated tracker app.
-
-Run: uv run pytest tests/integration/local/api/test_benchmark_concurrency.py
-"""
+import pytest
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session
@@ -10,11 +7,11 @@ from tests.factories import make_benchmark
 from tracker.database.models import Benchmark, BenchmarkStatus
 
 
+@pytest.mark.description("An authenticated update must return and persist the requested active-run limit.")
 def test_authenticated_concurrency_update_persists_full_arguments(
     client: TestClient,
     database_session: Session,
 ) -> None:
-    """An authenticated update must return and persist the requested active-run limit."""
     benchmark = make_benchmark(concurrency=2, session=database_session)
     original_arguments = benchmark.arguments
 

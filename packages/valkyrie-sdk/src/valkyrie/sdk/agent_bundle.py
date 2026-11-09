@@ -1,5 +1,6 @@
 """Client-side agent packaging and safe archive extraction."""
 
+import fnmatch
 import logging
 import os
 import re
@@ -7,11 +8,14 @@ import shutil
 import stat
 import tempfile
 import zipfile
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Generator, cast
+from typing import BinaryIO, cast
 
 import yaml
+
+from valkyrie.sdk.errors import ValkyrieInputError
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +27,7 @@ DEFAULT_MAX_ENTRIES = 100_000
 def validate_agent_name(name: str) -> str:
     """Validate names used as archive roots and library keys."""
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in {".", ".."}:
-        raise ValueError("Invalid agent name: use only letters, digits, dots, dashes, or underscores")
+        raise ValkyrieInputError("Invalid agent name: use only letters, digits, dots, dashes, or underscores")
 
     return name
 
@@ -35,7 +39,7 @@ def read_agent_name(agent_path: Path) -> str:
         if contract.is_file():
             data: object = yaml.safe_load(contract.read_text())
             if not isinstance(data, dict) or not isinstance(data.get("name"), str):
-                raise ValueError("Agent contract must contain a string name")
+                raise ValkyrieInputError("Agent contract must contain a string name")
 
             return validate_agent_name(cast(str, data["name"]))
 
@@ -46,39 +50,47 @@ def read_agent_name(agent_path: Path) -> str:
 def get_agent_zip_stream(agent_name: str, agent_path: Path) -> Generator[BinaryIO, None, None]:
     """Bundle a directory, excluding caches and environment files without following symlinks."""
     validate_agent_name(agent_name)
-    excluded = {
+    excluded = (
         "__pycache__",
-        ".pyc",
-        ".pyo",
-        ".pyd",
-        ".so",
-        ".dll",
-        ".dylib",
-        ".egg-info",
+        "*.pyc",
+        "*.pyo",
+        "*.pyd",
+        "*.so",
+        "*.so.*",
+        "*.dll",
+        "*.dylib",
+        "*.egg-info",
         ".git",
         ".venv",
         "venv",
         ".env",
+        ".env.*",
+        "*.env",
+        ".envrc",
         ".DS_Store",
-    }
+    )
+
+    def is_excluded(name: str) -> bool:
+        return any(fnmatch.fnmatchcase(name, pattern) for pattern in excluded)
+
     if agent_path.is_symlink():
-        raise ValueError(f"Agent path must not be a symlink: {agent_path}")
+        raise ValkyrieInputError(f"Agent path must not be a symlink: {agent_path}")
 
     with tempfile.TemporaryFile() as stream:
         with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
             if agent_path.is_dir():
                 for root, directories, files in os.walk(agent_path):
-                    directories[:] = [directory for directory in directories if directory not in excluded]
+                    directories[:] = [directory for directory in directories if not is_excluded(directory)]
                     for entry in [*directories, *files]:
                         path = Path(root) / entry
                         if path.is_symlink():
-                            raise ValueError(f"Agent bundles cannot contain symlinks: {path}")
+                            raise ValkyrieInputError(f"Agent bundles cannot contain symlinks: {path}")
                     for file in files:
-                        if any(pattern in file for pattern in excluded):
+                        if is_excluded(file):
                             continue
                         path = Path(root) / file
                         if not path.is_file():
-                            raise ValueError(f"Agent bundles require regular files: {path}")
+                            raise ValkyrieInputError(f"Agent bundles require regular files: {path}")
                         archive.write(path, f"{agent_name}/{path.relative_to(agent_path).as_posix()}")
             else:
                 archive.write(agent_path, f"{agent_name}/{agent_path.name}")
@@ -100,7 +112,7 @@ def extract_agent_archive(
     """Validate every member and CRC in staging before replacing the named target directory."""
     validate_agent_name(name)
     if min(max_archive_bytes, max_expanded_bytes, max_entries) <= 0:
-        raise ValueError("Agent archive limits must be positive")
+        raise ValkyrieInputError("Agent archive limits must be positive")
     if stream.seek(0, 2) > max_archive_bytes:
         raise ValueError("Agent archive exceeds max_archive_bytes")
     stream.seek(0)

@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/unit/api/test_run_settings.py`.
-
-Cover the routes where a user keeps their own default sandbox provider and benchmark services.
-"""
-
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -42,6 +37,7 @@ def client_as(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], TestClient]:
     return lambda user_id: TestClient(app, headers={"x-test-user": user_id})
 
 
+@pytest.mark.description("Each user keeps their own default service and URLs.")
 def test_users_keep_their_own_default_and_urls(client_as: Callable[[str], TestClient]) -> None:
     alice, bob = client_as("U-alice"), client_as("U-bob")
 
@@ -58,6 +54,7 @@ def test_users_keep_their_own_default_and_urls(client_as: Callable[[str], TestCl
     assert bob.get("/settings").json() == _NOTHING_SAVED
 
 
+@pytest.mark.description("A user with the same ID in another org sees none of the first org's saved settings.")
 def test_a_user_id_in_another_organization_is_a_different_user(
     client_as: Callable[[str], TestClient], database_session: Session
 ) -> None:
@@ -71,6 +68,7 @@ def test_a_user_id_in_another_organization_is_a_different_user(
     assert user.delete("/settings/benchmark-services/x").status_code == 404
 
 
+@pytest.mark.description("A saved URL can be removed.")
 def test_removing_a_saved_url(client_as: Callable[[str], TestClient]) -> None:
     user = client_as("U")
     user.put("/settings/benchmark-services/swebench", json={"url": "https://swe.example.com"})
@@ -87,6 +85,7 @@ def test_removing_a_saved_url(client_as: Callable[[str], TestClient]) -> None:
     assert user.get("/settings").json() == removed.json()
 
 
+@pytest.mark.description("Access keys read their user's settings but cannot change them.")
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
@@ -117,6 +116,7 @@ def test_keys_read_their_users_settings_but_cannot_change_them(
     assert user.get("/settings").json() == saved
 
 
+@pytest.mark.description("Saving a benchmark service URL outside the allowed destinations returns 403.")
 def test_saved_urls_must_be_allowed_destinations(client_as: Callable[[str], TestClient]) -> None:
     user = client_as("U")
 
@@ -128,6 +128,7 @@ def test_saved_urls_must_be_allowed_destinations(client_as: Callable[[str], Test
     assert allowed.json()["benchmark_services"] == {"x": _service("https://swe.example.com")}
 
 
+@pytest.mark.description("A saved service must name a secret the organization has.")
 def test_a_saved_service_names_a_secret_the_organization_has(
     client_as: Callable[[str], TestClient], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -149,6 +150,7 @@ def test_a_saved_service_names_a_secret_the_organization_has(
     assert "c" not in user.get("/settings").json()["benchmark_services"]
 
 
+@pytest.mark.description("Invalid settings return 422 and leave nothing saved.")
 @pytest.mark.parametrize(
     ("path", "body"),
     [

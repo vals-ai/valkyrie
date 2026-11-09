@@ -1,8 +1,3 @@
-"""Real filesystem coverage for publication, pagination, and cancellation.
-
-Run: pytest tests/unit/local/test_storage.py
-"""
-
 import asyncio
 import tempfile
 import threading
@@ -15,6 +10,7 @@ from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.local.storage import FilesystemObjectStore
 
 
+@pytest.mark.description("A cancelled upload leaves another writer's output in place and no staging file behind.")
 async def test_cancelled_upload_removes_only_its_staging_file(tmp_path: Path) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
     started = asyncio.Event()
@@ -34,6 +30,7 @@ async def test_cancelled_upload_removes_only_its_staging_file(tmp_path: Path) ->
     assert not list((tmp_path / "staging").iterdir())
 
 
+@pytest.mark.description("Cancelling while the staging file is created cleans it up.")
 async def test_cancellation_during_staging_creation_cleans_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
     created = threading.Event()
@@ -61,6 +58,7 @@ async def test_cancellation_during_staging_creation_cleans_up(tmp_path: Path, mo
     assert not list((tmp_path / "staging").iterdir())
 
 
+@pytest.mark.description("An upload whose authority is revoked keeps the previous output and removes its staging file.")
 async def test_revoked_upload_cannot_publish(tmp_path: Path) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
     await store.put_bytes("output", b"previous")
@@ -83,6 +81,7 @@ async def test_revoked_upload_cannot_publish(tmp_path: Path) -> None:
     assert not list((tmp_path / "staging").iterdir())
 
 
+@pytest.mark.description("A conditional upload leaves an existing agent in place.")
 async def test_conditional_upload_preserves_existing_agent(tmp_path: Path) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
 
@@ -99,11 +98,13 @@ async def test_conditional_upload_preserves_existing_agent(tmp_path: Path) -> No
     assert not list((tmp_path / "staging").iterdir())
 
 
+@pytest.mark.description("A staging folder inside the artifact root is rejected.")
 def test_rejects_staging_inside_the_artifact_root(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         FilesystemObjectStore(tmp_path, tmp_path / "staging")
 
 
+@pytest.mark.description("Invalid storage keys are rejected.")
 @pytest.mark.parametrize("key", ["../outside", "/absolute", "a/../../outside", "", "."])
 async def test_rejects_invalid_keys(tmp_path: Path, key: str) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
@@ -111,6 +112,7 @@ async def test_rejects_invalid_keys(tmp_path: Path, key: str) -> None:
         await store.put_bytes(key, b"invalid")
 
 
+@pytest.mark.description("A symlink that escapes the storage root is rejected.")
 async def test_rejects_symlink_escape(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     root.mkdir()
@@ -120,6 +122,7 @@ async def test_rejects_symlink_escape(tmp_path: Path) -> None:
     assert not (tmp_path / "outside").exists()
 
 
+@pytest.mark.description("Local storage returns object metadata and pages listings.")
 async def test_metadata_and_pagination(tmp_path: Path) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
     for key in ("run/a.txt", "run/a/x", "run/b"):
@@ -138,6 +141,7 @@ async def test_metadata_and_pagination(tmp_path: Path) -> None:
         await store.list_objects_page("other/", cursor="run/b", limit=2)
 
 
+@pytest.mark.description("Batch reads keep the bytes read at the time and skip missing objects.")
 async def test_batch_reads_keep_frozen_bytes_and_skip_missing_objects(tmp_path: Path) -> None:
     store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
     original = b"\x00original\xff"

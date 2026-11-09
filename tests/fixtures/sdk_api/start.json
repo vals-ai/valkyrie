@@ -16,6 +16,7 @@
       ],
       "egress_allowlist": [],
       "install_egress": null,
+      "allow_provider_tools": false,
       "secrets": {
         "ANTHROPIC_API_KEY": "AnthropicSecret"
       },
@@ -38,7 +39,8 @@
     "service_headers": {},
     "sandbox_provider": "daytona",
     "dataset_version": null,
-    "project": "google-report-xyz"
+    "project": "google-report-xyz",
+    "monitoring": {}
   },
   "response": {
     "benchmark_name": "swebench",
@@ -57,6 +59,7 @@
     "dataset_version": null,
     "dataset_version_warning": null,
     "project": {
+      "id": "11111111-1111-4111-8111-111111111111",
       "handle": "google-report-xyz",
       "name": "Google Report XYZ",
       "spend_type": "customer",
@@ -66,7 +69,8 @@
         "engagement": "q4"
       },
       "created_at": "2026-10-23T12:00:00+00:00",
-      "created_by_email": "researcher@vals.ai"
+      "created_by_email": "researcher@vals.ai",
+      "archived_at": null
     }
   }
 }

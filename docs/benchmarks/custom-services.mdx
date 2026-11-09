@@ -73,8 +73,8 @@ every restart. To point a run that already started at the new address, retry it 
 ## Deploy the service
 
 A tunnel works while you iterate. A service other people run against needs a stable HTTPS
-address. The generated `Dockerfile` serves the app on port `8001`, so any container host that
-routes HTTPS and WebSocket traffic to it works.
+address. The generated `Dockerfile` serves the app on port `8001`, so any container host
+that routes HTTPS and WebSocket traffic to it works.
 
 ```bash
 # Build benchmark-service:latest
@@ -85,9 +85,10 @@ docker tag benchmark-service:latest registry.example.com/swebench-benchmark-serv
 docker push registry.example.com/swebench-benchmark-service:v1
 ```
 
-Then deploy the image with your host's guide, for example
-[AWS App Runner](https://docs.aws.amazon.com/apprunner/latest/dg/service-source-image.html),
-[Amazon ECS behind an Application Load Balancer](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-load-balancing.html),
+Then deploy the image with your host's guide, for example [AWS App
+Runner](https://docs.aws.amazon.com/apprunner/latest/dg/service-source-image.html),
+[Amazon ECS behind an Application Load
+Balancer](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-load-balancing.html),
 [Google Cloud Run](https://cloud.google.com/run/docs/deploying) or
-[Fly.io](https://fly.io/docs/launch/deploy/). Before you share the address,
-[require a credential](/benchmarks/authentication#require-a-credential).
+[Fly.io](https://fly.io/docs/launch/deploy/). Before you share the address, [require a
+credential](/benchmarks/authentication#require-a-credential).

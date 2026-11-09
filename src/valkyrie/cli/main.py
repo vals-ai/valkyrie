@@ -1,13 +1,11 @@
-"""CLI views/commands for Valkyrie."""
-
 import sys
 from typing import Any
 
 import click
-from dotenv import load_dotenv
 
+from valkyrie.cli.entry import main
 from valkyrie.cli.lazy import LazyGroup
-from valkyrie.cli.logging import configure_cli_logging
+from valkyrie.cli.logging import load_cli_environment
 
 
 class _ValkyrieCLI(LazyGroup):
@@ -15,7 +13,6 @@ class _ValkyrieCLI(LazyGroup):
         try:
             return super().invoke(ctx)
         except Exception as error:
-            # Looked up, not imported: the SDK takes 0.3s to import, and until it's loaded no error can be one of its own.
             errors = sys.modules.get("valkyrie.sdk.errors")
             if errors is not None and isinstance(error, errors.ValkyrieConfigError):
                 raise click.ClickException(str(error)) from error
@@ -32,8 +29,8 @@ class _ValkyrieCLI(LazyGroup):
             "Export the task IDs in a benchmark dataset, and save benchmark services.",
         ),
         "queue": ("valkyrie.cli.queue:queue", "Inspect your organization's sandbox scheduler."),
-        "project": ("valkyrie.cli.project:project", "Manage the projects runs are started in"),
-        "secret": ("valkyrie.cli.secret:secret", "Store secrets that your runs reference"),
+        "project": ("valkyrie.cli.project:project", "Manage the projects runs are started in."),
+        "secret": ("valkyrie.cli.secret:secret", "Store secrets that your runs reference."),
         "provider": (
             "valkyrie.cli.provider:provider",
             "Choose the secret that configures each sandbox provider, and your default provider.",
@@ -51,16 +48,15 @@ class _ValkyrieCLI(LazyGroup):
         "org": ("valkyrie.cli.org:org", "Create, join and switch organizations, and manage their members."),
         "ui": ("valkyrie.cli.ui:ui", "Browse runs, tasks and logs in a terminal UI."),
     },
+    hidden_commands={"dataset": "valkyrie.cli.dataset:dataset"},
+    help="Run agents against benchmarks and manage their runs.",
 )
 def cli():
-    """Valkyrie CLI."""
-    configure_cli_logging()
-    load_dotenv()
-    configure_cli_logging()
+    load_cli_environment()
 
 
 __all__ = ["cli"]
 
 
 if __name__ == "__main__":
-    cli()
+    main()

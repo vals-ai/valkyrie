@@ -1,5 +1,3 @@
-"""Generation allowance normalization at the benchmark task boundary."""
-
 import pytest
 
 from benchmark_service.sandbox.types import ImageSource, Resources
@@ -7,6 +5,7 @@ from benchmark_service.schemas import CreditedGeneration, Episode, RetrieveTaskR
 from tracker.generation_plan import GenerationPlan
 
 
+@pytest.mark.description("A task fills in the default clock and staging.")
 @pytest.mark.parametrize(
     ("credited_generation", "agent_timeout", "expected_allowance", "expected_staged"),
     [

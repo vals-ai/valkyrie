@@ -1,8 +1,3 @@
-"""Tests for run output downloads.
-
-Run: uv run pytest tests/unit/cli/run/test_outputs.py
-"""
-
 import io
 import tarfile
 from pathlib import Path
@@ -31,10 +26,10 @@ def _tar(files: dict[str, bytes], mode: str = "w") -> bytes:
     return archive.getvalue()
 
 
+@pytest.mark.description("The default directory names the benchmark, agent and run. Selected task IDs reach Tracker.")
 def test_outputs_extract_into_a_named_directory_and_unpack_task_archives(
     tracker: MockTracker, cli_runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default directory names the benchmark, agent and run; selected task IDs reach Tracker."""
     nested = _tar({"nested.txt": b"nested contents"}, mode="w:gz")
     tracker.reply("GET", f"/fetch-benchmark-metadata/{_RUN_ID}", ok(make_fetch_metadata(_RUN_ID)))
     tracker.reply(
@@ -59,6 +54,7 @@ def test_outputs_extract_into_a_named_directory_and_unpack_task_archives(
     assert not (output_dir / "task-a" / "artifacts.tar.gz").exists()
 
 
+@pytest.mark.description("Output extraction rejects paths that escape the archive.")
 @pytest.mark.parametrize("nested", [False, True], ids=["outer-archive", "nested-archive"])
 def test_extract_run_outputs_rejects_archive_traversal(nested: bool, tmp_path: Path) -> None:
     if nested:

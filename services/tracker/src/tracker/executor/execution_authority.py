@@ -1,12 +1,12 @@
-"""Database-time authority fence for executor-originated writes."""
-
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 
-from tracker.database.models import Benchmark, BenchmarkStatus, ExecutorDispatch, ExecutorDispatchStatus
+from tracker.database.models import Benchmark, BenchmarkStatus, ExecutorDispatchStatus
 from tracker.exceptions import ExecutionAuthorityRevoked
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 
 
 @dataclass(frozen=True)
@@ -21,10 +21,7 @@ def lock_execution_authority(
     *,
     require_in_progress: bool = True,
 ) -> Benchmark:
-    """Lock the benchmark and prove that the exact dispatch remains authoritative."""
-    benchmark = session.exec(
-        select(Benchmark).where(col(Benchmark.id) == authority.benchmark_id).with_for_update()
-    ).one_or_none()
+    benchmark = BenchmarkRepository(session).get_by_id(authority.benchmark_id, for_update=True)
     if (
         benchmark is None
         or benchmark.status == BenchmarkStatus.STOPPED
@@ -32,13 +29,9 @@ def lock_execution_authority(
     ):
         raise ExecutionAuthorityRevoked("Executor benchmark authority was revoked")
 
-    dispatch_id = session.exec(
-        select(ExecutorDispatch.id)
-        .where(col(ExecutorDispatch.id) == authority.dispatch_id)
-        .where(col(ExecutorDispatch.benchmark_id) == authority.benchmark_id)
-        .where(col(ExecutorDispatch.status) == ExecutorDispatchStatus.RUNNING)
-        .with_for_update()
-    ).one_or_none()
-    if dispatch_id is None:
+    dispatch = ExecutorDispatchRepository(session).lock(
+        authority.dispatch_id, benchmark_id=authority.benchmark_id, status=ExecutorDispatchStatus.RUNNING
+    )
+    if dispatch is None:
         raise ExecutionAuthorityRevoked("Executor dispatch authority was revoked")
     return benchmark

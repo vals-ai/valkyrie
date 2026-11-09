@@ -1,5 +1,3 @@
-"""Canonical durable dispatch-intent transaction contracts."""
-
 import base64
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -14,6 +12,7 @@ from executor_protocol import (
     DATASET_VERSION_PROTOCOL_VERSION,
     MANAGED_EXECUTION_PROTOCOL_VERSION,
     RESERVED_QUEUE_PROTOCOL_VERSION,
+    SHARED_POOL_QUEUE_PROTOCOL_VERSION,
 )
 from tracker.database.models import (
     Benchmark,
@@ -29,6 +28,7 @@ from tracker.database.models import (
     TaskStatus,
 )
 from tracker.executor.dispatch_control import (
+    unowned_pending_task_ids,
     ClaimedDispatch,
     claim_dispatch,
     finish_dispatch,
@@ -82,6 +82,7 @@ def _release(release_id: str, *, protocol_version: str = MANAGED_EXECUTION_PROTO
     )
 
 
+@pytest.mark.description("Start admission picks the active executor release.")
 def test_start_admission_selects_active_release(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -103,6 +104,7 @@ def test_start_admission_selects_active_release(
     assert dispatch.executor_release_id == "active"
 
 
+@pytest.mark.description("A managed start needs a compatible active release.")
 @pytest.mark.parametrize("protocol_version", ["1", "2"])
 def test_managed_start_requires_a_compatible_active_release(
     protocol_version: str,
@@ -120,9 +122,15 @@ def test_managed_start_requires_a_compatible_active_release(
         )
 
 
+@pytest.mark.description("A managed start outside the queue accepts compatible protocols.")
 @pytest.mark.parametrize(
     "protocol_version",
-    [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION],
+    [
+        MANAGED_EXECUTION_PROTOCOL_VERSION,
+        DATASET_VERSION_PROTOCOL_VERSION,
+        RESERVED_QUEUE_PROTOCOL_VERSION,
+        SHARED_POOL_QUEUE_PROTOCOL_VERSION,
+    ],
 )
 def test_nonqueued_managed_start_accepts_compatible_protocols(
     protocol_version: str,
@@ -142,7 +150,11 @@ def test_nonqueued_managed_start_accepts_compatible_protocols(
     assert dispatch.executor_release_id == release.id
 
 
-@pytest.mark.parametrize("protocol_version", [DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION])
+@pytest.mark.description("A pinned dataset start outside the queue accepts compatible protocols.")
+@pytest.mark.parametrize(
+    "protocol_version",
+    [DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION, SHARED_POOL_QUEUE_PROTOCOL_VERSION],
+)
 def test_nonqueued_pinned_dataset_start_accepts_compatible_protocols(
     protocol_version: str,
     database_session: Session,
@@ -162,6 +174,7 @@ def test_nonqueued_pinned_dataset_start_accepts_compatible_protocols(
     assert dispatch.executor_release_id == release.id
 
 
+@pytest.mark.description("A pinned dataset start rejects protocols that lack dataset versions.")
 @pytest.mark.parametrize("protocol_version", ["1", "2", MANAGED_EXECUTION_PROTOCOL_VERSION])
 def test_pinned_dataset_start_rejects_protocols_without_dataset_version_support(
     protocol_version: str,
@@ -180,7 +193,11 @@ def test_pinned_dataset_start_rejects_protocols_without_dataset_version_support(
         admit_start_dispatch(database_session, benchmark=example_benchmark_object, dispatch_id=uuid4())
 
 
-@pytest.mark.parametrize("protocol_version", [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION])
+@pytest.mark.description("A queued start rejects old protocols and leaves admission untouched.")
+@pytest.mark.parametrize(
+    "protocol_version",
+    [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION],
+)
 def test_queued_start_rejects_old_protocols_without_mutating_admission(
     protocol_version: str,
     database_session: Session,
@@ -196,7 +213,7 @@ def test_queued_start_rejects_old_protocols_without_mutating_admission(
     database_session.commit()
     dispatch_id = uuid4()
 
-    with pytest.raises(ReleaseControlError, match="supports reserved queues"):
+    with pytest.raises(ReleaseControlError, match="supports shared pool admission"):
         admit_start_dispatch(database_session, benchmark=example_benchmark_object, dispatch_id=dispatch_id)
 
     assert example_benchmark_object.arguments.queue_pool_id == _LEGACY_QUEUE_POOL_ID
@@ -218,11 +235,12 @@ def test_queued_start_rejects_old_protocols_without_mutating_admission(
     assert database_session.get(ExecutorDispatch, dispatch_id) is None
 
 
-def test_start_persists_a_reserved_queue_id_with_protocol_five(
+@pytest.mark.description("A start on protocol 6 saves a reserved queue ID.")
+def test_start_persists_a_reserved_queue_id_with_protocol_six(
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    release = _release("active", protocol_version=RESERVED_QUEUE_PROTOCOL_VERSION)
+    release = _release("active", protocol_version=SHARED_POOL_QUEUE_PROTOCOL_VERSION)
     register_release(database_session, release)
     promote_release(database_session, release.id)
     database_session.commit()
@@ -241,7 +259,11 @@ def test_start_persists_a_reserved_queue_id_with_protocol_five(
     assert dispatch.executor_release_id == release.id
 
 
-@pytest.mark.parametrize("protocol_version", [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION])
+@pytest.mark.description("Reserved queue recovery rejects old protocols and leaves admission untouched.")
+@pytest.mark.parametrize(
+    "protocol_version",
+    [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION],
+)
 @pytest.mark.parametrize("pre_action_status", [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPED])
 def test_reserved_queue_recovery_rejects_old_protocols_without_mutating_admission(
     protocol_version: str,
@@ -264,7 +286,7 @@ def test_reserved_queue_recovery_rejects_old_protocols_without_mutating_admissio
     database_session.commit()
     dispatch_id = uuid4()
 
-    with pytest.raises(ReleaseControlError, match="supports reserved queues"):
+    with pytest.raises(ReleaseControlError, match="supports shared pool admission"):
         admit_recovery_dispatch(
             database_session,
             benchmark=example_benchmark_object,
@@ -284,13 +306,19 @@ def test_reserved_queue_recovery_rejects_old_protocols_without_mutating_admissio
     assert database_session.get(ExecutorDispatch, dispatch_id) is None
 
 
+@pytest.mark.description("Reserved queue recovery on protocol 6 keeps its queue ID.")
 @pytest.mark.parametrize("pre_action_status", [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPED])
-def test_reserved_queue_recovery_keeps_its_id_with_protocol_five(
+def test_reserved_queue_recovery_keeps_its_id_with_protocol_six(
     pre_action_status: BenchmarkStatus,
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    previous = _release("previous", protocol_version=RESERVED_QUEUE_PROTOCOL_VERSION)
+    previous_protocol = (
+        SHARED_POOL_QUEUE_PROTOCOL_VERSION
+        if pre_action_status == BenchmarkStatus.IN_PROGRESS
+        else RESERVED_QUEUE_PROTOCOL_VERSION
+    )
+    previous = _release("previous", protocol_version=previous_protocol)
     register_release(database_session, previous)
     promote_release(database_session, previous.id)
     pin_benchmark_to_release(example_benchmark_object, previous)
@@ -300,7 +328,7 @@ def test_reserved_queue_recovery_keeps_its_id_with_protocol_five(
         update={"queue_pool_id": reserved_id}
     )
     database_session.add(example_benchmark_object)
-    register_release(database_session, _release("active", protocol_version=RESERVED_QUEUE_PROTOCOL_VERSION))
+    register_release(database_session, _release("active", protocol_version=SHARED_POOL_QUEUE_PROTOCOL_VERSION))
     promote_release(database_session, "active")
     database_session.commit()
 
@@ -322,8 +350,12 @@ def test_reserved_queue_recovery_keeps_its_id_with_protocol_five(
     assert dispatch.executor_release_id == release_id
 
 
-@pytest.mark.parametrize("protocol_version", [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION])
-def test_legacy_queue_recovery_keeps_its_stored_id_with_compatible_protocols(
+@pytest.mark.description("Legacy queue recovery asks for a new run instead of dispatching work nothing can serve.")
+@pytest.mark.parametrize(
+    "protocol_version",
+    [MANAGED_EXECUTION_PROTOCOL_VERSION, DATASET_VERSION_PROTOCOL_VERSION, RESERVED_QUEUE_PROTOCOL_VERSION],
+)
+def test_legacy_queue_recovery_requires_a_new_run_instead_of_dispatching_unserviceable_work(
     protocol_version: str,
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -335,27 +367,27 @@ def test_legacy_queue_recovery_keeps_its_stored_id_with_compatible_protocols(
         update={"queue_pool_id": _LEGACY_QUEUE_POOL_ID}
     )
     database_session.add(example_benchmark_object)
-    register_release(database_session, _release("active", protocol_version=protocol_version))
+    register_release(database_session, _release("active", protocol_version=SHARED_POOL_QUEUE_PROTOCOL_VERSION))
     promote_release(database_session, "active")
     database_session.commit()
+    dispatch_id = uuid4()
 
-    dispatch = admit_recovery_dispatch(
-        database_session,
-        benchmark=example_benchmark_object,
-        pre_action_status=BenchmarkStatus.STOPPED,
-        dispatch_id=uuid4(),
-        kind=ExecutorDispatchKind.RETRY,
-    )
-    database_session.commit()
-    database_session.expire_all()
-
-    persisted = database_session.get(Benchmark, example_benchmark_object.id)
-    assert persisted is not None
-    assert persisted.arguments.queue_pool_id == _LEGACY_QUEUE_POOL_ID
-    assert persisted.current_execution_release_id == "active"
-    assert dispatch.executor_release_id == "active"
+    with pytest.raises(ReleaseControlError, match="start a new queued run"):
+        admit_recovery_dispatch(
+            database_session,
+            benchmark=example_benchmark_object,
+            pre_action_status=BenchmarkStatus.STOPPED,
+            dispatch_id=dispatch_id,
+            kind=ExecutorDispatchKind.RETRY,
+        )
+    database_session.rollback()
+    database_session.refresh(example_benchmark_object)
+    assert example_benchmark_object.arguments.queue_pool_id == _LEGACY_QUEUE_POOL_ID
+    assert example_benchmark_object.current_execution_release_id == legacy.id
+    assert database_session.get(ExecutorDispatch, dispatch_id) is None
 
 
+@pytest.mark.description("Managed recovery of an in progress run refuses a pinned legacy protocol.")
 def test_in_progress_managed_recovery_refuses_a_pinned_legacy_protocol(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -391,6 +423,7 @@ def test_in_progress_managed_recovery_refuses_a_pinned_legacy_protocol(
     assert dispatch.executor_release_id == "managed"
 
 
+@pytest.mark.description("A retry of an in progress run keeps its release and original dispatch active.")
 def test_in_progress_retry_keeps_release_and_original_dispatch_active(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -427,6 +460,7 @@ def test_in_progress_retry_keeps_release_and_original_dispatch_active(
     assert old_dispatch.finished_at is None
 
 
+@pytest.mark.description("An enqueue failure leaves the start retryable.")
 def test_enqueue_failure_makes_start_retryable(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -482,6 +516,7 @@ def test_enqueue_failure_makes_start_retryable(
         assert error_result.failed_attempt_number is None
 
 
+@pytest.mark.description("A payload decryption failure is recorded as an infrastructure failure.")
 def test_payload_decryption_failure_records_infrastructure_category(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -529,6 +564,7 @@ def test_payload_decryption_failure_records_infrastructure_category(
     assert error.category == FailureCategory.INFRASTRUCTURE
 
 
+@pytest.mark.description("An enqueue failure on an additive retry keeps the original execution active.")
 def test_additive_retry_enqueue_failure_keeps_original_execution_active(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -640,6 +676,7 @@ def test_additive_retry_enqueue_failure_keeps_original_execution_active(
     assert error_results[0].retry_scheduled is False
 
 
+@pytest.mark.description("An enqueue failure does not override a delivery that was already claimed.")
 def test_enqueue_failure_does_not_override_claimed_delivery(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -668,6 +705,7 @@ def test_enqueue_failure_does_not_override_claimed_delivery(
     assert example_benchmark_object.status == BenchmarkStatus.IN_PROGRESS
 
 
+@pytest.mark.description("A failed running dispatch leaves its active sibling alone.")
 def test_running_dispatch_failure_preserves_active_sibling(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -776,6 +814,7 @@ def test_running_dispatch_failure_preserves_active_sibling(
     assert error_result.failed_attempt_number is None
 
 
+@pytest.mark.description("When the last dispatch fails, a graceful stop completes.")
 @pytest.mark.parametrize(
     ("dispatch_status", "task_status"),
     [
@@ -826,6 +865,7 @@ def test_last_dispatch_failure_completes_graceful_stop(
     assert task.status == TaskStatus.ERROR
 
 
+@pytest.mark.description("A failed queued dispatch errors the run.")
 def test_queued_dispatch_failure_errors_the_benchmark(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -866,6 +906,7 @@ def test_queued_dispatch_failure_errors_the_benchmark(
     assert error_result.category == FailureCategory.INFRASTRUCTURE
 
 
+@pytest.mark.description("Terminal recovery finishes the active dispatches.")
 def test_terminal_recovery_terminalizes_active_dispatches(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -905,6 +946,7 @@ def test_terminal_recovery_terminalizes_active_dispatches(
     assert old_dispatch.finished_at is not None
 
 
+@pytest.mark.description("Finishing active dispatches keeps the chosen finalizer.")
 def test_terminalize_active_dispatches_preserves_selected_finalizer(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -925,6 +967,7 @@ def test_terminalize_active_dispatches_preserves_selected_finalizer(
         ExecutorDispatchKind.RETRY,
         dispatch_id=uuid4(),
     )
+    sibling.created_at = finalizer.created_at + timedelta(seconds=1)
     finalizer.status = ExecutorDispatchStatus.RUNNING
     finalizer.started_at = datetime.now(UTC)
     sibling.status = ExecutorDispatchStatus.RUNNING
@@ -947,6 +990,7 @@ def test_terminalize_active_dispatches_preserves_selected_finalizer(
     assert sibling.finished_at is not None
 
 
+@pytest.mark.description("Locking execution authority for a stopped run raises `ExecutionAuthorityRevoked`.")
 @pytest.mark.parametrize(
     ("status", "allowed"),
     [
@@ -998,6 +1042,16 @@ def test_terminal_authority_rejects_stopped_state(
         database_session.rollback()
 
 
+@pytest.mark.description(
+    (
+        "Failure recording respects sibling assignments and newer attempts.\n"
+        "\n"
+        "Test cases:\n"
+        "- An unrelated sibling does not prevent cleanup of an expired assignment.\n"
+        "- Overlapping or unknown assignments preserve potentially shared tasks.\n"
+        "- A newer task attempt and the sibling's own task remain untouched."
+    )
+)
 @pytest.mark.parametrize("task_status", [TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS])
 @pytest.mark.parametrize("assignment", [None, ["owned-task", "sibling-task"], ["sibling-task"]])
 def test_dispatch_failure_only_preserves_tasks_an_active_sibling_can_run(
@@ -1006,13 +1060,6 @@ def test_dispatch_failure_only_preserves_tasks_an_active_sibling_can_run(
     task_status: TaskStatus,
     assignment: list[str] | None,
 ) -> None:
-    """Verify failure recording respects sibling assignments and newer attempts.
-
-    Test cases:
-    - An unrelated sibling does not prevent cleanup of an expired assignment.
-    - Overlapping or unknown assignments preserve potentially shared tasks.
-    - A newer task attempt and the sibling's own task remain untouched.
-    """
     release = _release("active")
     register_release(database_session, release)
     pin_benchmark_to_release(example_benchmark_object, release)
@@ -1030,6 +1077,7 @@ def test_dispatch_failure_only_preserves_tasks_an_active_sibling_can_run(
         dispatch_id=uuid4(),
         task_ids=assignment,
     )
+    sibling.created_at = dispatch.created_at + timedelta(seconds=1)
     task = Task(
         org_id=example_benchmark_object.org_id,
         benchmark=example_benchmark_object.id,
@@ -1068,6 +1116,166 @@ def test_dispatch_failure_only_preserves_tasks_an_active_sibling_can_run(
     assert len(errors) == (1 if expected_status == TaskStatus.ERROR else 0)
     if errors:
         assert errors[0].cause_code == "ECS_TASK_STOPPED"
+
+
+def _retried_run(
+    session: Session, benchmark: Benchmark, *, retry_status: ExecutorDispatchStatus
+) -> tuple[ExecutorDispatch, ExecutorDispatch, Task, Task]:
+    release = _release("active")
+    register_release(session, release)
+    pin_benchmark_to_release(benchmark, release)
+    start = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["task-a", "task-b"]
+    )
+    start.status = ExecutorDispatchStatus.RUNNING
+    start.started_at = start.created_at
+    retry = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.RETRY, dispatch_id=uuid4(), task_ids=["task-a"]
+    )
+    retry.created_at = start.created_at + timedelta(minutes=30)
+    retry.status = retry_status
+    retried = Task(
+        org_id=benchmark.org_id,
+        benchmark=benchmark.id,
+        task_id="task-a",
+        status=TaskStatus.PENDING,
+        started_at=retry.created_at - timedelta(microseconds=1),
+    )
+    running = Task(
+        org_id=benchmark.org_id,
+        benchmark=benchmark.id,
+        task_id="task-b",
+        status=TaskStatus.IN_PROGRESS,
+        started_at=start.created_at + timedelta(seconds=1),
+    )
+    session.add_all([benchmark, start, retry, retried, running])
+    session.commit()
+    return start, retry, retried, running
+
+
+@pytest.mark.description(
+    "A retry runner that never starts must not leave its task PENDING behind the start dispatch's assignment."
+)
+def test_failed_retry_dispatch_errors_its_task_even_though_the_start_dispatch_listed_it(
+    database_session: Session, example_benchmark_object: Benchmark
+) -> None:
+    start, retry, retried, running = _retried_run(
+        database_session, example_benchmark_object, retry_status=ExecutorDispatchStatus.QUEUED
+    )
+
+    assert _fail_stopped_task(database_session, retry)
+    database_session.commit()
+    for row in (example_benchmark_object, start, retry, retried, running):
+        database_session.refresh(row)
+
+    assert retried.status == TaskStatus.ERROR
+    assert running.status == TaskStatus.IN_PROGRESS
+    assert retry.status == ExecutorDispatchStatus.FAILED
+    assert retry.failure_reason == "ECS_TASK_STOPPED"
+    assert start.status == ExecutorDispatchStatus.RUNNING
+    assert example_benchmark_object.status == BenchmarkStatus.IN_PROGRESS
+    error = database_session.exec(select(ErrorResult).where(ErrorResult.task == retried.id)).one()
+    assert error.cause_code == "ECS_TASK_STOPPED"
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
+
+
+@pytest.mark.description(
+    (
+        "A PENDING task is owned while a dispatch admitted for its attempt is active and stranded once it failed.\n"
+        "\n"
+        "An attempt the scheduler restarted in place (newer than every dispatch) still belongs to the start dispatch."
+    )
+)
+def test_unowned_pending_tasks_are_those_no_active_dispatch_runs(
+    database_session: Session, example_benchmark_object: Benchmark
+) -> None:
+    start, retry, retried, _running = _retried_run(
+        database_session, example_benchmark_object, retry_status=ExecutorDispatchStatus.QUEUED
+    )
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
+
+    retry.status = ExecutorDispatchStatus.FAILED
+    database_session.add(retry)
+    database_session.commit()
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == ["task-a"]
+
+    retried.started_at = retry.created_at + timedelta(minutes=1)
+    database_session.add(retried)
+    database_session.commit()
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
+
+    start.status = ExecutorDispatchStatus.FINISHED
+    database_session.add(start)
+    database_session.commit()
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == ["task-a"]
+
+    example_benchmark_object.status = BenchmarkStatus.ERROR
+    database_session.add(example_benchmark_object)
+    database_session.commit()
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
+
+
+@pytest.mark.description("Pending tasks of a run with no dispatch rows have no known owner.")
+def test_unowned_pending_tasks_are_unknown_for_a_run_without_dispatch_rows(
+    database_session: Session, example_benchmark_object: Benchmark
+) -> None:
+    pending = Task(
+        org_id=example_benchmark_object.org_id,
+        benchmark=example_benchmark_object.id,
+        task_id="task-a",
+        status=TaskStatus.PENDING,
+    )
+    database_session.add_all([example_benchmark_object, pending])
+    database_session.commit()
+
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
+
+
+@pytest.mark.description(
+    "Queued running recovery lists runnable tasks without resetting started_at. The start dispatch keeps them."
+)
+def test_failed_resume_of_untouched_attempts_keeps_tasks_the_start_dispatch_still_runs(
+    database_session: Session, example_benchmark_object: Benchmark
+) -> None:
+    release = _release("active")
+    register_release(database_session, release)
+    pin_benchmark_to_release(example_benchmark_object, release)
+    start = create_executor_dispatch(
+        example_benchmark_object.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["a", "b"]
+    )
+    start.status = ExecutorDispatchStatus.RUNNING
+    start.started_at = start.created_at
+    resume = create_executor_dispatch(
+        example_benchmark_object.id, release, ExecutorDispatchKind.RESUME, dispatch_id=uuid4(), task_ids=["a", "b"]
+    )
+    resume.created_at = start.created_at + timedelta(minutes=30)
+    building = Task(
+        org_id=example_benchmark_object.org_id,
+        benchmark=example_benchmark_object.id,
+        task_id="a",
+        status=TaskStatus.BUILDING,
+        started_at=start.created_at - timedelta(seconds=1),
+    )
+    pending = Task(
+        org_id=example_benchmark_object.org_id,
+        benchmark=example_benchmark_object.id,
+        task_id="b",
+        status=TaskStatus.PENDING,
+        started_at=start.created_at - timedelta(seconds=1),
+    )
+    database_session.add_all([example_benchmark_object, start, resume, building, pending])
+    database_session.commit()
+
+    assert _fail_stopped_task(database_session, resume)
+    database_session.commit()
+    for row in (building, pending, resume, start):
+        database_session.refresh(row)
+
+    assert building.status == TaskStatus.BUILDING
+    assert pending.status == TaskStatus.PENDING
+    assert resume.status == ExecutorDispatchStatus.FAILED
+    assert start.status == ExecutorDispatchStatus.RUNNING
+    assert unowned_pending_task_ids(database_session, example_benchmark_object) == []
 
 
 @pytest.fixture
@@ -1162,6 +1370,7 @@ def test_finish_finalizes_only_a_benchmark_no_dispatch_still_owns(
         sibling = create_executor_dispatch(
             example_benchmark_object.id, release, ExecutorDispatchKind.RETRY, dispatch_id=uuid4(), task_ids=["task-2"]
         )
+        sibling.created_at = dispatch.created_at + timedelta(seconds=1)
         database_session.add(sibling)
     example_benchmark_object.status = benchmark_status
     database_session.add(example_benchmark_object)

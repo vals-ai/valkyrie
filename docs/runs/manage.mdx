@@ -25,9 +25,9 @@ new ones until the run is under the limit. Only a run in progress can be updated
 valkyrie run stop RUN_ID
 ```
 
-The Valkyrie CLI asks you to confirm. Tasks that haven't started, and tasks being set up or graded,
-stop. Agents that are already running finish their task. The run shows `STOPPING` until
-they do, then `STOPPED`.
+The Valkyrie CLI asks you to confirm. Tasks that haven't started, and tasks being set up
+or graded, stop. Agents that are already running finish their task. The run shows
+`STOPPING` until they do, then `STOPPED`, or `FINISHED` if no task was stopped.
 
 To stop only some tasks and let the rest of the run go on, name them:
 
@@ -94,4 +94,5 @@ These options change what the rerun uses:
 | `--concurrency` | Sets a new concurrency. |
 | `--connect` | Streams progress after the rerun starts. |
 
-A rerun that restarts the agent gives the task a fresh [wall limit](/runs/time-limits#wall-limit).
+A rerun that restarts the agent gives the task a fresh [wall
+limit](/runs/time-limits#wall-limit).

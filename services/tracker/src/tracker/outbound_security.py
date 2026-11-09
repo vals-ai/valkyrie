@@ -1,10 +1,3 @@
-"""Validation for caller-controlled benchmark-service destinations and headers.
-
-This module intentionally implements Tracker's reject-only policy before HTTP
-transport. Generic URL and header containers normalize or accept inputs forbidden
-here, which would change persisted/API values or defer failures until request time.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -42,14 +35,12 @@ _INVALID_SERVICE_URL = "Invalid benchmark service URL"
 
 
 def validate_benchmark_name(value: str) -> str:
-    """Require the DNS-label grammar used to derive hosted benchmark-service URLs."""
     if not _BENCHMARK_NAME_RE.fullmatch(value):
         raise ValueError("Invalid benchmark name")
     return value
 
 
 def validate_service_headers(headers: Mapping[str, str]) -> None:
-    """Reject malformed headers and names that alter HTTP routing or protocol handling."""
     for name, value in headers.items():
         normalized = name.lower()
         if (
@@ -62,7 +53,6 @@ def validate_service_headers(headers: Mapping[str, str]) -> None:
 
 
 def validate_service_header_name(name: str) -> str:
-    """Accept a header name that validate_service_headers allows."""
     validate_service_headers({name: ""})
     return name
 
@@ -74,7 +64,6 @@ def validate_custom_service_destination(
     auth_required: bool,
     restrict_vals_hosts: bool = True,
 ) -> None:
-    """Keep private and optionally Vals-owned custom destinations limited to trusted callers."""
     from tracker.secret_access import may_use_shared_secrets
 
     if not auth_required or may_use_shared_secrets(org_name):
@@ -102,7 +91,6 @@ def validate_custom_service_destination(
 
 
 def validate_service_url_syntax(value: str) -> str:
-    """Validate and normalize a caller-provided benchmark-service base URL."""
     if _INVALID_URL_CHARACTERS_RE.search(value):
         raise ValueError(_INVALID_SERVICE_URL)
 

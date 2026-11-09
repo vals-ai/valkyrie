@@ -10,7 +10,7 @@ WORKDIR ${LAMBDA_TASK_ROOT}
 COPY pyproject.toml uv.lock ./
 
 RUN uv export --locked --no-dev --no-emit-project --output-file requirements.txt \
-    && uv pip install --system --requirements requirements.txt \
+    && uv pip install --system --no-config --requirements requirements.txt \
     && rm requirements.txt
 
 COPY src/tracker ./tracker

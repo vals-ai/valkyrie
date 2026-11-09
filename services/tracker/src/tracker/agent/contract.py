@@ -1,5 +1,3 @@
-"""Resolve agent contracts from yaml files / zipped agent bundles."""
-
 import io
 import tempfile
 import zipfile
@@ -15,7 +13,6 @@ from tracker.exceptions import BundlerError, ContractValidationError
 
 
 def read_agent_name(agent_dir: Path) -> str:
-    """Read and validate the agent name from a directory's contract.yaml/.yml."""
     for ext in (".yaml", ".yml"):
         contract_file = agent_dir / f"contract{ext}"
         if contract_file.exists():
@@ -31,7 +28,6 @@ def read_agent_name(agent_dir: Path) -> str:
 
 
 def get_contract_from_zip_bytes(agent_name: str, zip_bytes: bytes, agent_config: AgentConfig) -> AgentContractRequest:
-    """Extract contract from zip bytes into a temp dir and load it. Looks for contract.yaml/.yml."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -53,7 +49,6 @@ def get_contract_from_zip_bytes(agent_name: str, zip_bytes: bytes, agent_config:
 
 
 def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> AgentContractRequest:
-    """Parse a declarative agent.yaml and validate kwargs against its schema."""
     try:
         with open(contract_path, "r") as f:
             contract_dict = yaml.safe_load(f)
@@ -77,7 +72,6 @@ def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> Agen
         return AgentContractRequest(
             name=agent_contract.name,
             model=agent_config.model,
-            # Keep validated values for task setup and final command binding.
             kwargs={key: str(value) for key, value in validated_kwargs.items()},
             run_cmd=agent_contract.run_cmd,
             turns=agent_contract.turns,
@@ -86,6 +80,7 @@ def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> Agen
             output_artifacts=agent_contract.output_artifacts,
             egress_allowlist=agent_contract.egress_allowlist,
             install_egress=agent_contract.install_egress,
+            allow_provider_tools=agent_contract.allow_provider_tools,
             secrets=agent_contract.secrets,
         )
     except ContractValidationError:
@@ -95,7 +90,6 @@ def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> Agen
 
 
 def get_contract(contract_path: Path, agent_config: AgentConfig) -> AgentContractRequest:
-    """Dispatch a contract file to the right parser based on extension (.yaml/.yml)."""
     try:
         match contract_path.suffix:
             case ".yaml" | ".yml":

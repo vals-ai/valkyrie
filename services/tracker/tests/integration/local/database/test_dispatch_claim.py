@@ -1,8 +1,3 @@
-"""Dispatch claim fencing against disposable PostgreSQL.
-
-Run: uv run pytest tests/integration/local/database/test_dispatch_claim.py
-"""
-
 import os
 import subprocess
 import sys
@@ -29,11 +24,14 @@ from tracker.database.models import (
     Org,
 )
 from tracker.executor import dispatch_recovery
-from tracker.executor.dispatch_control import ClaimedDispatch, claim_dispatch
+from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW, ClaimedDispatch, claim_dispatch
 from tracker.executor.dispatch_payload import generate_payload_key, seal_payload
 from tracker.executor.release_control import create_executor_dispatch, pin_benchmark_to_release, register_release
 
 
+@pytest.mark.description(
+    "Of concurrent dispatch claims, one wins, the dispatch is `RUNNING`, and its payload row is deleted."
+)
 @pytest.mark.parametrize("task_arn", [None, "arn:aws:ecs:us-east-1:123456789012:task/test/task-1"])
 def test_concurrent_claims_admit_exactly_one_executor(
     postgres_engine: Engine, postgres_session: Session, task_arn: str | None
@@ -112,6 +110,9 @@ def test_concurrent_claims_admit_exactly_one_executor(
     assert postgres_session.get(ExecutorDispatchPayload, dispatch.id) is None
 
 
+@pytest.mark.description(
+    "A failed executor process marks the run `ERROR` with `PAYLOAD_DECRYPT_FAILED` or `EXECUTOR_FAILED` as the reason."
+)
 @pytest.mark.parametrize("outcome", ["malformed", "corrupt", "complete"])
 def test_executor_process_records_outcome(
     postgres_engine: Engine, postgres_session: Session, tmp_path: Path, outcome: str
@@ -148,13 +149,12 @@ def test_executor_process_records_outcome(
     )
     postgres_session.commit()
 
-    # Replace only benchmark work. The child owns the real claim and terminal transaction.
     if outcome == "complete":
         (tmp_path / "sitecustomize.py").write_text(
             "from uuid import UUID\nfrom sqlmodel import Session\n"
             "from tracker.database.session import engine\n"
             "from tracker.database.models import Benchmark, BenchmarkStatus\n"
-            "import tracker.utils.run_orchestration as orchestration\n"
+            "import tracker.services.runs.start as orchestration\n"
             "async def complete(benchmark_id_str, **kwargs):\n"
             "    with Session(engine) as session:\n"
             "        benchmark = session.get(Benchmark, UUID(benchmark_id_str))\n"
@@ -195,6 +195,9 @@ def test_executor_process_records_outcome(
         assert postgres_session.get(ExecutorDispatchPayload, dispatch.id) is None
 
 
+@pytest.mark.description(
+    "A local executor that is revoked or crashes leaves a `FAILED` dispatch and a `STOPPED` or `ERROR` run."
+)
 @pytest.mark.parametrize("termination", ["revoke", "kill"])
 def test_local_process_recovers_after_stop_or_crash(
     postgres_engine: Engine,
@@ -230,9 +233,8 @@ def test_local_process_recovers_after_stop_or_crash(
         ]
     )
     postgres_session.commit()
-    # Hold benchmark work at its boundary while the real process owns its claim and lease.
     (tmp_path / "sitecustomize.py").write_text(
-        "import asyncio\nimport tracker.utils.run_orchestration as orchestration\n"
+        "import asyncio\nimport tracker.services.runs.start as orchestration\n"
         "async def wait_for_stop(**kwargs):\n    await asyncio.Future()\n"
         "orchestration.process_benchmark = wait_for_stop\n"
     )
@@ -250,7 +252,7 @@ def test_local_process_recovers_after_stop_or_crash(
         text=True,
     ) as process:
         try:
-            deadline = monotonic() + 20
+            deadline = monotonic() + DISPATCH_CLAIM_WINDOW.total_seconds()
             while monotonic() < deadline:
                 postgres_session.refresh(dispatch)
                 if dispatch.status == ExecutorDispatchStatus.RUNNING:

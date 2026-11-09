@@ -1,10 +1,3 @@
-"""Provides FakeSource, a RunSource backed by fixtures, so the UI runs and tests without a tracker.
-
-Runs come from fixtures/runs.json, shaped like the SDK's models so captured tracker responses can replace them.
-Tasks and logs are generated from a seed to match each run's status counts. Active runs move one step forward per
-second of `clock`, and tests pass a clock that never moves, which freezes them.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +15,8 @@ from valkyrie.sdk.models import (
     BenchmarkStatus,
     BenchmarkStatusEntry,
     BenchmarkTableRow,
+    DatasetResponse,
+    DatasetTaskResponse,
     DocentReadingStatus,
     FailureCategory,
     FetchBenchmarkResponse,
@@ -32,12 +27,10 @@ from valkyrie.sdk.models import (
     TaskSummary,
 )
 
-from valkyrie.tui.source import FINAL_STATUSES, TASK_PAGE_LIMIT, TRIAGE_ORDER, Environment
+from valkyrie.tui.source import ACTIVE_TASKS, FINAL_STATUSES, TASK_PAGE_LIMIT, TRIAGE_ORDER, Environment
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ACTIVE = (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 
-# Weighted so failures cluster on a few messages, the way real runs do.
 ERRORS = [
     (FailureCategory.INFRASTRUCTURE, "dockerd not ready after 120s", 30),
     (FailureCategory.INFRASTRUCTURE, "Container killed: OOMKilled (memory limit 8 GiB)", 8),
@@ -150,7 +143,6 @@ class FakeSource:
     environment = Environment("fake", "built-in sample data")
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None, follow: bool = True, seed: int = 7) -> None:
-        """With `follow`, run and log streams stay open like the tracker's. Tests turn it off so streams end."""
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.follow = follow
         self._rng = random.Random(seed)
@@ -171,6 +163,52 @@ class FakeSource:
             BenchmarkStatusEntry.model_validate(self._row(run).model_dump())
             for run in self._runs
             if run.row.id in wanted
+        ]
+
+    async def datasets(self) -> list[DatasetResponse]:
+        now = self._clock()
+        return [
+            DatasetResponse(
+                benchmark="aider",
+                name="polyglot",
+                description="Polyglot coding exercises from the Aider benchmark",
+                created_by_email="ada@vals.ai",
+                created_at=now - timedelta(days=12),
+                updated_at=now - timedelta(days=2),
+            ),
+            DatasetResponse(
+                benchmark="swe-bench",
+                name="lite",
+                description="A 300-issue subset of SWE-bench",
+                created_by_email="ada@vals.ai",
+                created_at=now - timedelta(days=9),
+                updated_at=now - timedelta(days=9),
+            ),
+            DatasetResponse(
+                benchmark="swe-bench",
+                name="verified",
+                description="Human-verified GitHub issues from SWE-bench",
+                created_by_email="grace@vals.ai",
+                created_at=now - timedelta(days=5),
+                updated_at=now - timedelta(hours=7),
+            ),
+            DatasetResponse(
+                benchmark="terminal-bench",
+                name="core",
+                description="",
+                created_by_email=None,
+                created_at=now - timedelta(minutes=40),
+                updated_at=now - timedelta(minutes=40),
+            ),
+        ]
+
+    async def dataset_tasks(self, benchmark: str, dataset: str) -> list[DatasetTaskResponse]:
+        now = self._clock()
+        return [
+            DatasetTaskResponse(task_id=task_id, size=size, last_modified=now - age)
+            for task_id, size, age in (
+                (f"{dataset}-{number:03}", 4096 * number + 512, timedelta(hours=number)) for number in range(1, 6)
+            )
         ]
 
     async def watch_run(self, run_id: UUID) -> AsyncIterator[FetchBenchmarkResponse]:
@@ -218,7 +256,7 @@ class FakeSource:
             for event in events[emitted:]:
                 yield event
             emitted = len(events)
-            if not self.follow or task.status not in ACTIVE:
+            if not self.follow or task.status not in ACTIVE_TASKS:
                 return
             await asyncio.sleep(0.8)
 
@@ -241,7 +279,7 @@ class FakeSource:
             status = TaskStatus(status_name)
             for _ in range(count):
                 task = _Task(ids.pop(), status, row.started_at)
-                if status in ACTIVE:
+                if status in ACTIVE_TASKS:
                     task.started_at = end - timedelta(seconds=rng.randint(20, 1200))
                 elif status != TaskStatus.PENDING:
                     task.started_at = row.started_at + (end - row.started_at) * rng.random() * 0.8
@@ -250,11 +288,10 @@ class FakeSource:
                     task.error = _pick_error(rng)
                 task.resolved = rng.random() < (row.final_score or 0.65)
                 tasks.append(task)
-        active = sum(task.status in ACTIVE for task in tasks)
+        active = sum(task.status in ACTIVE_TASKS for task in tasks)
         return _Run(row, tasks, concurrency=max(active, 1))
 
     def _advance(self) -> None:
-        """Move live runs forward one step per elapsed second, at most five steps per call."""
         now = self._clock()
         steps = min(int((now - self._last_tick).total_seconds()), 5)
         if steps <= 0:
@@ -268,7 +305,7 @@ class FakeSource:
     def _step(self, run: _Run, now: datetime) -> None:
         stopping = run.row.status == BenchmarkStatus.STOPPING
         for task in run.tasks:
-            if task.status not in ACTIVE or self._rng.random() > 0.06:
+            if task.status not in ACTIVE_TASKS or self._rng.random() > 0.06:
                 continue
             if stopping:
                 task.status, task.finished_at = TaskStatus.STOPPED, now
@@ -280,13 +317,13 @@ class FakeSource:
                 task.status, task.finished_at = (TaskStatus.ERROR if failed else TaskStatus.FINISHED), now
                 task.error = _pick_error(self._rng) if failed else None
             else:
-                task.status = ACTIVE[ACTIVE.index(task.status) + 1]
+                task.status = ACTIVE_TASKS[ACTIVE_TASKS.index(task.status) + 1]
         pending = [task for task in run.tasks if task.status == TaskStatus.PENDING]
-        free = run.concurrency - sum(task.status in ACTIVE for task in run.tasks)
+        free = run.concurrency - sum(task.status in ACTIVE_TASKS for task in run.tasks)
         if not stopping:
             for task in pending[: max(free, 0)]:
                 task.status, task.started_at = TaskStatus.BUILDING, now
-        if not any(task.status in ACTIVE or task.status == TaskStatus.PENDING for task in run.tasks):
+        if not any(task.status in ACTIVE_TASKS or task.status == TaskStatus.PENDING for task in run.tasks):
             done = BenchmarkStatus.STOPPED if stopping else BenchmarkStatus.FINISHED
             resolved = sum(task.resolved and task.status == TaskStatus.FINISHED for task in run.tasks)
             score = None if stopping else round(resolved / len(run.tasks), 3)
@@ -337,7 +374,6 @@ class FakeSource:
         )
 
     def _log(self, run: _Run, task: _Task) -> list[LogEvent]:
-        """Return the task's log so far. Each status only appends lines, so a live stream can resume by line count."""
         if task.status == TaskStatus.PENDING:
             return []
         rng = random.Random(f"{run.row.id}/{task.task_id}")

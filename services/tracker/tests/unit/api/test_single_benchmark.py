@@ -1,9 +1,5 @@
-"""Run with `uv run pytest tests/unit/api/test_single_benchmark.py`.
-
-Cover single-benchmark details and task listing behavior.
-"""
-
 from __future__ import annotations
+import pytest
 
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -29,17 +25,20 @@ from tracker.database.models import (
 _client = TestClient(app)
 
 
+@pytest.mark.description(
+    (
+        "Run detail must count terminal outcomes and hide another organization's run.\n"
+        "\n"
+        "Test cases:\n"
+        "- Finished, error, and stopped tasks all count toward completed progress.\n"
+        "- Final score and run links are returned with the persisted metadata.\n"
+        "- A benchmark from another organization returns 404."
+    )
+)
 def test_single_benchmark_reports_terminal_progress_and_enforces_org_scope(
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    """Run detail must count terminal outcomes and hide another organization's run.
-
-    Test cases:
-    - Finished, error, and stopped tasks all count toward completed progress.
-    - Final score and run links are returned with the persisted metadata.
-    - A benchmark from another organization returns 404.
-    """
     benchmark = example_benchmark_object
     database_session.add(benchmark)
     database_session.flush()
@@ -86,11 +85,11 @@ def test_single_benchmark_reports_terminal_progress_and_enforces_org_scope(
     assert other_org_response.status_code == 404
 
 
+@pytest.mark.description("A run saved in a bucket the organization doesn't use still loads, without storage links.")
 def test_single_benchmark_omits_storage_links_for_another_bucket(
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    """A run saved in a bucket the organization doesn't use still loads, without storage links."""
     example_benchmark_object.arguments = AWSBenchmarkArguments(
         contract=example_benchmark_object.arguments.contract,
         concurrency=1,
@@ -108,17 +107,20 @@ def test_single_benchmark_omits_storage_links_for_another_bucket(
     assert response.json()["storage_bucket"] is None
 
 
+@pytest.mark.description(
+    (
+        "Task listing must preserve attention order, literal search, and retry history.\n"
+        "\n"
+        "Test cases:\n"
+        "- Status sorting places errors before finished tasks.\n"
+        "- Percent and underscore search characters are treated literally.\n"
+        "- The newest terminal error is returned when a newer scheduled-retry row exists."
+    )
+)
 def test_benchmark_tasks_filter_literal_search_and_latest_error(
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    """Task listing must preserve attention order, literal search, and retry history.
-
-    Test cases:
-    - Status sorting places errors before finished tasks.
-    - Percent and underscore search characters are treated literally.
-    - The newest terminal error is returned when a newer scheduled-retry row exists.
-    """
     now = datetime.now(ZoneInfo("UTC"))
     benchmark = example_benchmark_object
     database_session.add(benchmark)
@@ -196,6 +198,7 @@ def test_benchmark_tasks_filter_literal_search_and_latest_error(
     assert literal_search_response.json()["tasks"][0]["task_id"] == "literal_%_match"
 
 
+@pytest.mark.description("A run keeps returning its saved bucket after the default bucket changes.")
 def test_single_benchmark_returns_saved_bucket_after_default_changes(
     database_session: Session,
     example_benchmark_object: Benchmark,
@@ -223,3 +226,29 @@ def test_single_benchmark_returns_saved_bucket_after_default_changes(
     assert response.status_code == 200, response.text
     assert response.json()["storage_bucket"] == "test-bucket"
     assert f"log-group/logs$252F{benchmark.id}" in response.json()["cloudwatch_url"]
+
+
+@pytest.mark.description(
+    (
+        "Task listing rejects an unknown status filter instead of returning every task.\n"
+        "\n"
+        "Test cases:\n"
+        "- A misspelled status returns 422 and names the bad value.\n"
+        "- An unknown status next to a valid one still returns 422."
+    )
+)
+def test_benchmark_tasks_rejects_unknown_status_filter(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+) -> None:
+    database_session.add(example_benchmark_object)
+    database_session.flush()
+    database_session.add(make_task(example_benchmark_object, "finished", status=TaskStatus.FINISHED))
+    database_session.commit()
+
+    misspelled_response = _client.get(f"/benchmarks/{example_benchmark_object.id}/tasks", params={"status": "faild"})
+    mixed_response = _client.get(f"/benchmarks/{example_benchmark_object.id}/tasks", params={"status": "ERROR,faild"})
+
+    assert misspelled_response.status_code == 422
+    assert "faild" in misspelled_response.json()["detail"]
+    assert mixed_response.status_code == 422

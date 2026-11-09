@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from valkyrie.sdk.errors import ValkyrieInputError
 from valkyrie.sdk.models import (
     BenchmarkServiceCatalogResponse,
     BenchmarkServiceEntry,
@@ -59,7 +60,7 @@ class BenchmarkServicesResource:
     ) -> list[str]:
         """Fetch task IDs for a benchmark dataset."""
         if not benchmark.strip():
-            raise ValueError("benchmark must not be blank")
+            raise ValkyrieInputError("benchmark must not be blank")
 
         payload = FetchBenchmarkTasksRequest(
             benchmark_name=benchmark,

@@ -1,5 +1,3 @@
-"""Contracts for the stage-wide executor maintenance fence."""
-
 from uuid import UUID, uuid4
 
 import pytest
@@ -48,6 +46,7 @@ def _benchmark(org_id: UUID, name: str) -> Benchmark:
     )
 
 
+@pytest.mark.description("Beginning maintenance stops all work and closes admission.")
 def test_begin_maintenance_globally_stops_work_and_closes_admission(database_session: Session) -> None:
     release = _release()
     database_session.add(release)
@@ -93,6 +92,7 @@ def test_begin_maintenance_globally_stops_work_and_closes_admission(database_ses
     assert summary.tasks == 2
     assert summary.dispatches == 2
     assert all(benchmark.status == BenchmarkStatus.STOPPED for benchmark in benchmarks)
+    assert all(benchmark.finished_at is not None for benchmark in benchmarks)
     assert all(task.status == TaskStatus.STOPPED for task in database_session.exec(select(Task)).all())
     assert all(
         dispatch.status == ExecutorDispatchStatus.FAILED
@@ -102,6 +102,7 @@ def test_begin_maintenance_globally_stops_work_and_closes_admission(database_ses
         select_active_release(database_session, for_update=True)
 
 
+@pytest.mark.description("Finishing maintenance needs the current target.")
 def test_finish_maintenance_requires_current_target(database_session: Session) -> None:
     begin_maintenance(database_session, target_sha="a" * 40)
     database_session.commit()
@@ -118,6 +119,7 @@ def test_finish_maintenance_requires_current_target(database_session: Session) -
     assert admission.maintenance_target_sha is None
 
 
+@pytest.mark.description("Beginning maintenance again for the same target changes nothing.")
 def test_begin_maintenance_is_idempotent_for_same_target(database_session: Session) -> None:
     first = begin_maintenance(database_session, target_sha="a" * 40)
     database_session.commit()
@@ -126,6 +128,7 @@ def test_begin_maintenance_is_idempotent_for_same_target(database_session: Sessi
     assert first == second
 
 
+@pytest.mark.description("Beginning maintenance for a different target is rejected.")
 def test_begin_maintenance_rejects_a_different_target(database_session: Session) -> None:
     begin_maintenance(database_session, target_sha="a" * 40)
     database_session.commit()

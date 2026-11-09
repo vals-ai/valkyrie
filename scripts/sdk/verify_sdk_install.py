@@ -1,5 +1,3 @@
-"""Clean-install and exercise built Valkyrie SDK distributions."""
-
 from __future__ import annotations
 
 import argparse
@@ -12,13 +10,11 @@ from pathlib import Path
 
 
 class InstallVerificationError(RuntimeError):
-    """The distribution set cannot be verified unambiguously."""
+    pass
 
 
 @dataclass(frozen=True)
 class Command:
-    """One verification command and its working directory."""
-
     argv: tuple[str, ...]
     cwd: Path | None = None
 
@@ -100,7 +96,6 @@ def _artifact_commands(*, artifact: Path, label: str, workspace: Path, temporary
 
 
 def build_commands(*, dist: Path, workspace: Path, temporary_root: Path) -> list[Command]:
-    """Return commands that verify both SDK artifacts and the shared namespace."""
     dist = dist.resolve()
     workspace = workspace.resolve()
     wheel = _one_match(dist, "*.whl")
@@ -112,12 +107,14 @@ def build_commands(*, dist: Path, workspace: Path, temporary_root: Path) -> list
 
     root_dist = temporary_root / "root-dist"
     root_version = _project_version(workspace / "pyproject.toml")
-    root_wheel = root_dist / f"valkyrie-{root_version}-py3-none-any.whl"
+    root_wheel = root_dist / f"valkyrie_cli-{root_version}-py3-none-any.whl"
     combo = temporary_root / "sdk-with-root"
     combo_python = combo / "bin" / "python"
     commands.extend(
         [
-            Command(("uv", "build", "--package", "valkyrie", "--no-sources", "--out-dir", str(root_dist)), workspace),
+            Command(
+                ("uv", "build", "--package", "valkyrie-cli", "--no-sources", "--out-dir", str(root_dist)), workspace
+            ),
             Command(("uv", "venv", str(combo), "--python", "3.12"), workspace),
             Command(
                 ("uv", "pip", "install", "--python", str(combo_python), "--prerelease=disallow", str(wheel)), workspace
@@ -130,8 +127,7 @@ def build_commands(*, dist: Path, workspace: Path, temporary_root: Path) -> list
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run isolated artifact installation and namespace compatibility checks."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Clean-install and exercise built Valkyrie SDK distributions.")
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)

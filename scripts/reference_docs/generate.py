@@ -1,5 +1,3 @@
-"""Write or check generated reference files without touching handwritten content."""
-
 from __future__ import annotations
 
 import argparse
@@ -26,7 +24,6 @@ def _obsolete_files(docs_root: Path, expected: set[Path]) -> tuple[Path, ...]:
 
 
 def write_reference(docs_root: Path = DOCS_ROOT) -> tuple[Path, ...]:
-    """Write the manifest and remove only obsolete marked files."""
     rendered = render_reference()
     for relative_path in rendered:
         output = docs_root / relative_path
@@ -43,7 +40,6 @@ def write_reference(docs_root: Path = DOCS_ROOT) -> tuple[Path, ...]:
 
 
 def check_reference(docs_root: Path = DOCS_ROOT) -> tuple[str, ...]:
-    """Return bounded diagnostics for generated-file drift."""
     rendered = render_reference()
     diagnostics: list[str] = []
     for relative_path, expected in rendered.items():
@@ -68,11 +64,10 @@ def check_reference(docs_root: Path = DOCS_ROOT) -> tuple[str, ...]:
 
 
 def main(argv: Sequence[str] | None = None, docs_root: Path = DOCS_ROOT) -> int:
-    """Generate reference pages or verify committed output."""
     parser = argparse.ArgumentParser(
         description="Generate deterministic Mintlify reference pages from the public CLI and SDK APIs."
     )
-    parser.add_argument("--check", action="store_true", help="Check generated files without writing them")
+    parser.add_argument("--check", action="store_true", help="Check generated files without writing them.")
     arguments = parser.parse_args(argv)
     if arguments.check:
         diagnostics = check_reference(docs_root)

@@ -22,6 +22,7 @@
         ],
         "egress_allowlist": [],
         "install_egress": null,
+        "allow_provider_tools": false,
         "secrets": {},
         "kwargs": {},
         "inference_settings_attested": false
@@ -38,7 +39,9 @@
       "dataset": "default",
       "sandbox_provider": "modal",
       "sandbox_provider_secret_name": "ModalSecret",
-      "dataset_version": null
+      "dataset_version": null,
+      "monitoring": null,
+      "monitoring_rules": null
     },
     "tasks_stopped": 0,
     "final_evaluation": {

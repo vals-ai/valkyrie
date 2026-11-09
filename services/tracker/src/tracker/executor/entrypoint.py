@@ -1,5 +1,3 @@
-"""Run one executor dispatch inside its task: claim it, execute the benchmark, and record the outcome."""
-
 from __future__ import annotations
 
 import argparse
@@ -20,7 +18,7 @@ from sqlmodel import Session
 from executor_protocol import normalize_executor_telemetry_context
 from tracker.config import ENVIRONMENT
 from tracker.database.session import engine
-from tracker.database.models import ExecutorDispatch, ExecutorDispatchStatus, FailureCategory
+from tracker.database.models import ExecutorDispatchStatus, FailureCategory
 from tracker.executor.dispatch_control import (
     LOCAL_DISPATCH_LEASE,
     ClaimedDispatch,
@@ -37,9 +35,10 @@ from tracker.executor.runner_observability import (
     record_dispatch_completion,
 )
 from tracker.logging import configure_logging
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.observability import configure_observability
-from tracker.utils.run_orchestration import process_benchmark
-from tracker.utils.failures import classify_failure
+from tracker.services.runs.start import process_benchmark
+from tracker.services.failures import classify_failure
 
 logger = logging.getLogger(__name__)
 _LOCAL_RENEW_INTERVAL_SECONDS = 10
@@ -56,7 +55,7 @@ def _claim(dispatch_id: UUID) -> ClaimedDispatch | None:
             claimed = claim_dispatch(session, dispatch_id, task_arn=task_arn)
         except (InvalidTag, ClientError, ValueError) as error:
             session.rollback()
-            dispatch = session.get(ExecutorDispatch, dispatch_id)
+            dispatch = ExecutorDispatchRepository(session).get(dispatch_id)
             if dispatch is not None:
                 record_dispatch_failure(
                     session,

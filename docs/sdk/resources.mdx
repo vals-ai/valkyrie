@@ -1,7 +1,7 @@
 ---
 title: "Inspect resources with Python"
 sidebarTitle: "Tasks, logs, and more"
-description: "Read tasks, logs, artifacts, and the sandbox queue from Python, and manage agents, secrets, providers, and benchmark services."
+description: "Read tasks, logs, artifacts, and the sandbox queue from Python, and manage agents, datasets, secrets, providers, and benchmark services."
 ---
 
 These clients cover everything beside `client.runs`. Every method is in the
@@ -70,9 +70,9 @@ folder into a new directory.
 
 ## Page through the sandbox queue
 
-`client.scheduler.overview` returns what [`valkyrie queue status`](/runs/monitor#inspect-the-priority-queue)
-shows. The waiting and active lists page separately. Stop reading a list when its next
-offset is `None`:
+`client.scheduler.overview` returns what
+[`valkyrie queue status`](/runs/monitor#inspect-the-priority-queue) shows. The waiting and
+active lists page separately. Stop reading a list when its next offset is `None`:
 
 ```python
 waiting_offset = 0
@@ -94,9 +94,12 @@ tasks. The queue changes between calls, so a task can appear on two pages or on 
 
 ## Manage projects
 
-Every run spends for a project. Create one once, then start runs in it by its handle:
+A project carries the spend tags for the runs in it. Create one once, then start runs in
+it by its handle:
 
 ```python
+from decimal import Decimal
+
 from valkyrie.sdk import SpendType
 
 project = await client.projects.create(
@@ -106,13 +109,16 @@ project = await client.projects.create(
     subcategory="report",
     customer="google",
     extra_tags={"engagement": "q4"},
+    budget=Decimal("300"),
+    budget_reason="3 runs, about 100 each",
 )
 
 projects = (await client.projects.list()).projects
 ```
 
-The fields match [`valkyrie project create`](/runs/start#put-the-run-in-a-project). To move a
-run to another project, see [`client.runs.retag`](/sdk/runs#change-stop-and-rerun-a-run).
+The fields match [`valkyrie project create`](/runs/start#put-the-run-in-a-project). To
+move a run to another project, see
+[`client.runs.retag`](/sdk/runs#change-stop-and-rerun-a-run).
 
 ## Manage agents
 
@@ -126,6 +132,42 @@ await client.agents.download("my-agent", "./agents")
 
 The methods match [`valkyrie agent`](/agents/manage-agents), including `install` from GitHub
 and `remove`.
+
+## Manage datasets
+
+A benchmark your organization owns holds datasets, and each dataset holds task archives.
+To create a benchmark with one dataset and upload a task to it:
+
+```python
+await client.benchmark_definitions.create(
+    "contract-review", description="Contract review tasks"
+)
+
+await client.datasets.create("contract-review", "v1")
+
+await client.datasets.tasks.put("contract-review", "v1", "task-1", "./task-1.zip")
+```
+
+Names use lowercase letters and digits joined by single `.`, `_`, or `-`. Uploading a task
+with an ID the dataset already has replaces that task.
+
+To read the tasks back:
+
+```python
+listing = await client.datasets.tasks.list_all("contract-review", "v1")
+task_ids = [task.task_id for task in listing.tasks]
+
+await client.datasets.tasks.download(
+    "contract-review", "v1", "task-1", "./downloads/task-1.zip"
+)
+```
+
+`download` refuses to replace an existing file. To replace it, pass `overwrite=True`.
+
+To retire a dataset, call `client.datasets.remove("contract-review", "v1")`. It stays
+readable with `include_archived=True` and keeps its name, so bring it back with
+`client.datasets.restore` rather than creating it again. A benchmark can be archived with
+`client.benchmark_definitions.remove` only after all its datasets are archived.
 
 ## Store secrets and choose providers
 
@@ -159,6 +201,20 @@ Changing settings needs a login. An access key reads its creator's settings but 
 change them. See [Configure sandbox providers](/get-started/sandbox-providers) and
 [Benchmark authentication](/benchmarks/authentication).
 
+## Check your identity and organizations
+
+```python
+identity = await client.account.identity()
+
+listing = await client.account.organizations()
+
+members = await client.account.members()
+```
+
+The methods match [`valkyrie whoami`](/reference/cli/login#whoami),
+[`valkyrie token`](/reference/cli/token), and [`valkyrie org`](/reference/cli/org).
+Creating access keys and managing organizations needs a login, not an access key.
+
 ## Query benchmark services
 
 ```python
@@ -170,4 +226,6 @@ task_ids = await client.services.task_ids("swebench", dataset="default")
 ```
 
 `list` checks that every service responds, and `catalog` returns the hosted services
-without checking them. `task_ids` uses the URL you saved for the benchmark, if any. To ask the hosted service, pass `ignore_custom_services=True`. To send extra headers, pass `service_headers`.
+without checking them. `task_ids` uses the URL you saved for the benchmark, if any. To ask
+the hosted service, pass `ignore_custom_services=True`. To send extra headers, pass
+`service_headers`.

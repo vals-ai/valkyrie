@@ -1,5 +1,3 @@
-"""Store an organization's own secrets for its runs to reference."""
-
 import json
 import logging
 from typing import Annotated
@@ -16,6 +14,7 @@ from tracker.config import AUTH_REQUIRED, DESCOPE_ORG_ADMIN_ROLE, VALKYRIE_STAGE
 from tracker.exceptions import SecretNotFoundError
 from tracker.local import config as local_config
 from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
+from tracker.project_gateway import automatic_project_gateway, is_generated_project_gateway_secret_name
 from tracker.secret_access import may_use_shared_secrets, resolve_secret_name, tenant_secret_prefix
 from tracker.types import SecretEntry, SecretsResponse, SecretValueRequest
 
@@ -27,19 +26,27 @@ _PROVIDER_URL_FIELDS = ("DAYTONA_API_URL",)
 ADMINS_ONLY = {"description": "This organization lets only signed-in admins change its secrets"}
 
 
-def require_secret_writer(request: Request, org: Org = Depends(get_current_org)) -> Org:
-    if (VALKYRIE_STAGE, org.name) != ("bench", "vals.ai"):
-        return org
+def _require_org_secret_admin(request: Request, org: Org) -> None:
     if DESCOPE_ORG_ADMIN_ROLE not in get_current_login(request).organizations.get(org.name, ()):
         logger.info("Refused a secret change from a non-admin", extra={"org_id": str(org.id)})
         raise HTTPException(
             status_code=403, detail=f"Only {DESCOPE_ORG_ADMIN_ROLE}s of {org.name} can change its secrets."
         )
+
+
+def require_secret_writer(request: Request, org: Org = Depends(get_current_org)) -> Org:
+    if (VALKYRIE_STAGE, org.name) == ("bench", "vals.ai"):
+        _require_org_secret_admin(request, org)
+    return org
+
+
+def require_named_secret_writer(name: SecretName, request: Request, org: Org = Depends(require_secret_writer)) -> Org:
+    if automatic_project_gateway(org) and is_generated_project_gateway_secret_name(name):
+        _require_org_secret_admin(request, org)
     return org
 
 
 def _check_provider_urls(value: str, org: Org) -> None:
-    """Keep sandbox-provider endpoints in a tenant's own secrets off private and internal hosts."""
     try:
         fields = json.loads(value)
     except ValueError:
@@ -62,7 +69,6 @@ def _check_provider_urls(value: str, org: Org) -> None:
 
 
 def _entry(name: str, org: Org) -> SecretEntry:
-    """Report the name runs use: the short name wherever it resolves to this secret, else the full one."""
     stored = f"{tenant_secret_prefix(org.id)}{name}"
     resolved = resolve_secret_name(name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
     return SecretEntry(name=name, reference=name if resolved == stored else stored)
@@ -78,7 +84,6 @@ def secret_store(org: Org) -> SecretsManagerStore:
 
 
 async def require_own_secret(name: str, org: Org) -> None:
-    """Refuse a secret name that is not in the organization's own store, unless it may use shared secrets."""
     if not AUTH_REQUIRED or may_use_shared_secrets(org.name):
         return
     reference = resolve_secret_name(name, org_id=org.id, org_name=org.name, auth_required=True)
@@ -92,9 +97,10 @@ async def require_own_secret(name: str, org: Org) -> None:
         ) from error
 
 
-@router.get("", response_model=SecretsResponse)
+@router.get(
+    "", response_model=SecretsResponse, description="List the organization's secrets by name, never their values."
+)
 async def list_secrets_endpoint(org: Org = Depends(get_current_org)) -> SecretsResponse:
-    """List the organization's secrets by name, never their values."""
     prefix = tenant_secret_prefix(org.id)
     references = await secret_store(org).list_names(prefix)
     return SecretsResponse(secrets=[_entry(reference.removeprefix(prefix), org) for reference in references])
@@ -108,11 +114,11 @@ async def list_secrets_endpoint(org: Org = Depends(get_current_org)) -> SecretsR
         403: ADMINS_ONLY,
         409: {"description": "A secret with this name is still being deleted"},
     },
+    description="Create the secret or replace its value. Runs reference it by the returned reference.",
 )
 async def set_secret_endpoint(
-    name: SecretName, body: SecretValueRequest, org: Org = Depends(require_secret_writer)
+    name: SecretName, body: SecretValueRequest, org: Org = Depends(require_named_secret_writer)
 ) -> SecretEntry:
-    """Create the secret or replace its value. Runs reference it by the returned reference."""
     try:
         size = len(body.value.encode())
     except UnicodeEncodeError:
@@ -130,13 +136,16 @@ async def set_secret_endpoint(
 
 
 @router.delete(
-    "/{name}", response_model=SecretEntry, responses={403: ADMINS_ONLY, 404: {"description": "Secret does not exist"}}
+    "/{name}",
+    response_model=SecretEntry,
+    responses={403: ADMINS_ONLY, 404: {"description": "Secret does not exist"}},
+    description=(
+        "Delete the secret immediately. It cannot be recovered.\n"
+        "\n"
+        "Without a tenant access role, AWS can't tell a missing name apart, so deleting one also succeeds."
+    ),
 )
-async def remove_secret_endpoint(name: SecretName, org: Org = Depends(require_secret_writer)) -> SecretEntry:
-    """Delete the secret immediately; it cannot be recovered.
-
-    Without a tenant access role, AWS can't tell a missing name apart, so deleting one also succeeds.
-    """
+async def remove_secret_endpoint(name: SecretName, org: Org = Depends(require_named_secret_writer)) -> SecretEntry:
     reference = f"{tenant_secret_prefix(org.id)}{name}"
     if not await secret_store(org).delete(reference):
         raise HTTPException(status_code=404, detail=f"Secret '{name}' does not exist")

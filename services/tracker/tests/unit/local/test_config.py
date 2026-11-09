@@ -5,6 +5,7 @@ import pytest
 from tracker.local import config
 
 
+@pytest.mark.description("Relative paths in the local config resolve from its folder.")
 def test_relative_paths_resolve_from_config_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / ".env").write_text("KEY=value\n")
     config_path = tmp_path / "local-server.yaml"

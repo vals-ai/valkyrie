@@ -1,8 +1,3 @@
-"""Tests for executor dispatch log context and Sentry correlation.
-
-Run: uv run pytest services/tracker/tests/unit/executor/test_runner_observability.py
-"""
-
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -19,6 +14,7 @@ from tracker.logging.context import executor_dispatch_id_var, get_context_tags
 from tracker.executor import runner_observability as observability
 
 
+@pytest.mark.description("The dispatch database transaction commits before the executor starts running.")
 def test_dispatch_transaction_finishes_before_executor_work(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     transaction = Mock()
@@ -45,6 +41,7 @@ def test_dispatch_transaction_finishes_before_executor_work(monkeypatch: pytest.
     assert events == ["transaction-started", "transaction-finished", "executor-running"]
 
 
+@pytest.mark.description("A telemetry failure on dispatch acceptance keeps the dispatch context.")
 def test_dispatch_acceptance_telemetry_failure_preserves_context(monkeypatch: pytest.MonkeyPatch) -> None:
     telemetry_context: ExecutorTelemetryContext = {
         "request_id": "request-abc",
@@ -64,6 +61,7 @@ def test_dispatch_acceptance_telemetry_failure_preserves_context(monkeypatch: py
     assert child_context == telemetry_context
 
 
+@pytest.mark.description("The dispatch scope is exited cleanly even when binding its tags raises.")
 def test_dispatch_scope_is_released_when_tag_binding_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     scope = Mock()
     scope.set_tags.side_effect = RuntimeError("sentry unavailable")
@@ -84,6 +82,7 @@ def test_dispatch_scope_is_released_when_tag_binding_fails(monkeypatch: pytest.M
     scope_manager.__exit__.assert_called_once_with(None, None, None)
 
 
+@pytest.mark.description("A Sentry failure at the end of a dispatch does not escape.")
 def test_terminal_sentry_failure_does_not_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     telemetry_context: ExecutorTelemetryContext = {"request_id": "request-abc", "trace_headers": {}}
     monkeypatch.setattr(sentry_sdk, "new_scope", Mock(side_effect=RuntimeError("sentry unavailable")))
@@ -99,6 +98,9 @@ def test_terminal_sentry_failure_does_not_escape(monkeypatch: pytest.MonkeyPatch
     assert warning.call_count == 3
 
 
+@pytest.mark.description(
+    "The dispatch context includes the CloudWatch log link and the child Sentry trace and baggage."
+)
 def test_dispatch_context_correlates_cloudwatch_logs_and_child_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sentry_sdk, "get_traceparent", lambda: "sentry-child-trace")
     monkeypatch.setattr(sentry_sdk, "get_baggage", lambda: "sentry-child-baggage")

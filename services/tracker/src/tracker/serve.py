@@ -1,9 +1,3 @@
-"""Programmatic uvicorn entrypoint.
-
-Starts uvicorn with log_config=None so our configure_logging() dictConfig
-is not overwritten by uvicorn's default logging setup.
-"""
-
 import argparse
 import base64
 import os
@@ -18,8 +12,8 @@ from tracker.local import config
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, help="Local execution resource configuration")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--config", type=Path, help="Local execution resource configuration.")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on.")
     args = parser.parse_args()
     if args.config is not None:
         config.configure(args.config)

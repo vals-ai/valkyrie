@@ -1,8 +1,3 @@
-"""Live sandbox-provider lifecycle tests.
-
-Run: uv run pytest tests/integration/live/sandbox/test_provider.py
-"""
-
 import asyncio
 from collections.abc import Awaitable, Callable
 
@@ -60,9 +55,17 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
             ready.set()
 
 
+@pytest.mark.description("Live sandbox provider behavior after remote deletion and failure.")
 class TestProvider:
-    """Live sandbox provider behavior after remote deletion and failure."""
-
+    @pytest.mark.description(
+        (
+            "Deleted sandbox handles report the provider's SandboxNotFoundError.\n"
+            "\n"
+            "Test cases:\n"
+            "- Provider lookup raises SandboxNotFoundError after delete.\n"
+            "- Stale sandbox exec, stream, upload, and download operations preserve SandboxNotFoundError after delete."
+        )
+    )
     async def test_destroyed_sandbox_operations_raise_not_found(
         self,
         sandbox_provider: SandboxProvider,
@@ -71,12 +74,6 @@ class TestProvider:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify deleted sandbox handles report the provider's SandboxNotFoundError.
-
-        Test cases:
-        - Provider lookup raises SandboxNotFoundError after delete.
-        - Stale sandbox exec, stream, upload, and download operations preserve SandboxNotFoundError after delete.
-        """
         async with create_sandbox(
             sandbox_provider,
             random_sandbox_name,
@@ -107,6 +104,15 @@ class TestProvider:
             else:
                 pytest.fail(f"{operation_name} did not raise SandboxNotFoundError")
 
+    @pytest.mark.description(
+        (
+            "Deleting a sandbox during provider command streaming reports not-found.\n"
+            "\n"
+            "Test cases:\n"
+            "- The command stream starts returning output before deletion.\n"
+            "- Deleting the sandbox while the command is streaming raises SandboxNotFoundError in the stream consumer."
+        )
+    )
     async def test_streaming_command_raises_not_found_when_sandbox_is_deleted(
         self,
         sandbox_provider: SandboxProvider,
@@ -115,12 +121,6 @@ class TestProvider:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify deleting a sandbox during provider command streaming reports not-found.
-
-        Test cases:
-        - The command stream starts returning output before deletion.
-        - Deleting the sandbox while the command is streaming raises SandboxNotFoundError in the stream consumer.
-        """
         async with create_sandbox(
             sandbox_provider,
             random_sandbox_name,
@@ -137,6 +137,15 @@ class TestProvider:
             with pytest.raises(SandboxNotFoundError):
                 await stream_task
 
+    @pytest.mark.description(
+        (
+            "`list_sandboxes` does not return a deleted sandbox.\n"
+            "\n"
+            "Test cases:\n"
+            "- A live sandbox with a unique label appears in list_sandboxes.\n"
+            "- The same sandbox no longer appears in list_sandboxes after deletion."
+        )
+    )
     async def test_destroyed_sandbox_does_not_show_up_in_list_sandboxes(
         self,
         sandbox_provider: SandboxProvider,
@@ -145,12 +154,6 @@ class TestProvider:
         random_sandbox_name: str,
         creation_semaphore: asyncio.Semaphore,
     ) -> None:
-        """Verify list_sandboxes does not return a deleted sandbox.
-
-        Test cases:
-        - A live sandbox with a unique label appears in list_sandboxes.
-        - The same sandbox no longer appears in list_sandboxes after deletion.
-        """
         labels = {"ProviderIntegrationTest": random_sandbox_name}
         query = SandboxQuery(labels=labels)
 
@@ -170,18 +173,21 @@ class TestProvider:
         listed_after_delete = [listed.id async for listed in sandbox_provider.list_sandboxes(query)]
         assert sandbox.id not in listed_after_delete
 
+    @pytest.mark.description(
+        (
+            "Sandboxes that fail during image startup can still be deleted.\n"
+            "\n"
+            "Test cases:\n"
+            "- A missing-image create leaves a provider-visible failed sandbox.\n"
+            "- Deleting that errored sandbox succeeds and the sandbox becomes not found."
+        )
+    )
     async def test_error_state_sandbox_can_be_deleted(
         self,
         sandbox_provider: SandboxProvider,
         test_resources: Resources,
         random_sandbox_name: str,
     ) -> None:
-        """Verify sandboxes that fail during image startup can still be deleted.
-
-        Test cases:
-        - A missing-image create leaves a provider-visible failed sandbox.
-        - Deleting that errored sandbox succeeds and the sandbox becomes not found.
-        """
         request = SandboxCreateRequest(
             source=ImageSource(image=f"vals-ai/missing-provider-test-image:{random_sandbox_name}"),
             resources=test_resources,

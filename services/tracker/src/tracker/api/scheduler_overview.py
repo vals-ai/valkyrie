@@ -1,26 +1,18 @@
-"""Read-only snapshot of queued and active sandbox work."""
-
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
 from uuid import UUID
 
 from benchmark_service import SandboxProvider
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import JSON, and_, or_, select as sa_select, type_coerce
-from sqlalchemy.sql.elements import ColumnElement
-from sqlmodel import Session, col, func, select
-from sqlmodel.sql.expression import Select
 from starlette.concurrency import run_in_threadpool
 
 from tracker.auth import get_current_org
 from tracker.aws.resolver import deployment_aws_runtime
 from tracker.aws.secrets import SecretsManagerStore
-from tracker.database.models import Benchmark, BenchmarkStatus, Org, Task, TaskStatus
-from tracker.database.session import get_session
+from tracker.database.models import Org, TaskStatus
+from tracker.repositories.scheduler import PoolProviderReference, SchedulerRepository, SchedulerRepositoryDependency
 from tracker.logging import get_logger
 from tracker.scheduler.store import queue_pool_id, queue_pool_lock_id
 from tracker.types import (
@@ -32,174 +24,20 @@ from tracker.types import (
     SchedulerSummaryResponse,
     SchedulerWaitingEntryResponse,
 )
-from tracker.utils.resources import fetch_sandbox_provider_config
+from tracker.clients.benchmark_service import fetch_sandbox_provider_config
 
 router = APIRouter(prefix="/scheduler")
 logger = get_logger(__name__)
 
-_ACTIVE_STATUSES = (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 _CAPACITY_READ_TIMEOUT_SECONDS = 2.0
 _CAPACITY_REQUEST_TIMEOUT_SECONDS = 3.0
 _PROVIDER_CLOSE_TIMEOUT_SECONDS = 1.0
 _CAPACITY_MAX_CONCURRENCY = 4
 
-_ARGUMENTS = type_coerce(col(Benchmark.arguments), JSON)
-_IS_QUEUED = _ARGUMENTS["queue_pool_id"].as_string().is_not(None)
-
-
-@dataclass(frozen=True)
-class _PoolProviderReference:
-    provider_type: str | None
-    secret_name: str | None
-
-
-def _read_waiting_rows(
-    *,
-    session: Session,
-    org_id: UUID,
-    limit: int,
-    offset: int = 0,
-) -> tuple[list[tuple[Task, Benchmark, int, str, int]], dict[str, int]]:
-    priority = _ARGUMENTS["priority"].as_integer()
-    pool_id = _ARGUMENTS["queue_pool_id"].as_string()
-    queued_tasks = (
-        sa_select(
-            cast(ColumnElement[UUID], col(Task.id).label("task_id")),
-            priority.label("priority"),
-            pool_id.label("pool_id"),
-            func.row_number()
-            .over(
-                partition_by=pool_id,
-                order_by=(priority.asc(), col(Task.started_at).asc(), col(Task.id).asc()),
-            )
-            .label("position"),
-        )
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(
-            col(Task.status) == TaskStatus.PENDING,
-            col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
-            _IS_QUEUED,
-        )
-        .subquery()
-    )
-    scope = (col(Task.org_id) == org_id, col(Benchmark.org_id) == org_id)
-    pool_counts_statement = cast(
-        Select[tuple[str, int]],
-        sa_select(queued_tasks.c.pool_id, func.count(queued_tasks.c.task_id))
-        .join(Task, col(Task.id) == queued_tasks.c.task_id)
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(*scope)
-        .group_by(queued_tasks.c.pool_id),
-    )
-    pool_counts = dict(session.exec(pool_counts_statement).all())
-    rows_statement = cast(
-        Select[tuple[Task, Benchmark, int, str, int]],
-        sa_select(
-            Task,
-            Benchmark,
-            queued_tasks.c.priority,
-            queued_tasks.c.pool_id,
-            queued_tasks.c.position,
-        )
-        .join(queued_tasks, col(Task.id) == queued_tasks.c.task_id)
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(*scope)
-        .order_by(queued_tasks.c.priority.asc(), col(Task.started_at).asc(), col(Task.id).asc())
-        .offset(offset)
-        .limit(limit + 1),
-    )
-    rows = list(session.exec(rows_statement).all())
-
-    return rows, pool_counts
-
-
-def _read_pool_references(
-    *,
-    session: Session,
-    org_id: UUID,
-) -> dict[str, set[_PoolProviderReference]]:
-    """Return every distinct provider reference contributing waiting or active work."""
-    pool_id = _ARGUMENTS["queue_pool_id"].as_string()
-    provider_type = _ARGUMENTS["sandbox_provider"].as_string()
-    secret_name = _ARGUMENTS["sandbox_provider_secret_name"].as_string()
-    lifecycle_scope = or_(
-        and_(
-            col(Task.status) == TaskStatus.PENDING,
-            col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
-        ),
-        and_(
-            col(Task.status).in_(_ACTIVE_STATUSES),
-            col(Benchmark.status).in_((BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)),
-        ),
-    )
-    statement = cast(
-        Select[tuple[str, str | None, str | None]],
-        sa_select(
-            pool_id,
-            provider_type,
-            secret_name,
-        )
-        .select_from(Task)
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(
-            col(Task.org_id) == org_id,
-            col(Benchmark.org_id) == org_id,
-            lifecycle_scope,
-            _IS_QUEUED,
-        )
-        .distinct(),
-    )
-    references: dict[str, set[_PoolProviderReference]] = {}
-    for stored_pool_id, stored_provider_type, stored_secret_name in session.exec(statement).all():
-        references.setdefault(stored_pool_id, set()).add(
-            _PoolProviderReference(
-                provider_type=stored_provider_type,
-                secret_name=stored_secret_name,
-            )
-        )
-
-    return references
-
-
-def _read_active_rows(
-    *,
-    session: Session,
-    org_id: UUID,
-    limit: int,
-    offset: int = 0,
-) -> tuple[list[tuple[Task, Benchmark]], dict[TaskStatus, int]]:
-    scope = (
-        col(Task.org_id) == org_id,
-        col(Benchmark.org_id) == org_id,
-        col(Benchmark.status).in_((BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)),
-        col(Task.status).in_(_ACTIVE_STATUSES),
-        _IS_QUEUED,
-    )
-    counts = dict(
-        session.exec(
-            select(col(Task.status), func.count(col(Task.id)))
-            .select_from(Task)
-            .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-            .where(*scope)
-            .group_by(col(Task.status))
-        ).all()
-    )
-    rows = session.exec(
-        select(Task, Benchmark)
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(*scope)
-        .order_by(col(Task.started_at).asc(), col(Task.id).asc())
-        .offset(offset)
-        .limit(limit + 1)
-        .execution_options(populate_existing=True)
-    ).all()
-
-    return list(rows), counts
-
 
 def read_scheduler_overview(
     *,
-    session: Session,
+    repository: SchedulerRepository,
     org_id: UUID,
     now: datetime,
     waiting_limit: int,
@@ -207,12 +45,8 @@ def read_scheduler_overview(
     waiting_offset: int = 0,
     active_offset: int = 0,
 ) -> SchedulerOverviewResponse:
-    waiting_rows, pool_counts = _read_waiting_rows(
-        session=session, org_id=org_id, limit=waiting_limit, offset=waiting_offset
-    )
-    active_rows, active_counts = _read_active_rows(
-        session=session, org_id=org_id, limit=active_limit, offset=active_offset
-    )
+    waiting_rows, pool_counts = repository.waiting_rows(org_id=org_id, limit=waiting_limit, offset=waiting_offset)
+    active_rows, active_counts = repository.active_rows(org_id=org_id, limit=active_limit, offset=active_offset)
     waiting_entries = [
         SchedulerWaitingEntryResponse(
             benchmark_uuid=benchmark.id,
@@ -331,7 +165,7 @@ async def _read_provider_capacity(
 
 
 def _capacity_request(
-    references: set[_PoolProviderReference],
+    references: set[PoolProviderReference],
 ) -> tuple[str | None, tuple[str, str] | None]:
     provider_types = {reference.provider_type for reference in references if reference.provider_type}
     provider_type = next(iter(provider_types)) if len(provider_types) == 1 else None
@@ -348,7 +182,7 @@ async def _enrich_scheduler_capacity(
     overview: SchedulerOverviewResponse,
     *,
     org: Org,
-    references: dict[str, set[_PoolProviderReference]],
+    references: dict[str, set[PoolProviderReference]],
 ) -> SchedulerOverviewResponse:
     loop = asyncio.get_running_loop()
     started_at = loop.time()
@@ -403,19 +237,24 @@ async def _enrich_scheduler_capacity(
     return overview.model_copy(update={"pools": pools})
 
 
-@router.get("/overview", response_model=SchedulerOverviewResponse, response_model_exclude_unset=True)
+@router.get(
+    "/overview",
+    response_model=SchedulerOverviewResponse,
+    response_model_exclude_unset=True,
+    description="Show the organization's waiting and active runs per scheduler pool, with pool capacity when include_capacity is set.",
+)
 async def get_scheduler_overview(
+    repository: SchedulerRepositoryDependency,
     waiting_limit: int = Query(default=100, ge=1, le=200),
     active_limit: int = Query(default=100, ge=1, le=200),
     waiting_offset: int = Query(default=0, ge=0),
     active_offset: int = Query(default=0, ge=0),
     include_capacity: bool = Query(default=False),
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> SchedulerOverviewResponse:
     overview = await run_in_threadpool(
         read_scheduler_overview,
-        session=session,
+        repository=repository,
         org_id=org.id,
         now=datetime.now(UTC),
         waiting_limit=waiting_limit,
@@ -425,7 +264,7 @@ async def get_scheduler_overview(
     )
     if not include_capacity:
         return overview
-    references = await run_in_threadpool(_read_pool_references, session=session, org_id=org.id)
+    references = await run_in_threadpool(repository.pool_references, org_id=org.id)
     pools = {pool_id: SchedulerPoolResponse(pool_id=pool_id, waiting=0) for pool_id in references}
     pools.update({pool.pool_id: pool for pool in overview.pools})
     overview = overview.model_copy(update={"pools": [pools[pool_id] for pool_id in sorted(pools)]})

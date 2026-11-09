@@ -1,5 +1,3 @@
-"""Sealed dispatch input integrity and provider selection."""
-
 import base64
 from dataclasses import replace
 from uuid import uuid4
@@ -18,6 +16,7 @@ def local_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("EXECUTOR_PAYLOAD_KMS_KEY_ID", raising=False)
 
 
+@pytest.mark.description("A sealed dispatch payload round trips without storing plaintext.")
 def test_sealed_payload_roundtrip_without_plaintext(local_payload_key: None) -> None:
     dispatch_id = uuid4()
     payload = {"secret": "unique-sensitive-marker", "telemetry_context_json": {"request_id": "request-1"}}
@@ -28,6 +27,7 @@ def test_sealed_payload_roundtrip_without_plaintext(local_payload_key: None) -> 
     assert b"unique-sensitive-marker" not in sealed.encrypted_data_key
 
 
+@pytest.mark.description("A sealed payload cannot be opened for another dispatch.")
 def test_sealed_payload_rejects_another_dispatch(local_payload_key: None) -> None:
     dispatch_id = uuid4()
     sealed = seal_payload(dispatch_id, {"secret": "sensitive"}, generate_payload_key(dispatch_id))
@@ -35,6 +35,7 @@ def test_sealed_payload_rejects_another_dispatch(local_payload_key: None) -> Non
         open_payload(uuid4(), sealed)
 
 
+@pytest.mark.description("A sealed payload with tampered ciphertext is rejected.")
 def test_sealed_payload_rejects_ciphertext_tampering(local_payload_key: None) -> None:
     dispatch_id = uuid4()
     sealed = seal_payload(dispatch_id, {"secret": "sensitive"}, generate_payload_key(dispatch_id))
@@ -43,12 +44,14 @@ def test_sealed_payload_rejects_ciphertext_tampering(local_payload_key: None) ->
         open_payload(dispatch_id, altered)
 
 
+@pytest.mark.description("The ECS launcher refuses the local payload key.")
 def test_local_payload_key_refused_for_ecs_launcher(local_payload_key: None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
     with pytest.raises(ValueError, match="Local payload key requires"):
         generate_payload_key(uuid4())
 
 
+@pytest.mark.description("KMS sealing binds the payload to its context and detects changes.")
 def test_kms_payload_context_and_integrity(monkeypatch: pytest.MonkeyPatch) -> None:
     class KmsClient:
         def __init__(self) -> None:

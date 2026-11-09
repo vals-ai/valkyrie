@@ -1,5 +1,3 @@
-"""Structured logging subpackage for the tracker service."""
-
 from tracker.logging.config import DevFormatter, configure_logging
 from tracker.logging.context import (
     ContextFilter,

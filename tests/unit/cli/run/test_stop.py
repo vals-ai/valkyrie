@@ -1,9 +1,4 @@
-"""Tests for task-scoped run stops.
-
-Run: uv run pytest tests/unit/cli/run/test_stop.py
-
-Covers CLI task selection and conflicting task sources for `valkyrie run stop`.
-"""
+import pytest
 
 import json
 from pathlib import Path
@@ -19,15 +14,18 @@ from tests.unit.cli.conftest import MockTracker
 _RUN_ID = UUID("123e4567-e89b-12d3-a456-426614174000")
 
 
+@pytest.mark.description(
+    (
+        "Resolve valid task selectors and reject ambiguous or empty input.\n"
+        "\n"
+        "Test cases:\n"
+        "- Comma-separated task IDs are trimmed and deduplicated.\n"
+        "- A task ID file uses the shared one-per-line parser.\n"
+        "- Inline and file selectors cannot be combined.\n"
+        "- A delimiter-only selector cannot widen into a full-run stop."
+    )
+)
 def test_stop_task_selection(tracker: MockTracker, tmp_path: Path) -> None:
-    """Resolve valid task selectors and reject ambiguous or empty input.
-
-    Test cases:
-    - Comma-separated task IDs are trimmed and deduplicated.
-    - A task ID file uses the shared one-per-line parser.
-    - Inline and file selectors cannot be combined.
-    - A delimiter-only selector cannot widen into a full-run stop.
-    """
     tracker.reply("POST", f"/stop-benchmark/{_RUN_ID}", httpx.Response(200, json={"status": "success"}))
     task_ids_file = tmp_path / "task-ids.txt"
     task_ids_file.write_text("task-c\ntask-d\n", encoding="utf-8")
@@ -50,3 +48,15 @@ def test_stop_task_selection(tracker: MockTracker, tmp_path: Path) -> None:
     assert "mutually exclusive" in conflicting_result.output
     assert empty_result.exit_code == 2
     assert "No task ids provided" in empty_result.output
+
+
+@pytest.mark.description("`run stop --yes` stops without a prompt, so scripts can run it.")
+def test_stop_yes_skips_the_prompt(tracker: MockTracker) -> None:
+    tracker.reply("POST", f"/stop-benchmark/{_RUN_ID}", httpx.Response(200, json={"status": "success"}))
+
+    result = CliRunner().invoke(stop, [str(_RUN_ID), "--force", "-y"])
+
+    assert result.exit_code == 0, result.output
+    assert "?" not in result.output
+    assert len(tracker.requests) == 1
+    assert "force stopped" in result.output

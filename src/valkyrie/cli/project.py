@@ -1,16 +1,15 @@
-"""Create, list, update, and delete the projects runs are started in, and describe a run's project."""
-
 import re
+from decimal import Decimal, InvalidOperation
 
 import click
 from click.core import ParameterSource
-from valkyrie.sdk import SPEND_SUBCATEGORIES, ProjectCreateRequest, ProjectResponse, SpendType
+from valkyrie.sdk import SPEND_SUBCATEGORIES, NewProjectRequest, ProjectResponse, SpendType
 from valkyrie.sdk.models import FetchBenchmarkMetadataResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, terminal_safe
+from valkyrie.cli.display import format_option, format_table, one_line
 
-_CORE_FIELDS = frozenset(name for name in ProjectCreateRequest.model_fields if name != "extra_tags")
+_CORE_FIELDS = frozenset(name for name in NewProjectRequest.model_fields if name != "extra_tags")
 
 _ALL_SUBCATEGORIES = tuple(subcategory for choices in SPEND_SUBCATEGORIES.values() for subcategory in choices)
 
@@ -62,23 +61,41 @@ class _ProjectLabel(click.types.StringParamType):
         return label
 
 
+class _Budget(click.ParamType):
+    name = "amount"
+
+    def convert(self, value: object, param: click.Parameter | None, ctx: click.Context | None) -> Decimal:
+        try:
+            budget = Decimal(str(value))
+        except InvalidOperation:
+            self.fail(f"'{value}' is not an amount (e.g., 300)", param, ctx)
+        if not budget.is_finite() or budget <= 0:
+            self.fail(f"must be an amount above 0 (e.g., 300), got '{value}'", param, ctx)
+        return budget
+
+
 project_option = click.option(
     "--project",
     type=_ProjectName(),
     required=True,
-    help="Handle of the project this run is for (e.g., router-bench); create one with `valkyrie project create`",
+    help="Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`.",
+)
+
+optional_project_option = click.option(
+    "--project",
+    type=_ProjectName(),
+    default=None,
+    help="Handle of the project this run is for (e.g., router-bench). Optional unless your organization requires one.",
 )
 
 
 def describe_project(project: ProjectResponse) -> str:
-    """Join the project's spend type, handle, subcategory, customer and extra tags into one display line."""
     parts = [project.spend_type.value, project.handle, project.subcategory, project.customer]
     parts += [f"{key}={value}" for key, value in project.extra_tags.items()]
-    return terminal_safe(" · ".join(part for part in parts if part), preserve_newlines=False)
+    return one_line(" · ".join(part for part in parts if part))
 
 
 def describe_run_spend(metadata: FetchBenchmarkMetadataResponse | None) -> str:
-    """Show a run's project on one line, or say why there is none to show."""
     if metadata is None:
         return "unavailable"
     if metadata.project is None:
@@ -100,60 +117,82 @@ def _parse_tags(_context: click.Context, _parameter: click.Parameter, values: tu
     return tags
 
 
-@click.group()
+@click.group(help="Manage the projects runs are started in.")
 def project() -> None:
-    """Manage the projects runs are started in"""
+    pass
 
 
-@project.command(name="create")
+@project.command(
+    name="create",
+    help=(
+        "Create a project that runs can be started in with `valkyrie run start --project HANDLE`.\n"
+        "\n"
+        "HANDLE is the project's permanent handle: lowercase letters, digits and hyphens (e.g., my-project).\n"
+        "\n"
+        "Development subcategories: `new_benchmark_generation`, `new_benchmark_launch_runs`, `post_launch_benchmark_update`.\n"
+        "\n"
+        "Customer subcategories: `report`, `paid_run`, `eval_server`, `platform`.\n"
+        "\n"
+        "Internal subcategories: `unpaid_leaderboard_run`, `other_unpaid_run`, `fellows_interns`, `blog`, `miscellaneous`.\n"
+        "\n"
+        "Example:\n"
+        '    valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation --budget 300 --budget-reason "3 runs, about 100 each"'
+    ),
+)
 @click.argument("handle", metavar="HANDLE", type=_ProjectHandle())
 @click.option(
     "--name",
     type=_ProjectLabel(),
     required=True,
-    help='Name people read (e.g., "My Project"); the HANDLE is what runs are started with and never changes',
+    help='Name people read (e.g., "My Project"). The HANDLE is what runs are started with and never changes.',
 )
 @click.option(
     "--spend-type",
     type=click.Choice([spend_type.value for spend_type in SpendType]),
     required=True,
-    help="Why this project's runs spend money: development, internal, or customer",
+    help="Why this project's runs spend money: development, internal, or customer.",
 )
 @click.option(
     "--subcategory",
     type=_SpendSubcategory(_ALL_SUBCATEGORIES),
     required=True,
-    help=(
-        "development: New Benchmark Generation (new_benchmark_generation), New Benchmark Launch Runs "
-        "(new_benchmark_launch_runs), Post-Launch Benchmark Update (post_launch_benchmark_update); customer: "
-        "Report (report), Paid Run (paid_run), Eval Server (eval_server), Platform (platform); internal: Unpaid "
-        "Leaderboard Run (unpaid_leaderboard_run), Other Unpaid Run (other_unpaid_run), Fellows/Interns "
-        "(fellows_interns), Blog (blog), Miscellaneous (miscellaneous)"
-    ),
+    help=("Kind of spend within `--spend-type`. The command help lists the subcategories for each spend type."),
 )
 @click.option(
     "--customer",
     type=str,
     default=None,
-    help="Customer the project is for; required with --spend-type customer",
+    help="Customer the project is for. Required with --spend-type customer.",
 )
 @click.option(
     "--tag",
     "tags",
     multiple=True,
     callback=_parse_tags,
-    help="Extra tag as key=value, repeatable (e.g., --tag engagement=q4)",
+    help="Extra tag as key=value, repeatable (e.g., --tag engagement=q4).",
+)
+@click.option(
+    "--budget",
+    type=_Budget(),
+    default=None,
+    help="Budget the project's main Model Gateway key asks for (e.g., 300). Required where projects get a Gateway key.",
+)
+@click.option(
+    "--budget-reason",
+    type=str,
+    default=None,
+    help='Why the project needs that budget (e.g., "3 runs, about 100 each"). Required where projects get a Gateway key.',
 )
 def create_project(
-    handle: str, name: str, spend_type: str, subcategory: str, customer: str | None, tags: dict[str, str]
+    handle: str,
+    name: str,
+    spend_type: str,
+    subcategory: str,
+    customer: str | None,
+    tags: dict[str, str],
+    budget: Decimal | None,
+    budget_reason: str | None,
 ) -> None:
-    """Create a project that runs can be started in with `valkyrie run start --project HANDLE`.
-
-    HANDLE is the project's permanent handle: lowercase letters, digits and hyphens (e.g., my-project).
-
-    Example:
-        valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation
-    """
     resolved_type = SpendType(spend_type)
     allowed = SPEND_SUBCATEGORIES[resolved_type]
     if subcategory not in allowed:
@@ -167,23 +206,22 @@ def create_project(
         raise click.UsageError("Missing option '--customer'. --spend-type customer requires the customer's name.")
     created = call(
         lambda client: client.projects.create(
-            handle, name=name, spend_type=resolved_type, subcategory=subcategory, customer=customer, extra_tags=tags
+            handle,
+            name=name,
+            spend_type=resolved_type,
+            subcategory=subcategory,
+            customer=customer,
+            extra_tags=tags,
+            budget=budget,
+            budget_reason=budget_reason,
         )
     )
     click.echo(click.style(f"✓ Project created: {describe_project(created)}", fg="green", bold=True))
 
 
-@project.command(name="list")
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
-)
+@project.command(name="list", help="List your organization's projects.")
+@format_option()
 def list_projects(output_format: str) -> None:
-    """List your organization's projects."""
     response = call(lambda client: client.projects.list())
     if output_format == "json":
         click.echo(response.model_dump_json())
@@ -191,14 +229,12 @@ def list_projects(output_format: str) -> None:
     format_table(
         [
             {
-                "Handle": terminal_safe(entry.handle, preserve_newlines=False),
-                "Name": terminal_safe(entry.name, preserve_newlines=False),
+                "Handle": one_line(entry.handle),
+                "Name": one_line(entry.name),
                 "Spend type": entry.spend_type.value,
-                "Subcategory": terminal_safe(entry.subcategory or "", preserve_newlines=False),
-                "Customer": terminal_safe(entry.customer or "", preserve_newlines=False),
-                "Tags": terminal_safe(
-                    ", ".join(f"{key}={value}" for key, value in entry.extra_tags.items()), preserve_newlines=False
-                ),
+                "Subcategory": one_line(entry.subcategory or ""),
+                "Customer": one_line(entry.customer or ""),
+                "Tags": one_line(", ".join(f"{key}={value}" for key, value in entry.extra_tags.items())),
             }
             for entry in response.projects
         ],
@@ -207,7 +243,7 @@ def list_projects(output_format: str) -> None:
     )
 
 
-@project.command(name="update")
+@project.command(name="update", help="Update a project's shared spend metadata without changing HANDLE.")
 @click.argument("handle", metavar="HANDLE", type=_ProjectHandle())
 @click.option("--name", type=_ProjectLabel(), help="New name people read.")
 @click.option(
@@ -223,7 +259,7 @@ def list_projects(output_format: str) -> None:
     "tags",
     multiple=True,
     callback=_parse_tags,
-    help="Replace all extra tags with key=value values; repeatable.",
+    help="Replace all extra tags with key=value values. Repeatable.",
 )
 @click.option("--clear-tags", is_flag=True, help="Remove all extra tags.")
 @click.pass_context
@@ -238,7 +274,6 @@ def update_project(
     tags: dict[str, str],
     clear_tags: bool,
 ) -> None:
-    """Update a project's shared spend metadata without changing HANDLE."""
     tags_given = context.get_parameter_source("tags") is ParameterSource.COMMANDLINE
     if customer is not None and clear_customer:
         raise click.UsageError("Use either --customer or --clear-customer, not both.")
@@ -260,7 +295,7 @@ def update_project(
         customer = customer.strip()
         if not customer:
             raise click.BadParameter("must not be blank; use --clear-customer to remove it", param_hint="--customer")
-    projects = call(lambda client: client.projects.list()).projects
+    projects = call(lambda client: client.projects.list(include_archived=True)).projects
     saved = next((entry for entry in projects if entry.handle == handle), None)
     if saved is None:
         raise click.ClickException(f"Project '{handle}' was not found.")
@@ -293,11 +328,10 @@ def update_project(
     click.echo(click.style(f"✓ Project updated: {describe_project(updated)}", fg="green", bold=True))
 
 
-@project.command(name="delete")
+@project.command(name="delete", help="Delete an unused project. Projects with run history cannot be deleted.")
 @click.argument("handle", metavar="HANDLE", type=_ProjectHandle())
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 def delete_project(handle: str, yes: bool) -> None:
-    """Delete an unused project. Projects with run history cannot be deleted."""
     if not yes and not click.confirm(f"Delete project '{handle}'? Only projects without run history can be deleted."):
         click.echo("Cancelled.")
         return

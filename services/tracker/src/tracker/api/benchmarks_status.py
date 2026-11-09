@@ -1,44 +1,37 @@
-"""GET /benchmarks/status — lightweight polling for live status updates."""
-
 from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
-from sqlmodel import Session, col, func, select
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from tracker.api.parsing import parse_csv
 from tracker.auth import get_current_org
-from tracker.database.models import Benchmark, Org, Task, TaskStatus
-from tracker.database.session import get_session
+from tracker.database.models import Org, TaskStatus
+from tracker.repositories.benchmark import BenchmarkRepositoryDependency
 from tracker.types import BenchmarkStatusEntry, BenchmarkStatusResponse
 
 router = APIRouter(prefix="/benchmarks")
 
 
-@router.get("/status", response_model=BenchmarkStatusResponse)
+@router.get(
+    "/status",
+    response_model=BenchmarkStatusResponse,
+    description="Return the status and task counts of each listed run.",
+)
 def get_benchmarks_status(
+    repository: BenchmarkRepositoryDependency,
     ids: str = Query(default=""),
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> BenchmarkStatusResponse:
-    """Return status + task-count breakdown for the listed benchmark ids."""
-    parsed_ids = parse_csv(ids, UUID)
+    try:
+        parsed_ids = parse_csv(ids, UUID)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="ids must be a comma-separated list of run UUIDs") from error
     if not parsed_ids:
         return BenchmarkStatusResponse(entries=[])
 
-    benchmarks = session.exec(
-        select(Benchmark).where(Benchmark.org_id == org.id).where(col(Benchmark.id).in_(parsed_ids))
-    ).all()
-
-    count_rows = session.exec(
-        select(Task.benchmark, Task.status, func.count())
-        .where(col(Task.benchmark).in_([benchmark.id for benchmark in benchmarks]))
-        .group_by(col(Task.benchmark), col(Task.status))
-    ).all()
-    counts_by_benchmark_id: dict[UUID, dict[TaskStatus, int]] = {}
-    for benchmark_id, status, count in count_rows:
-        counts_by_benchmark_id.setdefault(benchmark_id, {})[TaskStatus(status)] = count
+    benchmarks = repository.list_by_ids(org.id, parsed_ids)
+    counts_by_benchmark_id = repository.task_state_counts([benchmark.id for benchmark in benchmarks])
 
     entries: list[BenchmarkStatusEntry] = []
     for benchmark in benchmarks:

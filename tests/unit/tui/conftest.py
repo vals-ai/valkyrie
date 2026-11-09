@@ -11,8 +11,6 @@ NOW = datetime(2026, 10, 10, 18, 0, tzinfo=timezone.utc)
 
 
 class MockClock:
-    """A clock tests move by hand, shared by the app and the fake source."""
-
     def __init__(self) -> None:
         self.now = NOW
 
@@ -25,7 +23,6 @@ class MockClock:
 
 @pytest.fixture(autouse=True)
 def utc_local_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Log and detail times render in local time, so snapshots pin it to UTC."""
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()
 
@@ -43,7 +40,6 @@ def clock() -> MockClock:
 
 @pytest.fixture
 def assert_snapshot(tmp_path: Path) -> Callable[[str, str], None]:
-    """Compare an SVG screenshot with snapshots/<name>.svg. UPDATE_SNAPSHOTS=1 rewrites the stored one."""
 
     def check(svg: str, name: str) -> None:
         stored = SNAPSHOTS / f"{name}.svg"

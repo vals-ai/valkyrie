@@ -31,36 +31,29 @@ _ORG = Org(id=_ORG_ID, name="acme.example", storage_key="org-bucket")
 def _configure_managed_runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    submissions_enabled: bool = True,
     resources_configured: bool = True,
 ) -> None:
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_ACCOUNT_ID", "123456789012")
-    monkeypatch.setattr(config, "AWS_MANAGED_SUBMISSIONS_ENABLED", submissions_enabled)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_REGION", "deployment-region" if resources_configured else None)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_S3_BUCKET", "deployment-bucket" if resources_configured else None)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_GROUP", "deployment-log-group" if resources_configured else None)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "30" if resources_configured else None)
 
 
+@pytest.mark.description("A run start picks its runtime from the request and deployment.")
 @pytest.mark.parametrize(
-    ("submissions_enabled", "resources_configured", "expected_status"),
+    ("resources_configured", "expected_status"),
     [
-        pytest.param(True, True, None, id="managed-open"),
-        pytest.param(False, True, 503, id="managed-gate-closed"),
-        pytest.param(True, False, 500, id="managed-config-missing"),
+        pytest.param(True, None, id="managed-open"),
+        pytest.param(False, 500, id="managed-config-missing"),
     ],
 )
 def test_start_runtime_selection(
     monkeypatch: pytest.MonkeyPatch,
-    submissions_enabled: bool,
     resources_configured: bool,
     expected_status: int | None,
 ) -> None:
-    _configure_managed_runtime(
-        monkeypatch,
-        submissions_enabled=submissions_enabled,
-        resources_configured=resources_configured,
-    )
+    _configure_managed_runtime(monkeypatch, resources_configured=resources_configured)
 
     if expected_status is not None:
         with pytest.raises(HTTPException) as exc_info:
@@ -75,6 +68,9 @@ def test_start_runtime_selection(
     assert runtime.expected_bucket_owner == "123456789012"
 
 
+@pytest.mark.description(
+    "A managed runtime uses the org's bucket, a tenant log group, and the deployment's log retention."
+)
 @pytest.mark.parametrize("log_prefix", ["/deployment/logs", "/deployment/logs/"])
 def test_managed_runtime_uses_the_org_bucket_with_deployment_settings(
     monkeypatch: pytest.MonkeyPatch, log_prefix: str
@@ -92,6 +88,7 @@ def test_managed_runtime_uses_the_org_bucket_with_deployment_settings(
     )
 
 
+@pytest.mark.description("New run logs use the org's ID, not its name.")
 def test_new_run_logs_use_org_identity_not_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
     renamed_org = Org(id=_ORG_ID, name="renamed", storage_key="org-bucket")
@@ -106,6 +103,7 @@ def test_new_run_logs_use_org_identity_not_its_name(monkeypatch: pytest.MonkeyPa
     assert other.resources.log_group == f"deployment-log-group/tenants/{_OTHER_ORG_ID}"
 
 
+@pytest.mark.description("A run saved before resources were stored keeps using the deployment log group.")
 def test_legacy_run_without_saved_resources_keeps_the_deployment_log_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
 
@@ -117,6 +115,7 @@ def test_legacy_run_without_saved_resources_keeps_the_deployment_log_prefix(monk
     assert metadata.resources.log_group == "deployment-log-group"
 
 
+@pytest.mark.description("Starting a run with a log group outside its tenant returns 400.")
 @pytest.mark.parametrize(
     "log_group",
     ["deployment-log-group", f"deployment-log-group/tenants/{_OTHER_ORG_ID}", "unrelated/logs"],
@@ -132,10 +131,13 @@ def test_new_run_cannot_select_logs_outside_its_tenant(monkeypatch: pytest.Monke
     assert resolve_start_aws_runtime(_ORG, resources).resources == resources
 
 
+@pytest.mark.description(
+    (
+        "A run stored before its organization had its own bucket can no longer be read or resumed, and its page has no\n"
+        "storage links."
+    )
+)
 def test_run_saved_outside_the_org_bucket_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run stored before its organization had its own bucket can no longer be read or resumed, and its page has no
-    storage links.
-    """
     _configure_managed_runtime(monkeypatch)
     saved = AWSResources(
         region="deployment-region",
@@ -151,6 +153,7 @@ def test_run_saved_outside_the_org_bucket_is_gone(monkeypatch: pytest.MonkeyPatc
     assert resolve_run_metadata_aws_runtime(org=_ORG, properties=saved) is None
 
 
+@pytest.mark.description("A hosted org with no bucket gets a 500 that says it has no storage bucket.")
 def test_hosted_org_without_a_bucket_cannot_use_managed_aws(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
     monkeypatch.setattr(config, "AUTH_REQUIRED", True)
@@ -162,8 +165,8 @@ def test_hosted_org_without_a_bucket_cannot_use_managed_aws(monkeypatch: pytest.
     assert exc_info.value.detail == "This organization has no storage bucket"
 
 
+@pytest.mark.description("A Tracker without authentication runs one organization from its configured bucket.")
 def test_self_hosted_org_uses_the_deployment_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Tracker without authentication runs one organization from its configured bucket."""
     _configure_managed_runtime(monkeypatch)
     monkeypatch.setattr(config, "AUTH_REQUIRED", False)
 
@@ -172,13 +175,16 @@ def test_self_hosted_org_uses_the_deployment_bucket(monkeypatch: pytest.MonkeyPa
     assert runtime.resources.s3_bucket == "deployment-bucket"
 
 
+@pytest.mark.description(
+    (
+        "A run saved in the organization's bucket keeps its saved resources, such as a log group from its own config.\n"
+        "\n"
+        "Test cases:\n"
+        "- The runtime uses the saved resources with deployment credentials and the deployment's bucket owner.\n"
+        "- Metadata reports the saved bucket."
+    )
+)
 def test_run_saved_in_the_org_bucket_uses_its_saved_resources(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run saved in the organization's bucket keeps its saved resources, such as a log group from its own config.
-
-    Test cases:
-    - The runtime uses the saved resources with deployment credentials and the deployment's bucket owner.
-    - Metadata reports the saved bucket.
-    """
     _configure_managed_runtime(monkeypatch)
     saved = AWSResources(region="us-east-1", s3_bucket="org-bucket", log_group="benchmarks", log_retention_days=7)
 
@@ -191,8 +197,9 @@ def test_run_saved_in_the_org_bucket_uses_its_saved_resources(monkeypatch: pytes
     assert metadata is not None and metadata.resources == saved
 
 
+@pytest.mark.description("Run metadata for a managed run reports the org bucket.")
 def test_run_metadata_returns_deployment_runtime_for_managed_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_managed_runtime(monkeypatch, submissions_enabled=False)
+    _configure_managed_runtime(monkeypatch)
 
     runtime = resolve_run_metadata_aws_runtime(org=_ORG)
 
@@ -200,6 +207,7 @@ def test_run_metadata_returns_deployment_runtime_for_managed_runs(monkeypatch: p
     assert runtime.resources.s3_bucket == "org-bucket"
 
 
+@pytest.mark.description("A managed runtime without a deployment account is rejected.")
 def test_managed_runtime_rejects_missing_deployment_account(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_ACCOUNT_ID", None)
@@ -211,6 +219,7 @@ def test_managed_runtime_rejects_missing_deployment_account(monkeypatch: pytest.
     assert error.value.detail == "AWS_DEPLOYMENT_ACCOUNT_ID must be a 12-digit AWS account ID"
 
 
+@pytest.mark.description("A run's saved resources survive new defaults.")
 def test_saved_resources_survive_new_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,6 +239,7 @@ def test_saved_resources_survive_new_defaults(
     assert resumed.clients.region == original.resources.region
 
 
+@pytest.mark.description("A managed start that asks for a different bucket returns 400.")
 def test_managed_start_cannot_override_deployment_resources(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
     original = resolve_start_aws_runtime(_ORG)
@@ -238,25 +248,14 @@ def test_managed_start_cannot_override_deployment_resources(monkeypatch: pytest.
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    ("submissions_enabled", "expected_status"),
-    [
-        pytest.param(True, 200, id="open"),
-        pytest.param(False, 503, id="closed"),
-    ],
-)
-def test_aws_runtime_metadata_reflects_managed_submission_availability(
-    monkeypatch: pytest.MonkeyPatch,
-    submissions_enabled: bool,
-    expected_status: int,
-) -> None:
-    _configure_managed_runtime(monkeypatch, submissions_enabled=submissions_enabled)
+@pytest.mark.description("`GET /aws-runtime` returns managed mode with the deployment region and bucket.")
+def test_aws_runtime_metadata_returns_managed_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_managed_runtime(monkeypatch)
 
     response = TestClient(app).get("/aws-runtime")
 
-    assert response.status_code == expected_status
-    if expected_status == 200:
-        assert response.json() == {"mode": "managed", "region": "deployment-region", "s3_bucket": "test-bucket"}
+    assert response.status_code == 200
+    assert response.json() == {"mode": "managed", "region": "deployment-region", "s3_bucket": "test-bucket"}
 
 
 def _mapping_keys(value: Any) -> Iterator[str]:
@@ -269,6 +268,7 @@ def _mapping_keys(value: Any) -> Iterator[str]:
             yield from _mapping_keys(nested_value)
 
 
+@pytest.mark.description("A managed execution context holds no credentials at any depth.")
 def test_managed_execution_context_is_recursively_credential_free() -> None:
     request = RunExecutionRequest(
         contract=AgentContractRequest(
@@ -313,6 +313,7 @@ def test_managed_execution_context_is_recursively_credential_free() -> None:
             )
 
 
+@pytest.mark.description("A start request drops `harness_config` and the retired webhook fields.")
 def test_start_request_ignores_retired_fields() -> None:
     request = StartBenchmarkRequest.model_validate(
         {
@@ -327,10 +328,11 @@ def test_start_request_ignores_retired_fields() -> None:
     assert {"harness_config", "webhook_secret_name", "webhook_intervals"}.isdisjoint(request.model_dump())
 
 
+@pytest.mark.description("Listing agents uses the org bucket for an eligible org.")
 def test_agent_list_uses_the_org_bucket_for_eligible_org(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_managed_runtime(monkeypatch, submissions_enabled=False)
+    _configure_managed_runtime(monkeypatch)
     from tracker.aws.s3 import S3ObjectStore
 
     create_store = MagicMock(wraps=S3ObjectStore)
@@ -344,12 +346,13 @@ def test_agent_list_uses_the_org_bucket_for_eligible_org(
     assert runtime.resources.s3_bucket == "test-bucket"
 
 
+@pytest.mark.description("Managed results report the capped presigned URL expiry.")
 def test_managed_results_report_capped_presign_expiry(
     monkeypatch: pytest.MonkeyPatch,
     database_session: Session,
     example_benchmark_object: Benchmark,
 ) -> None:
-    _configure_managed_runtime(monkeypatch, submissions_enabled=False)
+    _configure_managed_runtime(monkeypatch)
     database_session.add(example_benchmark_object)
     database_session.commit()
 
@@ -375,16 +378,8 @@ def test_managed_results_report_capped_presign_expiry(
     observed_expiration.assert_called_once_with(3600)
 
 
-def test_managed_start_errors_provide_recovery_steps(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure_managed_runtime(monkeypatch, submissions_enabled=False)
-    with pytest.raises(HTTPException) as error:
-        resolve_start_aws_runtime(_ORG)
-    assert error.value.status_code == 503
-    assert "Try again later or contact Vals support" in error.value.detail
-
-
+@pytest.mark.description("The AWS-only stack must not silently accept local execution.")
 def test_local_start_is_rejected_before_aws_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The AWS-only stack must not silently accept local execution."""
     resolve = MagicMock(side_effect=AssertionError("AWS resolution should not run"))
     monkeypatch.setattr("main.resolve_start_aws_runtime", resolve)
     response = TestClient(app).post(
@@ -396,9 +391,9 @@ def test_local_start_is_rejected_before_aws_resolution(monkeypatch: pytest.Monke
     resolve.assert_not_called()
 
 
+@pytest.mark.description("Reject unusable resource settings before admitting a run.")
 @pytest.mark.parametrize("invalid_property", [{"region": ""}, {"s3_bucket": ""}, {"log_retention_days": 0}])
 def test_start_rejects_invalid_resource_properties(invalid_property: dict[str, object]) -> None:
-    """Reject unusable resource settings before admitting a run."""
     response = TestClient(app).post(
         "/start-benchmark",
         json={
@@ -416,6 +411,7 @@ def test_start_rejects_invalid_resource_properties(invalid_property: dict[str, o
     assert response.status_code == 422
 
 
+@pytest.mark.description("A hosted runtime without a tenant role uses the default credential chain.")
 def test_hosted_runtime_uses_the_default_chain_without_a_tenant_role(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_managed_runtime(monkeypatch)
     monkeypatch.setattr(config, "AWS_TENANT_ACCESS_ROLE_ARN", None)
@@ -423,6 +419,7 @@ def test_hosted_runtime_uses_the_default_chain_without_a_tenant_role(monkeypatch
     assert type(deployment_aws_runtime(_ORG).clients) is AWSClientProvider
 
 
+@pytest.mark.description("A hosted runtime assumes its org's tenant role.")
 @pytest.mark.parametrize(
     ("shared_secret_tenants", "shared_secrets"),
     [("", False), ("acme.*", True)],
@@ -443,6 +440,7 @@ def test_hosted_runtime_assumes_the_tenant_role_for_its_org(
     )
 
 
+@pytest.mark.description("A dedicated customer gets a tenant role client scoped to its org ID with shared secrets off.")
 @pytest.mark.parametrize("environment", ["dev", "prod"])
 def test_dedicated_customer_runtime_cannot_assume_shared_secret_scope(
     monkeypatch: pytest.MonkeyPatch, environment: str

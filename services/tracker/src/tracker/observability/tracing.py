@@ -1,5 +1,3 @@
-"""Tracing configuration: OTel instrumentation (via logfire) with Sentry as the backend."""
-
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -31,7 +29,6 @@ _EXCLUDED_SPAN_NAMES = frozenset(
 
 @contextmanager
 def observability_span(name: str, **attributes: Any) -> Generator[None, None, None]:
-    """Create a span without allowing telemetry failures to escape."""
     span_manager = None
     span_entered = False
     try:
@@ -65,7 +62,6 @@ def observability_span(name: str, **attributes: Any) -> Generator[None, None, No
 
 @contextmanager
 def error_span(name: str, exc: BaseException, **attributes: Any) -> Generator[None, None, None]:
-    """Create a bounded error span for a handled exception."""
     with observability_span(name, **attributes):
         span = trace.get_current_span()
         try:
@@ -77,8 +73,6 @@ def error_span(name: str, exc: BaseException, **attributes: Any) -> Generator[No
 
 
 class _ContextVarSpanProcessor(SpanProcessor):
-    """Attaches execution context vars to every span as attributes."""
-
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
         existing = span.attributes or {}
         for key, value in get_context_tags().items():
@@ -96,8 +90,6 @@ class _ContextVarSpanProcessor(SpanProcessor):
 
 
 class _FilteredSentrySpanProcessor(SpanProcessor):
-    """Drop low-level polling span subtrees before exporting them to Sentry."""
-
     def __init__(self) -> None:
         self._delegate = SentrySpanProcessor()
         self._excluded_span_ids: set[int] = set()
@@ -125,27 +117,22 @@ class _FilteredSentrySpanProcessor(SpanProcessor):
 
 
 def configure_tracing(service_name: str, environment: str) -> None:
-    """Configure OTel tracing. Call after init_sentry() and before any instrument_*() hooks."""
     logfire.configure(
         service_name=service_name,
         environment=environment,
         send_to_logfire=False,
-        # Keep Logfire's existing environment overrides available for fully traced probes.
         sampling=(
             None
             if os.getenv("LOGFIRE_TRACE_SAMPLE_RATE") or os.getenv("OTEL_TRACES_SAMPLER_ARG")
             else logfire.SamplingOptions(head=0.1)
         ),
-        # Opt in: trace context is propagated through the dispatch's sealed telemetry context.
         distributed_tracing=True,
-        # configure_logging() owns stdout.
         console=False,
         additional_span_processors=[_ContextVarSpanProcessor(), _FilteredSentrySpanProcessor()],
     )
-    # Composite: inject both W3C traceparent/tracestate (for non-Sentry peers like Daytona /
-    # benchmark_service) and Sentry's sentry-trace/baggage. Extract honors whichever headers arrive.
     set_global_textmap(
         CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator(), SentryPropagator()])
     )
 
     logfire.instrument_httpx()
+    logfire.instrument_aiohttp_client()

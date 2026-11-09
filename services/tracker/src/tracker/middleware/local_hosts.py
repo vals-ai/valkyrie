@@ -1,5 +1,3 @@
-"""ASGI middleware restricting a local Tracker to loopback Host headers."""
-
 from typing import TYPE_CHECKING
 
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -13,8 +11,6 @@ LOCAL_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
 
 class LocalTrustedHostMiddleware:
-    """Reject non-loopback Host headers in local mode; a 127.0.0.1 bind alone does not stop DNS rebinding."""
-
     def __init__(self, app: "ASGIApp"):
         self.app = app
         self.trusted = TrustedHostMiddleware(app, allowed_hosts=LOCAL_ALLOWED_HOSTS)

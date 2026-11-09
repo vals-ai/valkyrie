@@ -1,5 +1,3 @@
-"""Fixtures for local tracker API integration tests."""
-
 import base64
 import importlib
 from collections.abc import Generator
@@ -32,7 +30,6 @@ def setup_app_dependencies(
     tracker_database: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Route the app through the local database and organization."""
 
     def get_test_session() -> Generator[Session, None, None]:
         yield tracker_database
@@ -47,7 +44,6 @@ def local_app(
     monkeypatch: pytest.MonkeyPatch,
     database_session: Session,
 ) -> Generator[FastAPI, None, None]:
-    """Configure the local app and database shared by API clients."""
     monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_fake")
 
@@ -56,7 +52,6 @@ def local_app(
     importlib.reload(main_module)
 
     for key, value in {
-        "AWS_MANAGED_SUBMISSIONS_ENABLED": True,
         "AWS_DEPLOYMENT_ACCOUNT_ID": "123456789012",
         "AWS_DEPLOYMENT_REGION": "us-east-1",
         "AWS_DEPLOYMENT_S3_BUCKET": "test-bucket",
@@ -93,7 +88,6 @@ def access_key_auth(local_app: FastAPI) -> Generator[None, None, None]:
 
 @pytest.fixture
 def session_client(local_app: FastAPI) -> Generator[TestClient, None, None]:
-    """Use a dashboard-style Descope session token with the local tracker app."""
     with patch.object(auth_module, "_descope_client") as mock_client:
         mock_client.validate_session.return_value = {"tenants": {"default": {}}}
         with TestClient(local_app) as test_client:
@@ -108,5 +102,4 @@ def access_key_client(access_key_auth: None, local_app: FastAPI) -> Generator[Te
 
 @pytest.fixture
 def client(access_key_client: TestClient) -> Generator[TestClient, None, None]:
-    """Use access-key authentication with the local tracker app."""
     yield access_key_client

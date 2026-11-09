@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
-import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from functools import wraps
 from math import floor
@@ -19,6 +19,7 @@ from tracker.aws.clients import AWSClientProvider
 from tracker.aws.runtime import AWSResources
 from tracker.exceptions import CloudWatchError
 from tracker.runtime.logs import (
+    TASK_LOG_LINE_FIELDS,
     BenchmarkLogLocations,
     BenchmarkLogSink,
     LogEvent,
@@ -26,23 +27,28 @@ from tracker.runtime.logs import (
     LogProvider,
     LogProviderError,
     RunLogReference,
+    TaskLogLine,
     TaskLogReference,
     task_log_stream_name,
 )
 
 _created_streams: set[str] = set()
 _FOLLOW_DEDUPLICATION_WINDOW = 10_000
+_MAX_BATCH_EVENTS = 10_000
+_MAX_BATCH_BYTES = 1_000_000
+_EVENT_OVERHEAD_BYTES = 26
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
+_MAX_FILTER_REQUESTS_PER_PAGE = 10
+
+
 def benchmark_log_group_name(log_group: str, benchmark_id: str) -> str:
-    """Return the canonical CloudWatch log group for a benchmark run."""
     return f"{log_group}/{benchmark_id}"
 
 
 def _legacy_task_log_stream_name(task_id: str, started_at: datetime) -> str:
-    """Return the lossy versioned stream name used before reversible escaping."""
     if started_at.utcoffset() is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     return f"{re.sub(r'[:*]', '_', task_id)}_{int(started_at.timestamp() * 1_000_000):x}"
@@ -53,6 +59,8 @@ def _stream_names(task_id: str, started_at: datetime) -> tuple[str, str]:
 
 
 def _task_log_stream_names(reference: TaskLogReference) -> list[str]:
+    if reference.strict_attempt:
+        return [task_log_stream_name(reference.task_id, reference.started_at)]
     names = list(dict.fromkeys(_stream_names(reference.task_id, reference.started_at)))
     if reference.siblings is None:
         return names[:1]
@@ -81,8 +89,6 @@ def handle_cloudwatch_error(message: str) -> Callable[[Callable[_P, _R]], Callab
 
 
 class CloudWatchBenchmarkLogLocations(BenchmarkLogLocations):
-    """CloudWatch console locations for resolved AWS resources."""
-
     def __init__(self, resources: AWSResources) -> None:
         self._resources = resources
 
@@ -105,8 +111,6 @@ class CloudWatchBenchmarkLogLocations(BenchmarkLogLocations):
 
 
 class CloudWatchBenchmarkLogSink(BenchmarkLogSink):
-    """CloudWatch transport using already-resolved AWS authority."""
-
     def __init__(self, clients: AWSClientProvider, log_group: str) -> None:
         self._clients = clients
         self._log_group = log_group
@@ -126,8 +130,8 @@ class CloudWatchBenchmarkLogSink(BenchmarkLogSink):
             raise CloudWatchError(f"Failed to create log group: {error}") from error
 
     @handle_cloudwatch_error(message="Failed to create cloudwatch stream")
-    def write(self, stream_key: str, message: str) -> None:
-        if not message.strip():
+    def write(self, stream_key: str, lines: Sequence[TaskLogLine]) -> None:
+        if not lines:
             return
 
         benchmark_id, stream_name = stream_key.split(":", 1)
@@ -147,19 +151,48 @@ class CloudWatchBenchmarkLogSink(BenchmarkLogSink):
                 raise CloudWatchError(f"Failed to create log stream '{stream_name}': {error}") from error
             _created_streams.add(stream_key)
 
-        try:
-            client.put_log_events(  # pyright: ignore[reportUnknownMemberType]
-                logGroupName=log_group_name,
-                logStreamName=stream_name,
-                logEvents=[{"timestamp": int(time.time() * 1000), "message": message}],
-            )
-        except (ClientError, BotoCoreError) as error:
-            raise CloudWatchError(f"Failed to put log event: {error}") from error
+        for batch in _log_event_batches(lines):
+            try:
+                client.put_log_events(  # pyright: ignore[reportUnknownMemberType]
+                    logGroupName=log_group_name,
+                    logStreamName=stream_name,
+                    logEvents=batch,
+                )
+            except (ClientError, BotoCoreError) as error:
+                raise CloudWatchError(f"Failed to put log event: {error}") from error
+
+
+def _log_event_batches(lines: Sequence[TaskLogLine]) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = [[]]
+    batch_bytes = 0
+    for line in lines:
+        message = json.dumps({"message": line.message, **line.fields}, ensure_ascii=False)
+        event_bytes = len(message.encode()) + _EVENT_OVERHEAD_BYTES
+        if batches[-1] and (len(batches[-1]) == _MAX_BATCH_EVENTS or batch_bytes + event_bytes > _MAX_BATCH_BYTES):
+            batches.append([])
+            batch_bytes = 0
+        batches[-1].append({"timestamp": int(line.received_at * 1000), "message": message})
+        batch_bytes += event_bytes
+    return batches
+
+
+def _event_message(raw_message: str) -> str:
+    if not raw_message.startswith("{"):
+        return raw_message
+    try:
+        payload: object = json.loads(raw_message)
+    except ValueError:
+        return raw_message
+    if not isinstance(payload, dict):
+        return raw_message
+    fields = cast(dict[str, object], payload)
+    message = fields.get("message")
+    if isinstance(message, str) and set(fields) - {"message"} <= set(TASK_LOG_LINE_FIELDS):
+        return message
+    return raw_message
 
 
 class CloudWatchLogProvider(LogProvider):
-    """Read benchmark logs from CloudWatch without exposing AWS details to callers."""
-
     def __init__(self, clients: AWSClientProvider, log_group: str) -> None:
         self._clients = clients
         self._log_group = log_group
@@ -174,7 +207,6 @@ class CloudWatchLogProvider(LogProvider):
         cursor: str | None = None,
         limit: int = 1_000,
     ) -> LogPage:
-        """Return one filtered page for a run or one task."""
         task_id = reference.task_id if isinstance(reference, TaskLogReference) else None
         stream_names = _task_log_stream_names(reference) if isinstance(reference, TaskLogReference) else None
         request: dict[str, Any] = {
@@ -192,26 +224,33 @@ class CloudWatchLogProvider(LogProvider):
 
         response = await self._request("filter_log_events", request)
         if response is None and stream_names and len(stream_names) > 1:
-            # CloudWatch rejects the whole request if either stream name is absent.
             for stream_name in stream_names:
                 response = await self._request("filter_log_events", {**request, "logStreamNames": [stream_name]})
                 if response is not None:
+                    request = {**request, "logStreamNames": [stream_name]}
                     break
         if response is None:
-            return LogPage(events=[])
+            return LogPage(events=[], available=False)
 
-        events = _parse_events(
-            response.get("events", []),
-            task_id=task_id,
-            stream_task_ids=None if isinstance(reference, TaskLogReference) else _stream_task_ids(reference),
-        )
-        if query is not None:
-            events = [event for event in events if query in event.message]
+        stream_task_ids = None if isinstance(reference, TaskLogReference) else _stream_task_ids(reference)
+        requests = 1
+        while True:
+            events = _parse_events(response.get("events", []), task_id=task_id, stream_task_ids=stream_task_ids)
+            if query is not None:
+                events = [event for event in events if query in event.message]
+            next_cursor = response.get("nextToken")
+            if not isinstance(next_cursor, str) or next_cursor == request.get("nextToken"):
+                next_cursor = None
+            if events or next_cursor is None or requests == _MAX_FILTER_REQUESTS_PER_PAGE:
+                break
+            request = {**request, "nextToken": next_cursor}
+            next_response = await self._request("filter_log_events", request)
+            if next_response is None:
+                break
+            response = next_response
+            requests += 1
         events.sort(key=_event_sort_key)
-        next_cursor = response.get("nextToken")
-        return LogPage(
-            events=events, next_cursor=next_cursor if isinstance(next_cursor, str) and next_cursor != cursor else None
-        )
+        return LogPage(events=events, next_cursor=next_cursor)
 
     async def stream_task(
         self,
@@ -222,7 +261,6 @@ class CloudWatchLogProvider(LogProvider):
         end_time: datetime | None = None,
         poll_interval: float = 1.0,
     ) -> AsyncIterator[LogEvent]:
-        """Yield a task stream from its current start position, then poll for new events."""
         log_group_name = benchmark_log_group_name(self._log_group, str(reference.run_id))
         stream_names = _task_log_stream_names(reference)
         stream_name = stream_names[0]
@@ -247,6 +285,8 @@ class CloudWatchLogProvider(LogProvider):
 
             response = await self._request("get_log_events", request)
             if response is None:
+                if reference.strict_attempt:
+                    raise LogProviderError("Task log source is unavailable")
                 if legacy_stream_name is not None and stream_name != legacy_stream_name:
                     stream_name = legacy_stream_name
                     cursor = None
@@ -289,7 +329,6 @@ class CloudWatchLogProvider(LogProvider):
                 await asyncio.sleep(poll_interval)
 
     async def _request(self, operation: str, request: dict[str, Any]) -> dict[str, Any] | None:
-        """Call a logs operation, returning None when the log group or stream does not exist."""
         try:
             client = await asyncio.to_thread(self._clients.cloudwatch_logs_client)
             return cast(dict[str, Any], await asyncio.to_thread(getattr(client, operation), **request))
@@ -345,7 +384,7 @@ def _parse_events(
         events.append(
             LogEvent(
                 timestamp=datetime.fromtimestamp(timestamp / 1_000, timezone.utc),
-                message=message,
+                message=_event_message(message),
                 task_id=resolved_task_id,
                 ingestion_time=ingestion_time,
                 event_id=event_id,
@@ -365,5 +404,5 @@ def _stream_task_ids(reference: RunLogReference) -> dict[str, str | None]:
     return stream_task_ids
 
 
-def _event_sort_key(event: LogEvent) -> tuple[datetime, datetime, str]:
-    return (event.timestamp, event.ingestion_time or event.timestamp, event.event_id or "")
+def _event_sort_key(event: LogEvent) -> tuple[datetime, datetime]:
+    return (event.timestamp, event.ingestion_time or event.timestamp)

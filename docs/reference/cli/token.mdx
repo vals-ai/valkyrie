@@ -9,7 +9,7 @@ This page documents all 2 commands in the `token` group in registration order. U
 
 ## `valkyrie token create` {#create}
 
-Create an access key for your organization; set it as VALKYRIE_API_KEY where you need it.
+Create an access key for your organization. Set it as VALKYRIE_API_KEY where you need it.
 
 ```bash Syntax
 valkyrie token create \
@@ -36,7 +36,7 @@ Task guidance: [Token guides](/get-started/configuration#create-an-access-key-fo
 
 ## `valkyrie token revoke` {#revoke}
 
-Delete an access key you created. The Tracker may accept it for up to one more hour.
+Delete an access key you created. The Tracker may accept it for up to one more minute, and tokens exchanged from it until they expire.
 
 ```bash Syntax
 valkyrie token revoke \

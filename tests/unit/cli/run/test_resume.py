@@ -1,8 +1,3 @@
-"""Tests for resuming and retrying runs.
-
-Run: uv run pytest tests/unit/cli/run/test_resume.py
-"""
-
 import json
 from uuid import UUID
 
@@ -24,6 +19,9 @@ _RESTART_PATH = f"/retry-or-resume-benchmark/{_RUN_ID}"
 _OVERRIDES = ["--benchmark-url", "https://new.example", "--lambda", "vals-format-lambda"]
 
 
+@pytest.mark.description(
+    "`-H` headers reach custom benchmark services, and the retry alias always retries errored tasks."
+)
 @pytest.mark.parametrize(
     ("command", "arguments", "retry"),
     [(resume, [], "false"), (resume, ["--retry", "--update-agent"], "true"), (retry_command, _OVERRIDES, "true")],
@@ -32,7 +30,6 @@ _OVERRIDES = ["--benchmark-url", "https://new.example", "--lambda", "vals-format
 def test_restart_forwards_headers_overrides_and_mode(
     tracker: MockTracker, cli_runner: CliRunner, command: click.Command, arguments: list[str], retry: str
 ) -> None:
-    """`-H` headers reach custom benchmark services, and the retry alias always retries errored tasks."""
     tracker.reply("GET", "/fetch-benchmark", ok(make_fetch_response(_RUN_ID)))
     tracker.reply("POST", _RESTART_PATH, httpx.Response(200, json={"status": "success"}))
 
@@ -49,6 +46,7 @@ def test_restart_forwards_headers_overrides_and_mode(
         assert (body["benchmark_url"], body["lambda_function"]) == ("https://new.example", "vals-format-lambda")
 
 
+@pytest.mark.description("`run resume --connect` streams the run to completion and prints no track progress hint.")
 def test_connected_resume_streams_the_run_without_a_track_progress_hint(
     tracker: MockTracker, cli_runner: CliRunner
 ) -> None:
@@ -61,3 +59,16 @@ def test_connected_resume_streams_the_run_without_a_track_progress_hint(
     assert result.exit_code == 0, result.output
     assert "✓ Run completed!" in result.output
     assert "Track progress:" not in result.output
+
+
+@pytest.mark.description("`run retry` retries errored tasks under any invoked name and with or without `--retry`.")
+@pytest.mark.parametrize("arguments", [[], ["--retry"]], ids=["bare", "retry-flag"])
+def test_retry_command_always_retries(tracker: MockTracker, cli_runner: CliRunner, arguments: list[str]) -> None:
+    tracker.reply("GET", "/fetch-benchmark", ok(make_fetch_response(_RUN_ID)))
+    tracker.reply("POST", _RESTART_PATH, httpx.Response(200, json={"status": "success"}))
+
+    result = cli_runner.invoke(retry_command, [str(_RUN_ID), *arguments], prog_name="valkyrie-retry")
+
+    assert result.exit_code == 0, result.output
+    (request,) = tracker.requested("POST", _RESTART_PATH)
+    assert request.url.params["retry"] == "true"

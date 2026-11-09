@@ -1,5 +1,3 @@
-"""PostgreSQL transaction boundaries for native-output HTTP reads."""
-
 import asyncio
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +40,7 @@ def postgres_engine(postgres_container: PostgresContainer) -> Generator[Engine, 
         engine.dispose()
 
 
+@pytest.mark.description("Waiting on the provider for native output does not block task DDL or generation changes.")
 @pytest.mark.parametrize("endpoint", ["files", "file"])
 def test_native_output_provider_wait_does_not_block_task_ddl_or_stale_generation(
     client: TestClient,

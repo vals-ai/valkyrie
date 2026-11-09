@@ -1,5 +1,3 @@
-"""AWS resources and authentication selected for one tracker operation."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

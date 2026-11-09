@@ -1,7 +1,4 @@
-"""Integration tests for CLI commands that change or export tracker state.
-
-Run: uv run pytest tests/integration/local/cli/test_write_commands.py
-"""
+import pytest
 
 import json
 from pathlib import Path
@@ -15,6 +12,7 @@ from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
 from valkyrie.cli.main import cli
 
 
+@pytest.mark.description("A project can be created, updated, and deleted.")
 def test_project_create_update_and_delete_round_trip(cli_runner: CliRunner) -> None:
     created = cli_runner.invoke(
         cli,
@@ -65,6 +63,7 @@ def test_project_create_update_and_delete_round_trip(cli_runner: CliRunner) -> N
     assert json.loads(after_delete.output)["projects"] == []
 
 
+@pytest.mark.description("An agent library entry can be saved and read back.")
 def test_agent_library_round_trip(
     cli_runner: CliRunner,
     agent_library: dict[str, bytes],
@@ -137,18 +136,21 @@ def test_agent_library_round_trip(
     assert "404" in missing.output
 
 
+@pytest.mark.description(
+    (
+        "A selective stop must preserve the run and every unselected task.\n"
+        "\n"
+        "Test cases:\n"
+        "- The CLI sends selected task IDs through the FastAPI request body.\n"
+        "- The tracker stops the selected pending task without stopping the run.\n"
+        "- An unselected active task keeps its current state."
+    )
+)
 def test_cli_stops_only_selected_pending_tasks(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
     database_session: Session,
 ) -> None:
-    """A selective stop must preserve the run and every unselected task.
-
-    Test cases:
-    - The CLI sends selected task IDs through the FastAPI request body.
-    - The tracker stops the selected pending task without stopping the run.
-    - An unselected active task keeps its current state.
-    """
     running, _finished = seeded_runs
 
     result = cli_runner.invoke(
@@ -171,19 +173,22 @@ def test_cli_stops_only_selected_pending_tasks(
     assert stored_run.status == BenchmarkStatus.IN_PROGRESS
 
 
+@pytest.mark.description(
+    (
+        "The public CLI must persist live concurrency through the production HTTP path.\n"
+        "\n"
+        "Test cases:\n"
+        "- A live update travels through Click, the SDK, and the FastAPI route.\n"
+        "- Repeating the same update is idempotent.\n"
+        "- A subsequent CLI read and direct database read return the new limit.\n"
+        "- Updating concurrency preserves the rest of the stored benchmark arguments."
+    )
+)
 def test_cli_updates_active_run_concurrency_through_tracker(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
     database_session: Session,
 ) -> None:
-    """The public CLI must persist live concurrency through the production HTTP path.
-
-    Test cases:
-    - A live update travels through Click, the SDK, and the FastAPI route.
-    - Repeating the same update is idempotent.
-    - A subsequent CLI read and direct database read return the new limit.
-    - Updating concurrency preserves the rest of the stored benchmark arguments.
-    """
     running, _finished = seeded_runs
     original_arguments = running.arguments
 
@@ -204,12 +209,12 @@ def test_cli_updates_active_run_concurrency_through_tracker(
     assert stored_run.arguments == original_arguments.model_copy(update={"concurrency": 4})
 
 
+@pytest.mark.description("A terminal run must reject updates without changing its stored arguments.")
 def test_cli_rejects_concurrency_update_for_finished_run(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
     database_session: Session,
 ) -> None:
-    """A terminal run must reject updates without changing its stored arguments."""
     _running, finished = seeded_runs
     original_arguments = finished.arguments
 
@@ -217,7 +222,7 @@ def test_cli_rejects_concurrency_update_for_finished_run(
 
     assert result.exit_code == 1
     assert "Valkyrie API request failed (409)" in result.output
-    assert "BenchmarkStatus.FINISHED" in result.output
+    assert "currently in the FINISHED state." in result.output
 
     database_session.expire_all()
     stored_run = database_session.get(Benchmark, finished.id)
@@ -225,17 +230,20 @@ def test_cli_rejects_concurrency_update_for_finished_run(
     assert stored_run.arguments == original_arguments
 
 
+@pytest.mark.description(
+    (
+        "Result export must preserve tracker data without persisting private agent configuration.\n"
+        "\n"
+        "Test cases:\n"
+        "- The CLI accepts the FastAPI final-view response and writes its evaluation and final score.\n"
+        "- Agent secrets and runtime kwargs are absent from the saved JSON."
+    )
+)
 def test_cli_exports_tracker_results_without_private_contract_values(
     cli_runner: CliRunner,
     seeded_runs: tuple[Benchmark, Benchmark],
     tmp_path: Path,
 ) -> None:
-    """Result export must preserve tracker data without persisting private agent configuration.
-
-    Test cases:
-    - The CLI accepts the FastAPI final-view response and writes its evaluation and final score.
-    - Agent secrets and runtime kwargs are absent from the saved JSON.
-    """
     _running, finished = seeded_runs
     output_path = tmp_path / "results.json"
 
@@ -251,6 +259,7 @@ def test_cli_exports_tracker_results_without_private_contract_values(
     assert "finished-secret-must-not-leak" not in output_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.description("The SDK updates a run's saved concurrency.")
 async def test_sdk_updates_persisted_concurrency(
     seeded_runs: tuple[Benchmark, Benchmark], database_session: Session, local_tracker_app
 ) -> None:
@@ -264,6 +273,7 @@ async def test_sdk_updates_persisted_concurrency(
     assert running.arguments.concurrency == result.concurrency == 3
 
 
+@pytest.mark.description("`valkyrie run output` saves a task's artifacts from the Tracker under the `-o` folder.")
 def test_cli_downloads_run_artifacts_through_tracker(
     cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark], monkeypatch, tmp_path: Path
 ) -> None:
@@ -280,12 +290,15 @@ def test_cli_downloads_run_artifacts_through_tracker(
 
     monkeypatch.setattr(AWSClientProvider, "s3_client", lambda _: client)
 
-    async def download(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "download.test"
+    tracker = httpx.ASGITransport.handle_async_request
+
+    async def download(transport: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
+        if request.url.host != "download.test":
+            return await tracker(transport, request)
         assert "x-api-key" not in request.headers
         return httpx.Response(200, content=b"result")
 
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", download)
+    monkeypatch.setattr(httpx.ASGITransport, "handle_async_request", download)
     listing = cli_runner.invoke(cli, ["run", "artifacts", str(running.id), "--format", "json"])
     assert listing.exit_code == 0, listing.output
     assert json.loads(listing.output)["artifacts"][0]["path"] == "task/result.txt"

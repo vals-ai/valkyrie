@@ -1,8 +1,3 @@
-"""PostgreSQL-backed scheduler overview reads.
-
-Run: uv run pytest tests/unit/api/test_scheduler_overview.py
-"""
-
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -21,12 +16,9 @@ from main import app
 from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
 import tracker.api.scheduler_overview as scheduler_overview_api
-from tracker.api.scheduler_overview import (  # pyright: ignore[reportPrivateUsage]
-    _PoolProviderReference,
-    _read_active_rows,
-    read_scheduler_overview,
-)
+from tracker.api.scheduler_overview import read_scheduler_overview
 from tracker.database.models import Benchmark, BenchmarkStatus, Org, Task, TaskStatus
+from tracker.repositories.scheduler import PoolProviderReference, SchedulerRepository
 from tracker.scheduler.store import queue_pool_id, reserved_queue_pool_id
 from tracker.types import SchedulerOverviewResponse, SchedulerPoolResponse, SchedulerSummaryResponse
 
@@ -126,7 +118,7 @@ def _capacity_enrichment_case(
     )
     references = {
         _QUEUE_POOL_ID: {
-            _PoolProviderReference(
+            PoolProviderReference(
                 provider_type="daytona",
                 secret_name="provider-secret",
             )
@@ -142,6 +134,7 @@ def _capacity_enrichment_case(
     return request, provider, fetch_config
 
 
+@pytest.mark.description("The scheduler overview lists the org's queued rows by priority, then oldest first.")
 async def test_reports_org_queued_rows_in_priority_fifo_order(database_session: Session) -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
     pool_a, pool_b = "pool_a", "pool_b"
@@ -205,7 +198,7 @@ async def test_reports_org_queued_rows_in_priority_fifo_order(database_session: 
     database_session.commit()
 
     overview = read_scheduler_overview(
-        session=database_session,
+        repository=SchedulerRepository(database_session),
         org_id=TEST_ORG_ID,
         now=now,
         waiting_limit=3,
@@ -232,6 +225,7 @@ async def test_reports_org_queued_rows_in_priority_fifo_order(database_session: 
     assert overview.active_capped
 
 
+@pytest.mark.description("Overview pages keep the totals, queue positions, and org scope.")
 @pytest.mark.parametrize(("waiting_limit", "active_limit"), [(200, 100), (100, 200)])
 def test_pages_preserve_totals_positions_and_org_scope(
     database_session: Session, waiting_limit: int, active_limit: int
@@ -271,7 +265,7 @@ def test_pages_preserve_totals_positions_and_org_scope(
 
     for _ in range(4):
         page = read_scheduler_overview(
-            session=database_session,
+            repository=SchedulerRepository(database_session),
             org_id=TEST_ORG_ID,
             now=now,
             waiting_limit=waiting_limit,
@@ -300,7 +294,7 @@ def test_pages_preserve_totals_positions_and_org_scope(
     assert (True, True) in exhaustion
 
     beyond = read_scheduler_overview(
-        session=database_session,
+        repository=SchedulerRepository(database_session),
         org_id=TEST_ORG_ID,
         now=now,
         waiting_limit=200,
@@ -316,6 +310,7 @@ def test_pages_preserve_totals_positions_and_org_scope(
     assert beyond.summary.in_progress == 201
 
 
+@pytest.mark.description("Reading active work refreshes task state that was loaded earlier.")
 def test_active_read_refreshes_preloaded_task_state(database_session: Session) -> None:
     benchmark = _queue(make_benchmark(name="transitioning"), pool_id="pool_a", priority=3)
     task = make_task(benchmark, "transitioning", status=TaskStatus.PENDING)
@@ -328,12 +323,13 @@ def test_active_read_refreshes_preloaded_task_state(database_session: Session) -
         stored_task.status = TaskStatus.IN_PROGRESS
         writer.commit()
 
-    rows, counts = _read_active_rows(session=database_session, org_id=TEST_ORG_ID, limit=100)
+    rows, counts = SchedulerRepository(database_session).active_rows(org_id=TEST_ORG_ID, limit=100)
 
     assert counts == {TaskStatus.IN_PROGRESS: 1}
     assert [(row.task_id, row.status) for row, _benchmark in rows] == [(task.task_id, TaskStatus.IN_PROGRESS)]
 
 
+@pytest.mark.description("The default overview route keeps the legacy pool shape.")
 def test_default_route_preserves_legacy_pool_shape(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -356,6 +352,7 @@ def test_default_route_preserves_legacy_pool_shape(
     assert payload["waiting_entries"][0]["started_by_email"] is None
 
 
+@pytest.mark.description("The overview route runs its synchronous database reads off the event loop.")
 async def test_route_offloads_synchronous_database_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     overview_entered = Event()
     overview_release = Event()
@@ -380,7 +377,7 @@ async def test_route_offloads_synchronous_database_reads(monkeypatch: pytest.Mon
             timed_out_reads.append("overview")
         return overview
 
-    def blocking_reference_read(**_kwargs: object) -> dict[str, set[object]]:
+    def blocking_reference_read(*_args: object, **_kwargs: object) -> dict[str, set[object]]:
         references_entered.set()
         if not references_release.wait(timeout=1):
             timed_out_reads.append("references")
@@ -396,7 +393,7 @@ async def test_route_offloads_synchronous_database_reads(monkeypatch: pytest.Mon
 
     enrich = AsyncMock(return_value=overview)
     monkeypatch.setattr(scheduler_overview_api, "read_scheduler_overview", blocking_overview_read)
-    monkeypatch.setattr(scheduler_overview_api, "_read_pool_references", blocking_reference_read)
+    monkeypatch.setattr(SchedulerRepository, "pool_references", blocking_reference_read)
     monkeypatch.setattr(scheduler_overview_api, "_enrich_scheduler_capacity", enrich)
 
     result, _ = await asyncio.gather(
@@ -405,7 +402,7 @@ async def test_route_offloads_synchronous_database_reads(monkeypatch: pytest.Mon
             active_limit=100,
             include_capacity=True,
             org=_TEST_ORG,
-            session=cast(Session, Mock()),
+            repository=SchedulerRepository(cast(Session, Mock())),
         ),
         release_from_event_loop(),
     )
@@ -415,6 +412,9 @@ async def test_route_offloads_synchronous_database_reads(monkeypatch: pytest.Mon
     enrich.assert_awaited_once_with(overview, org=_TEST_ORG, references={})
 
 
+@pytest.mark.description(
+    "The capacity route reads the provider config and capacity domains once and closes the provider."
+)
 @pytest.mark.parametrize("pool_id", [_QUEUE_POOL_ID, reserved_queue_pool_id(_QUEUE_POOL_ID)])
 def test_capacity_route_projects_provider_values_and_uses_complete_pool_references(
     database_session: Session,
@@ -475,6 +475,7 @@ def test_capacity_route_projects_provider_values_and_uses_complete_pool_referenc
     provider.close.assert_awaited_once()
 
 
+@pytest.mark.description("The capacity route adds provider data to a pool that has only active work.")
 def test_capacity_route_enriches_active_only_pool(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -525,6 +526,7 @@ def test_capacity_route_enriches_active_only_pool(
     provider.close.assert_awaited_once()
 
 
+@pytest.mark.description("An ambiguous pool never falls back to the deployment's AWS account.")
 def test_ambiguous_pools_never_use_deployment_aws(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -552,6 +554,7 @@ def test_ambiguous_pools_never_use_deployment_aws(
     deployment_runtime.assert_not_called()
 
 
+@pytest.mark.description("A capacity timeout closes the provider, and a pool that changed skips its reading.")
 async def test_capacity_timeout_closes_provider_and_pool_drift_skips_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -612,6 +615,7 @@ async def test_capacity_timeout_closes_provider_and_pool_drift_skips_observation
     provider.close.assert_awaited_once()
 
 
+@pytest.mark.description("Capacity enrichment caps concurrent provider reads.")
 async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     active = 0
     peak = 0
@@ -641,7 +645,7 @@ async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch:
     )
     references = {
         pool_id: {
-            scheduler_overview_api._PoolProviderReference(  # pyright: ignore[reportPrivateUsage]
+            PoolProviderReference(
                 provider_type="daytona",
                 secret_name=f"secret-{index}",
             )
@@ -674,6 +678,7 @@ async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch:
     assert [pool.capacity_domains for pool in result.pools] == [None] * len(pool_ids)
 
 
+@pytest.mark.description("The shared capacity deadline cancels, closes, and drains the provider reads.")
 async def test_capacity_enrichment_shared_deadline_cancels_close_and_drains_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -719,6 +724,7 @@ async def test_capacity_enrichment_shared_deadline_cancels_close_and_drains_task
     provider.close.assert_awaited_once()
 
 
+@pytest.mark.description("The request deadline cancels secret cleanup during capacity enrichment.")
 async def test_capacity_enrichment_request_deadline_cancels_secret_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -755,6 +761,7 @@ async def test_capacity_enrichment_request_deadline_cancels_secret_cleanup(
     fetch_config_mock.assert_awaited_once()
 
 
+@pytest.mark.description("Repeated cancellation still waits for the provider to close.")
 async def test_capacity_enrichment_repeated_cancellation_waits_for_terminal_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -805,6 +812,7 @@ async def test_capacity_enrichment_repeated_cancellation_waits_for_terminal_clos
     provider.close.assert_awaited_once()
 
 
+@pytest.mark.description("A capacity failure leaves the overview available.")
 def test_capacity_failure_keeps_overview_available(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,

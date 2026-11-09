@@ -1,5 +1,3 @@
-"""Local installation resources selected by the server's configuration file."""
-
 from pathlib import Path
 
 import yaml

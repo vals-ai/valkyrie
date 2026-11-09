@@ -1,11 +1,3 @@
-"""Defines the colors for `valk ui`, built around Vals's logo green (#284D32) and the docs site's palette.
-
-Each palette becomes a Textual theme for what Textual draws (borders, cursors, scrollbars). Status glyphs, bars
-and log highlighting are Rich text the UI renders itself, so they read `palette()`, which follows the app's theme,
-and switching themes re-renders them. Text colors keep at least 4.5:1 contrast with the background, and the focused
-border 3:1.
-"""
-
 from dataclasses import dataclass
 
 from textual.theme import Theme
@@ -70,7 +62,6 @@ class Palette:
                 "scrollbar-background-active": self.background,
                 "scrollbar-corner-color": self.background,
                 "input-selection-background": f"{self.accent} 30%",
-                # Textual's default is a transparent foreground, which the log can't blend, so selected text vanished.
                 "screen-selection-foreground": self.text,
             },
         )
@@ -127,7 +118,6 @@ _active = DARK
 
 
 def palette() -> Palette:
-    """Return the palette for the app's current theme."""
     return _active
 
 

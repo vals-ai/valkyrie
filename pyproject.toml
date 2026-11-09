@@ -1,19 +1,24 @@
 [project]
-name = "valkyrie"
+name = "valkyrie-cli"
 version = "0.1.0"
 description = "Valkyrie - An agentic harness that interfaces with benchmarks hosted by Vals AI"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 
 dependencies = [
   "click>=8.1.0",
-  "httpx>=0.28.1",
   "python-dotenv",
-  "valkyrie-sdk>=0.19.0,<1",
-  "tracker",
+  "valkyrie-sdk>=0.20.0,<1",
   "pyyaml>=6.0.3",
   "textual>=8.2,<9",
 ]
+
+[project.urls]
+Documentation = "https://docs.valkyrie.vals.ai"
+Repository = "https://github.com/vals-ai/Valkyrie"
+Issues = "https://github.com/vals-ai/Valkyrie/issues"
 
 [project.scripts]
 valkyrie = "valkyrie.cli.entry:main"
@@ -21,6 +26,8 @@ valk = "valkyrie.cli.entry:main"
 
 [dependency-groups]
 dev = [
+  "tracker",
+  "httpx>=0.28.1",
   "check-wheel-contents>=0.6,<1",
   "pytest",
   "pytest-asyncio",
@@ -31,6 +38,7 @@ dev = [
   "pytest-cov>=7.1.0",
   "docstr-coverage>=2.3.2",
   "twine>=6.2,<7",
+  "datamodel-code-generator>=0.80,<1",
 ]
 
 [tool.ruff]
@@ -46,7 +54,6 @@ venvPath="."
 venv=".venv"
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-extraPaths = ["services/tracker/src"]
 
 reportExplicitAny = false
 reportAny = false
@@ -60,10 +67,11 @@ enableTypeIgnoreComments = true
 include = [
   "src",
   "packages/valkyrie-sdk/src",
+  "services/egress_proxy",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
@@ -72,9 +80,19 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/valkyrie"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/LICENSE",
+  "/README.md",
+  "/pyproject.toml",
+  "/src/valkyrie",
+]
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = ["description(text): what the test checks"]
 pythonpath = [".", "services/tracker/src"]
 
 # Async test configuration

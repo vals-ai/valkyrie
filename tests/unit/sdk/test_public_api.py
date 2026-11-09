@@ -1,16 +1,18 @@
-"""Published SDK compatibility tests.
-
-Run: pytest tests/unit/sdk/test_public_api.py
-"""
-
 from __future__ import annotations
 
+import pytest
 import inspect
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from importlib import import_module
+from uuid import UUID
+
+import httpx
 
 from valkyrie.sdk.client import ValkyrieClient  # pyright: ignore[reportMissingImports]
+from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieSDKError  # pyright: ignore[reportMissingImports]
+from valkyrie.sdk.models import FetchBenchmarksRequest  # pyright: ignore[reportMissingImports]
 from valkyrie.sdk.config import ValkyrieConfig  # pyright: ignore[reportMissingImports]
+from valkyrie.sdk.login import LoginSession, SessionAuth, device_login  # pyright: ignore[reportMissingImports]
 from valkyrie.sdk.resources.agents import AgentsResource  # pyright: ignore[reportMissingImports]
 from valkyrie.sdk.resources.benchmarks import BenchmarksResource  # pyright: ignore[reportMissingImports]
 from valkyrie.sdk.resources.logs import LogsResource  # pyright: ignore[reportMissingImports]
@@ -21,6 +23,14 @@ from valkyrie.sdk.resources.settings import ProvidersResource, SettingsResource 
 from valkyrie.sdk.resources.services import BenchmarkServicesResource  # pyright: ignore[reportMissingImports]
 
 EXPECTED_ALL = [
+    "AccessKeyResponse",
+    "IdentityResponse",
+    "InviteResponse",
+    "MemberEntry",
+    "MembersResponse",
+    "OrganizationEntry",
+    "OrganizationResponse",
+    "OrganizationsResponse",
     "RunArtifactEntry",
     "RunArtifactsResponse",
     "RunArtifactDownloadResponse",
@@ -48,8 +58,10 @@ EXPECTED_ALL = [
     "FinalViewResponse",
     "LogEvent",
     "LogPage",
+    "LoginSession",
     "Order",
     "Parameter",
+    "NewProjectRequest",
     "ProjectCreateRequest",
     "ProjectResponse",
     "ProjectsResponse",
@@ -72,12 +84,15 @@ EXPECTED_ALL = [
     "ProvidersResponse",
     "RunSettingsResponse",
     "SavedBenchmarkService",
+    "SessionAuth",
     "SingleBenchmarkResponse",
     "SingleTaskResponse",
     "ShedBenchmarkRequest",
     "ShedBenchmarkResponse",
     "SPEND_SUBCATEGORIES",
     "SpendType",
+    "RunMonitoring",
+    "RunMonitoringRules",
     "StartBenchmarkResponse",
     "StopBenchmarkResponse",
     "UpdateBenchmarkConcurrencyRequest",
@@ -91,19 +106,25 @@ EXPECTED_ALL = [
     "ValkyrieConfig",
     "ValkyrieConfigError",
     "ValkyrieContractError",
+    "ValkyrieInputError",
     "ValkyrieRunError",
     "ValkyrieSDKError",
     "ValkyrieStreamError",
     "ValkyrieTransportError",
+    "device_login",
 ]
 
 EXPECTED_SIGNATURES = {
-    ValkyrieClient: "config=None, *, timeout=120, transport=None",
+    ValkyrieClient: "config=None, *, timeout=120, transport=None, auth=None",
+    device_login: "tracker_url, announce, *, timeout=30, transport=None",
+    SessionAuth: "session",
+    LoginSession.load: "tracker_url",
+    LoginSession.forget: "tracker_url",
     RunsResource.start: (
         "self, agent, benchmark, *, model=None, concurrency=5, priority=None, task_ids=None, "
         "slice_str=None, dataset=None, dataset_version=None, "
         "label=None, lambda_function=None, provider=None, agent_kwargs=None, secrets=None, service_headers=None, "
-        "ignore_custom_services=False, project=None"
+        "ignore_custom_services=False, project=None, monitoring=None"
     ),
     RunsResource.retag: "self, run_id, project",
     RunsResource.filter_options: "self",
@@ -187,19 +208,25 @@ def signature_text(callable_object: Callable[..., object]) -> str:
     return ", ".join(parts)
 
 
+@pytest.mark.description("`valkyrie.sdk` exports the same names and constants as the recorded public API.")
 def test_public_exports_and_constants_are_stable() -> None:
     sdk = import_module("valkyrie.sdk")
 
     assert getattr(sdk, "__all__") == EXPECTED_ALL
     assert getattr(sdk, "ValkyrieClient") is ValkyrieClient
     assert getattr(sdk, "ValkyrieConfig") is ValkyrieConfig
+    assert getattr(sdk, "LoginSession") is LoginSession
+    assert getattr(sdk, "SessionAuth") is SessionAuth
+    assert getattr(sdk, "device_login") is device_login
 
 
+@pytest.mark.description("Public SDK functions and methods keep their recorded signatures.")
 def test_public_signatures_are_stable() -> None:
     for callable_object, expected in EXPECTED_SIGNATURES.items():
         assert signature_text(callable_object) == expected
 
 
+@pytest.mark.description("Signature text keeps parameter kinds.")
 def test_signature_text_preserves_parameter_kinds() -> None:
     def sample(value: object, /, other: object, *, flag: bool = False) -> None:
         pass
@@ -207,6 +234,7 @@ def test_signature_text_preserves_parameter_kinds() -> None:
     assert signature_text(sample) == "value, /, other, *, flag=False"
 
 
+@pytest.mark.description("The client has a typed attribute for each v2 resource such as `settings`.")
 async def test_client_exposes_v2_resource_namespaces(make_client) -> None:
     async with make_client(lambda _request: None) as client:
         assert isinstance(client.runs, RunsResource)
@@ -218,3 +246,61 @@ async def test_client_exposes_v2_resource_namespaces(make_client) -> None:
         assert isinstance(client.secrets, SecretsResource)
         assert isinstance(client.providers, ProvidersResource)
         assert isinstance(client.settings, SettingsResource)
+
+
+RUN_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+INVALID_INPUT_CALLS: dict[str, Callable[[ValkyrieClient], Awaitable[object]]] = {
+    "runs.start": lambda client: client.runs.start("agent", "bench", concurrency=0),
+    "runs.iter": lambda client: anext(client.runs.iter(FetchBenchmarksRequest(offset=5))),
+    "runs.download_outputs": lambda client: client.runs.download_outputs(RUN_ID, "outputs", max_entries=0),
+    "logs.page_run": lambda client: client.logs.page_run(RUN_ID, query=" "),
+    "artifacts.list": lambda client: client.artifacts.list(RUN_ID, limit=0),
+    "artifacts.download_url": lambda client: client.artifacts.download_url(RUN_ID, "../secret"),
+    "benchmarks.task": lambda client: client.benchmarks.task(RUN_ID, "a/b"),
+    "benchmark_definitions.get": lambda client: client.benchmark_definitions.get("Bad Name"),
+    "datasets.get": lambda client: client.datasets.get("bench", "Bad Name"),
+    "services.task_ids": lambda client: client.services.task_ids(" "),
+    "scheduler.overview": lambda client: client.scheduler.overview(waiting_limit=0),
+    "secrets.remove": lambda client: client.secrets.remove("a/b"),
+    "agents.download": lambda client: client.agents.download("agent", max_entries=0),
+    "agents.install": lambda client: client.agents.install("https://gitlab.com/a/b"),
+    "providers.remove": lambda client: client.providers.remove(".."),
+}
+
+
+@pytest.mark.description(
+    "Every resource rejects an invalid argument with `ValkyrieInputError` before sending a request."
+)
+@pytest.mark.parametrize("call", INVALID_INPUT_CALLS.values(), ids=INVALID_INPUT_CALLS.keys())
+async def test_invalid_input_raises_valkyrie_input_error(make_client, call) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    async with make_client(handler) as client:
+        with pytest.raises(ValkyrieInputError) as raised:
+            await call(client)
+
+    assert isinstance(raised.value, ValkyrieSDKError)
+    assert isinstance(raised.value, ValueError)
+
+
+@pytest.mark.description("Pushing a bad local agent directory raises `ValkyrieInputError` before sending a request.")
+@pytest.mark.parametrize("problem", ["non_string_name", "symlink_path", "symlink_member"])
+async def test_agent_push_rejects_bad_directory_with_valkyrie_input_error(make_client, tmp_path, problem) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "contract.yaml").write_text("name: 5\n" if problem == "non_string_name" else "name: demo\n")
+    path = agent
+    if problem == "symlink_path":
+        path = tmp_path / "link"
+        path.symlink_to(agent, target_is_directory=True)
+    if problem == "symlink_member":
+        (agent / "link").symlink_to(tmp_path)
+
+    async with make_client(handler) as client:
+        with pytest.raises(ValkyrieInputError):
+            await client.agents.push(path)

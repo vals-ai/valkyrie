@@ -1,12 +1,14 @@
-"""Tests for isolated SDK artifact verification orchestration."""
-
 from __future__ import annotations
 
+import pytest
 from pathlib import Path
 
 from scripts.sdk.verify_sdk_install import build_commands
 
 
+@pytest.mark.description(
+    "Install verification builds the package and imports both `valkyrie.cli` and `valkyrie.sdk` from the installed artifacts."
+)
 def test_verification_covers_both_artifacts_public_api_examples_and_namespace(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -16,7 +18,7 @@ def test_verification_covers_both_artifacts_public_api_examples_and_namespace(tm
     sdist.touch()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "pyproject.toml").write_text('[project]\nname = "valkyrie"\nversion = "0.1.0"\n', encoding="utf-8")
+    (workspace / "pyproject.toml").write_text('[project]\nname = "valkyrie-cli"\nversion = "0.1.0"\n', encoding="utf-8")
     commands = build_commands(dist=dist, workspace=workspace, temporary_root=tmp_path / "verify")
     rendered = [" ".join(command.argv) for command in commands]
 
@@ -29,5 +31,5 @@ def test_verification_covers_both_artifacts_public_api_examples_and_namespace(tm
     assert sum("test_public_api.py::test_public_signatures_are_stable" in command for command in rendered) == 2
     assert any("docs/sdk/examples/run_lifecycle.py --help" in command for command in rendered)
     assert any("docs/sdk/examples/manage_run.py --help" in command for command in rendered)
-    assert any("uv build --package valkyrie" in command for command in rendered)
+    assert any("uv build --package valkyrie-cli" in command for command in rendered)
     assert any("valkyrie.cli" in command and "valkyrie.sdk" in command for command in rendered)

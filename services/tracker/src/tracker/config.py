@@ -1,5 +1,3 @@
-"""Configuration for the tracker service."""
-
 import math
 from enum import Enum
 import os
@@ -18,22 +16,26 @@ _BENCHMARK_SERVICE_CLOUDMAP_NAMESPACE: str = os.environ.get("BENCHMARK_SERVICE_C
 _CLOUDMAP_PORT = 8001
 _BENCHMARK_SERVICE_BASE_URL: str | None = os.environ.get("BENCHMARK_SERVICE_BASE_URL")
 BENCHMARK_CATALOG_URL = os.environ.get("BENCHMARK_CATALOG_URL", "").rstrip("/")
+PASSKEY_ORGS = frozenset(name.strip() for name in os.environ.get("TRACKER_PASSKEY_ORGS", "").split(",") if name.strip())
+GATEWAY_KEY_ORGS = frozenset({"vals.ai", *PASSKEY_ORGS})
+
+
+class ProjectGatewayKeysMode(str, Enum):
+    MANUAL = "manual"
+    PROVISION = "provision"
+    AUTOMATIC = "automatic"
+
+
+def project_gateway_keys_mode() -> ProjectGatewayKeysMode:
+    return ProjectGatewayKeysMode(os.environ.get("MODEL_GATEWAY_PROJECT_KEYS_MODE", "manual"))
 
 
 class BenchmarkServiceDestination(Enum):
-    """Trust classification for benchmark-service credential forwarding."""
-
     HOSTED = "hosted"
     CUSTOM = "custom"
 
 
 def create_benchmark_service_url(benchmark_name: str) -> str:
-    """
-    Derive the benchmark service URL from the benchmark name.
-
-    NOTE: If BENCHMARK_SERVICE_BASE_URL is set (e.g. benchmarks.vals.ai), use HTTPS subdomains.
-    Otherwise fall back to CloudMap internal DNS (only works inside the VPC).
-    """
     benchmark_name = validate_benchmark_name(benchmark_name)
 
     if _BENCHMARK_SERVICE_BASE_URL:
@@ -54,11 +56,9 @@ def classify_benchmark_service_destination(
     benchmark_name: str,
     service_url: str | None,
 ) -> BenchmarkServiceDestination:
-    """Trust only the exact origin derived for a hosted benchmark service."""
     try:
         hosted_url = create_benchmark_service_url(benchmark_name)
     except ValueError:
-        # Persisted custom-service runs can predate benchmark-name validation.
         if service_url is not None:
             return BenchmarkServiceDestination.CUSTOM
         raise
@@ -93,8 +93,17 @@ EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS = (
 )
 
 
+def project_gateway_configuration() -> tuple[str, str]:
+    url = os.environ["MODEL_GATEWAY_URL"]
+    machine_api_key = os.environ["MODEL_GATEWAY_MACHINE_API_KEY"]
+    if not url or not machine_api_key:
+        raise ValueError("MODEL_GATEWAY_URL and MODEL_GATEWAY_MACHINE_API_KEY must be nonempty")
+    return url, machine_api_key
+
+
 RUN_ACCESS_KEY_TTL_SECONDS = _positive_int_setting("RUN_ACCESS_KEY_TTL_SECONDS", 14 * 24 * 3600)
 AGENT_UPLOAD_MAX_BYTES = _positive_int_setting("AGENT_UPLOAD_MAX_BYTES", 1073741824)
+DATASET_TASK_UPLOAD_MAX_BYTES = _positive_int_setting("DATASET_TASK_UPLOAD_MAX_BYTES", 4294967296)
 AGENT_ARCHIVE_MAX_EXPANDED_BYTES = _positive_int_setting("AGENT_ARCHIVE_MAX_EXPANDED_BYTES", 5368709120)
 AGENT_ARCHIVE_MAX_ENTRIES = _positive_int_setting("AGENT_ARCHIVE_MAX_ENTRIES", 100000)
 
@@ -107,15 +116,12 @@ AWS_DEPLOYMENT_S3_BUCKET = os.environ.get("AWS_DEPLOYMENT_S3_BUCKET")
 AWS_TENANT_BUCKET_PREFIX = os.environ.get("AWS_TENANT_BUCKET_PREFIX")
 AWS_DEPLOYMENT_LOG_GROUP = os.environ.get("AWS_DEPLOYMENT_LOG_GROUP")
 AWS_DEPLOYMENT_LOG_RETENTION_DAYS = os.environ.get("AWS_DEPLOYMENT_LOG_RETENTION_DAYS")
-AWS_MANAGED_SUBMISSIONS_ENABLED = os.environ.get("AWS_MANAGED_SUBMISSIONS_ENABLED", "false").lower() == "true"
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
 
 def _build_database_url() -> str:
-    """Build DATABASE_URL from individual components or use direct URL."""
     if url := os.environ.get("DATABASE_URL"):
         return url
-    # Build from individual components (used with RDS secrets)
     db_user = os.environ.get("DB_USERNAME", "tracker")
     db_pass = os.environ.get("DB_PASSWORD", "tracker")
     db_host = os.environ.get("DB_HOST", "localhost")

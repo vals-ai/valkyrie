@@ -1,5 +1,3 @@
-"""Shows one run, with its progress on top, its tasks (errors first) on the left, and the highlighted task's log and detail on the right."""
-
 from __future__ import annotations
 
 import asyncio
@@ -44,7 +42,7 @@ from valkyrie.sdk.models import (
 from valkyrie.tui.theme import palette
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.errors import ErrorsScreen, failed_tasks
-from valkyrie.tui.source import FINAL_STATUSES, TRIAGE_ORDER, RunSource
+from valkyrie.tui.source import ACTIVE_TASKS, FINAL_STATUSES, TRIAGE_ORDER, RunSource
 from valkyrie.tui.widgets import (
     CATEGORY_LABEL,
     CommandLine,
@@ -65,33 +63,24 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-ACTIVE_TASKS = {TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
 TABS = ("logs", "detail")
 TASK_REFRESH_SECONDS = 2
 RECONNECT_SECONDS = 3
 LOG_MAX_LINES = 50_000
 ERROR_PREVIEW_LINES = 2
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-# A task loads once the cursor has rested this long, so moving through tasks loads only the ones stopped on. Each log
-# costs at least two CloudWatch reads, and those share one per-account rate limit. Cached tasks show at once.
 MOVE_DELAY_SECONDS = 0.25
-# Log lines can land a few seconds after a task finishes, so a finished task's log is cached once it's been quiet.
 SETTLED_AFTER = timedelta(minutes=1)
 
 
 @dataclass
 class RunCache:
-    """Holds each run's last task list and finished tasks' logs and detail, kept on the app so reopening them is instant."""
-
     tasks: dict[UUID, TasksResponse] = field(default_factory=dict)
-    # Keyed by run, task and start time, since a retry reuses the task's ID and moves its start time.
     logs: LRUCache[tuple[UUID, str, datetime], list[str]] = field(default_factory=lambda: LRUCache(50))
     details: LRUCache[tuple[UUID, str, datetime], SingleTaskResponse] = field(default_factory=lambda: LRUCache(50))
 
 
 class RunSummary(Widget):
-    """Shows the run's status, a progress bar split by task state, and per-state counts with errors broken down by category."""
-
     run: reactive[BenchmarkTableRow | None] = reactive(None)
     categories: reactive[tuple[tuple[str, int], ...]] = reactive(())
 
@@ -111,7 +100,6 @@ class RunSummary(Widget):
         bar = progress_bar(run.task_state_counts, run.total_tasks, width) if run.total_tasks else Text(" " * width)
         lines = [Text.assemble(status, "  ", bar, tail), self._counts(run)]
         if run.error_message:
-            # A run's error can be a whole traceback; the task detail and `e` show the task errors in full.
             message = shown(run.error_message).splitlines()
             lines += [
                 Text(line, style=palette().error, no_wrap=True, overflow="ellipsis")
@@ -140,9 +128,6 @@ class RunSummary(Widget):
 
 
 class LogHighlighter(Highlighter):
-    """Dims timestamps and agent chatter, colors error lines red, and marks the search term, most strongly on the
-    current match's line."""
-
     def __init__(self) -> None:
         self.term = ""
         self.on_current_line = False
@@ -162,12 +147,6 @@ class LogHighlighter(Highlighter):
 
 
 class TaskLog(Log):
-    """Shows the highlighted task's log. Scrolling up pauses following, and `G` jumps to the end and resumes it.
-
-    `/` searches the loaded lines for literal, case-sensitive text, as `valk run logs --query` does, and `n`/`N` step
-    through the matching lines. The term stays when another task's log loads.
-    """
-
     BINDINGS = [
         Binding("j", "scroll_down", show=False),
         Binding("k", "scroll_up", show=False),
@@ -190,7 +169,6 @@ class TaskLog(Log):
         return self.marks.term
 
     def search(self, term: str) -> None:
-        """Mark `term` and scroll to its first line from the current match, or from the top of the view."""
         self.marks.term = term
         self.notify_style_update()
         self.refresh()
@@ -201,7 +179,6 @@ class TaskLog(Log):
         self._jump(round(self.scroll_y) if self.current is None else self.current, step)
 
     def render_line(self, y: int) -> Strip:
-        # The highlighter sees only the line's text, so it's told whether this is the current match's line.
         self.marks.on_current_line = self.scroll_offset.y + y == self.current
         return super().render_line(y)
 
@@ -225,7 +202,6 @@ class TaskLog(Log):
         self.matches = tuple(y for y, line in enumerate(self.lines) if term in line) if term else ()
 
     def _jump(self, start: int, step: int) -> None:
-        """Scroll to the first match at or after `start` (step 0), after it (1) or before it (-1), wrapping around."""
         if not self.matches:
             self.current = None
             return
@@ -270,9 +246,6 @@ class RunScreen(BrowseScreen[None]):
         ("esc", "clear the search or the filter, or go back to the runs"),
         ("y", "copy the command on the bottom line"),
         ("o", "open the run's Docent reading"),
-        ("t", "light or dark theme"),
-        ("?", "these keys"),
-        ("q", "quit"),
     ]
     CAN_GO_BACK = True
 
@@ -336,7 +309,6 @@ class RunScreen(BrowseScreen[None]):
 
     @work(exclusive=True, group="stream")
     async def watch_run(self) -> None:
-        """Follow the run's state, reconnecting after a pause if the stream ends before the run does."""
         try:
             async for snapshot in self.source.watch_run(self.run.id):
                 self._apply_snapshot(snapshot)
@@ -363,10 +335,10 @@ class RunScreen(BrowseScreen[None]):
         )
         self.docent_url = details.docent_reading_url
         self.query_one(RunSummary).run = self.run
-        self.query_one(TopBar).status = ("● live", "accent")
+        self.fresh()
 
     def _refresh_if_stale(self) -> None:
-        if self.tasks_stale:
+        if self.tasks_stale and not self.busy("tasks"):
             self.load_tasks()
 
     @work(exclusive=True, group="tasks")
@@ -407,7 +379,6 @@ class RunScreen(BrowseScreen[None]):
             self._clear_task()
 
     def _clear_task(self) -> None:
-        """Empty the task pane when the filter hides every task, so it doesn't describe a task that isn't listed."""
         if self.shown_task is None:
             return
         self.shown_task = None
@@ -429,7 +400,6 @@ class RunScreen(BrowseScreen[None]):
         task_id = self.query_one(Table).highlighted_key()
         if task_id is None:
             return
-        # A refresh that reorders the table highlights the same task again; only a different task reloads.
         if task_id != self.shown_task:
             delay = 0 if self.shown_task is None else MOVE_DELAY_SECONDS
             self.shown_task = task_id
@@ -440,33 +410,28 @@ class RunScreen(BrowseScreen[None]):
         self._show_command()
 
     def _reload_shown_task(self) -> None:
-        """Reload the shown task's panes when a refresh shows it changed status or started a new attempt.
-
-        A retry is a new attempt with a later start time, so it reloads the log too; otherwise the log reloads only
-        when no stream is following it.
-        """
         task = self.tasks.get(self.shown_task) if self.shown_task else None
-        shown = self.shown_summary
-        if task is None or shown is None or (task.status, task.started_at) == (shown.status, shown.started_at):
+        previous = self.shown_summary
+        if task is None or previous is None or (task.status, task.started_at) == (previous.status, previous.started_at):
             return
-        if task.started_at != shown.started_at or shown.status not in ACTIVE_TASKS:
+        if task.started_at != previous.started_at or previous.status not in ACTIVE_TASKS:
             self.load_logs(task.task_id, 0)
         self.load_detail(task.task_id, 0)
         self.shown_summary = task
 
     @work(exclusive=True, group="logs")
     async def load_logs(self, task_id: str, delay: float) -> None:
-        """Follow a running task's log, reconnecting if it drops, or fetch a finished one's, caching it once settled."""
         log = self.query_one(TaskLog)
         log.clear()
         log.border_title = escape(shown(task_id))
         task = self.tasks[task_id]
+        active = task.status in ACTIVE_TASKS
         key = (self.run.id, task_id, task.started_at)
-        lines = None if task.status in ACTIVE_TASKS else self.cache.logs.get(key)
+        lines = None if active else self.cache.logs.get(key)
         if lines is None:
             await asyncio.sleep(delay)
         try:
-            if task.status in ACTIVE_TASKS:
+            if active:
                 async for events in _batched(self.source.stream_logs(self.run.id, task_id)):
                     log.write_lines([log_line(event) for event in events])
             else:
@@ -476,11 +441,11 @@ class RunScreen(BrowseScreen[None]):
                         self.cache.logs.set(key, lines)
                 log.write_lines(lines)
         except ValkyrieSDKError as error:
-            if task.status not in ACTIVE_TASKS:
-                log.write_line(f"⚠ couldn't load the log: {shown(str(error))}")
-            else:
+            if active:
                 log.write_line(f"⚠ log stream lost, reconnecting: {shown(str(error))}")
                 self.set_timer(RECONNECT_SECONDS, lambda: self._reconnect_log(task_id))
+            else:
+                log.write_line(f"⚠ couldn't load the log: {shown(str(error))}")
         if not log.line_count:
             log.write_line("No log lines yet.")
 
@@ -571,7 +536,6 @@ class RunScreen(BrowseScreen[None]):
             self.notify("No task errors in this run.")
 
     def show_task(self, task_id: str | None) -> None:
-        """Put the cursor on a task, clearing the filter if it hides the task."""
         table = self.query_one(Table)
         if task_id is None or task_id not in self.tasks:
             return
@@ -587,11 +551,10 @@ class RunScreen(BrowseScreen[None]):
         if not url:
             self.notify("No Docent reading for this run yet.")
             return
-        # The Tracker may be self-hosted, so only a web link with a host is handed to the system to open.
         try:
             parts = urlparse(url)
             web = parts.scheme in ("http", "https") and bool(parts.hostname)
-        except ValueError:  # urlparse rejects some malformed URLs, such as `https://[`
+        except ValueError:
             web = False
         if web:
             webbrowser.open(url)
@@ -600,7 +563,6 @@ class RunScreen(BrowseScreen[None]):
 
     def _show_tab(self) -> None:
         self.query_one(ContentSwitcher).current = self.tab
-        # Both tabs set a color, since the panel's title turns accent when it has focus.
         titles = [
             f"[bold $accent]{tab.title()}[/]" if tab == self.tab else f"[$text-muted]{tab.title()}[/]" for tab in TABS
         ]
@@ -667,12 +629,6 @@ def _task_cells(task: TaskSummary, now: datetime) -> list[Text]:
 
 
 def log_line(event: LogEvent) -> str:
-    """Format a log event the way a terminal would show it, with continuation lines indented under the message.
-
-    Messages are raw terminal output, and Textual's Log passes escape codes through, so the real terminal would act on
-    them and move its cursor. Each line keeps only the text after its last carriage return, as a progress bar ends up,
-    without escape codes or other control characters.
-    """
     lines = (
         CONTROL_CHARACTERS.sub("", AnsiDecoder().decode_line(line.rstrip("\r")).plain)
         for line in event.message.rstrip("\r\n").split("\n")
@@ -705,12 +661,10 @@ def _detail(task: SingleTaskResponse, now: datetime) -> Text:
     for label, value in fields:
         if value:
             lines.append(Text.assemble((f"{label:<12}", palette().muted), (shown(value), palette().text)))
-    # One Text rather than a Group, so the detail can be selected and copied.
     return Text("\n").join(lines)
 
 
 async def _batched(events: AsyncIterator[T], size: int = 500, wait: float = 0.05) -> AsyncIterator[list[T]]:
-    """Group a stream into batches of up to `size` items, yielding early whenever it goes quiet for `wait` seconds."""
     batch: list[T] = []
     pending: asyncio.Task[T] | None = None
     iterator = aiter(events)

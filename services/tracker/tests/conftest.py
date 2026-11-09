@@ -12,7 +12,7 @@ from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, StaticPool, create_engine
 
 from tests.factories import make_benchmark
-from tests.utils import TEST_ORG_ID, FakeAccessKeys
+from tests.utils import TEST_ORG_ID, FakeAccessKeys, add_sqlite_btrim
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -47,21 +47,19 @@ def aws_runtime() -> AWSRuntime:
 
 @pytest.fixture(scope="function")
 def database_session() -> Generator[Session, None, None]:
-    """Create an in-memory database and mock the session engine."""
     test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
 
     @event.listens_for(test_engine, "connect")
     def set_sqlite_pragma(dbapi_connection: Connection, _connection_record: ConnectionPoolEntry) -> None:  # type: ignore
-        """Enable WAL mode to allow for concurrent commits to the database."""
         cursor: Cursor = cast(Cursor, dbapi_connection.cursor())  # type: ignore
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 
+    event.listen(test_engine, "connect", add_sqlite_btrim)
     SQLModel.metadata.create_all(test_engine)
 
     try:
         with Session(test_engine, expire_on_commit=False) as session:
-            # Mirror migration-owned singleton rows and the default organization.
             session.add(ExecutorAdmission())
             session.add(Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME, storage_key="test-bucket"))
             session.commit()
@@ -75,7 +73,6 @@ def database_session() -> Generator[Session, None, None]:
 def executor_authority_kwargs(
     database_session: Session,
 ) -> Callable[..., dict[str, object]]:
-    """Create one live runner claim for direct process_benchmark tests."""
 
     def create(
         benchmark: Benchmark,
@@ -141,7 +138,6 @@ def executor_authority(
 
 @pytest.fixture
 def contract() -> AgentContractRequest:
-    """Provide the smallest valid agent contract for tracker tests."""
     return AgentContractRequest(
         name="dummy",
         install_cmd="echo installing dependencies...",
@@ -151,7 +147,6 @@ def contract() -> AgentContractRequest:
 
 @pytest.fixture
 def example_benchmark_object(contract: AgentContractRequest) -> Benchmark:
-    """Provide a benchmark with the shared test organization and contract."""
     return make_benchmark(contract=contract, concurrency=5)
 
 

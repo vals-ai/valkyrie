@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import functools
 import json
 import time
 from collections.abc import Callable
@@ -12,12 +11,11 @@ import pytest
 from click.testing import CliRunner
 
 import valkyrie.cli.login as login_module
-import valkyrie.cli.org as org_module
 from valkyrie.cli.main import cli
 from valkyrie.sdk import ValkyrieConfig
 from valkyrie.sdk.config import DEFAULT_TRACKER_URL
-from valkyrie.sdk.errors import ValkyrieConfigError
-from valkyrie.sdk.login import LoginSession
+from valkyrie.sdk.errors import ValkyrieConfigError, ValkyrieTransportError
+from valkyrie.sdk import LoginSession
 
 TRACKER = "https://tracker.test"
 
@@ -91,7 +89,12 @@ def requests(
             if organization not in [membership["id"] for membership in memberships]:
                 return httpx.Response(403, json={"detail": "This login is not a member of the requested organization"})
             credential = "login" if "authorization" in request.headers else "access_key"
-            identity = {"organization": organization, "email": "alice@example.com", "credential": credential}
+            identity = {
+                "organization": organization,
+                "email": "alice@example.com",
+                "name": None,
+                "credential": credential,
+            }
             return httpx.Response(200, json=identity)
         if url == f"{TRACKER}/access-keys":
             assert json.loads(request.content) == {"name": "ci", "expires_in_days": 7}
@@ -100,17 +103,22 @@ def requests(
             return httpx.Response(204)
         return httpx.Response(404)
 
-    def device_login(tracker_url: str, http: httpx.Client, announce: Callable[[str, str], None]) -> LoginSession:
+    def device_login(tracker_url: str, announce: Callable[[str, str], None]) -> LoginSession:
         announce("https://login.test/activate", "ABCD-EFGH")
         return _session(tracker_url, 600).model_copy(update={"refresh_token": "r-1"})
 
-    monkeypatch.setattr(httpx, "Client", functools.partial(httpx.Client, transport=httpx.MockTransport(handler)))
+    async def handle(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return handler(request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     monkeypatch.setattr(login_module, "device_login", device_login)
     monkeypatch.setattr(login_module.click, "launch", lambda _url: 0)
     monkeypatch.setenv("VALKYRIE_URL", TRACKER)
     return seen
 
 
+@pytest.mark.description("`login` saves a session for the Tracker and lists orgs with the new bearer token.")
 @pytest.mark.parametrize(
     ("memberships", "invitations", "listing"),
     [
@@ -133,6 +141,9 @@ def test_login_saves_a_session_and_lists_the_organizations(requests: list[httpx.
     assert requests[-1].headers["authorization"] == "Bearer access-1"
 
 
+@pytest.mark.description(
+    "After `login` the CLI uses that Tracker until `logout`, and an access key in the environment is used as `x-api-key`."
+)
 def test_login_picks_the_tracker_until_logout(requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch) -> None:
     runner = CliRunner()
     runner.invoke(cli, ["login"])
@@ -162,6 +173,9 @@ def test_login_picks_the_tracker_until_logout(requests: list[httpx.Request], mon
     assert requests[-1].headers["x-api-key"] == "ci-secret"
 
 
+@pytest.mark.description(
+    "`token create` prints only the new key on stdout, and `token revoke` passes the key ID through as given."
+)
 def test_token_create_prints_only_the_key_on_stdout(requests: list[httpx.Request]) -> None:
     runner = CliRunner()
     runner.invoke(cli, ["login"])
@@ -175,6 +189,7 @@ def test_token_create_prints_only_the_key_on_stdout(requests: list[httpx.Request
     assert revoke.output == "Revoked access key ../K1.\n"
 
 
+@pytest.mark.description("An expired login tells the user to run `valkyrie login` without a traceback.")
 def test_an_expired_login_is_reported_without_a_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VALKYRIE_URL", "http://tracker")
     _session("http://tracker", -10).save()
@@ -186,6 +201,7 @@ def test_an_expired_login_is_reported_without_a_traceback(monkeypatch: pytest.Mo
     assert not isinstance(result.exception, ValkyrieConfigError)
 
 
+@pytest.mark.description("`org create` refreshes the saved session and makes the new org current.")
 def test_creating_an_organization_refreshes_the_login_and_switches_to_it(requests: list[httpx.Request]) -> None:
     runner = CliRunner()
     runner.invoke(cli, ["login"])
@@ -201,6 +217,7 @@ def test_creating_an_organization_refreshes_the_login_and_switches_to_it(request
     assert session is not None and session.tenant == "acme-labs"
 
 
+@pytest.mark.description("`org use` changes the saved org only when the Tracker accepts the switch.")
 def test_org_use_switches_only_to_an_organization_the_tracker_accepts(
     requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -211,20 +228,25 @@ def test_org_use_switches_only_to_an_organization_the_tracker_accepts(
     listed = runner.invoke(cli, ["org", "list"])
     refused = runner.invoke(cli, ["org", "use", "gamma"])
 
-    def unavailable(*args: Any, **kwargs: Any) -> None:
-        raise ValkyrieConfigError("Refreshing your login failed (503)")
+    tracker = httpx.AsyncHTTPTransport.handle_async_request
 
-    monkeypatch.setattr(org_module, "request_tracker", unavailable)
+    async def refresh_unavailable(transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://login.test/v1/auth/refresh":
+            return httpx.Response(503)
+        return await tracker(transport, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refresh_unavailable)
     failed = runner.invoke(cli, ["org", "use", "acme"])
 
     assert switched.output == "Now acting for beta.\n"
     assert listed.output == "  acme (admin)\n* beta\n"
     assert refused.exit_code == 1 and "not a member" in refused.output
-    assert failed.exit_code != 0
+    assert failed.exit_code == 1 and "Refreshing the Valkyrie login failed (503)" in failed.output
     session = LoginSession.load(TRACKER)
     assert session is not None and session.tenant == "beta"
 
 
+@pytest.mark.description("Organization members can be invited, listed, and removed.")
 def test_org_invite_members_and_remove(requests: list[httpx.Request]) -> None:
     runner = CliRunner()
     runner.invoke(cli, ["login"])
@@ -239,6 +261,7 @@ def test_org_invite_members_and_remove(requests: list[httpx.Request]) -> None:
     assert requests[-1].url.raw_path == b"/orgs/members/bob%40gmail.com"
 
 
+@pytest.mark.description("Accepting an invitation switches the session to that org, and declining leaves it unchanged.")
 def test_invitations_can_be_accepted_or_declined(requests: list[httpx.Request], invitations: list[str]) -> None:
     invitations.extend(["gamma", "delta"])
     runner = CliRunner()
@@ -255,6 +278,9 @@ def test_invitations_can_be_accepted_or_declined(requests: list[httpx.Request], 
     assert session is not None and session.tenant == "gamma"
 
 
+@pytest.mark.description(
+    "With only an access key, org commands tell the user to run `valkyrie login` and send nothing."
+)
 def test_organization_commands_never_use_an_access_key(
     requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,16 +293,36 @@ def test_organization_commands_never_use_an_access_key(
     assert requests == []
 
 
+@pytest.mark.description("Logging in to a Tracker without org support prints the user's single org.")
 def test_login_to_a_tracker_without_organizations_reports_its_organization(
     requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    request_tracker = login_module.request_tracker
+    tracker = httpx.AsyncHTTPTransport.handle_async_request
 
-    def without_organizations(method: str, path: str, **kwargs: Any) -> Any:
-        return request_tracker(method, "/missing" if path == "/orgs" else path, **kwargs)
+    async def without_organizations(transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/orgs":
+            return httpx.Response(404, json={"detail": "Not Found"})
+        return await tracker(transport, request)
 
-    monkeypatch.setattr(login_module, "request_tracker", without_organizations)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", without_organizations)
     result = CliRunner().invoke(cli, ["login"])
 
     assert result.exit_code == 0, result.output
     assert f"Logged in to {TRACKER} as alice@example.com for acme." in result.output
+
+
+@pytest.mark.description(
+    "An unreachable login service fails `valkyrie login` with the SDK's message and saves nothing."
+)
+def test_an_unreachable_login_service_is_reported_without_a_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    def offline(tracker_url: str, _announce: Callable[[str, str], None]) -> LoginSession:
+        raise ValkyrieTransportError(f"The login to {tracker_url} could not finish: offline")
+
+    monkeypatch.setenv("VALKYRIE_URL", TRACKER)
+    monkeypatch.setattr(login_module, "device_login", offline)
+
+    result = CliRunner().invoke(cli, ["login"])
+
+    assert result.exit_code == 1
+    assert f"The login to {TRACKER} could not finish: offline" in result.output
+    assert LoginSession.load(TRACKER) is None

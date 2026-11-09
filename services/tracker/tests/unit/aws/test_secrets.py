@@ -1,5 +1,3 @@
-"""AWS Secrets Manager adapter tests."""
-
 import asyncio
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -26,8 +24,6 @@ _SECRETS_MANAGER = get_session().get_service_model("secretsmanager")
 
 
 class FakeAsyncSecretsManagerClient:
-    """Record calls; writes are checked against the Secrets Manager API model first."""
-
     def __init__(
         self,
         response: dict[str, Any] | None = None,
@@ -101,6 +97,7 @@ class FakeAsyncClientProvider:
         return self.context
 
 
+@pytest.mark.description("Reading a secret keeps JSON values and raw strings apart.")
 @pytest.mark.parametrize(
     ("secret_string", "expected"),
     [
@@ -124,6 +121,7 @@ async def test_get_preserves_json_and_raw_string_domains(secret_string: str, exp
     assert context.exited
 
 
+@pytest.mark.description("A failed secret read is translated and keeps the client error as its cause.")
 @pytest.mark.parametrize(
     ("code", "message"),
     [
@@ -145,6 +143,9 @@ async def test_get_preserves_client_error_translation_and_cause(code: str, messa
     assert captured.value.__cause__ is provider_error
 
 
+@pytest.mark.description(
+    "An access denied tenant secret is reported as not existing under its short name, without the tenant prefix."
+)
 async def test_denied_tenant_secret_is_named_without_its_prefix_or_the_provider_error() -> None:
     provider_error = ClientError(
         {
@@ -165,6 +166,7 @@ async def test_denied_tenant_secret_is_named_without_its_prefix_or_the_provider_
     assert str(captured.value) == "Secret error: Secret 'daytona' does not exist"
 
 
+@pytest.mark.description("Cancelling a secret read cancels the request and closes the client.")
 async def test_get_cancels_underlying_request_and_exits_client() -> None:
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -192,6 +194,7 @@ async def test_get_cancels_underlying_request_and_exits_client() -> None:
     assert context.exited
 
 
+@pytest.mark.description("Building the secret store does not touch the client.")
 def test_store_constructs_without_accessing_the_client() -> None:
     provider = FakeAsyncClientProvider(FakeAsyncClientContext(FakeAsyncSecretsManagerClient({"SecretString": "value"})))
 
@@ -216,6 +219,7 @@ _CREATE = (
 )
 
 
+@pytest.mark.description("Putting a secret creates it or replaces its value.")
 @pytest.mark.parametrize(
     ("create_error", "calls"),
     [
@@ -234,6 +238,7 @@ async def test_put_creates_the_secret_or_replaces_its_value(create_error: str | 
     assert client.calls == calls
 
 
+@pytest.mark.description("Putting a secret reports other failures.")
 @pytest.mark.parametrize("failing", ["CreateSecret", "PutSecretValue"])
 async def test_put_reports_other_failures(failing: str) -> None:
     error = _client_error("AccessDeniedException", failing)
@@ -248,6 +253,7 @@ async def test_put_reports_other_failures(failing: str) -> None:
     assert captured.value.__cause__ is error
 
 
+@pytest.mark.description("Listing secret names filters by prefix and sorts them.")
 async def test_list_names_filters_by_prefix_and_sorts() -> None:
     client = FakeAsyncSecretsManagerClient(
         names=["valkyrie/tenants/org/modal", "valkyrie/tenants/org-other/x", "valkyrie/tenants/org/daytona"]
@@ -259,6 +265,7 @@ async def test_list_names_filters_by_prefix_and_sorts() -> None:
     assert client.calls == [("ListSecrets", {"Filters": [{"Key": "name", "Values": ["valkyrie/tenants/org/"]}]})]
 
 
+@pytest.mark.description("Deleting a secret removes it without a recovery window.")
 @pytest.mark.parametrize(
     ("error_code", "deleted"),
     [(None, True), ("AccessDeniedException", False)],
@@ -272,6 +279,7 @@ async def test_delete_removes_the_secret_without_recovery(error_code: str | None
     assert client.calls == [("DeleteSecret", {"SecretId": _NAME, "ForceDeleteWithoutRecovery": True})]
 
 
+@pytest.mark.description("Putting a secret whose name is still being deleted reports that.")
 async def test_put_reports_a_name_still_being_deleted() -> None:
     pending = ClientError(
         {

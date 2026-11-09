@@ -1,8 +1,3 @@
-"""Tests for run error output contracts.
-
-Run: uv run pytest tests/unit/cli/run/test_errors.py
-"""
-
 import json
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +18,7 @@ def invoke_with_tracker(tracker: MockTracker, response: FinalViewResponse, *args
     return CliRunner().invoke(errors, [str(response.benchmark_id), *args])
 
 
+@pytest.mark.description("Text errors group identical messages without writing files.")
 def test_errors_text_groups_identical_messages_without_writing_files(tracker: MockTracker) -> None:
     run_id = uuid4()
     shared_message = "Required output artifact was not produced."
@@ -49,6 +45,7 @@ def test_errors_text_groups_identical_messages_without_writing_files(tracker: Mo
     assert dict(request.url.params) == {"benchmark_id": str(run_id), "s3": "false"}
 
 
+@pytest.mark.description("Text errors handle run, task, and empty states.")
 @pytest.mark.parametrize(
     ("error_message", "task_errors", "status", "expected", "unexpected"),
     [
@@ -77,6 +74,7 @@ def test_errors_text_handles_run_task_and_empty_states(
     assert status.value.replace("_", " ").title() in result.stdout
 
 
+@pytest.mark.description("Text errors keep empty messages.")
 def test_errors_text_preserves_empty_messages(tracker: MockTracker) -> None:
     result = invoke_with_tracker(tracker, make_final_view(uuid4(), error_message="", task_errors={"task-a": ""}))
 
@@ -84,6 +82,7 @@ def test_errors_text_preserves_empty_messages(tracker: MockTracker) -> None:
     assert result.stdout.count("(empty error message)") == 2
 
 
+@pytest.mark.description("Text errors strip terminal control characters.")
 def test_errors_text_sanitizes_terminal_controls(tracker: MockTracker) -> None:
     unsafe_message = "\x1b]8;;https://example.invalid\x07click\x1b]8;;\x07\rrewritten\nnext\tline\u202e"
     response = make_final_view(uuid4(), error_message=unsafe_message, task_errors={"task\x1b[31m": "boom\b"})
@@ -100,6 +99,7 @@ def test_errors_text_sanitizes_terminal_controls(tracker: MockTracker) -> None:
     assert "next    line" in result.stdout
 
 
+@pytest.mark.description("JSON errors are versioned, limited to known fields, and deterministic.")
 def test_errors_json_is_versioned_allowlisted_and_deterministic(tracker: MockTracker) -> None:
     run_id = uuid4()
     raw_error = "task failed\n\x1b[31mred"
@@ -150,6 +150,7 @@ def test_errors_json_is_versioned_allowlisted_and_deterministic(tracker: MockTra
     assert fixed_payload["observed_at"] == "2026-07-10T20:15:00Z"
 
 
+@pytest.mark.description("JSON errors normalize an empty error state.")
 def test_errors_json_normalizes_empty_error_state(tracker: MockTracker) -> None:
     response = make_final_view(uuid4(), status=BenchmarkStatus.FINISHED, error_message=None, task_errors=None)
 
@@ -163,6 +164,7 @@ def test_errors_json_normalizes_empty_error_state(tracker: MockTracker) -> None:
     assert payload["task_errors"] == {}
 
 
+@pytest.mark.description("Text errors label each group with its category.")
 def test_errors_text_labels_groups_with_category(tracker: MockTracker) -> None:
     response = make_final_view(
         uuid4(),

@@ -1,5 +1,3 @@
-"""Admission HTTP regressions with bounded, deterministic external-work barriers."""
-
 import asyncio
 import threading
 from collections.abc import AsyncGenerator
@@ -16,7 +14,7 @@ from sqlmodel import Session, select
 
 import main as main_module
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
-from tests.unit.utils.task_execution_support import MockLauncher
+from tests.unit.services.task_execution_support import MockLauncher
 from tests.utils import TEST_ORG_ID
 from tracker.auth import get_current_org
 from tracker.database.models import (
@@ -29,9 +27,9 @@ from tracker.database.models import (
     Task,
     TaskStatus,
 )
-from tracker.executor import release_control
 from tracker.executor.release_control import promote_release
 from tracker.logging import benchmark_id_var
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 from tracker import config
 from tracker.types import StartBenchmarkRequest
 
@@ -65,7 +63,6 @@ def recovery_run(database_session: Session, example_benchmark_object: Benchmark)
 
 @pytest.fixture
 def observed_sessions(database_session: Session, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Session, int]]:
-    """Use real auth read transactions and observe thread-owned admission Sessions."""
     sessions: list[tuple[Session, int]] = []
 
     class ObservedSession(Session):
@@ -101,7 +98,6 @@ def _start_body(benchmark: Benchmark) -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def managed_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config, "AWS_MANAGED_SUBMISSIONS_ENABLED", True)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_ACCOUNT_ID", "123456789012")
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_REGION", "us-east-1")
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_S3_BUCKET", "test-bucket")
@@ -110,6 +106,7 @@ def managed_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.exists", AsyncMock(return_value=True))
 
 
+@pytest.mark.description("Verification releases its transaction and admission so other requests proceed.")
 @pytest.mark.parametrize("contender", ["retry", "start"])
 async def test_verification_releases_transactions_and_admission_for_other_requests(
     contender: str,
@@ -136,7 +133,7 @@ async def test_verification_releases_transactions_and_admission_for_other_reques
         first = asyncio.create_task(client.post(url, json={}))
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
-            assert len(observed_sessions) == 2  # Auth and prepare, each already closed.
+            assert len(observed_sessions) == 2
             assert all(not session.in_transaction() for session, _ in observed_sessions)
             assert observed_sessions[0][1] == loop_thread
             assert observed_sessions[1][1] != loop_thread
@@ -157,6 +154,7 @@ async def test_verification_releases_transactions_and_admission_for_other_reques
         assert all(not session.in_transaction() for session, _ in observed_sessions)
 
 
+@pytest.mark.description("The health route returns 200 while admission waits, and no database transaction stays open.")
 @pytest.mark.parametrize("operation", ["retry", "start", "shed"])
 async def test_blocking_admission_wait_does_not_block_health(
     operation: str,
@@ -174,19 +172,19 @@ async def test_blocking_admission_wait_does_not_block_health(
     entered, release = threading.Event(), threading.Event()
     lock_threads: list[int] = []
     loop_thread = threading.get_ident()
-    get_admission = release_control._get_admission
+    get_admission = ExecutorReleaseRepository.admission
 
-    def blocked_lock(session: Session, *, for_update: bool) -> Any:
+    def blocked_lock(repository: ExecutorReleaseRepository, *, for_update: bool = False) -> Any:
         if for_update:
             lock_threads.append(threading.get_ident())
             entered.set()
             assert release.wait(timeout=5), "admission blocked the request event loop"
-        return get_admission(session, for_update=for_update)
+        return get_admission(repository, for_update=for_update)
 
     async def verify(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
         return VerifyTaskIdsResponse(task_ids=["task_0"])
 
-    monkeypatch.setattr(release_control, "_get_admission", blocked_lock)
+    monkeypatch.setattr(ExecutorReleaseRepository, "admission", blocked_lock)
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify)
     url, body = {
         "retry": (f"/retry-or-resume-benchmark/{benchmark.id}", {}),
@@ -210,6 +208,7 @@ async def test_blocking_admission_wait_does_not_block_health(
         assert all(not session.in_transaction() for session, _ in observed_sessions)
 
 
+@pytest.mark.description("Cancellation during commit waits for the outcome before it propagates.")
 @pytest.mark.parametrize("operation", ["retry", "start"])
 @pytest.mark.parametrize("commit_error", [False, True])
 async def test_cancellation_during_commit_observes_outcome_before_propagating(
@@ -243,7 +242,6 @@ async def test_cancellation_during_commit_observes_outcome_before_propagating(
         with Session(database_session.get_bind()) as checked:
             assert checked.get(ExecutorDispatch, dispatch.id) is not None
         if operation == "start":
-            # Enqueue is a child task and must inherit the request's benchmark correlation.
             assert benchmark_id_var.get() == str(dispatch.benchmark_id)
         enqueued_dispatch_ids.append(dispatch.id)
 
@@ -276,6 +274,7 @@ async def test_cancellation_during_commit_observes_outcome_before_propagating(
     assert all(not session.in_transaction() for session, _ in observed_sessions)
 
 
+@pytest.mark.description("A cancelled start still enqueues after a bind failure and chains the cause.")
 @pytest.mark.parametrize("enqueue_error", [False, True])
 async def test_start_cancellation_enqueues_after_bind_failure_and_chains_cause(
     enqueue_error: bool,
@@ -334,6 +333,7 @@ async def test_start_cancellation_enqueues_after_bind_failure_and_chains_cause(
     assert all(not session.in_transaction() for session, _ in observed_sessions)
 
 
+@pytest.mark.description("Cancellation during enqueue waits for the enqueue to finish.")
 @pytest.mark.parametrize("operation", ["retry", "start"])
 @pytest.mark.parametrize("enqueue_error", [False, True])
 async def test_cancellation_during_enqueue_waits_for_completion(
@@ -375,6 +375,7 @@ async def test_cancellation_during_enqueue_waits_for_completion(
     assert all(not session.in_transaction() for session, _ in observed_sessions)
 
 
+@pytest.mark.description("Recovery checks the verified state again before it changes or dispatches anything.")
 @pytest.mark.parametrize(
     "change", ["execution", "status", "attempt", "selection", "dataset", "destination", "stopping", "unrelated"]
 )

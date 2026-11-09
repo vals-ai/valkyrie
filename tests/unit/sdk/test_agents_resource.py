@@ -1,8 +1,3 @@
-"""Agent management, GitHub checkout, and archive safety.
-
-Run: uv run pytest tests/unit/sdk/test_agents_resource.py
-"""
-
 import io
 import os
 import stat
@@ -13,7 +8,7 @@ import httpx
 import pytest
 
 from tests.unit.sdk.conftest import ClientFactory
-from valkyrie.sdk import agent_install
+from valkyrie.sdk import ValkyrieAPIError, agent_install
 from valkyrie.sdk.agent_bundle import extract_agent_archive, get_agent_zip_stream
 
 _CONTRACT = "name: demo\ninstall_cmd: 'true'\nrun_cmd: 'echo {problem_statement_path}'\n"
@@ -35,9 +30,9 @@ def _unexpected_request(_request: httpx.Request) -> httpx.Response:
     pytest.fail("invalid input reached tracker")
 
 
+@pytest.mark.description("SDK library requests and external archive transfers.")
 class TestAgentsResource:
-    """SDK library requests and external archive transfers."""
-
+    @pytest.mark.description("`client.agents.list` returns agent models with their names.")
     async def test_list_returns_typed_agents(self, make_client: ClientFactory) -> None:
         def listing(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"agents": [{"name": "demo"}]})
@@ -47,6 +42,7 @@ class TestAgentsResource:
 
         assert response.agents[0].name == "demo"
 
+    @pytest.mark.description("Agent methods raise `ValueError` for an invalid name before any request.")
     @pytest.mark.parametrize("name", ["", " ", "agent one", ".", "..", "team/agent", "a\\b", "agent\n"])
     async def test_invalid_names_never_reach_tracker(self, make_client: ClientFactory, name: str) -> None:
         async with make_client(_unexpected_request) as client:
@@ -54,24 +50,23 @@ class TestAgentsResource:
                 with pytest.raises(ValueError, match="Invalid agent name"):
                     await operation(name)
 
+    @pytest.mark.description(
+        "`agents.download` fetches the archive URL without Tracker credentials and replaces the old folder."
+    )
     @pytest.mark.parametrize("download_host", ["download.test", "tracker.test"])
     async def test_download_never_forwards_tracker_credentials(
         self,
         make_client: ClientFactory,
-        monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         download_host: str,
     ) -> None:
-        async def download(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-            assert request.url.host == download_host
-            assert ("x-api-key" in request.headers) == (download_host == "tracker.test")
-            assert "authorization" not in request.headers
-
-            return httpx.Response(200, content=_archive())
-
-        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", download)
-
         def download_url(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/demo.zip":
+                assert request.url.host == download_host
+                assert ("x-api-key" in request.headers) == (download_host == "tracker.test")
+                assert "authorization" not in request.headers
+
+                return httpx.Response(200, content=_archive())
             assert request.headers["X-Api-Key"] == "vals-key"
             return httpx.Response(
                 200,
@@ -96,16 +91,38 @@ class TestAgentsResource:
 
         assert not (path / "obsolete").exists()
 
+    @pytest.mark.description(
+        "A storage error on the archive URL raises `ValkyrieAPIError` with its status and body and writes no folder."
+    )
+    async def test_download_reports_the_storage_error_status(self, make_client: ClientFactory, tmp_path: Path) -> None:
+        def download_url(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "download.test":
+                return httpx.Response(403, text="<Error><Code>AccessDenied</Code></Error>")
+            return httpx.Response(
+                200, json={"name": "demo", "download_url": "https://download.test/demo.zip", "expires_in": 300}
+            )
+
+        async with make_client(download_url) as client:
+            with pytest.raises(ValkyrieAPIError) as raised:
+                await client.agents.download("demo", tmp_path)
+
+        assert (raised.value.status_code, raised.value.detail) == (403, "<Error><Code>AccessDenied</Code></Error>")
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.description(
+        "Installing a repo subfolder pushes it under the given alias and leaves its contract file unchanged."
+    )
     async def test_install_subfolder_pushes_override_without_rewriting_contract(
         self,
         make_client: ClientFactory,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        async def git(_repository: Path | None, *arguments: str) -> None:
+        async def git(_repository: Path | None, *arguments: str) -> str:
             if arguments[0] == "clone":
                 folder = Path(arguments[-1]) / "agents" / "demo"
                 folder.mkdir(parents=True)
                 (folder / "contract.yaml").write_text(_CONTRACT)
+            return "refs/remotes/origin/main\n" if arguments[0] == "for-each-ref" else ""
 
         def upload(request: httpx.Request) -> httpx.Response:
             assert request.method == "PUT"
@@ -124,6 +141,41 @@ class TestAgentsResource:
 
         assert response.name == "alias"
 
+    @pytest.mark.description(
+        "A `/tree/` URL checks out the longest matching branch or tag and treats the rest as the subfolder."
+    )
+    @pytest.mark.parametrize(
+        ("tree_path", "reference", "subfolder"),
+        [
+            ("main", "main", ""),
+            ("feature/demo/", "feature/demo", ""),
+            ("feature/demo/agents/demo", "feature/demo", "agents/demo"),
+            ("v1/agents", "v1", "agents"),
+            ("0a1b2c3/agents", "0a1b2c3", "agents"),
+        ],
+    )
+    async def test_tree_url_resolves_reference_and_subfolder(
+        self, monkeypatch: pytest.MonkeyPatch, tree_path: str, reference: str, subfolder: str
+    ) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        async def git(_repository: Path | None, *arguments: str) -> str:
+            commands.append(arguments)
+            if arguments[0] == "clone":
+                (Path(arguments[-1]) / "agents" / "demo").mkdir(parents=True)
+            if arguments[0] == "for-each-ref":
+                return "refs/remotes/origin/HEAD\nrefs/remotes/origin/main\nrefs/remotes/origin/feature/demo\nrefs/tags/v1\n"
+            return ""
+
+        monkeypatch.setattr(agent_install, "_run_git_command", git)
+        async with agent_install.checkout_agent(f"https://github.com/example/agents/tree/{tree_path}") as path:
+            checked_out = path
+
+        assert ("checkout", reference, "--") in commands
+        assert checked_out == Path(commands[0][-1]) / subfolder
+        assert (("sparse-checkout", "set", "--", subfolder) in commands) == bool(subfolder)
+
+    @pytest.mark.description("Push controls whether an alias is overwritten.")
     @pytest.mark.parametrize("overwrite", [False, True])
     async def test_push_controls_alias_overwrite(
         self, make_client: ClientFactory, tmp_path: Path, overwrite: bool
@@ -137,6 +189,7 @@ class TestAgentsResource:
         async with make_client(upload) as client:
             await client.agents.push(tmp_path, overwrite=overwrite)
 
+    @pytest.mark.description("Submodules validate each level before fetching.")
     @pytest.mark.parametrize("nested_url", ["https://github.com/example/nested", "https://example.test/nested"])
     async def test_submodules_validate_each_level_before_fetch(
         self, monkeypatch: pytest.MonkeyPatch, nested_url: str
@@ -174,6 +227,9 @@ class TestAgentsResource:
                     pytest.fail("unvalidated submodule accepted")
             assert fetched == [str(repositories[0])]
 
+    @pytest.mark.description(
+        "`agents.install` raises `ValueError` for non-GitHub URLs, `..` paths, bad refs, and newlines before any request."
+    )
     @pytest.mark.parametrize(
         "url",
         [
@@ -189,9 +245,9 @@ class TestAgentsResource:
                 await client.agents.install(url)
 
 
+@pytest.mark.description("Bundle exclusions and extraction without filesystem escapes.")
 class TestAgentArchive:
-    """Bundle exclusions and extraction without filesystem escapes."""
-
+    @pytest.mark.description("The agent bundle leaves out caches and rejects symlinks.")
     def test_bundle_excludes_caches_and_rejects_symlinks(self, tmp_path: Path) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -208,6 +264,19 @@ class TestAgentArchive:
             with get_agent_zip_stream("alias", source):
                 pytest.fail("symlink accepted")
 
+    @pytest.mark.description(
+        "Exclusions match whole names, so excluded suffixes are dropped and lookalike names are kept."
+    )
+    def test_bundle_exclusions_match_whole_names(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        (source / "demo.egg-info").mkdir(parents=True)
+        (source / "demo.egg-info" / "PKG-INFO").touch()
+        for name in ("data.sources.json", ".gitignore", ".env.local", "prod.env", ".envrc", "native.so", "libfoo.so.1"):
+            (source / name).touch()
+        with get_agent_zip_stream("alias", source) as stream, zipfile.ZipFile(stream) as archive:
+            assert sorted(archive.namelist()) == ["alias/.gitignore", "alias/data.sources.json"]
+
+    @pytest.mark.description("An unsafe archive leaves the existing target alone.")
     @pytest.mark.parametrize(
         "member",
         [
@@ -234,6 +303,7 @@ class TestAgentArchive:
         assert (target / "keep").read_text() == "original"
         assert sorted(path.name for path in tmp_path.iterdir()) == ["demo"]
 
+    @pytest.mark.description("Symlinks and corrupt archives are rejected.")
     def test_symlinks_and_corruption_are_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="Unsafe"):
             extract_agent_archive(io.BytesIO(_archive(symlink=True)), "demo", tmp_path, overwrite=False)
@@ -245,12 +315,16 @@ class TestAgentArchive:
 
         assert not (tmp_path / "demo").exists()
 
+    @pytest.mark.description(
+        "Extracting over a target that is a symlink raises `FileExistsError` and writes nothing through it."
+    )
     def test_existing_target_symlink_is_never_followed(self, tmp_path: Path) -> None:
         (tmp_path / "demo").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
 
         with pytest.raises(FileExistsError):
             extract_agent_archive(io.BytesIO(_archive()), "demo", tmp_path, overwrite=True)
 
+    @pytest.mark.description("An archive over the limits leaves the existing target alone.")
     @pytest.mark.parametrize("limit", ["max_archive_bytes", "max_expanded_bytes", "max_entries"])
     def test_limits_preserve_existing_target(self, tmp_path: Path, limit: str) -> None:
         target = tmp_path / "demo"
@@ -263,6 +337,7 @@ class TestAgentArchive:
         assert (target / "keep").read_text() == "original"
         assert list(tmp_path.iterdir()) == [target]
 
+    @pytest.mark.description("A failed overwrite keeps the previous copy.")
     @pytest.mark.parametrize("rollback_fails", [False, True])
     def test_failed_overwrite_preserves_previous_copy(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool
@@ -289,6 +364,7 @@ class TestAgentArchive:
             assert (target / "keep").read_text() == "original"
             assert list(tmp_path.iterdir()) == [target]
 
+    @pytest.mark.description("The actual expanded size is bounded.")
     def test_actual_expanded_bytes_are_bounded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         def expanded(_source: zipfile.ZipExtFile, _size: int = -1) -> bytes:
             return b"x" * 1001
@@ -300,6 +376,9 @@ class TestAgentArchive:
 
         assert not (tmp_path / "demo").exists()
 
+    @pytest.mark.description(
+        "If the old copy cannot be deleted after replacement, the new agent stays and a warning names the backup to remove."
+    )
     def test_backup_cleanup_failure_keeps_successful_replacement(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

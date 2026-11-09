@@ -3,12 +3,19 @@ from pathlib import Path
 from uuid import UUID
 
 import click
-from valkyrie.sdk import AgentContract, StartBenchmarkResponse, ValkyrieAPIError, ValkyrieClient, ValkyrieSDKError
+from valkyrie.sdk import (
+    AgentContract,
+    RunMonitoring,
+    StartBenchmarkResponse,
+    ValkyrieAPIError,
+    ValkyrieClient,
+    ValkyrieSDKError,
+)
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import local_time, terminal_safe
-from valkyrie.cli.project import describe_project, project_option
-from valkyrie.cli.run.progress import stream_benchmark_status
+from valkyrie.cli.display import local_time, one_line
+from valkyrie.cli.project import describe_project, optional_project_option
+from valkyrie.cli.run.progress import follow_run_status
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
 
@@ -31,7 +38,6 @@ def format_run_start_details(
     task_ids: str | None,
     priority: int | None,
 ) -> None:
-    """Format and display the start details of a run."""
     click.echo("┌─ Benchmark ".ljust(BOX_WIDTH, "─"))
     click.echo(row("Name:", benchmark))
     click.echo(row("Dataset:", dataset or "default"))
@@ -54,7 +60,6 @@ def format_agent_start_details(
     kwargs: tuple[tuple[str, str], ...],
     header_names: Iterable[str],
 ) -> None:
-    """Format and display the start details of an agent."""
     click.echo("┌─ Agent ".ljust(BOX_WIDTH, "─"))
     click.echo(row("Agent:", agent))
     if model:
@@ -70,7 +75,6 @@ def format_agent_start_details(
 
 
 def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResponse, connect: bool = False) -> None:
-    """Format and display the start run response."""
     run_id = start_benchmark_response.benchmark_id
     version = start_benchmark_response.dataset_version
     details = [
@@ -109,7 +113,6 @@ def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResp
 
 
 def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unknown: bool = False) -> None:
-    """Display confirmed run IDs, their combined status command, and any unknown start outcome."""
     if count > 1:
         click.echo()
         click.echo(f"{len(run_ids)} / {count} requested runs successfully started.")
@@ -121,34 +124,36 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
 
 @click.command(
     help=(
-        "Start a run. \n\nExample:\nvalkyrie run start --agent agents/claude_code --benchmark swebench "
-        "--project router-bench --concurrency 5"
+        "Start a run of an agent on a benchmark.\n"
+        "\n"
+        "Example:\n"
+        "    valkyrie run start --agent agents/claude_code --benchmark swebench --project router-bench --concurrency 5"
     )
 )
 @click.option(
     "--agent",
     type=str,
     required=True,
-    help="Path to local agent directory or S3 agent name (e.g., agents/claude_code or claude_code)",
+    help="Published agent name, or a local agent directory given as a path (e.g., claude_code or ./claude_code).",
 )
 @click.option(
     "--model",
     type=str,
     required=False,
-    help="Model key (e.g., openai/gpt-4o)",
+    help="Model key (e.g., openai/gpt-4o).",
 )
 @click.option(
     "--benchmark",
     type=str,
     required=True,
-    help="Name of the benchmark to run (e.g., swebench, finance)",
+    help="Name of the benchmark to run (e.g., swebench, finance).",
 )
 @click.option(
     "--concurrency",
     type=click.IntRange(min=1),
     default=5,
     required=False,
-    help="Maximum concurrent tasks; defaults to 5",
+    help="Maximum concurrent tasks. Defaults to 5.",
 )
 @click.option(
     "--lambda",
@@ -156,21 +161,21 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     type=str,
     default=None,
     required=False,
-    help="Lambda function to invoke at the end of the benchmark run",
+    help="Lambda function to invoke at the end of the benchmark run.",
 )
 @click.option(
     "--task-ids",
     type=str,
     required=False,
     default=None,
-    help="Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)",
+    help="Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908).",
 )
 @click.option(
     "--task-ids-file",
     type=str,
     required=False,
     default=None,
-    help="Path or http(s) URL to a text file with one task ID per line",
+    help="Path or http(s) URL to a text file with one task ID per line.",
 )
 @click.option(
     "--slice",
@@ -178,29 +183,29 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     type=str,
     required=False,
     default=None,
-    help="Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10)",
+    help="Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10).",
 )
 @click.option(
     "--dataset",
     type=str,
     required=False,
     default=None,
-    help="Dataset name to use from the benchmark service (defaults to 'default')",
+    help="Dataset name to use from the benchmark service (defaults to 'default').",
 )
-@click.option("--dataset-version", type=str, default=None, help="Fixed dataset version to use for this run")
+@click.option("--dataset-version", type=str, default=None, help="Fixed dataset version to use for this run.")
 @click.option(
     "--provider",
     type=str,
     required=False,
     default=None,
-    help="Sandbox provider (e.g., daytona, modal); defaults to your default provider, then daytona",
+    help="Sandbox provider (e.g., daytona, modal). Defaults to your default provider, then daytona.",
 )
 @click.option(
     "--priority",
     type=click.IntRange(0, 4),
     required=False,
     default=None,
-    help="Override configured queue priority: 0 (highest) through 4 (lowest); default is 3",
+    help="Override configured queue priority: 0 (highest) through 4 (lowest). Default is 3.",
 )
 @click.option(
     "--label",
@@ -208,9 +213,9 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     type=str,
     required=False,
     default=None,
-    help="Label to attach to the run",
+    help="Label to attach to the run.",
 )
-@project_option
+@optional_project_option
 @click.option(
     "--kwarg",
     "-k",
@@ -218,7 +223,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000)",
+    help="Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000).",
 )
 @click.option(
     "--secret",
@@ -227,7 +232,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY YourAnthropicKeySecret)",
+    help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY YourAnthropicKeySecret).",
 )
 @click.option(
     "--header",
@@ -236,7 +241,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential)",
+    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential).",
 )
 @click.option(
     "--ignore-custom-services",
@@ -248,7 +253,10 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     "--connect",
     is_flag=True,
     required=False,
-    help="Connect to the tracker service to stream run updates after starting",
+    help="Connect to the tracker service to stream run updates after starting.",
+)
+@click.option(
+    "--monitor", is_flag=True, help="Enroll the run in the external run monitor, including its network requests."
 )
 @click.option(
     "--count",
@@ -256,7 +264,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     type=click.IntRange(1, 10),
     default=1,
     show_default=True,
-    help="Number of independent runs to start",
+    help="Number of independent runs to start.",
 )
 def start(
     agent: str,
@@ -272,32 +280,28 @@ def start(
     provider: str | None,
     priority: int | None,
     label: str | None,
-    project: str,
+    project: str | None,
     kwargs: tuple[tuple[str, str]],
     secrets: tuple[tuple[str, str]],
     headers: tuple[tuple[str, str]],
     ignore_custom_services: bool,
     connect: bool,
+    monitor: bool,
     count: int,
 ) -> None:
-    """
-    Run an agent on a benchmark.
-
-    Example:
-        valkyrie run start --agent agents/claude_code --benchmark swebench --project router-bench
-    """
     if count > 1 and connect:
         raise click.UsageError("--connect cannot be used when --count is greater than 1")
 
+    monitoring = RunMonitoring() if monitor else None
     formatted_task_ids = resolve_task_ids(task_ids, task_ids_file)
-    agent_path = Path(agent)
+    agent_dir = _local_agent_dir(agent)
 
-    async def start_runs(client: ValkyrieClient) -> None:
+    async def start_runs(client: ValkyrieClient) -> list[UUID]:
         task_ids_display = ",".join(formatted_task_ids) if formatted_task_ids else None
         format_run_start_details(benchmark, dataset, concurrency, slice_str, task_ids_display, priority)
         format_agent_start_details(agent, model, secrets, kwargs, dict(headers))
 
-        agent_name = await _publish_local_agent(client, agent_path, model, kwargs) if agent_path.is_dir() else agent
+        agent_name = await _publish_local_agent(client, agent_dir, model, kwargs) if agent_dir else agent
         confirmed_run_ids: list[UUID] = []
         for _ in range(count):
             click.echo(f"{_CLEAR_LINE}Starting run for: {agent_name}...", nl=False)
@@ -320,12 +324,13 @@ def start(
                     service_headers=dict(headers),
                     ignore_custom_services=ignore_custom_services,
                     project=project,
+                    monitoring=monitoring,
                 )
             except ValkyrieAPIError as error:
                 click.echo(_CLEAR_LINE, nl=False)
                 click.echo(click.style("Run failed to start!", fg="red", bold=True))
                 format_confirmed_start_summary(confirmed_run_ids, count, outcome_unknown=error.status_code >= 500)
-                raise click.ClickException(terminal_safe(str(error.detail), preserve_newlines=False)) from error
+                raise click.ClickException(one_line(str(error.detail))) from error
             except (ValkyrieSDKError, ValueError):
                 click.echo(_CLEAR_LINE, nl=False)
                 format_confirmed_start_summary(confirmed_run_ids, count, outcome_unknown=True)
@@ -334,22 +339,35 @@ def start(
             click.echo(_CLEAR_LINE, nl=False)
             confirmed_run_ids.append(response.benchmark_id)
             format_start_benchmark_response(response, connect)
-            if connect:
-                await stream_benchmark_status(client, response.benchmark_id)
 
         format_confirmed_start_summary(confirmed_run_ids, count)
+        return confirmed_run_ids
 
-    call(start_runs)
+    run_ids = call(start_runs)
+    if connect:
+        follow_run_status(run_ids[0])
+
+
+def _local_agent_dir(agent: str) -> Path | None:
+    path = Path(agent)
+    if agent == path.name and agent != "..":
+        if path.is_dir():
+            click.echo(
+                click.style(
+                    f"Running the published agent '{agent}'. Use --agent ./{agent} to run the local directory.",
+                    fg="yellow",
+                ),
+                err=True,
+            )
+        return None
+    if not path.is_dir():
+        raise click.BadParameter(f"Agent directory not found: {agent}", param_hint="'--agent'")
+    return path
 
 
 async def _publish_local_agent(
     client: ValkyrieClient, agent_path: Path, model: str | None, kwargs: tuple[tuple[str, str], ...]
 ) -> str:
-    """Validate a local agent directory and its run kwargs, then publish it under its contract name.
-
-    Tracker renders the run from the published bundle, so a published agent with the same name
-    is never replaced here.
-    """
     contract = AgentContract.from_directory(agent_path)
     contract.validate_kwargs(dict(kwargs), model=model)
     try:
@@ -360,8 +378,9 @@ async def _publish_local_agent(
         raise click.UsageError(
             f"A published agent named '{contract.name}' already exists. "
             "Refusing to overwrite it as a side effect of run start. "
-            f"Use --agent {contract.name} to run the published release, "
-            "or explicitly publish the local directory under a different name first."
+            f"Use --agent {contract.name} to run the published release, or publish the local copy under "
+            f"another name with `valkyrie agent push {agent_path} --name <new-name>` and run --agent <new-name>. "
+            f"Only `valkyrie agent push {agent_path}` without --name replaces the published release."
         ) from error
 
     return contract.name

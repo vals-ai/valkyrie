@@ -1,5 +1,3 @@
-"""Unit tests for Valkyrie's sandbox cleanup policy."""
-
 from __future__ import annotations
 
 import asyncio
@@ -116,6 +114,7 @@ class FakeLambdaContext:
         return self.remaining_milliseconds[0]
 
 
+@pytest.mark.description("Sandbox cleanup lists every sandbox before changing any and closes the provider.")
 async def test_run_cleanup_materializes_inventory_before_mutation_and_closes_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -136,6 +135,9 @@ async def test_run_cleanup_materializes_inventory_before_mutation_and_closes_pro
     assert config.create_calls == 1
 
 
+@pytest.mark.description(
+    "Cleanup deletes only old sandboxes with valid metadata that did not opt out, and counts each outcome."
+)
 async def test_cleanup_applies_strict_age_opt_out_and_metadata_rules() -> None:
     provider = FakeSandboxProvider(
         [
@@ -158,6 +160,7 @@ async def test_cleanup_applies_strict_age_opt_out_and_metadata_rules() -> None:
     assert outcomes == Counter({"deleted": 3, "invalid_metadata": 3, "not_old": 1, "opted_out": 1})
 
 
+@pytest.mark.description("Cleanup rereads metadata before deleting and skips a sandbox whose identity changed.")
 async def test_cleanup_reclassifies_refreshed_metadata_and_rejects_identity_change() -> None:
     listed = [
         _sandbox("newly-opted-out"),
@@ -189,6 +192,7 @@ async def test_cleanup_reclassifies_refreshed_metadata_and_rejects_identity_chan
     )
 
 
+@pytest.mark.description("Cleanup treats a missing sandbox as done and continues after item failures.")
 async def test_cleanup_treats_not_found_as_complete_and_continues_after_item_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,7 +229,6 @@ async def test_cleanup_treats_not_found_as_complete_and_continues_after_item_fai
     ]
     assert provider.delete_calls == [delete_failed.id, gone_before_delete.id, deleted_after_failures.id]
     assert outcomes == Counter({"already_absent": 2, "refresh_failed": 1, "delete_failed": 1, "deleted": 1})
-    # Every delete the reaper attempts names itself, so an unexplained deletion can be traced back here.
     assert [(call.args[0].id, call.args[1], call.kwargs["outcome"]) for call in audit.call_args_list] == [
         (delete_failed.id, "orphan_cleanup", "failed"),
         (gone_before_delete.id, "orphan_cleanup", "already_gone"),
@@ -233,6 +236,9 @@ async def test_cleanup_treats_not_found_as_complete_and_continues_after_item_fai
     ]
 
 
+@pytest.mark.description(
+    "The cleanup Lambda raises when any sandbox has invalid metadata, an identity mismatch, or a failed refresh or delete."
+)
 def test_lambda_handler_fails_for_each_unsuccessful_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
     failure_outcome = "invalid_metadata"
 
@@ -250,6 +256,7 @@ def test_lambda_handler_fails_for_each_unsuccessful_outcome(monkeypatch: pytest.
             cleanup_module.lambda_handler({}, FakeLambdaContext(840_000))
 
 
+@pytest.mark.description("Provider config loading builds the cleanup store on the default credential chain.")
 async def test_load_provider_config_builds_the_cleanup_default_chain_store(monkeypatch: pytest.MonkeyPatch) -> None:
     expected_provider = object()
     expected_store = object()
@@ -281,6 +288,7 @@ async def test_load_provider_config_builds_the_cleanup_default_chain_store(monke
     assert provider.closed
 
 
+@pytest.mark.description("The cleanup Lambda keeps its shutdown margin around config loading.")
 def test_lambda_handler_preserves_shutdown_margin_around_config_loading(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cleanup_module, "configure_logging", lambda: None)
     monkeypatch.setenv("SANDBOX_CLEANUP_SECRET_NAME", "cleanup-secret")

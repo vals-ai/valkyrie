@@ -1,5 +1,3 @@
-"""ASGI middleware for request correlation IDs."""
-
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -10,8 +8,6 @@ if TYPE_CHECKING:
 
 
 class RequestContextMiddleware:
-    """Pure ASGI middleware that generates a request_id per HTTP request."""
-
     def __init__(self, app: "ASGIApp"):
         self.app = app
 

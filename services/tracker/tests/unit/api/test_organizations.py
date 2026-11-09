@@ -8,12 +8,14 @@ from typing import Any
 import pytest
 from descope.exceptions import AuthException
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from main import app
 from tracker.api import organizations
 from tracker.auth import NO_ORGANIZATION, NOT_A_MEMBER, SEVERAL_ORGANIZATIONS, LoginIdentity, get_current_login
 from tracker.database.models import Org, OrganizationInvite
+from tracker.repositories.organization_invite import OrganizationInviteRepository
 
 _client = TestClient(app)
 ADMIN = "Valkyrie Admin"
@@ -61,6 +63,7 @@ class _Users:
     def __init__(self) -> None:
         self.users: dict[str, dict[str, Any]] = {}
         self.logged_out: list[str] = []
+        self.fail_remove_tenant = False
 
     def logout_user_by_user_id(self, user_id: str) -> None:
         self.logged_out.append(user_id)
@@ -90,6 +93,8 @@ class _Users:
                 tenant["roleNames"] = [*tenant["roleNames"], *role_names]
 
     def remove_tenant(self, login_id: str, tenant_id: str) -> None:
+        if self.fail_remove_tenant:
+            raise ConnectionError("Descope is unavailable")
         self.users[login_id]["userTenants"] = [t for t in self._tenants(login_id) if t["tenantId"] != tenant_id]
 
     def search_all(
@@ -174,6 +179,7 @@ def test_creating_an_organization_makes_the_creator_its_admin(
     assert descope.user.users["google-alice"]["userTenants"] == [{"tenantId": organization, "roleNames": [ADMIN]}]
 
 
+@pytest.mark.description("Only verified logins on self serve Trackers can create organizations.")
 @pytest.mark.parametrize(("enabled", "verified"), [(False, True), (True, False)], ids=["not-self-serve", "unverified"])
 def test_organizations_are_created_only_by_verified_logins_on_self_serve_trackers(
     monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, enabled: bool, verified: bool
@@ -249,6 +255,7 @@ def test_a_failed_create_is_rolled_back(
     assert f"Descope failed to create the organization: {failure}" in logs.text
 
 
+@pytest.mark.description("An invite takes effect only after the invitee accepts it.")
 def test_invites_need_the_invitees_acceptance(
     monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
 ) -> None:
@@ -322,6 +329,9 @@ def test_invitations_go_only_to_the_verified_invitee(
     assert descope.user.users[BOB]["userTenants"] == []
 
 
+@pytest.mark.description(
+    "Inviting or removing members as a non-admin of the selected org is refused, while listing orgs still works."
+)
 @pytest.mark.parametrize(
     ("memberships", "current", "status", "detail"),
     [
@@ -348,6 +358,7 @@ def test_only_admins_of_the_chosen_organization_manage_members(
     assert _client.get("/orgs").status_code == 200
 
 
+@pytest.mark.description("Members and invitations can be listed and removed.")
 def test_members_and_invitations_are_listed_and_removed(
     monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
 ) -> None:
@@ -390,6 +401,59 @@ def test_members_and_invitations_are_listed_and_removed(
     assert database_session.exec(select(OrganizationInvite)).all() == []
 
 
+def _carol_in_acme_with_a_key_and_an_invite(
+    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
+) -> None:
+    descope.user.add("U-carol", "carol-sso", "carol@other.com")
+    descope.user.add_tenant("carol-sso", "acme")
+    descope.access_key.keys = {
+        "K-carol-acme": {
+            "id": "K-carol-acme",
+            "keyTenants": [{"tenantId": "acme"}],
+            "customClaims": {"user_id": "U-carol"},
+        }
+    }
+    _invite(database_session, "carol@other.com")
+    _as(monkeypatch, {"acme": (ADMIN,)}, "acme")
+
+
+@pytest.mark.description("A removal that Descope fails partway leaves the member removable, and repeating it finishes.")
+def test_a_partial_removal_is_finished_by_repeating_it(
+    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
+) -> None:
+    _carol_in_acme_with_a_key_and_an_invite(monkeypatch, descope, database_session)
+    descope.user.fail_remove_tenant = True
+
+    failed = _client.delete("/orgs/members/carol@other.com")
+    descope.user.fail_remove_tenant = False
+    repeated = _client.delete("/orgs/members/carol@other.com")
+
+    assert [failed.status_code, repeated.status_code] == [503, 204]
+    assert descope.user.users["carol-sso"]["userTenants"] == []
+    assert descope.access_key.keys == {}
+    assert database_session.exec(select(OrganizationInvite)).all() == []
+
+
+@pytest.mark.description("A removal whose invitation delete fails to commit leaves the member in Descope untouched.")
+def test_a_failed_invitation_commit_leaves_descope_untouched(
+    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
+) -> None:
+    _carol_in_acme_with_a_key_and_an_invite(monkeypatch, descope, database_session)
+
+    def fail_commit(self: OrganizationInviteRepository) -> None:
+        raise OperationalError("COMMIT", None, ConnectionError("database is unavailable"))
+
+    monkeypatch.setattr(OrganizationInviteRepository, "commit", fail_commit)
+
+    response = TestClient(app, raise_server_exceptions=False).delete("/orgs/members/carol@other.com")
+
+    assert response.status_code == 500
+    assert descope.user.users["carol-sso"]["userTenants"] == [{"tenantId": "acme", "roleNames": []}]
+    assert set(descope.access_key.keys) == {"K-carol-acme"}
+    assert descope.user.logged_out == []
+    assert [invite.email for invite in database_session.exec(select(OrganizationInvite))] == ["carol@other.com"]
+
+
 @pytest.mark.usefixtures("bob")
 def test_invitations_expire_after_two_weeks(
     monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session
@@ -423,6 +487,7 @@ def test_an_invitation_to_a_deleted_organization_is_dropped(
     assert descope.user.users[BOB]["userTenants"] == []
 
 
+@pytest.mark.description("The member list follows every directory page and returns all members in order.")
 def test_members_are_listed_across_pages(monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace) -> None:
     monkeypatch.setattr(organizations, "_MEMBERS_PAGE_SIZE", 2)
     for n in range(5):

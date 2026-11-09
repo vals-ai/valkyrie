@@ -1,5 +1,3 @@
-"""Services shared by one API operation or executor execution."""
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -19,8 +17,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class RuntimeServices(ABC):
-    """Storage, secrets, logs, and execution-scoped sandbox access."""
-
     objects: ObjectStore
     secrets: SecretStore
     logs: BenchmarkLogSink
@@ -32,16 +28,13 @@ class RuntimeServices(ABC):
 
     @abstractmethod
     async def prepare_execution(self, request: "StartBenchmarkRequest", benchmark_id: UUID) -> None:
-        """Prepare backend resources before sandbox work."""
         raise NotImplementedError
 
     @abstractmethod
     async def run_completion_callback(self, final_view: "FinalViewResponse") -> None:
-        """Run the configured completion callback after results are stored."""
         raise NotImplementedError
 
     async def get_sandbox_provider_config(self) -> SandboxProviderConfig:
-        """Resolve provider credentials only when sandbox access is requested."""
         if not self.sandbox_provider_secret_name:
             raise InvalidSandboxConfigurationError("Sandbox access requires a provider secret name")
 

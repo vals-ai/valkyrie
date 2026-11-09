@@ -1,5 +1,3 @@
-"""Run with `uv run pytest tests/unit/middleware/test_run_request_size.py`."""
-
 from collections.abc import Iterator
 
 import pytest
@@ -29,6 +27,7 @@ def _chunks(total: int) -> Iterator[bytes]:
     yield b"x" * (total % len(chunk))
 
 
+@pytest.mark.description("A run request of exactly `MAX_RUN_REQUEST_BYTES` returns 200, and one byte more returns 413.")
 @pytest.mark.parametrize("path", ["/start-benchmark", "/retry-or-resume-benchmark/run-1"])
 def test_run_request_at_limit_passes_and_one_byte_over_is_rejected(client: TestClient, path: str) -> None:
     accepted = client.post(path, content=b"x" * MAX_RUN_REQUEST_BYTES)
@@ -39,12 +38,14 @@ def test_run_request_at_limit_passes_and_one_byte_over_is_rejected(client: TestC
     assert rejected.status_code == 413
 
 
+@pytest.mark.description("A streamed run request with no content length is rejected once it passes the limit.")
 def test_streamed_run_request_without_content_length_is_rejected_once_over_limit(client: TestClient) -> None:
     response = client.post("/start-benchmark", content=_chunks(MAX_RUN_REQUEST_BYTES + 1))
 
     assert response.status_code == 413
 
 
+@pytest.mark.description("Other routes have no run request size limit.")
 def test_other_routes_are_not_limited(client: TestClient) -> None:
     response = client.post("/other", content=b"x" * (MAX_RUN_REQUEST_BYTES + 1))
 

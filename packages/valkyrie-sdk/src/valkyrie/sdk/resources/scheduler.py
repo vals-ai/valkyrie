@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from valkyrie.sdk.errors import ValkyrieInputError
 from valkyrie.sdk.models.scheduler import SchedulerOverviewResponse
 
 if TYPE_CHECKING:
@@ -35,12 +36,12 @@ class SchedulerResource:
         """
         for name, value in (("waiting_limit", waiting_limit), ("active_limit", active_limit)):
             if type(value) is not int or not 1 <= value <= 200:
-                raise ValueError(f"{name} must be an integer from 1 to 200")
+                raise ValkyrieInputError(f"{name} must be an integer from 1 to 200")
         for name, value in (("waiting_offset", waiting_offset), ("active_offset", active_offset)):
             if type(value) is not int or value < 0:
-                raise ValueError(f"{name} must be a nonnegative integer")
+                raise ValkyrieInputError(f"{name} must be a nonnegative integer")
         if type(include_capacity) is not bool:
-            raise ValueError("include_capacity must be a boolean")
+            raise ValkyrieInputError("include_capacity must be a boolean")
 
         params: dict[str, int | bool] = {
             "waiting_limit": waiting_limit,

@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import httpx
 from pydantic import ValidationError
 
 _FIELD_ERROR_TEMPLATES = {
@@ -18,8 +19,12 @@ class ValkyrieConfigError(ValkyrieSDKError):
     """A saved Valkyrie login could not be read, or signing in or refreshing it failed."""
 
 
-class ValkyrieRunError(ValkyrieSDKError):
-    """A run operation received invalid input."""
+class ValkyrieInputError(ValkyrieSDKError, ValueError):
+    """An SDK call received an invalid argument. It is also a `ValueError`."""
+
+
+class ValkyrieRunError(ValkyrieInputError):
+    """A run or run log operation received invalid input."""
 
 
 class ValkyrieTransportError(ValkyrieSDKError):
@@ -34,9 +39,19 @@ class ValkyrieAPIError(ValkyrieSDKError):
         self.detail = detail
         super().__init__(f"Valkyrie API request failed ({status_code}): {detail}")
 
+    @classmethod
+    def from_response(cls, response: httpx.Response) -> "ValkyrieAPIError":
+        """Build one from a read non-success response, using its JSON `detail` or body as the detail."""
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = response.text
+        detail = body.get("detail", body) if isinstance(body, dict) else body
+        return cls(response.status_code, detail)
+
 
 class ValkyrieStreamError(ValkyrieSDKError):
-    """A run update stream returned an error or invalid event."""
+    """A Tracker stream or paginated listing returned an error, an invalid event, or a repeated cursor."""
 
 
 class ValkyrieContractError(ValkyrieSDKError):

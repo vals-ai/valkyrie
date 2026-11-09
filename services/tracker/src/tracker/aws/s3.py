@@ -1,6 +1,4 @@
-"""S3 upload utilities for the tracker service."""
-
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,19 +21,15 @@ _R = TypeVar("_R")
 
 S3_BENCHMARKS_PREFIX = "benchmarks"
 
-# S3 multipart uploads require every part except the last to be at least 5 MiB.
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class S3ObjectCopy:
-    """Identify an object created by a copy operation."""
-
     version_id: str | None
 
 
 def s3_owner_arguments(runtime: AWSRuntime) -> dict[str, str]:
-    """Guard every S3 call with the deployment account that must own the bucket."""
     if runtime.expected_bucket_owner is None:
         raise ValueError("Managed AWS runtime is missing the expected bucket owner")
 
@@ -43,17 +37,10 @@ def s3_owner_arguments(runtime: AWSRuntime) -> dict[str, str]:
 
 
 def get_benchmark_contract_s3_key(benchmark_id: str, contract_name: str) -> str:
-    """Get the S3 key for an agent zip copied into a benchmark's folder."""
     return benchmark_agent_bundle_key(benchmark_id, contract_name)
 
 
-def get_agent_result_s3_key(benchmark_id: str, task_id: str, output_name: str) -> str:
-    """Get the S3 key for a run output archive."""
-    return f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/{task_id}/{output_name}"
-
-
 def handle_s3_error(message: str) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Coroutine[Any, Any, _R]]]:
-    """Wrap AWS errors raised by an async S3 helper as S3Error."""
 
     def decorator(func: Callable[_P, Awaitable[_R]]) -> Callable[_P, Coroutine[Any, Any, _R]]:
         @wraps(func)
@@ -71,17 +58,6 @@ def handle_s3_error(message: str) -> Callable[[Callable[_P, Awaitable[_R]]], Cal
 @logfire.instrument("upload_to_s3", extract_args=("s3_key",))
 @handle_s3_error(message="Failed to upload to S3")
 async def upload_to_s3(file_content: bytes, s3_key: str, runtime: AWSRuntime) -> None:
-    """
-    Upload file content to S3.
-
-    Args:
-        file_content: File content as bytes
-        s3_key: S3 object key (path in bucket)
-        runtime: AWS resources and clients for the operation
-
-    Raises:
-        S3Error: If upload fails due to AWS errors or network issues
-    """
     async with runtime.clients.s3_client() as client:
         await client.put_object(
             Bucket=runtime.resources.s3_bucket,
@@ -101,21 +77,6 @@ async def upload_stream_to_s3(
     *,
     overwrite: bool = True,
 ) -> int:
-    """
-    Upload a byte stream to S3 via multipart upload, buffering at most one part in memory.
-
-    Args:
-        chunks: Async iterable of byte chunks to upload
-        s3_key: S3 object key (path in bucket)
-        runtime: AWS resources and clients for the operation
-        should_continue: Optional authority check before each part and completion
-
-    Returns:
-        Total number of bytes uploaded
-
-    Raises:
-        S3Error: If upload fails due to AWS errors or network issues
-    """
     total_bytes = 0
     s3_bucket = runtime.resources.s3_bucket
     owner_arguments = s3_owner_arguments(runtime)
@@ -166,7 +127,6 @@ async def upload_stream_to_s3(
                 status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
                 if not overwrite and status_code == 412:
                     raise FileExistsError(s3_key) from error
-                # A concurrent conditional write returns 409; the key exists when that write won.
                 if not overwrite and status_code == 409 and await s3_object_exists(s3_key, runtime):
                     raise FileExistsError(s3_key) from error
                 raise
@@ -182,54 +142,8 @@ async def upload_stream_to_s3(
     return total_bytes
 
 
-async def _as_async_iter(keys: AsyncIterable[str] | Iterable[str]) -> AsyncIterator[str]:
-    """Normalize a sync or async iterable of keys into an async iterator."""
-    if isinstance(keys, AsyncIterable):
-        async for key in keys:
-            yield key
-    else:
-        for key in keys:
-            yield key
-
-
-async def download_many_from_s3(
-    s3_keys: AsyncIterable[str] | Iterable[str], runtime: AWSRuntime
-) -> AsyncIterator[tuple[str, bytes]]:
-    """Download multiple objects over a single shared client (one connection pool).
-
-    Accepts a sync or async iterable of keys, so it can stream lazily from
-    list_s3_objects without materializing the full key list. Best-effort: keys
-    that fail to download are logged and skipped. Yields ``(s3_key, content)``;
-    each object is read fully into memory one at a time, so peak memory is
-    bounded by the largest single object rather than the whole set.
-    """
-    owner_arguments = s3_owner_arguments(runtime)
-    async with runtime.clients.s3_client() as client:
-        async for s3_key in _as_async_iter(s3_keys):
-            try:
-                response = await client.get_object(
-                    Bucket=runtime.resources.s3_bucket,
-                    Key=s3_key,
-                    **owner_arguments,
-                )
-                async with response["Body"] as stream:
-                    yield s3_key, await stream.read()
-            except (ClientError, BotoCoreError) as e:
-                logger.warning(f"Failed to download {s3_key} from S3: {e}")
-
-
 @handle_s3_error(message="Failed to delete from S3")
 async def delete_from_s3(s3_key: str, runtime: AWSRuntime, *, version_id: str | None = None) -> None:
-    """
-    Delete file from S3.
-
-    Args:
-        s3_key: S3 object key (path in bucket)
-        runtime: AWS resources and clients for the operation
-
-    Raises:
-        S3Error: If deletion fails due to AWS errors or network issues
-    """
     try:
         async with runtime.clients.s3_client() as client:
             if version_id is None:
@@ -250,12 +164,6 @@ async def delete_from_s3(s3_key: str, runtime: AWSRuntime, *, version_id: str | 
 
 
 async def copy_s3_object(source_key: str, dest_key: str, runtime: AWSRuntime) -> str | None:
-    """
-    Copy an S3 object from source_key to dest_key within the same bucket.
-
-    Raises:
-        S3Error: If copy fails due to AWS errors or network issues
-    """
     try:
         async with runtime.clients.s3_client() as client:
             response = await client.copy_object(
@@ -283,16 +191,6 @@ async def copy_agent_to_benchmark(benchmark_id: str, contract_name: str, runtime
 
 @handle_s3_error(message="Failed to check S3 object existence")
 async def s3_object_exists(s3_key: str, runtime: AWSRuntime) -> bool:
-    """
-    Check if an S3 object exists.
-
-    Args:
-        s3_key: S3 object key (path in bucket)
-        runtime: AWS resources and clients for the operation
-
-    Returns:
-        True if the object exists, False otherwise
-    """
     async with runtime.clients.s3_client() as client:
         try:
             await client.head_object(
@@ -308,51 +206,8 @@ async def s3_object_exists(s3_key: str, runtime: AWSRuntime) -> bool:
             raise
 
 
-async def list_s3_objects(prefix: str, runtime: AWSRuntime) -> AsyncIterator[str]:
-    """
-    Yield S3 object keys with the given prefix, a page at a time (no full list held in memory).
-
-    Args:
-        prefix: S3 prefix to filter objects
-        runtime: AWS resources and clients for the operation
-
-    Yields:
-        S3 object keys
-
-    Raises:
-        S3Error: If listing fails due to AWS errors or network issues
-    """
-    try:
-        async with runtime.clients.s3_client() as client:
-            paginator = client.get_paginator("list_objects_v2")
-            async for page in paginator.paginate(
-                Bucket=runtime.resources.s3_bucket,
-                Prefix=prefix,
-                **s3_owner_arguments(runtime),
-            ):
-                for s3_object in page.get("Contents", []):
-                    if "Key" in s3_object:
-                        yield s3_object["Key"]
-    except (ClientError, BotoCoreError) as e:
-        raise S3Error(f"Failed to list objects from S3: {e}") from e
-
-
 @handle_s3_error(message="Failed to create presigned URL")
 async def create_presigned_url(s3_key: str, runtime: AWSRuntime, expiration: int = 86400) -> str:
-    """
-    Create a presigned URL for an S3 object.
-
-    Args:
-        s3_key: S3 object key (path in bucket)
-        runtime: AWS resources and clients for the operation
-        expiration: URL expiration time in seconds (default: 1 day)
-
-    Returns:
-        Presigned URL as a string
-
-    Raises:
-        S3Error: If presigned URL creation fails
-    """
     actual_expiration = runtime.clients.maximum_presign_ttl(expiration)
     async with runtime.clients.s3_client() as client:
         presigned_url: str = await client.generate_presigned_url(
@@ -365,16 +220,6 @@ async def create_presigned_url(s3_key: str, runtime: AWSRuntime, expiration: int
 
 
 def create_console_url(s3_key: str, resources: AWSResources) -> str:
-    """
-    Create an AWS console URL for an S3 object.
-
-    Args:
-        s3_key: S3 object key (path in bucket)
-        resources: AWS resource locations
-
-    Returns:
-        AWS console URL as a string
-    """
     return (
         f"https://{resources.region}.console.aws.amazon.com/s3/object/{resources.s3_bucket}"
         f"?region={resources.region}&prefix={s3_key}"
@@ -382,16 +227,6 @@ def create_console_url(s3_key: str, resources: AWSResources) -> str:
 
 
 def create_benchmark_url(benchmark_id: str, resources: AWSResources) -> str:
-    """
-    Create the AWS Console URL for a benchmark's S3 folder.
-
-    Args:
-        benchmark_id: Benchmark UUID as a string
-        resources: AWS resource locations
-
-    Returns:
-        AWS Console URL pointing to the benchmark folder prefix
-    """
     prefix = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/"
     return (
         f"https://{resources.region}.console.aws.amazon.com/s3/buckets/{resources.s3_bucket}"
@@ -401,13 +236,6 @@ def create_benchmark_url(benchmark_id: str, resources: AWSResources) -> str:
 
 @handle_s3_error(message="Failed to list agents from S3")
 async def list_agents(runtime: AWSRuntime) -> list[tuple[str, datetime | None]]:
-    """List zipped agent bundles under the `agents/` prefix.
-
-    Returns (name, last_modified) pairs, one per `agents/<name>.zip`.
-
-    Raises:
-        S3Error: If listing fails due to AWS errors or network issues
-    """
     agents: list[tuple[str, datetime | None]] = []
     async with runtime.clients.s3_client() as client:
         paginator = client.get_paginator("list_objects_v2")
@@ -426,8 +254,6 @@ async def list_agents(runtime: AWSRuntime) -> list[tuple[str, datetime | None]]:
 
 
 class _S3ObjectReadSession:
-    """S3 reads scoped to an already-open client."""
-
     def __init__(self, client: Any, bucket: str, owner_arguments: dict[str, str]) -> None:
         self._client = client
         self._bucket = bucket
@@ -454,8 +280,6 @@ class _S3ObjectReadSession:
 
 
 class S3ObjectStore:
-    """Object-store adapter using already-resolved AWS authority."""
-
     def __init__(self, runtime: AWSRuntime) -> None:
         self._runtime = runtime
 
@@ -500,7 +324,7 @@ class S3ObjectStore:
                     async with response["Body"] as stream:
                         yield key, await stream.read()
                 except (ClientError, BotoCoreError) as error:
-                    logger.warning(f"Failed to download {key} from S3: {error}")
+                    logger.warning("Failed to download %s from S3: %s", key, error)
 
     async def delete(self, key: str, *, deletion_token: str | None = None) -> None:
         await delete_from_s3(key, self._runtime, version_id=deletion_token)
@@ -544,8 +368,6 @@ class S3ObjectStore:
 
 
 class S3ArtifactLocations(ArtifactLocations):
-    """AWS-console artifact locations for resolved S3 resources."""
-
     def __init__(self, resources: AWSResources) -> None:
         self._resources = resources
 

@@ -3,17 +3,20 @@ title: "Start a run"
 description: "Run an agent on a benchmark dataset or part of one, with the model, secrets, and concurrency you choose."
 ---
 
-Start a run with an agent from your library and a benchmark, in a project you created once:
+Start a run with an agent from your library and a benchmark, optionally in a project you
+created once:
 
 ```bash
-valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation
+valkyrie project create my-project --name "My Project" --spend-type development \
+  --subcategory new_benchmark_generation \
+  --budget 300 --budget-reason "3 runs, about 100 each"
 valkyrie run start --agent my-agent --benchmark swebench --project my-project \
   --model anthropic/claude-sonnet-4-6
 ```
 
-Valkyrie prints the run ID, which every other `valkyrie run` command takes. Every option is
-in the [`valkyrie run start` reference](/reference/cli/run#start). To start runs from Python,
-see [Manage runs with Python](/sdk/runs).
+Valkyrie prints the run ID, which every other `valkyrie run` command takes. Every option
+is in the [`valkyrie run start` reference](/reference/cli/run#start). To start runs from
+Python, see [Manage runs with Python](/sdk/runs).
 
 ## Pass the model and parameters
 
@@ -39,7 +42,8 @@ valkyrie run start --agent my-agent --benchmark terminal-bench --project my-proj
 Run a slice of the dataset for a cheap first try:
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --slice 0:10 --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --slice 0:10 \
+  --project my-project
 ```
 
 To pick tasks by ID, export the dataset's task IDs, edit the file, and pass it back:
@@ -47,7 +51,8 @@ To pick tasks by ID, export the dataset's task IDs, edit the file, and pass it b
 ```bash
 valkyrie benchmark tasks swebench --output tasks.txt
 
-valkyrie run start --agent my-agent --benchmark swebench --task-ids-file tasks.txt --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --task-ids-file tasks.txt \
+  --project my-project
 ```
 
 `--task-ids` takes a comma-separated list instead.
@@ -59,7 +64,8 @@ sooner but spends sandbox and model budget faster, and can reach your model prov
 limits. You can [change it while the run goes](/runs/manage#change-concurrency).
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --concurrency 20 --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --concurrency 20 \
+  --project my-project
 ```
 
 ## Pass secrets and headers
@@ -78,8 +84,8 @@ valkyrie run start --agent my-agent --benchmark swebench --project my-project \
 
 ## Choose the sandbox provider
 
-`--provider` picks the provider for this run. Without it, the run uses your default provider,
-or `daytona`. See [Configure sandbox providers](/get-started/sandbox-providers).
+`--provider` picks the provider for this run. Without it, the run uses your default
+provider, or `daytona`. See [Configure sandbox providers](/get-started/sandbox-providers).
 
 ## Use the hosted benchmark service
 
@@ -94,12 +100,13 @@ tasks against other waiting work, from `0`, the highest, to `4`, the lowest. Run
 priority get `3`.
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --priority 1 --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --priority 1 \
+  --project my-project
 ```
 
 Where the selected provider isn't queued, `--priority` fails with
-`Queue priority requires ...`; leave it out. [`valkyrie queue status`](/runs/monitor#inspect-the-priority-queue)
-shows the queue.
+`Queue priority requires ...`; leave it out.
+[`valkyrie queue status`](/runs/monitor#inspect-the-priority-queue) shows the queue.
 
 ## Label a run
 
@@ -112,11 +119,18 @@ The label is saved on the run. Find every run with it later with
 
 ## Put the run in a project
 
-Every CLI start names a project by its handle with `--project`. The handle is lowercase letters, digits and hyphens, such as `google-report-xyz`, and it never changes. The name, such as `Google Report XYZ`, is the label people read. The project holds the spend type, subcategory, customer and extra tags, so you set them once when you create it. Valkyrie saves the project with the run, so failed and stopped runs keep it, and cost reports can group spend by it.
+`--project` names the project a start belongs to by its handle. Leave it off and the run
+starts without a project, unless your organization requires one; then the Tracker refuses
+the start and says so. The handle is lowercase letters, digits and hyphens, such as
+`google-report-xyz`, and it never changes. The name, such as `Google Report XYZ`, is the
+label people read. The project holds the spend type, subcategory, customer and extra tags,
+so you set them once when you create it. Valkyrie saves the project with the run, so
+failed and stopped runs keep it, and cost reports can group spend by it.
 
 ```bash
 valkyrie project create google-report-xyz --name "Google Report XYZ" \
-  --spend-type customer --subcategory report --customer google --tag engagement=q4
+  --spend-type customer --subcategory report --customer google --tag engagement=q4 \
+  --budget 300 --budget-reason "3 runs, about 100 each"
 valkyrie run start --agent my-agent --benchmark swebench --project google-report-xyz
 ```
 
@@ -135,13 +149,19 @@ valkyrie run start --agent my-agent --benchmark swebench --project google-report
 | `internal` | Blog | `blog` | optional |
 | `internal` | Miscellaneous | `miscellaneous` | optional |
 
-`--name`, `--spend-type` and `--subcategory` are required. `--tag key=value` adds extra tags and can be repeated. List your organization's projects:
+`--name`, `--spend-type` and `--subcategory` are required. `--tag key=value` adds extra
+tags and can be repeated. List your organization's projects:
 
 ```bash
 valkyrie project list
 ```
 
-To move a run to another project later, in any run state, retag it. Retagging adds a new link and keeps the earlier ones, and `valkyrie run fetch` shows the newest:
+The list leaves out archived projects. Valkyrie refuses to start, retry, resume, or retag
+a run in an archived project, and the error names its handle. Runs already in the project
+keep it, and its spend stays in cost reports.
+
+To move a run to another project later, in any run state, retag it. Retagging adds a new
+link and keeps the earlier ones, and `valkyrie run fetch` shows the newest:
 
 ```bash
 valkyrie run retag RUN_ID --project google-report-xyz
@@ -150,7 +170,8 @@ valkyrie run retag RUN_ID --project google-report-xyz
 ## Watch the run as it starts
 
 `--connect` streams progress until the run finishes. Without it, attach later with
-`valkyrie run fetch RUN_ID --connect`, where *`RUN_ID`* is the ID that `run start` printed. See [Monitor runs](/runs/monitor).
+`valkyrie run fetch RUN_ID --connect`, where *`RUN_ID`* is the ID that `run start`
+printed. See [Monitor runs](/runs/monitor).
 
 ## Start several runs at once
 
@@ -158,9 +179,9 @@ valkyrie run retag RUN_ID --project google-report-xyz
 valkyrie run start --agent my-agent --benchmark swebench --count 3 --project my-project
 ```
 
-`--count` starts up to 10 identical, independent runs, one after another. The Valkyrie CLI stops
-at the first start that fails, so if one fails, check `valkyrie run list` before you start the
-rest again. `--connect` can't be combined with `--count`.
+`--count` starts up to 10 identical, independent runs, one after another. The Valkyrie CLI
+stops at the first start that fails, so if one fails, check `valkyrie run list` before you
+start the rest again. `--connect` can't be combined with `--count`.
 
 <Warning>
 
@@ -171,5 +192,5 @@ Each run uses its own concurrency, so `--count 3 --concurrency 20` can run 60 ta
 ## Limits
 
 - If starting, retrying, or resuming a run fails with
-  `This user cannot start or retry benchmarks`, starting runs is turned off for your account.
-  You can still read and stop runs. Ask Vals AI to turn it back on.
+  `This user cannot start or retry benchmarks`, starting runs is turned off for your
+  account. You can still read and stop runs. Ask Vals AI to turn it back on.

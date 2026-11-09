@@ -1,10 +1,6 @@
-"""Tests for the run tasks command.
-
-Run: uv run pytest tests/unit/cli/run/test_run_tasks.py
-"""
-
 from __future__ import annotations
 
+import pytest
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -37,6 +33,7 @@ def _invoke(tracker: MockTracker, response: TasksResponse, *arguments: str):
     return CliRunner().invoke(tasks, [str(RUN_ID), *arguments])
 
 
+@pytest.mark.description("Text tasks show a category column that is blank for legacy rows.")
 def test_tasks_text_shows_category_column_and_blank_for_legacy_rows(tracker: MockTracker) -> None:
     response = TasksResponse(
         tasks=[
@@ -59,6 +56,7 @@ def test_tasks_text_shows_category_column_and_blank_for_legacy_rows(tracker: Moc
     assert "Agent command failed with exit code 2" in result.output
 
 
+@pytest.mark.description("JSON tasks include the failure category.")
 def test_tasks_json_emits_failure_category(tracker: MockTracker) -> None:
     response = TasksResponse(
         tasks=[_summary(0, error="sandbox lost", category=FailureCategory.INFRASTRUCTURE), _summary(1)],

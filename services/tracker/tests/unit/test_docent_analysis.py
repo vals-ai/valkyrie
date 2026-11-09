@@ -1,8 +1,3 @@
-"""Unit tests for invoke_analyzer status-transition behavior.
-
-Run: uv run pytest tests/unit/test_docent_analysis.py
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -14,18 +9,17 @@ from sqlmodel import Session
 from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import Benchmark, BenchmarkStatus, DocentReadingStatus
 from tracker.docent_analysis import invoke_analyzer
-from tracker.utils import catch_errors_during_cleanup
+from tracker.services.runs.finalize import catch_errors_during_cleanup
 
 
 @pytest.fixture(autouse=True)
 def patch_engine(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> None:
-    """Point analyzer sessions at the in-memory test database."""
     monkeypatch.setattr("tracker.docent_analysis.engine", database_session.bind)
 
 
+@pytest.mark.description("Docent analyzer status transitions and result URLs.")
 class TestInvokeAnalyzer:
-    """Docent analyzer status transitions and result URLs."""
-
+    @pytest.mark.description("A successful Docent analysis is marked done with its URL.")
     async def test_invoke_analyzer_success_sets_done_and_url(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -56,6 +50,7 @@ class TestInvokeAnalyzer:
         assert example_benchmark_object.docent_reading_url == "https://x.test/r/123"
         assert result == lambda_response
 
+    @pytest.mark.description("A failed Docent analysis is marked as an error and raises.")
     @pytest.mark.parametrize("error", [RuntimeError("lambda exploded"), asyncio.CancelledError()])
     async def test_invoke_analyzer_failure_sets_error_and_raises(
         self,
@@ -85,6 +80,9 @@ class TestInvokeAnalyzer:
         assert example_benchmark_object.docent_reading_status == DocentReadingStatus.ERROR
         assert example_benchmark_object.docent_reading_url is None
 
+    @pytest.mark.description(
+        "A successful Lambda call with no reading_plan_url still marks the analysis DONE and leaves the URL untouched."
+    )
     async def test_invoke_analyzer_no_url_still_marks_done(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -92,7 +90,6 @@ class TestInvokeAnalyzer:
         example_benchmark_object: Benchmark,
         aws_runtime: AWSRuntime,
     ) -> None:
-        """Lambda returned successfully but no reading_plan_url — still DONE; URL remains untouched."""
         database_session.add(example_benchmark_object)
         database_session.commit()
 
@@ -113,14 +110,17 @@ class TestInvokeAnalyzer:
         assert example_benchmark_object.docent_reading_url is None
 
 
+@pytest.mark.description(
+    (
+        "A benchmark stuck at IN_PROGRESS with docent_reading_status=RUNNING is\n"
+        "swept to ERROR (both the benchmark itself and the analyzer status)."
+    )
+)
 def test_cleanup_sweeps_running_docent_status_to_error(
     database_session: Session,
     example_benchmark_object: Benchmark,
     executor_authority: Any,
 ) -> None:
-    """A benchmark stuck at IN_PROGRESS with docent_reading_status=RUNNING is
-    swept to ERROR (both the benchmark itself and the analyzer status).
-    """
     from tests.utils import TEST_ORG_ID
     from tracker.database.models import Org
 

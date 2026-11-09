@@ -1,8 +1,3 @@
-"""Tests for Tracker FastAPI route behavior.
-
-Run: uv run pytest tests/unit/test_main.py
-"""
-
 import io
 import json
 import logging
@@ -28,7 +23,6 @@ from benchmark_service.client import (
 from benchmark_service.schemas import DatasetVersion, FinalScoreResponse, VerifyTaskIdsResponse
 from dateutil.parser import isoparse
 from descope.exceptions import AuthException
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 from sqlmodel import Session, select
@@ -37,7 +31,7 @@ import main as main_module
 import tracker.auth as auth_module
 from tracker import config
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
-from main import app, tracker_service_error_handler
+from main import app, benchmark_service_error_handler, tracker_service_error_handler
 from tests.storage_lifecycle_support import MemoryS3
 from tests.utils import TEST_ORG_ID, FakeAccessKeys, async_iterator
 from tracker.auth import RequestIdentity, get_current_identity, get_current_org, get_current_runner
@@ -46,6 +40,7 @@ from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws.s3 import s3_owner_arguments, upload_to_s3
 from tracker.aws.services import CloudRuntimeFactory
+from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
 from tracker.database.models import (
     LocalBenchmarkArguments,
@@ -53,6 +48,7 @@ from tracker.database.models import (
     Benchmark,
     AWSBenchmarkArguments,
     BenchmarkStatus,
+    BenchmarkServiceWake,
     ExecutorAdmission,
     ExecutorDispatch,
     ExecutorDispatchKind,
@@ -75,6 +71,7 @@ from tracker.database.models import (
 )
 from tracker.exceptions import SecretNotFoundError, TrackerServiceError
 from tracker.executor.launcher import DefinitiveLaunchFailure
+from tracker.scheduler import service_capacity
 from tracker.runtime.artifacts import copy_agent_to_benchmark as copy_agent_artifact_to_benchmark
 from tracker.types import (
     BenchmarkTableRow,
@@ -83,7 +80,7 @@ from tracker.types import (
     RunExecutionRequest,
     StartBenchmarkRequest,
 )
-from tracker.utils import update_benchmark_concurrency
+from tracker.services.benchmarks import update_benchmark_concurrency
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
 client = TestClient(app)
@@ -94,7 +91,6 @@ _write_cloudwatch_log = CloudWatchBenchmarkLogSink.write
 
 @pytest.fixture(autouse=True)
 def active_executor_release(database_session: Session) -> None:
-    """Provide the admission target required by benchmark-start tests."""
     release = ExecutorRelease(
         id="test-release",
         artifact_uri="s3://artifacts/test-release.pex",
@@ -112,12 +108,10 @@ def active_executor_release(database_session: Session) -> None:
 
 
 async def _verify_single_task_id(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
-    """Return the single task used by benchmark start route tests."""
     return VerifyTaskIdsResponse(task_ids=["task_0"])
 
 
 def _managed_test_runtime(bucket: str) -> AWSRuntime:
-    """Build a guarded managed runtime for admission storage tests."""
     return AWSRuntime(
         resources=AWSResources(
             region="us-east-1",
@@ -136,7 +130,6 @@ _TENANT_SECRETS = f"valkyrie/tenants/{TEST_ORG_ID}/"
 
 @pytest.fixture
 def saved_settings(database_session: Session) -> None:
-    """Alice defaults to e2b, which the organization maps too, and saved a swebench URL."""
     database_session.add_all(
         [
             OrgProviderSecret(org_id=TEST_ORG_ID, provider="e2b", secret_name="e2bsecret"),
@@ -147,13 +140,11 @@ def saved_settings(database_session: Session) -> None:
 
 
 def _save_service(session: Session, url: str, user_id: str = "local", **auth: str) -> None:
-    """Save a swebench service for a user; "local" is the one user of a Tracker without auth."""
     session.merge(UserBenchmarkService(org_id=TEST_ORG_ID, user_id=user_id, benchmark="swebench", url=url, **auth))
     session.commit()
 
 
 def _as_user(monkeypatch: MonkeyPatch, user_id: str | None) -> None:
-    """Call the Tracker as a user of a hosted organization; None is a key made in the console."""
     monkeypatch.setattr(main_module, "AUTH_REQUIRED", True)
     monkeypatch.setattr("tracker.api.run_settings.AUTH_REQUIRED", True)
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
@@ -163,11 +154,11 @@ def _as_user(monkeypatch: MonkeyPatch, user_id: str | None) -> None:
 
 
 def _start_body(contract: AgentContractRequest, **fields: Any) -> dict[str, Any]:
-    """A start request carrying only what a client chooses to send."""
     return {"contract": contract.model_dump(mode="json"), "benchmark_name": "swebench", **fields}
 
 
 class TestNoStartRoleHTTP:
+    @pytest.mark.description("A user without the start role cannot change state but can still read and stop runs.")
     @pytest.mark.parametrize(
         "credential",
         ["login", "bound-key", "key-derived-bearer", "bound-key-without-claim", "key-derived-bearer-without-claim"],
@@ -261,9 +252,9 @@ class TestNoStartRoleHTTP:
             assert stopped.json()["status"] == "success"
 
 
+@pytest.mark.description("Tracker API route behavior and error responses.")
 class TestTrackerAPI:
-    """Tracker API route behavior and error responses."""
-
+    @pytest.mark.description("A start with path segments in the agent name is rejected before storage.")
     @pytest.mark.parametrize("agent_name", ["team/secret-agent", "../secret-agent", ".."])
     @pytest.mark.parametrize("inline_contract", [False, True])
     def test_start_rejects_agent_path_segments_before_storage(
@@ -283,9 +274,7 @@ class TestTrackerAPI:
         assert "Invalid agent name" in response.json()["detail"]
         exists.assert_not_awaited()
 
-    async def _mock_verify_task_ids_error(self, *_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
-        raise Exception("Error verifying task ids")
-
+    @pytest.mark.description("A run keeps its dataset version when the default changes and on retry.")
     @pytest.mark.parametrize("selected_version", ["release-a", None])
     async def test_dataset_version_survives_default_switch_and_retry(
         self,
@@ -404,6 +393,9 @@ class TestTrackerAPI:
         assert observed_versions[-1] == "release-b"
         assert second.json()["dataset_version"]["id"] == "release-b"
 
+    @pytest.mark.description(
+        "A run on a service with no dataset version starts with `dataset_version` empty and a `dataset_version_warning`."
+    )
     @pytest.mark.parametrize("missing_version_endpoint", [False, True])
     async def test_unversioned_service_starts_with_consistency_warning(
         self,
@@ -444,6 +436,7 @@ class TestTrackerAPI:
         assert response.json()["dataset_version"] is None
         assert response.json()["dataset_version_warning"] == "Unversioned — dataset consistency is not guaranteed."
 
+    @pytest.mark.description("An explicit dataset version needs a service that supports versions.")
     @pytest.mark.parametrize("missing_version_endpoint", [False, True])
     async def test_explicit_dataset_version_requires_service_support(
         self,
@@ -473,6 +466,7 @@ class TestTrackerAPI:
         assert response.status_code == 400
         assert database_session.exec(select(Benchmark)).all() == []
 
+    @pytest.mark.description("A dataset that fails to resolve rejects the run before it is created.")
     @pytest.mark.parametrize("failure_mode", ["version_error", "wrong_dataset"])
     async def test_invalid_dataset_resolution_rejects_run_before_creation(
         self,
@@ -512,6 +506,7 @@ class TestTrackerAPI:
         assert response.json()["detail"] == "Failed to select dataset version"
         assert database_session.exec(select(Benchmark)).all() == []
 
+    @pytest.mark.description("A dataset version that is too long is rejected.")
     @pytest.mark.parametrize("dataset_version", ["", "x" * 1025])
     async def test_invalid_dataset_version_length_is_rejected(
         self,
@@ -531,14 +526,8 @@ class TestTrackerAPI:
 
         assert response.status_code == 422
 
+    @pytest.mark.description("The health check returns 200 with status ok.")
     def test_health_check(self, monkeypatch: MonkeyPatch) -> None:
-        """Test health check of the fastapi server.
-
-        Test Cases:
-            - Returns 200 OK
-            - Response contains expected format
-        """
-        # Mock database connection check for unit tests
         monkeypatch.setattr("main.check_database_connection", lambda: True)
 
         response = client.get("/health")
@@ -547,11 +536,13 @@ class TestTrackerAPI:
 
         assert response.json() == {"status": "ok"}
 
+    @pytest.mark.description("`GET /executor-releases` returns 404.")
     def test_executor_release_status_is_not_exposed_over_http(self) -> None:
         response = client.get("/executor-releases")
 
         assert response.status_code == 404
 
+    @pytest.mark.description("Run concurrency must be a positive integer.")
     @pytest.mark.parametrize("concurrency", [0, -1, 1.5, "2", True])
     def test_update_benchmark_concurrency_rejects_non_positive_or_non_integer_values(
         self,
@@ -571,6 +562,7 @@ class TestTrackerAPI:
         database_session.refresh(example_benchmark_object)
         assert example_benchmark_object.arguments.concurrency == 5
 
+    @pytest.mark.description("A concurrency update saves the full arguments and can be repeated safely.")
     def test_update_benchmark_concurrency_persists_full_arguments_and_is_idempotent(
         self,
         database_session: Session,
@@ -604,6 +596,7 @@ class TestTrackerAPI:
         assert persisted is not None
         assert persisted.arguments == original_arguments.model_copy(update={"concurrency": 9})
 
+    @pytest.mark.description("A concurrency update returns 404 for missing runs and other orgs' runs.")
     def test_update_benchmark_concurrency_hides_missing_and_other_org_runs(
         self,
         monkeypatch: MonkeyPatch,
@@ -631,6 +624,7 @@ class TestTrackerAPI:
         database_session.refresh(example_benchmark_object)
         assert example_benchmark_object.arguments.concurrency == 5
 
+    @pytest.mark.description("A concurrency update is rejected for a run that is not active.")
     def test_update_benchmark_concurrency_rejects_non_active_run(
         self,
         database_session: Session,
@@ -646,9 +640,11 @@ class TestTrackerAPI:
         )
 
         assert response.status_code == 409
+        assert response.json() == {"detail": f"Run {example_benchmark_object.id} is currently in the STOPPED state."}
         database_session.refresh(example_benchmark_object)
         assert example_benchmark_object.arguments.concurrency == 5
 
+    @pytest.mark.description("A concurrency update reloads the run's state before it changes it.")
     def test_update_benchmark_concurrency_refreshes_preloaded_state_before_mutating(
         self,
         database_session: Session,
@@ -678,6 +674,7 @@ class TestTrackerAPI:
         assert persisted.status == BenchmarkStatus.STOPPED
         assert persisted.arguments.concurrency == 5
 
+    @pytest.mark.description("A concurrency update returns the run as seen inside its locked transaction.")
     def test_update_benchmark_concurrency_returns_snapshot_from_locked_transaction(
         self,
         monkeypatch: MonkeyPatch,
@@ -715,7 +712,6 @@ class TestTrackerAPI:
 
     @staticmethod
     def _add_shed_tasks(database_session: Session, benchmark: Benchmark) -> None:
-        """Persist one task per status; ``started_at`` grows with the position in the list."""
         statuses = [
             ("task_evaluating", TaskStatus.EVALUATING),
             ("task_oldest", TaskStatus.IN_PROGRESS),
@@ -743,6 +739,7 @@ class TestTrackerAPI:
         tasks = database_session.exec(select(Task).where(Task.benchmark == benchmark.id)).all()
         return {task.task_id: task.status for task in tasks}
 
+    @pytest.mark.description("Three of four active tasks are above a limit of two. The evaluating one is spared.")
     @pytest.mark.parametrize("dry_run", [False, True])
     def test_shed_benchmark_stops_newest_tasks_above_new_limit(
         self,
@@ -751,7 +748,6 @@ class TestTrackerAPI:
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Three of four active tasks are above a limit of two; the evaluating one is spared."""
         self._add_shed_tasks(database_session, example_benchmark_object)
         statuses_before = self._task_statuses(database_session, example_benchmark_object)
         force_stop = AsyncMock()
@@ -784,6 +780,7 @@ class TestTrackerAPI:
             assert force_stop.await_args is not None
             assert force_stop.await_args.kwargs["task_ids"] == ["task_newest", "task_building"]
 
+    @pytest.mark.description("Shedding a local run stops its newest tasks and saves the lower limit.")
     def test_local_shed_benchmark_stops_newest_tasks_and_persists_lower_limit(
         self,
         tmp_path: Path,
@@ -827,6 +824,7 @@ class TestTrackerAPI:
         }
         force_stop.assert_awaited_once()
 
+    @pytest.mark.description("Shedding a run already within the new limit lowers it without stopping tasks.")
     def test_shed_benchmark_lowers_limit_without_stopping_when_within_it(
         self,
         monkeypatch: MonkeyPatch,
@@ -850,6 +848,7 @@ class TestTrackerAPI:
         assert self._task_statuses(database_session, example_benchmark_object) == statuses_before
         force_stop.assert_not_awaited()
 
+    @pytest.mark.description("Shedding cannot raise the limit or apply to an inactive run.")
     @pytest.mark.parametrize(
         ("status", "concurrency", "expected_status"),
         [
@@ -884,14 +883,16 @@ class TestTrackerAPI:
         assert self._task_statuses(database_session, example_benchmark_object) == statuses_before
         force_stop.assert_not_awaited()
 
+    @pytest.mark.description(
+        (
+            "Non-canonical route paths cannot construct redirects from forwarded request data.\n"
+            "\n"
+            "Test cases:\n"
+            "- The canonical health path remains available.\n"
+            "- The trailing-slash variant returns not found without a Location header."
+        )
+    )
     def test_trailing_slash_does_not_redirect(self, monkeypatch: MonkeyPatch) -> None:
-        """
-        Verify non-canonical route paths cannot construct redirects from forwarded request data.
-
-        Test cases:
-        - The canonical health path remains available.
-        - The trailing-slash variant returns not found without a Location header.
-        """
         monkeypatch.setattr("main.check_database_connection", lambda: True)
 
         canonical_response = client.get("/health")
@@ -905,6 +906,16 @@ class TestTrackerAPI:
         assert slash_response.status_code == 404
         assert "location" not in slash_response.headers
 
+    @pytest.mark.description(
+        (
+            "Docent analysis must reject invalid runs and return a completed cached result.\n"
+            "\n"
+            "Test cases:\n"
+            "- An active run cannot be analyzed.\n"
+            "- A finished uncached run requires an analyzer Lambda.\n"
+            "- A finished cached run returns its stored reading-plan URL without invoking Lambda."
+        )
+    )
     def test_analyze_benchmark_enforces_state_and_reuses_cached_result(
         self,
         tmp_path: Path,
@@ -912,13 +923,6 @@ class TestTrackerAPI:
         example_benchmark_object: Benchmark,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Docent analysis must reject invalid runs and return a completed cached result.
-
-        Test cases:
-        - An active run cannot be analyzed.
-        - A finished uncached run requires an analyzer Lambda.
-        - A finished cached run returns its stored reading-plan URL without invoking Lambda.
-        """
         database_session.add(example_benchmark_object)
         database_session.commit()
 
@@ -972,18 +976,20 @@ class TestTrackerAPI:
         assert local_response.json()["detail"] == "Docent analysis requires S3 storage"
         resolver.assert_not_called()
 
+    @pytest.mark.description(
+        (
+            "Internal Tracker errors retain diagnostics only in server logs.\n"
+            "\n"
+            "Test cases:\n"
+            "- The client receives a stable generic detail.\n"
+            "- The full exception remains available to operators in logs."
+        )
+    )
     async def test_tracker_service_error_hides_internal_detail(
         self,
         caplog: pytest.LogCaptureFixture,
         monkeypatch: MonkeyPatch,
     ) -> None:
-        """
-        Verify internal Tracker errors retain diagnostics only in server logs.
-
-        Test cases:
-        - The client receives a stable generic detail.
-        - The full exception remains available to operators in logs.
-        """
         sensitive_detail = "sensitive-internal-tracker-detail"
 
         def capture_exception(_exception: BaseException) -> None:
@@ -991,21 +997,33 @@ class TestTrackerAPI:
 
         monkeypatch.setattr("sentry_sdk.capture_exception", capture_exception)
 
-        with pytest.raises(HTTPException) as exc_info:
-            await tracker_service_error_handler(MagicMock(), TrackerServiceError(sensitive_detail))
+        response = await tracker_service_error_handler(MagicMock(), TrackerServiceError(sensitive_detail))
 
-        assert exc_info.value.status_code == 500
-        assert exc_info.value.detail == "Tracker service operation failed"
+        assert response.status_code == 500
+        assert json.loads(response.body) == {"detail": "Tracker service operation failed"}
         assert sensitive_detail in caplog.text
 
-    async def test_fetch_benchmark_tasks_hides_downstream_error(self, monkeypatch: MonkeyPatch) -> None:
-        """
-        Verify downstream benchmark-service diagnostics are not reflected to callers.
+    @pytest.mark.description("A failed upstream benchmark service request is a bad gateway, not a Tracker error.")
+    async def test_benchmark_service_error_returns_bad_gateway(self, monkeypatch: MonkeyPatch) -> None:
+        monkeypatch.setattr("sentry_sdk.capture_exception", lambda _exception: None)
 
-        Test cases:
-        - The endpoint retains its gateway-error status.
-        - The downstream sentinel is absent from the stable response detail.
-        """
+        response = await benchmark_service_error_handler(
+            MagicMock(), BenchmarkServiceError("upstream down", status_code=503)
+        )
+
+        assert response.status_code == 502
+        assert json.loads(response.body) == {"detail": "Benchmark service request failed"}
+
+    @pytest.mark.description(
+        (
+            "Downstream benchmark-service diagnostics are not reflected to callers.\n"
+            "\n"
+            "Test cases:\n"
+            "- The endpoint retains its gateway-error status.\n"
+            "- The downstream sentinel is absent from the stable response detail."
+        )
+    )
+    async def test_fetch_benchmark_tasks_hides_downstream_error(self, monkeypatch: MonkeyPatch) -> None:
         sensitive_detail = "sensitive-downstream-provider-detail"
 
         async def _raise_downstream_error(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
@@ -1022,6 +1040,7 @@ class TestTrackerAPI:
         assert response.json() == {"detail": "Failed to fetch task ids from benchmark service"}
         assert sensitive_detail not in response.text
 
+    @pytest.mark.description("Fetching a run's tasks returns them from the benchmark service.")
     async def test_fetch_benchmark_tasks(
         self,
         monkeypatch: MonkeyPatch,
@@ -1042,6 +1061,7 @@ class TestTrackerAPI:
         assert response.status_code == 200
         assert response.json() == {"task_ids": ["task_1", "task_2"]}
 
+    @pytest.mark.description("A run start saves its tasks before dispatch and sets the queue fields.")
     @pytest.mark.parametrize(
         (
             "sandbox_queue_enabled",
@@ -1113,13 +1133,13 @@ class TestTrackerAPI:
         if provider is not None:
             provider.close.assert_awaited_once_with()
 
+    @pytest.mark.description("Queued Daytona admission should load provider configuration through the secret store.")
     async def test_start_benchmark_queue_resolves_daytona_provider_from_secret_store(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         database_session: Session,
     ) -> None:
-        """Queued Daytona admission should load provider configuration through the secret store."""
         monkeypatch.setattr("main.SANDBOX_QUEUE_ENABLED", True, raising=False)
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
         request = StartBenchmarkRequest(
@@ -1137,6 +1157,7 @@ class TestTrackerAPI:
         assert benchmark_row.arguments.priority == 3
         assert benchmark_row.arguments.queue_pool_id is not None
 
+    @pytest.mark.description("Starting a run whose provider secret is missing returns 404 that names the secret.")
     async def test_start_benchmark_reports_a_missing_provider_secret_as_not_existing(
         self,
         contract: AgentContractRequest,
@@ -1160,6 +1181,7 @@ class TestTrackerAPI:
         assert response.status_code == 404, response.text
         assert response.json() == {"detail": "Secret 'provider-secret' does not exist"}
 
+    @pytest.mark.description("A Modal run start skips queue provider resolution.")
     @pytest.mark.parametrize(
         ("priority", "expected_status"),
         [
@@ -1196,6 +1218,7 @@ class TestTrackerAPI:
         else:
             assert response.json() == {"detail": "Queue priority requires a sandbox provider configured for admission"}
 
+    @pytest.mark.description("A run start with the Docker provider is rejected for AWS execution.")
     async def test_start_benchmark_rejects_docker_provider_for_aws_execution(
         self,
         contract: AgentContractRequest,
@@ -1213,6 +1236,7 @@ class TestTrackerAPI:
         assert response.json() == {"detail": "AWS execution does not support the Docker sandbox provider"}
         assert not database_session.exec(select(Benchmark)).all()
 
+    @pytest.mark.description("A failed start setup marks the saved run as a queue error.")
     async def test_start_benchmark_marks_persisted_queue_error_when_start_setup_fails(
         self,
         contract: AgentContractRequest,
@@ -1245,6 +1269,7 @@ class TestTrackerAPI:
         assert database_session.exec(select(Benchmark)).all() == []
         assert database_session.exec(select(Task)).all() == []
 
+    @pytest.mark.description("Fetching tasks forwards the Tracker key only to the hosted service.")
     async def test_fetch_benchmark_tasks_forwards_tracker_key_only_to_hosted_origin(
         self,
         monkeypatch: MonkeyPatch,
@@ -1278,6 +1303,7 @@ class TestTrackerAPI:
         assert "X-Descope-Api-Key" not in observed_headers[1]
         assert fake_access_keys.created == []
 
+    @pytest.mark.description("Fetching tasks with a login uses that login's key.")
     async def test_fetch_benchmark_tasks_keys_login_calls(
         self, monkeypatch: MonkeyPatch, fake_access_keys: FakeAccessKeys
     ) -> None:
@@ -1300,6 +1326,9 @@ class TestTrackerAPI:
         assert created["expire_time"] <= time.time() + 600
         assert fake_access_keys.deleted == ["K1"]
 
+    @pytest.mark.description(
+        "Older clients and the dashboard still send X-Harness-* headers. Runs use the deployment's AWS."
+    )
     def test_start_benchmark_ignores_caller_aws_headers(
         self,
         contract: AgentContractRequest,
@@ -1307,7 +1336,6 @@ class TestTrackerAPI:
         mock_launcher: Any,
         database_session: Session,
     ) -> None:
-        """Older clients and the dashboard still send X-Harness-* headers; runs use the deployment's AWS."""
         monkeypatch.setattr("main.SANDBOX_QUEUE_ENABLED", False)
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
         request = StartBenchmarkRequest(
@@ -1330,6 +1358,7 @@ class TestTrackerAPI:
         assert benchmark_row.arguments.properties is not None
         assert benchmark_row.arguments.properties.s3_bucket == "test-bucket"
 
+    @pytest.mark.description("A run start creates the run and returns its ID.")
     async def test_start_benchmark(
         self,
         contract: AgentContractRequest,
@@ -1353,15 +1382,12 @@ class TestTrackerAPI:
 
         response = client.post("/start-benchmark", json=request.model_dump())
 
-        # Test case 1. Returns 200 OK
         assert response.status_code == 200
         json_response = response.json()
 
-        # Test case 2. Benchmark row has been created and pushed to the database
         benchmark_row = database_session.get(Benchmark, UUID(json_response["benchmark_id"]))
         assert benchmark_row
 
-        # Secondary test. Arguments is correct serialized into the database
         assert benchmark_row.arguments == AWSBenchmarkArguments(
             properties=AWSResources(
                 region="us-east-1",
@@ -1376,10 +1402,8 @@ class TestTrackerAPI:
             sandbox_provider_secret_name="provider-secret",
         )
 
-        # Test case 3. Start timestamp is in UTC timezone and matches the benchmark row
         assert isoparse(json_response["started_at"]) == benchmark_row.started_at.replace(tzinfo=timezone.utc)
 
-        # Test case 4. Returning task count provided from the verify_task_ids function
         assert json_response["task_count"] == 500
 
         assert benchmark_row.executor_release_id == "test-release"
@@ -1403,7 +1427,6 @@ class TestTrackerAPI:
         assert len(task_rows) == 500
         assert all(task.started_at <= dispatch.created_at for task in task_rows)
 
-        # Remaining fields match what we passed into the request
         assert json_response["benchmark_name"] == request.benchmark_name
         assert json_response["agent_name"] == request.contract.name
         assert json_response["executor_release_id"] == "test-release"
@@ -1412,6 +1435,69 @@ class TestTrackerAPI:
         assert json_response["executor_protocol_version"] == SUPPORTED_PROTOCOL_VERSION
         assert json_response["concurrency"] == request.concurrency
 
+    @pytest.mark.description(
+        "A start against a custom service runs one health check and does not wake a hosted service."
+    )
+    def test_start_custom_service_checks_health_without_tracker_wake(
+        self,
+        contract: AgentContractRequest,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        mock_launcher: Any,
+    ) -> None:
+        _save_service(database_session, _SAVED_URL)
+        wake = AsyncMock()
+        health_check = AsyncMock()
+        monkeypatch.setattr(main_module, "wake_benchmark_service", wake)
+        monkeypatch.setattr(BenchmarkServiceClient, "health_check", health_check)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            sandbox_provider="daytona",
+            sandbox_provider_secret_name="provider-secret",
+        )
+
+        response = client.post("/start-benchmark", json=request.model_dump())
+
+        assert response.status_code == 200, response.text
+        wake.assert_not_awaited()
+        health_check.assert_awaited_once_with()
+
+    @pytest.mark.description(
+        "A hosted start outside a runner cluster runs one health check without calling ECS or recording a wake."
+    )
+    def test_start_outside_a_runner_cluster_checks_hosted_service_without_waking(
+        self,
+        contract: AgentContractRequest,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        mock_launcher: Any,
+    ) -> None:
+        monkeypatch.delenv("EXECUTOR_RUNNER_CLUSTER", raising=False)
+        record_wake = Mock()
+        aws = Mock()
+        monkeypatch.setattr(service_capacity, "record_wake", record_wake)
+        monkeypatch.setattr(service_capacity, "boto3", aws)
+        health_check = AsyncMock()
+        monkeypatch.setattr(BenchmarkServiceClient, "health_check", health_check)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            sandbox_provider="daytona",
+            sandbox_provider_secret_name="provider-secret",
+        )
+
+        response = client.post("/start-benchmark", json=request.model_dump())
+
+        assert response.status_code == 200, response.text
+        health_check.assert_awaited_once_with()
+        record_wake.assert_not_called()
+        aws.client.assert_not_called()
+        assert database_session.get(BenchmarkServiceWake, "swebench") is None
+
+    @pytest.mark.description("The queued dispatch payload is encrypted and carries the run ID and verified task IDs.")
     @pytest.mark.parametrize("protocol_version", [SUPPORTED_PROTOCOL_VERSION])
     async def test_start_benchmark_seals_committed_dispatch_before_launch(
         self,
@@ -1471,6 +1557,7 @@ class TestTrackerAPI:
         assert envelope["execution_context_json"]["benchmark_id"] == str(benchmark.id)
         assert envelope["execution_context_json"]["verified_task_ids"] == ["task_0"]
 
+    @pytest.mark.description("A launch failure during start can be retried.")
     async def test_start_benchmark_launch_failure_is_retryable(
         self,
         contract: AgentContractRequest,
@@ -1514,6 +1601,7 @@ class TestTrackerAPI:
         assert dispatch.status == ExecutorDispatchStatus.FAILED
         assert task.status == TaskStatus.ERROR
 
+    @pytest.mark.description("A superseded launch returns 409 with the exact error body.")
     async def test_start_benchmark_superseded_launch_returns_exact_409_body(
         self,
         contract: AgentContractRequest,
@@ -1546,6 +1634,7 @@ class TestTrackerAPI:
         dispatch = database_session.exec(select(ExecutorDispatch)).one()
         assert dispatch.status == ExecutorDispatchStatus.FAILED
 
+    @pytest.mark.description("A run start is rejected without an active executor release.")
     async def test_start_benchmark_rejects_without_active_executor_release(
         self,
         contract: AgentContractRequest,
@@ -1573,6 +1662,7 @@ class TestTrackerAPI:
         assert response.json().get("detail") == "No active executor release is configured"
         copy_agent.assert_not_awaited()
 
+    @pytest.mark.description("A payload failure on start rolls back and deletes the copy it created.")
     async def test_start_payload_failure_rolls_back_and_deletes_created_copy(
         self,
         contract: AgentContractRequest,
@@ -1615,6 +1705,7 @@ class TestTrackerAPI:
             deletion_token="copy-version",
         )
 
+    @pytest.mark.description("A lost commit acknowledgement on start keeps the saved copy.")
     async def test_start_commit_acknowledgement_failure_retains_durable_copy(
         self,
         contract: AgentContractRequest,
@@ -1654,6 +1745,7 @@ class TestTrackerAPI:
         assert dispatch.status == ExecutorDispatchStatus.QUEUED
         delete_agent_copy.assert_not_awaited()
 
+    @pytest.mark.description("A failed rollback on start keeps the copy.")
     async def test_start_rollback_failure_retains_copy(
         self,
         contract: AgentContractRequest,
@@ -1685,6 +1777,9 @@ class TestTrackerAPI:
         verify_absent.assert_not_called()
         delete_agent_copy.assert_not_awaited()
 
+    @pytest.mark.description(
+        "Starting a run against an unreachable benchmark service returns 502 that names the service and closes its client."
+    )
     async def test_start_benchmark_returns_502_when_benchmark_service_is_unreachable(
         self,
         contract: AgentContractRequest,
@@ -1714,6 +1809,9 @@ class TestTrackerAPI:
         assert response.json().get("detail") == expected_detail
         close_client.assert_awaited_once()
 
+    @pytest.mark.description(
+        "The Tracker API key is sent as `X-Descope-Api-Key` to the hosted benchmark service and saved in the queued request."
+    )
     @pytest.mark.parametrize(
         "custom_benchmark_service",
         [None, "https://swebench.benchmarks.vals.ai:443/path"],
@@ -1791,6 +1889,7 @@ class TestTrackerAPI:
         headers = {"X-Api-Key": api_key} if api_key else {}
         return client.post("/start-benchmark", json=request.model_dump(), headers=headers)
 
+    @pytest.mark.description("A run start sends a run key instead of the caller's key.")
     async def test_start_benchmark_sends_a_run_key_instead_of_the_callers_key(
         self,
         contract: AgentContractRequest,
@@ -1818,6 +1917,7 @@ class TestTrackerAPI:
         assert (recorded.key_id, str(recorded.benchmark_id)) == ("K1", response.json()["benchmark_id"])
         assert fake_access_keys.deleted == []
 
+    @pytest.mark.description("A failed start deletes its run key.")
     async def test_start_benchmark_deletes_the_run_key_when_the_start_fails(
         self,
         contract: AgentContractRequest,
@@ -1827,7 +1927,7 @@ class TestTrackerAPI:
     ) -> None:
         self._hosted_start(monkeypatch)
         monkeypatch.setattr(
-            BenchmarkServiceClient, "verify_task_ids", AsyncMock(side_effect=RuntimeError("service is down"))
+            BenchmarkServiceClient, "verify_task_ids", AsyncMock(side_effect=BenchmarkServiceError("service is down"))
         )
 
         response = self._post_hosted_start(contract)
@@ -1848,6 +1948,7 @@ class TestTrackerAPI:
         assert "login sessions" in response.json()["detail"]
         assert database_session.exec(select(Benchmark)).all() == []
 
+    @pytest.mark.description("A run start fails when no run key can be made.")
     async def test_start_benchmark_fails_without_a_run_key(
         self,
         contract: AgentContractRequest,
@@ -1863,6 +1964,9 @@ class TestTrackerAPI:
         assert response.status_code == 503
         assert database_session.exec(select(Benchmark)).all() == []
 
+    @pytest.mark.description(
+        "A custom benchmark service never receives `X-Descope-Api-Key`, at start or in the queued request."
+    )
     async def test_start_benchmark_does_not_forward_tracker_key_to_custom_service(
         self,
         contract: AgentContractRequest,
@@ -1900,6 +2004,7 @@ class TestTrackerAPI:
         queued_request = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]
         assert "X-Descope-Api-Key" not in queued_request["service_headers"]
 
+    @pytest.mark.description("A run start keeps a custom service's Descope key.")
     async def test_start_benchmark_preserves_custom_service_descope_key(
         self,
         contract: AgentContractRequest,
@@ -1946,6 +2051,7 @@ class TestTrackerAPI:
         queued_request = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]
         assert queued_request["service_headers"]["X-Descope-Api-Key"] == "custom-service-key"
 
+    @pytest.mark.description("A run start keeps the selected provider secret.")
     async def test_start_benchmark_keeps_selected_provider_secret(
         self,
         contract: AgentContractRequest,
@@ -1984,28 +2090,29 @@ class TestTrackerAPI:
         assert queued_request["sandbox_provider"] == "modal"
         assert queued_request["sandbox_provider_secret_name"] == "ModalSecrets"
 
+    @pytest.mark.description(
+        (
+            "A run is returned with its details and progress, or 404 when it does not exist.\n"
+            "\n"
+            "Test cases:\n"
+            "- Returns 200 OK.\n"
+            "- Raising exception if benchmark row is not found.\n"
+            "- Existing benchmark without discovered tasks returns empty progress.\n"
+            "- Benchmark details are returned in the response.\n"
+            "- Benchmark details are updated as benchmark progresses.\n"
+            "- Run-level errors are returned only after the benchmark reaches ERROR."
+        )
+    )
     async def test_fetch_benchmark(
         self,
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Test fetch benchmark of the fastapi server.
 
-        Test Cases:
-            - Returns 200 OK
-            - Raising exception if benchmark row is not found
-            - Existing benchmark without discovered tasks returns empty progress
-            - Benchmark details are returned in the response
-            - Benchmark details are updated as benchmark progresses
-            - Run-level errors are returned only after the benchmark reaches ERROR
-        """
-
-        # Test case 1. Return 404 Not Found if benchmark does not exist
         query_params = {"benchmark_id": str(uuid4())}
         response = client.get("/fetch-benchmark", params=query_params)
         assert response.status_code == 404
 
-        # Add benchmark row to the database to fetch
         benchmark_row = example_benchmark_object
         benchmark_row.executor_release_id = "initial-release"
         benchmark_row.current_execution_release_id = "current-release"
@@ -2016,7 +2123,6 @@ class TestTrackerAPI:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        # Fetch during the interval between benchmark creation and task discovery.
         query_params = {"benchmark_id": str(benchmark_row.id)}
         response = client.get("/fetch-benchmark", params=query_params)
 
@@ -2027,22 +2133,17 @@ class TestTrackerAPI:
         assert details["finished_tasks"] == 0
         assert details["task_breakdown"] == {}
 
-        # Push some task rows that we can use to check the progress of the benchmark
         task_rows = [Task(org_id=TEST_ORG_ID, task_id=f"task_{i}", benchmark=benchmark_row.id) for i in range(10)]
         database_session.add_all(task_rows)
         database_session.commit()
 
-        # Send request to fetch the benchmark and ensure that the fetch response is returned
         query_params = {"benchmark_id": str(benchmark_row.id)}
         response = client.get("/fetch-benchmark", params=query_params)
 
-        # Test case 2. Returns 200 OK
         assert response.status_code == 200
         details = response.json().get("details")
         assert details
 
-        # Test case 3. Benchmark details are returned in the response
-        # NOTE: Let's just check the fields that are being tracked and are due to change
         assert details.get("status") == BenchmarkStatus.IN_PROGRESS
         assert details.get("total_tasks") == 10
         assert details.get("finished_tasks") == 0
@@ -2052,16 +2153,12 @@ class TestTrackerAPI:
         assert response.json()["executor_artifact_digest"] == "a" * 64
         assert response.json()["executor_protocol_version"] == "1"
 
-        # Test case 4. Benchmark details are updated as benchmark progresses
-        # Change a few to in progress, finished and error
-        # NOTE: as of now only error and finished are "task ended" states
         for i, task_row in enumerate(task_rows[:9]):
             if i < 3:
                 task_row.status = TaskStatus.IN_PROGRESS
             elif i < 6:
                 task_row.status = TaskStatus.FINISHED
 
-                # Create evaluation result rows for finished tasks
                 evaluation_result_row = EvaluationResult(
                     org_id=TEST_ORG_ID,
                     task=task_row.id,
@@ -2084,13 +2181,11 @@ class TestTrackerAPI:
 
         database_session.commit()
 
-        # Send request to fetch the benchmark and ensure that the fetch response is returned
         query_params = {"benchmark_id": str(benchmark_row.id)}
         response = client.get("/fetch-benchmark", params=query_params)
         details = response.json().get("details")
         assert details
 
-        # Test case 5. Benchmark details are updated as benchmark progresses
         assert details.get("total_tasks") and details["total_tasks"] == 10
         assert details.get("finished_tasks") and details["finished_tasks"] == 6
 
@@ -2106,7 +2201,6 @@ class TestTrackerAPI:
 
         response = client.get("/fetch-benchmark", params=query_params)
 
-        # Test case 6. Final score is returned when the benchmark has a final evaluation
         assert response.status_code == 200
         assert response.json().get("final_score") == 83.25
 
@@ -2117,34 +2211,34 @@ class TestTrackerAPI:
 
         response = client.get("/fetch-benchmark", params=query_params)
 
-        # Test case 7. Terminal errors return the stored run-level message
         assert response.status_code == 200
         assert response.json().get("error_message") == "Dominant task error affecting 10/10 tasks"
 
+    @pytest.mark.description(
+        (
+            "Results grow as tasks complete, and the final evaluation appears only once the run finishes.\n"
+            "\n"
+            "Test cases:\n"
+            "- 404 on invalid benchmark id.\n"
+            "- Final evaluation is omitted if benchmark has not finished yet.\n"
+            "- Evaluation results are returned as the tasks are being completed.\n"
+            "- Works when no tasks are completed.\n"
+            "- Base fields are included within response.\n"
+            "- Tasks stopped field is populated when we stop the benchmark.\n"
+            "- Task errors field is populated when we encounter an error."
+        )
+    )
     async def test_retrieve_results(
         self,
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Test the retrieve results endpoint of the fastapi server.
 
-        Test Cases:
-            - 404 on invalid benchmark id
-            - Final evaluation is omitted if benchmark has not finished yet
-            - Evaluation results are returned as the tasks are being completed
-            - Works when no tasks are completed
-            - Base fields are included within response
-            - Tasks stopped field is populated when we stop the benchmark
-            - Task errors field is populated when we encounter an error
-        """
-
-        # Test case 1. 404 on invalid benchmark id
         query_params = {"benchmark_id": str(uuid4())}
         response = client.get("/retrieve-results", params=query_params)
         assert response.status_code == 404
 
-        # Add benchmark row
         benchmark_row = example_benchmark_object
         database_session.add(benchmark_row)
         database_session.commit()
@@ -2154,17 +2248,13 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # Base fields are included within response
         assert response_json.get("benchmark_name") == benchmark_row.name
         assert response_json.get("status") == benchmark_row.status
 
-        # Test case 2. Final evaluation is omitted if benchmark has not finished yet
         assert response_json.get("final_evaluation") is None
 
-        # Test case 3. Empty evaluation result are returned if no tasks are completed
         assert response_json.get("evaluation_results") == {}
 
-        # Test case 4. Evaluation results are returned as the tasks are being completed
         task_rows = [
             Task(org_id=TEST_ORG_ID, task_id=f"task_{i}", benchmark=benchmark_row.id, status=TaskStatus.FINISHED)
             for i in range(10)
@@ -2180,19 +2270,14 @@ class TestTrackerAPI:
         response = client.get("/retrieve-results", params=query_params)
         assert response.status_code == 200
 
-        # NOTE: We have defaults so we need to exclude none to get the same response as the user
         response_json = FinalViewResponse(**response.json()).model_dump(exclude_none=True)
 
-        # Test case 5. Evaluation results are returned if they exist even if benchmark has not finished yet
         assert response_json.get("evaluation_results")
         assert len(response_json.get("evaluation_results", {})) == 10
 
-        # No stopped tasks or task_errors fields in response
         assert "tasks_stopped" not in response_json
         assert "task_errors" not in response_json
 
-        # Change benchmark status to finished and add final evaluation row
-        # Refresh to get the latest state
         database_session.refresh(benchmark_row)
         benchmark_row.status = BenchmarkStatus.FINISHED
         database_session.add(benchmark_row)
@@ -2211,17 +2296,13 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # Test case 6. Final evaluation now exists
         assert response_json.get("final_evaluation")
         assert response_json.get("final_evaluation").get("final_score") == 100
 
-        # Test case 7. Tasks stopped field is populated when we stop the benchmark
-        # Stop the benchmark
         benchmark_row.status = BenchmarkStatus.STOPPED
         database_session.add(benchmark_row)
         database_session.commit()
 
-        # Add some new tasks with the status stopped
         task_rows = [
             Task(org_id=TEST_ORG_ID, task_id=f"task_{i}", benchmark=benchmark_row.id, status=TaskStatus.STOPPED)
             for i in range(11, 21)
@@ -2233,12 +2314,9 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # NOTE: We chose to use a number instead of a list or string since some benchmarks have a lot of tasks
         assert response_json.get("tasks_stopped") == 10
         assert len(response_json.get("evaluation_results")) == 10
 
-        # Test case 8. Task errors field is populated when we encounter an error
-        # Add some new tasks with the status error (one with ErrorResult and one without)
         error_message = "Error occurred during task execution or evaluation"
         task_rows = [
             Task(
@@ -2264,22 +2342,17 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # Ensure we did not lose any previous data
         assert response_json.get("tasks_stopped") == 10
         assert len(response_json.get("evaluation_results")) == 10
         assert response_json.get("final_evaluation")
 
-        # Check for tasks with error
         assert response_json.get("task_errors")
         assert len(response_json.get("task_errors")) == 2
 
-        # Error message we saved was returned in the response
         assert response_json.get("task_errors").get("task_22") == error_message
 
-        # If we did not get an error message, we return a default message
         assert response_json.get("task_errors").get("task_23") == "No error message was provided"
 
-        # Test case 9. task_ids subset filters evaluation_results and recomputes final_score
         observed_headers: dict[str, str] = {}
         observed_results: dict[str, Any] = {}
 
@@ -2302,9 +2375,6 @@ class TestTrackerAPI:
         assert body["final_evaluation"]["final_score"] == 2.0
         assert observed_headers["X-Descope-Api-Key"] == "tracker-api-key"
 
-        # Test case 10. A requested task without a result (stopped/errored/missing) is still
-        # scored: it is passed to the benchmark service as {task_id: None}, contributing to
-        # the denominator rather than being silently dropped from the subset.
         response = client.get(
             "/retrieve-results",
             params=[("benchmark_id", str(benchmark_row.id)), ("task_ids", "task_1"), ("task_ids", "task_11")],
@@ -2315,6 +2385,7 @@ class TestTrackerAPI:
         assert observed_results["task_11"] is None
         assert response.json()["final_evaluation"]["final_score"] == 2.0
 
+    @pytest.mark.description("Run results keep the accounting summary inside the task breakdown.")
     async def test_retrieve_results_keeps_accounting_summary_inside_task_breakdown(
         self,
         database_session: Session,
@@ -2377,22 +2448,25 @@ class TestTrackerAPI:
             "attempts": 1,
         }
 
+    @pytest.mark.description(
+        (
+            "Preview retrieval archives the canonical result, overwrites it, and runs the callback.\n"
+            "\n"
+            "Test cases:\n"
+            "- Preview mode enables S3 without an explicit S3 query parameter.\n"
+            "- An existing canonical result is copied under archive/ before being overwritten.\n"
+            "- Unfinished tasks remain in the score input with a null result.\n"
+            "- A configured Lambda receives the completion payload plus ``preview``.\n"
+            "- A preview without a Lambda or an existing result can score an unfinished task subset.\n"
+            "- Unknown IDs reject the whole request before scoring, S3 writes, or callback invocation."
+        )
+    )
     async def test_preview_results_archives_then_overwrites_canonical_result(
         self,
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Preview retrieval archives the canonical result, overwrites it, and runs the callback.
-
-        Test cases:
-        - Preview mode enables S3 without an explicit S3 query parameter.
-        - An existing canonical result is copied under archive/ before being overwritten.
-        - Unfinished tasks remain in the score input with a null result.
-        - A configured Lambda receives the completion payload plus ``preview``.
-        - A preview without a Lambda or an existing result can score an unfinished task subset.
-        - Unknown IDs reject the whole request before scoring, S3 writes, or callback invocation.
-        """
         benchmark_row = example_benchmark_object
         benchmark_row.arguments.lambda_function = "vals-format-lambda"
         finished_task = Task(
@@ -2531,6 +2605,7 @@ class TestTrackerAPI:
         assert len(copied) == 1
         assert len(lambda_payloads) == 1
 
+    @pytest.mark.description("Run results are blocked when a saved internal destination is reached from outside.")
     async def test_retrieve_results_blocks_external_persisted_internal_destination(
         self,
         example_benchmark_object: Benchmark,
@@ -2554,6 +2629,7 @@ class TestTrackerAPI:
         assert response.status_code == 403
         assert response.json() == {"detail": "Custom benchmark destination is not allowed"}
 
+    @pytest.mark.description("Run results do not forward the Tracker key to a legacy custom service.")
     async def test_retrieve_results_does_not_forward_tracker_key_to_legacy_named_custom_service(
         self,
         monkeypatch: MonkeyPatch,
@@ -2601,25 +2677,102 @@ class TestTrackerAPI:
         assert response.json()["final_evaluation"]["final_score"] == 1.0
         assert "X-Descope-Api-Key" not in observed_headers
 
+    @pytest.mark.description("A task ID the benchmark service rejects returns 400 with the service's reason.")
+    @pytest.mark.parametrize(
+        ("error", "status_code", "detail"),
+        [
+            (
+                BenchmarkServiceError(
+                    'Verify task ids failed with status code 400, response: {"detail":"Task ID not found: typo"}',
+                    status_code=400,
+                    detail="Task ID not found: typo",
+                ),
+                400,
+                "Task ID not found: typo",
+            ),
+            (
+                BenchmarkServiceError("Verify task ids failed", status_code=404, detail="Unknown dataset: typo"),
+                400,
+                "Unknown dataset: typo",
+            ),
+            (
+                BenchmarkServiceError(
+                    'Verify task ids failed with status code 422, response: {"detail":[{"msg":"bad"}]}',
+                    status_code=422,
+                    detail=[{"msg": "bad"}],
+                ),
+                400,
+                "Benchmark service rejected the task IDs",
+            ),
+            (
+                BenchmarkServiceError("Verify task ids failed with status code 403, response: <html>", status_code=403),
+                400,
+                "Benchmark service rejected the task IDs",
+            ),
+            (
+                BenchmarkServiceError("Verify task ids failed with status code 429, response: busy", status_code=429),
+                502,
+                "Failed to verify task ids",
+            ),
+            (
+                BenchmarkServiceError("Verify task ids failed with status code 503, response: down", status_code=503),
+                502,
+                "Failed to verify task ids",
+            ),
+        ],
+        ids=[
+            "rejected-with-detail",
+            "detail-without-body",
+            "non-string-detail",
+            "rejected-without-detail",
+            "rate-limited",
+            "unavailable",
+        ],
+    )
+    async def test_start_maps_rejected_task_ids_to_400(
+        self,
+        contract: AgentContractRequest,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+        error: BenchmarkServiceError,
+        status_code: int,
+        detail: str,
+    ) -> None:
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", AsyncMock(side_effect=error))
+        row_count_before = len(database_session.exec(select(Benchmark)).all())
+
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            concurrency=10,
+            task_ids=["typo"],
+            sandbox_provider="daytona",
+            sandbox_provider_secret_name="provider-secret",
+        )
+        response = client.post("/start-benchmark", json=request.model_dump())
+
+        assert response.status_code == status_code
+        assert response.json() == {"detail": detail}
+        assert len(database_session.exec(select(Benchmark)).all()) == row_count_before
+
+    @pytest.mark.description("A failed pre-flight check returns 502 with the error and creates no run.")
+    @pytest.mark.parametrize(
+        "error",
+        [BenchmarkServiceError("Error verifying task ids"), json.JSONDecodeError("Expecting value", "", 0)],
+        ids=["service-error", "malformed-response"],
+    )
     async def test_benchmark_error_handling(
         self,
         contract: AgentContractRequest,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        error: Exception,
     ) -> None:
-        """Test benchmark error handling of the fastapi server.
 
-        Test Cases:
-            - Verify failure returns 502 with the error message
-            - No benchmark row is created when pre-flight checks fail
-        """
-
-        # Exception is raised if verify task ids fails
-        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", self._mock_verify_task_ids_error)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", AsyncMock(side_effect=error))
 
         row_count_before = len(database_session.exec(select(Benchmark)).all())
 
-        # Example request sent from the cli to the fastapi server
         request = StartBenchmarkRequest(
             contract=contract,
             benchmark_name="swebench",
@@ -2631,28 +2784,28 @@ class TestTrackerAPI:
 
         response = client.post("/start-benchmark", json=request.model_dump())
 
-        # Test case 1. Verify failure returns a stable 502 without internal detail
         assert response.status_code == 502
         assert response.json() == {"detail": "Failed to verify task ids"}
         assert "Error verifying task ids" not in response.text
 
-        # Test case 2. No benchmark row is created when pre-flight checks fail
         row_count_after = len(database_session.exec(select(Benchmark)).all())
         assert row_count_after == row_count_before
 
+    @pytest.mark.description(
+        (
+            "Runs can be listed with filters and ordering, along with a total count.\n"
+            "\n"
+            "Test cases:\n"
+            "- Fetch using no filters all all, returns 5 benchmarks with total count.\n"
+            "- Can fetch using contract name, benchmark name and status.\n"
+            "- Can order by started at.\n"
+            "- Edge cases with no benchmarks found."
+        )
+    )
     async def test_fetch_benchmarks(self, database_session: Session, example_benchmark_object: Benchmark) -> None:
-        """Test fetch benchmarks of the fastapi server.
-
-        Test Cases:
-            - Fetch using no filters all all, returns 5 benchmarks with total count
-            - can fetch using contract name, benchmark name and status
-            - Can order by started at
-            - Edge cases with no benchmarks found
-        """
 
         fetch_benchmarks_request = FetchBenchmarksRequest()
 
-        # When no benchmarks have been created yet, we return an empty list and total count of 0
         response = client.get(
             "/fetch-benchmarks", params=fetch_benchmarks_request.model_dump(exclude_none=True, mode="json")
         )
@@ -2661,7 +2814,6 @@ class TestTrackerAPI:
         assert response_json.get("benchmarks") == []
         assert response_json.get("total_count") == 0
 
-        # Add benchmark row to the database to fetch
         example_benchmark_object.executor_release_id = "initial-release"
         example_benchmark_object.current_execution_release_id = "current-release"
         example_benchmark_object.executor_artifact_uri = "s3://artifacts/initial-release.pex"
@@ -2670,10 +2822,8 @@ class TestTrackerAPI:
         database_session.add(example_benchmark_object)
         database_session.commit()
 
-        # Add benchmark name to be a random string (expected no matches)
         fetch_benchmarks_request.benchmark_name = [str(uuid4())]
 
-        # When we fetch with no benchmarks found, we return an empty list and total count of 0
         response = client.get(
             "/fetch-benchmarks", params=fetch_benchmarks_request.model_dump(exclude_none=True, mode="json")
         )
@@ -2682,7 +2832,6 @@ class TestTrackerAPI:
         assert response_json.get("benchmarks") == []
         assert response_json.get("total_count") == 0
 
-        # Create 4 more benchmark rows that have the same data
         benchmark_rows = [
             Benchmark(org_id=TEST_ORG_ID, id=uuid4(), name="swebench", arguments=example_benchmark_object.arguments)
             for _ in range(4)
@@ -2691,7 +2840,6 @@ class TestTrackerAPI:
             database_session.add(benchmark_row)
             database_session.commit()
 
-        # Create benchmark with unique data
         unique_contract = AgentContractRequest(
             name="terminus_2",
             install_cmd="echo installing dependencies...",
@@ -2711,12 +2859,10 @@ class TestTrackerAPI:
         database_session.add(unique_benchmark)
         database_session.commit()
 
-        # Search for the 4 benchmarks just created + the original one we added before
         fetch_benchmarks_request.benchmark_name = ["swebench"]
         fetch_benchmarks_request.agent_name = ["dummy"]
         fetch_benchmarks_request.status = [BenchmarkStatus.IN_PROGRESS]
 
-        # When we fetch with benchmarks found, we return a 200 OK
         response = client.get(
             "/fetch-benchmarks", params=fetch_benchmarks_request.model_dump(exclude_none=True, mode="json")
         )
@@ -2737,7 +2883,6 @@ class TestTrackerAPI:
         assert persisted_row["executor_artifact_digest"] == "a" * 64
         assert persisted_row["executor_protocol_version"] == "1"
 
-        # Clear filters and search again (checking limit and total)
         fetch_benchmarks_request.benchmark_name = None  # type: ignore[assignment]
         fetch_benchmarks_request.agent_name = None  # type: ignore[assignment]
         fetch_benchmarks_request.status = None  # type: ignore[assignment]
@@ -2748,16 +2893,13 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # There are 6 total benchmarks (default limit is 50, so all are returned)
         assert response_json.get("total_count") == 6
         assert len(response_json.get("benchmarks")) == 6
 
-        # Change benchmark status to finished and search again
         unique_benchmark.status = BenchmarkStatus.FINISHED
         database_session.add(unique_benchmark)
         database_session.commit()
 
-        # Search for finished benchmarks
         fetch_benchmarks_request.status = [BenchmarkStatus.FINISHED]
 
         response = client.get(
@@ -2766,7 +2908,6 @@ class TestTrackerAPI:
         assert response.status_code == 200
         response_json = response.json()
 
-        # There is 1 finished benchmark
         assert response_json.get("total_count") == 1
         assert len(response_json.get("benchmarks")) == 1
 
@@ -2784,6 +2925,7 @@ class TestTrackerAPI:
         assert response_json.get("total_count") == 1
         assert response_json["benchmarks"][0]["error_message"] == "Dominant task error"
 
+    @pytest.mark.description("A run start limits secret names to the organization.")
     @pytest.mark.parametrize(
         ("org_name", "provider_secret", "contract_secret", "expected_status"),
         [
@@ -2825,6 +2967,9 @@ class TestTrackerAPI:
         if expected_status == 404:
             assert "does not exist" in response.json()["detail"]
 
+    @pytest.mark.description(
+        "A run with no provider flags uses the provider, tenant secret, and service URL saved in Tracker settings."
+    )
     @pytest.mark.parametrize(
         ("user_id", "fields", "expected"),
         [
@@ -2867,6 +3012,7 @@ class TestTrackerAPI:
             queued["custom_benchmark_service"],
         ) == (provider, f"{_TENANT_SECRETS}{secret}", url)
 
+    @pytest.mark.description("A run start without a provider secret returns 400.")
     async def test_start_without_a_provider_secret_is_a_400(
         self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session
     ) -> None:
@@ -2881,6 +3027,9 @@ class TestTrackerAPI:
         }
         assert not database_session.exec(select(Benchmark)).all()
 
+    @pytest.mark.description(
+        "A saved service URL that is no longer allowed returns 403, and `ignore_custom_services` starts on the hosted service."
+    )
     @pytest.mark.parametrize("route", ["/start-benchmark", "/fetch-benchmark-tasks"])
     async def test_a_saved_url_must_still_be_an_allowed_destination(
         self,
@@ -2900,6 +3049,9 @@ class TestTrackerAPI:
         assert (refused.status_code, refused.json()) == (403, {"detail": "Custom benchmark destination is not allowed"})
         assert hosted.status_code == 200, hosted.text
 
+    @pytest.mark.description(
+        "A saved service sends its secret as the `Authorization` header, and sends none when it has no secret."
+    )
     @pytest.mark.parametrize("route", ["/start-benchmark", "/fetch-benchmark-tasks"])
     @pytest.mark.parametrize(
         ("fields", "sent"),
@@ -2952,6 +3104,9 @@ class TestTrackerAPI:
             [sent] if sent else []
         )
 
+    @pytest.mark.description(
+        "A Tracker without auth applies one local user's saved provider, secret, and service URL to runs."
+    )
     async def test_a_tracker_without_auth_keeps_settings_for_one_local_user(
         self,
         contract: AgentContractRequest,
@@ -2982,6 +3137,7 @@ class TestTrackerAPI:
             queued["custom_benchmark_service"],
         ) == ("e2b", "e2bsecret", local_url)
 
+    @pytest.mark.description("Listing runs filters by dataset.")
     async def test_fetch_benchmarks_filters_by_dataset(
         self, database_session: Session, contract: AgentContractRequest
     ) -> None:
@@ -3019,6 +3175,7 @@ class TestTrackerAPI:
         assert response_json["total_count"] == 2
         assert {row["dataset"] for row in response_json["benchmarks"]} == {"default"}
 
+    @pytest.mark.description("A run start records who started it.")
     @pytest.mark.parametrize(
         ("access_key_id", "user_id", "expected_id"),
         [("K2abc", None, "K2abc"), (None, "U-alice", "U-alice")],
@@ -3061,13 +3218,13 @@ class TestTrackerAPI:
         assert benchmark_row.started_by_id == expected_id
         assert benchmark_row.started_by_email == "alice@vals.ai"
 
+    @pytest.mark.description("A self hosted run start leaves the starter columns empty.")
     async def test_start_benchmark_self_hosted_writes_nulls(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         database_session: Session,
     ) -> None:
-        # The autouse override_starter_and_runner fixture already returns a self-hosted identity.
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
 
         request = StartBenchmarkRequest(
@@ -3087,16 +3244,17 @@ class TestTrackerAPI:
         assert benchmark_row.started_by_id is None
         assert benchmark_row.started_by_email is None
 
+    @pytest.mark.description(
+        (
+            "A hosted-mode start with an email-less access key warns once. Self-hosted identity, where access_key_id is None, never warns."
+        )
+    )
     async def test_start_benchmark_warns_when_email_claim_missing(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Hosted-mode start with an email-less access key emits a one-shot warning. Self-hosted
-        identity (access_key_id is None) must NOT warn — that's the bug fix for the warning
-        firing on every authenticated request.
-        """
         test_org = Org(id=TEST_ORG_ID, name="default", storage_key="test-bucket")
         app.dependency_overrides[get_current_runner] = lambda: RequestIdentity(org=test_org, access_key_id="K2abc")
 
@@ -3120,6 +3278,7 @@ class TestTrackerAPI:
         assert "K2abc" in warnings[0].message
         assert getattr(warnings[0], "benchmark_id") == benchmark_id
 
+    @pytest.mark.description("Listed runs include the starter's email.")
     async def test_fetch_benchmarks_includes_started_by_email(
         self,
         contract: AgentContractRequest,
@@ -3141,14 +3300,16 @@ class TestTrackerAPI:
         rows = response.json()["benchmarks"]
         assert any(r["started_by_email"] == "alice@vals.ai" for r in rows)
 
+    @pytest.mark.description(
+        (
+            "`started_by` binds from repeated query params. FastAPI's Depends(PydanticModel) can't bind list[str] from the query, so the endpoint declares it as a separate Query() parameter."
+        )
+    )
     async def test_fetch_benchmarks_started_by_query_param_filters(
         self,
         contract: AgentContractRequest,
         database_session: Session,
     ) -> None:
-        """Regression: FastAPI's Depends(PydanticModel) doesn't bind list[str] from query params;
-        started_by must be declared as a separate Query() parameter on the endpoint.
-        """
         for email in ("alice@vals.ai", "bob@vals.ai", None):
             database_session.add(
                 Benchmark(
@@ -3167,7 +3328,6 @@ class TestTrackerAPI:
         assert len(rows) == 1
         assert rows[0]["started_by_email"] == "alice@vals.ai"
 
-        # Repeated query params for multi-value filter
         response = client.get(
             "/fetch-benchmarks",
             params=[("started_by", "alice@vals.ai"), ("started_by", "bob@vals.ai"), ("limit", "10")],
@@ -3177,18 +3337,21 @@ class TestTrackerAPI:
         assert len(rows) == 2
         assert {r["started_by_email"] for r in rows} == {"alice@vals.ai", "bob@vals.ai"}
 
+    @pytest.mark.description(
+        (
+            "Run labels should persist on start and be visible through fetch and list.\n"
+            "\n"
+            "Test cases:\n"
+            "- Start stores the label on the benchmark row.\n"
+            "- Fetch and list responses expose the label, and list can filter by it."
+        )
+    )
     async def test_run_label_is_persisted_fetchable_and_filterable(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         database_session: Session,
     ) -> None:
-        """Run labels should persist on start and be visible through fetch and list.
-
-        Test cases:
-            - Start stores the label on the benchmark row.
-            - Fetch and list responses expose the label, and list can filter by it.
-        """
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
 
@@ -3223,6 +3386,7 @@ class TestTrackerAPI:
         assert rows[0]["id"] == str(benchmark_id)
         assert rows[0]["label"] == "nightly"
 
+    @pytest.mark.description("Run metadata includes the starter's email.")
     async def test_fetch_benchmark_metadata_includes_started_by_email(
         self,
         contract: AgentContractRequest,
@@ -3242,6 +3406,7 @@ class TestTrackerAPI:
         assert response.status_code == 200
         assert response.json()["started_by_email"] == "alice@vals.ai"
 
+    @pytest.mark.description("Run detail keeps using the run's saved log group after the deployment default changes.")
     async def test_fetch_and_metadata_use_saved_storage_after_deployment_default_changes(
         self,
         contract: AgentContractRequest,
@@ -3286,12 +3451,14 @@ class TestTrackerAPI:
         assert detail_response.status_code == 200, detail_response.text
         assert detail_response.json()["cloudwatch_url"].endswith(f"/saved-log-group$252F{benchmark.id}")
 
+    @pytest.mark.description(
+        "A run saved in another bucket, such as one started with the caller's own AWS keys, has no storage bucket."
+    )
     async def test_metadata_omits_storage_for_run_saved_outside_org_bucket(
         self,
         contract: AgentContractRequest,
         database_session: Session,
     ) -> None:
-        """A run saved in another bucket, such as one started with the caller's own AWS keys, has no storage bucket."""
         benchmark = Benchmark(
             org_id=TEST_ORG_ID,
             name="swebench",
@@ -3315,6 +3482,7 @@ class TestTrackerAPI:
         assert response.status_code == 200, response.text
         assert response.json()["storage_bucket"] is None
 
+    @pytest.mark.description("Metadata for a legacy managed run uses the org bucket.")
     async def test_legacy_managed_metadata_uses_org_bucket(
         self,
         contract: AgentContractRequest,
@@ -3347,6 +3515,7 @@ class TestTrackerAPI:
         assert detail_response.status_code == 200, detail_response.text
         assert detail_response.json()["cloudwatch_url"].endswith(f"/logs$252F{benchmark.id}")
 
+    @pytest.mark.description("Run outputs stream as a tar archive.")
     async def test_fetch_run_outputs_streams_tar(
         self,
         monkeypatch: MonkeyPatch,
@@ -3390,13 +3559,13 @@ class TestTrackerAPI:
             assert task_file is not None
             assert task_file.read() == b"output contents"
 
+    @pytest.mark.description("Never copy unsafe S3 key suffixes into a downloaded tar.")
     async def test_fetch_run_outputs_omits_unsafe_tar_members(
         self,
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Never copy unsafe S3 key suffixes into a downloaded tar."""
         database_session.add(example_benchmark_object)
         database_session.commit()
 
@@ -3423,13 +3592,13 @@ class TestTrackerAPI:
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tar:
             assert tar.getnames() == ["task/output.txt"]
 
+    @pytest.mark.description("Do not download outputs when every listed tar member name is unsafe.")
     async def test_fetch_run_outputs_returns_404_when_all_members_are_unsafe(
         self,
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
     ) -> None:
-        """Do not download outputs when every listed tar member name is unsafe."""
         database_session.add(example_benchmark_object)
         database_session.commit()
 
@@ -3449,6 +3618,7 @@ class TestTrackerAPI:
         assert response.json() == {"detail": f"No outputs found for run '{example_benchmark_object.id}'"}
         get_many.assert_not_called()
 
+    @pytest.mark.description("Run outputs return 404 when there are none.")
     async def test_fetch_run_outputs_returns_404_when_empty(
         self,
         monkeypatch: MonkeyPatch,
@@ -3470,20 +3640,23 @@ class TestTrackerAPI:
         assert response.status_code == 404
         assert response.json() == {"detail": f"No outputs found for run '{example_benchmark_object.id}'"}
 
+    @pytest.mark.description(
+        (
+            "BenchmarkServiceUnauthenticatedError returns 502 without capturing to Sentry.\n"
+            "\n"
+            "Test cases:\n"
+            "- /start-benchmark returns 502 when benchmark service returns 401.\n"
+            "- /fetch-benchmark-tasks returns 502 when benchmark service returns 401.\n"
+            "- /retry-or-resume-benchmark returns 502 when benchmark service returns 401.\n"
+            "- None of the above cases capture the exception to Sentry."
+        )
+    )
     async def test_benchmark_service_unauthenticated_error_returns(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         database_session: Session,
     ) -> None:
-        """Test that BenchmarkServiceUnauthenticatedError returns 502 without capturing to Sentry.
-
-        Test Cases:
-            - /start-benchmark returns 502 when benchmark service returns 401
-            - /fetch-benchmark-tasks returns 502 when benchmark service returns 401
-            - /retry-or-resume-benchmark returns 502 when benchmark service returns 401
-            - None of the above cases capture the exception to Sentry
-        """
         captured: list[Exception] = []
 
         def capture_exception(exception: Exception) -> None:
@@ -3496,7 +3669,6 @@ class TestTrackerAPI:
 
         no_raise_client = TestClient(app, raise_server_exceptions=False)
 
-        # Case 1: /start-benchmark
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _raise_unauth)
         request = StartBenchmarkRequest(
             contract=contract,
@@ -3512,7 +3684,6 @@ class TestTrackerAPI:
         assert response.json() == {"detail": "Benchmark service authentication failed"}
         assert "401 Unauthorized" not in response.text
 
-        # Case 2: /fetch-benchmark-tasks
         response = no_raise_client.post(
             "/fetch-benchmark-tasks",
             json={"benchmark_name": "swebench"},
@@ -3521,7 +3692,6 @@ class TestTrackerAPI:
         assert response.json() == {"detail": "Failed to fetch task ids from benchmark service"}
         assert "401 Unauthorized" not in response.text
 
-        # Case 3: /retry-or-resume-benchmark — needs at least one task so verify_task_ids is reached
         benchmark = Benchmark(
             org_id=TEST_ORG_ID,
             name="swebench",
@@ -3553,9 +3723,14 @@ class TestTrackerAPI:
         assert response.json() == {"detail": "Benchmark service authentication failed"}
         assert "401 Unauthorized" not in response.text
 
-        # None of the three cases should have reached Sentry
         assert captured == []
 
+    @pytest.mark.description(
+        (
+            "Runs saved in the organization's bucket stay downloadable, including runs started with the caller's own\n"
+            "AWS keys. Runs saved in any other bucket return 410."
+        )
+    )
     @pytest.mark.parametrize(
         ("saved_bucket", "expected_status"),
         [("test-bucket", 200), ("customer-bucket", 410)],
@@ -3569,9 +3744,6 @@ class TestTrackerAPI:
         saved_bucket: str,
         expected_status: int,
     ) -> None:
-        """Runs saved in the organization's bucket stay downloadable, including runs started with the caller's own
-        AWS keys; runs saved in any other bucket return 410.
-        """
         example_benchmark_object.arguments = example_benchmark_object.arguments.model_copy(
             update={
                 "properties": AWSResources(
@@ -3600,6 +3772,7 @@ class TestTrackerAPI:
                 assert tar.getnames() == ["task_1/output.txt"]
 
 
+@pytest.mark.description("A run's storage keeps its saved bucket and logs through its lifecycle.")
 async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
     contract: AgentContractRequest,
     database_session: Session,
@@ -3614,7 +3787,6 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
         "AWS_DEPLOYMENT_S3_BUCKET": "deployment-bucket",
         "AWS_DEPLOYMENT_LOG_GROUP": "deployment-log-group",
         "AWS_DEPLOYMENT_LOG_RETENTION_DAYS": "30",
-        "AWS_MANAGED_SUBMISSIONS_ENABLED": True,
     }.items():
         monkeypatch.setattr(f"tracker.config.{name}", value)
 
@@ -3715,7 +3887,7 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
         benchmark.id,
         properties=benchmark.arguments.properties,
     )
-    runtime.logs.write(f"{run_id}:task_0", "run log")
+    runtime.logs.write(f"{run_id}:task_0", [TaskLogLine(received_at=time.time(), message="run log", fields={})])
     expected_log_group = f"deployment-log-group/tenants/{TEST_ORG_ID}/{run_id}"
     assert logs_client.create_log_group.call_args.kwargs["logGroupName"] == expected_log_group
     assert logs_client.put_log_events.call_args.kwargs["logGroupName"] == expected_log_group
@@ -3784,6 +3956,7 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
         assert arguments["Bucket"] == "test-bucket", (operation, arguments)
 
 
+@pytest.mark.description("A local Tracker starts a Docker run and drops the client's cloud configuration.")
 async def test_local_start_persists_server_root_without_credentials(
     tmp_path: Path,
     contract: AgentContractRequest,
@@ -3791,7 +3964,6 @@ async def test_local_start_persists_server_root_without_credentials(
     database_session: Session,
     mock_launcher: Any,
 ) -> None:
-    """A local Tracker starts a Docker run and drops the client's cloud configuration."""
     from tracker.local import config as local_config
     from tracker.local.resources import LocalResources
 
@@ -3830,6 +4002,7 @@ async def test_local_start_persists_server_root_without_credentials(
     assert resumed_request.contract.secrets == {"MODEL_KEY": "model-key"}
 
 
+@pytest.mark.description("A local start with an invalid root is rejected before admission.")
 @pytest.mark.parametrize("failure", ["server-unconfigured", "caller-root", "missing-agent"])
 async def test_local_start_rejects_invalid_root_before_admission(
     tmp_path: Path,
@@ -3867,6 +4040,9 @@ async def test_local_start_rejects_invalid_root_before_admission(
     assert not mock_launcher.queued_calls
 
 
+@pytest.mark.description(
+    "A stopped local run's `--update-agent` copies the pushed agent into its frozen bundle on disk."
+)
 async def test_local_resume_updates_agent_from_the_local_library(
     tmp_path: Path,
     example_benchmark_object: Benchmark,
@@ -3874,7 +4050,6 @@ async def test_local_resume_updates_agent_from_the_local_library(
     database_session: Session,
     mock_launcher: Any,
 ) -> None:
-    """A stopped local run's `--update-agent` copies the pushed agent into its frozen bundle on disk."""
     from tracker.local import config as local_config
     from tracker.local.resources import LocalResources
     from tracker.local.runtime import LocalRuntimeFactory
@@ -3910,6 +4085,7 @@ async def test_local_resume_updates_agent_from_the_local_library(
     assert mock_launcher.queued_calls
 
 
+@pytest.mark.description("A local run start with cloud callbacks or service secrets returns 422.")
 @pytest.mark.parametrize(
     ("field", "message"),
     [
@@ -3945,6 +4121,7 @@ async def test_local_start_rejects_cloud_callbacks_and_service_secrets(
     assert message in response.text
 
 
+@pytest.mark.description("Local run metadata reports no storage bucket even when the client sends AWS headers.")
 async def test_local_run_metadata_ignores_client_aws_headers(
     tmp_path: Path,
     contract: AgentContractRequest,
@@ -3975,6 +4152,7 @@ async def test_local_run_metadata_ignores_client_aws_headers(
         assert response.json()["storage_bucket"] is None
 
 
+@pytest.mark.description("A local Tracker answers requests to loopback hosts and refuses other host names.")
 @pytest.mark.parametrize(
     ("local", "base_url", "expected_status"),
     [

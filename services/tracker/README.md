@@ -39,6 +39,44 @@ make stop
 make clean
 ```
 
+`MODEL_GATEWAY_PROJECT_KEYS_MODE` controls project Gateway keys for `vals.ai`
+projects using managed secrets. Hosted DEV, BENCH, and PROD deploy with
+`automatic` mode; their protected GitHub Environments each supply
+`MODEL_GATEWAY_URL` and an account-local
+`MODEL_GATEWAY_MACHINE_API_KEY_SECRET_NAME`. The three stages share the
+connected DEV Gateway URL, but each stage loads its registered machine bearer
+from a secret in its own AWS account. Release-test and file-backed local
+Tracker use supplied keys.
+For a standalone Tracker with no mode set, the process defaults to `manual`.
+
+| Mode | New `vals.ai` projects | New runs selecting a `vals.ai` project |
+| --- | --- | --- |
+| `manual` | No Gateway request | Use supplied keys |
+| `provision` | Request a Gateway key and save its request ID | Use supplied keys |
+| `automatic` | Request a Gateway key and save its request ID | Collect an approved key and select its secret references; a missing or unapproved binding blocks the run, with no supplied-key fallback |
+
+For a standalone AWS-backed Tracker explicitly using `provision` or
+`automatic`, set `MODEL_GATEWAY_URL` and `MODEL_GATEWAY_MACHINE_API_KEY` in
+the Tracker process. Tracker reads them when requesting or collecting a key,
+not at startup. Hosted deployments instead inject the account-local machine
+bearer from the Secrets Manager secret named by their GitHub Environment;
+runner tasks do not receive that bearer or the Gateway endpoint. The machine
+API key is not the executor's project key or the release-test gateway control
+token.
+
+Backfill a Gateway key request for every existing eligible project in the
+relevant hosted stage and obtain its approval before deploying that stage's
+Tracker.
+Other organizations and projectless runs continue to use supplied keys. A
+file-only local Tracker also uses supplied keys, even for `vals.ai`. An
+AWS-backed local Tracker can explicitly select a non-manual mode only with a
+Gateway configured for its own project database and organization; a DEV
+Gateway URL alone does not establish that trust. On retry or resume, a run
+keeps its original saved `MODEL_GATEWAY_URL` and `MODEL_GATEWAY_API_KEY`
+references (or their absence), rather than accepting overrides for those
+keys or selecting a new project's key after a retag. Other secret overrides
+still work.
+
 ## Tests
 
 ```bash

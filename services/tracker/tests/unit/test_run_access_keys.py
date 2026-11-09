@@ -19,9 +19,11 @@ from tracker.database.models import (
     Org,
     RunAccessKey,
 )
+from tracker import run_access_keys as run_access_keys_module
 from tracker.run_access_keys import delete_finished_run_keys, issued_run_keys, run_service_key
 
 
+@pytest.mark.description("A cancelled run key creation still deletes the key it created.")
 @pytest.mark.parametrize("creation_fails", [False, True])
 @pytest.mark.parametrize("cancellations", [1, 2])
 async def test_cancelled_creation_finishes_before_request_cleanup(
@@ -105,6 +107,9 @@ def _remaining(session: Session) -> set[str]:
     return set(session.exec(select(RunAccessKey.key_id)).all())
 
 
+@pytest.mark.description(
+    "The sweep deletes keys of `ERROR`, `FINISHED`, and `STOPPED` runs and keeps keys of live runs."
+)
 def test_sweep_deletes_keys_of_runs_that_have_ended(
     database_session: Session, fake_access_keys: FakeAccessKeys
 ) -> None:
@@ -123,6 +128,7 @@ def test_sweep_deletes_keys_of_runs_that_have_ended(
     assert _remaining(database_session) == {"K-running", "K-draining", "K-stopping"}
 
 
+@pytest.mark.description("A key whose deletion keeps failing does not block the next key from being deleted.")
 def test_failed_deletions_move_to_the_back_of_the_queue(
     database_session: Session, fake_access_keys: FakeAccessKeys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -156,3 +162,23 @@ async def test_login_runs_need_descope_management(headers: list[tuple[bytes, byt
         await run_service_key(request, _org(), BenchmarkServiceDestination.HOSTED, None, [])
 
     assert exc_info.value.status_code == 503
+
+
+@pytest.mark.description("A malformed key creation response returns 503 and logs the traceback of its cause.")
+async def test_malformed_key_creation_logs_its_cause(
+    fake_access_keys: FakeAccessKeys, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(fake_access_keys, "create", lambda *_args, **_kwargs: {"cleartext": "secret"})
+
+    run_access_keys_module.logger.addHandler(caplog.handler)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await run_service_key(
+                Request({"type": "http", "headers": []}), _org(), BenchmarkServiceDestination.HOSTED, None, []
+            )
+    finally:
+        run_access_keys_module.logger.removeHandler(caplog.handler)
+
+    assert exc_info.value.status_code == 503
+    (record,) = [r for r in caplog.records if r.getMessage() == "Failed to create a run access key"]
+    assert record.exc_info is not None and record.exc_info[0] is KeyError

@@ -1,5 +1,3 @@
-"""Exercise the local runtime and agent transfer against the real Docker daemon."""
-
 import asyncio
 import io
 import tarfile
@@ -27,9 +25,9 @@ from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.sandbox import SandboxCreationState, create_sandbox, run_agent, upload_agent_artifacts
 
 
+@pytest.mark.description("Execute a frozen local bundle without S3, curl, unzip, or package downloads.")
 @pytest.mark.parametrize("exit_code", [0, 7])
 async def test_local_runtime_transfers_and_executes_frozen_agent(tmp_path: Path, exit_code: int) -> None:
-    """Execute a frozen local bundle without S3, curl, unzip, or package downloads."""
     org_id = uuid4()
     run_id = uuid4()
     benchmark_id = str(run_id)
@@ -98,6 +96,7 @@ async def test_local_runtime_transfers_and_executes_frozen_agent(tmp_path: Path,
                         deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
                         agent_output_s3_key=output_key,
                         benchmark_id=benchmark_id,
+                        log_line=logs.write_line,
                     )
                     assert exit_reason is None
                     assert duration >= 0

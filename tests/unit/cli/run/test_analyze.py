@@ -1,8 +1,3 @@
-"""Tests for run analysis command behavior.
-
-Run: uv run pytest tests/unit/cli/run/test_analyze.py
-"""
-
 import io
 import json
 import zipfile
@@ -23,7 +18,6 @@ _CONTRACT = "name: mini_sweagent\ninstall_cmd: 'true'\nrun_cmd: 'run {problem_st
 
 
 def serve_pushed_agent(tracker: MockTracker, contract: str | None) -> None:
-    """Serve the run's metadata and its agent's current bundle, or a 404 when `contract` is None."""
     tracker.reply("GET", f"/fetch-benchmark-metadata/{_RUN_ID}", ok(make_fetch_metadata(_RUN_ID)))
     if contract is None:
         tracker.reply("GET", "/agents/mini_sweagent/download-url", httpx.Response(404, json={"detail": "Not found"}))
@@ -37,10 +31,10 @@ def serve_pushed_agent(tracker: MockTracker, contract: str | None) -> None:
     tracker.reply("GET", "/agent.zip", httpx.Response(200, content=bundle.getvalue()))
 
 
+@pytest.mark.description("Only `ingest_lambda` is read, so a pushed contract missing required fields still works.")
 def test_analysis_uses_the_pushed_contracts_lambda_and_reports_the_plan(
     tracker: MockTracker, cli_runner: CliRunner
 ) -> None:
-    """Only `ingest_lambda` is read, so a pushed contract missing required fields still works."""
     serve_pushed_agent(tracker, "name: mini_sweagent\ningest_lambda: docent-ingest\n")
     events = [
         ("started", {"lambda_function": "docent-ingest"}),
@@ -61,6 +55,7 @@ def test_analysis_uses_the_pushed_contracts_lambda_and_reports_the_plan(
     assert json.loads(request.content) == {"no_cache": True, "lambda_function": "docent-ingest"}
 
 
+@pytest.mark.description("An unusable analysis contract reports how to fix it.")
 @pytest.mark.parametrize(
     ("contract", "expected_message"),
     [
@@ -82,6 +77,7 @@ def test_unusable_analysis_contract_reports_remediation(
     assert tracker.requested("POST", _ANALYZE_PATH) == []
 
 
+@pytest.mark.description("Analyzing an unfinished run reports its state without an internal error.")
 @pytest.mark.parametrize(
     ("status", "expected_message"),
     [

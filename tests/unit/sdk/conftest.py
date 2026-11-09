@@ -1,5 +1,3 @@
-"""Shared fixtures for Valkyrie SDK unit tests."""
-
 from collections.abc import Callable
 from uuid import UUID
 
@@ -16,7 +14,6 @@ ClientFactory = Callable[..., ValkyrieClient]
 
 @pytest.fixture
 def config_values() -> ConfigValuesFactory:
-    """Return a factory for complete SDK configuration."""
 
     def factory(**overrides: object) -> dict[str, object]:
         values: dict[str, object] = {"api_key": "vals-key", "url": "https://tracker.test"}
@@ -28,7 +25,6 @@ def config_values() -> ConfigValuesFactory:
 
 @pytest.fixture
 def sdk_config(config_values: ConfigValuesFactory) -> SDKConfigFactory:
-    """Return a factory for validated SDK configuration."""
 
     def factory(**overrides: object) -> ValkyrieConfig:
         return ValkyrieConfig.model_validate(config_values(**overrides))
@@ -38,7 +34,6 @@ def sdk_config(config_values: ConfigValuesFactory) -> SDKConfigFactory:
 
 @pytest.fixture
 def fetch_response() -> FetchResponseFactory:
-    """Return a factory for tracker fetch responses."""
 
     def factory(run_id: UUID, *, status: str = "IN_PROGRESS") -> dict[str, object]:
         return {
@@ -63,7 +58,6 @@ def fetch_response() -> FetchResponseFactory:
 
 @pytest.fixture
 def make_client(sdk_config: SDKConfigFactory) -> ClientFactory:
-    """Return a factory for SDK clients backed by an HTTPX mock transport."""
 
     def factory(
         handler: Callable[[httpx.Request], httpx.Response],

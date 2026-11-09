@@ -1,5 +1,3 @@
-"""Provider-neutral object storage capabilities used by Tracker and the CLI."""
-
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,8 +6,6 @@ from typing import Protocol
 
 @dataclass(frozen=True)
 class StoredObject:
-    """Metadata returned while listing stored objects."""
-
     key: str
     last_modified: datetime | None = None
     size: int = field(kw_only=True)
@@ -17,14 +13,10 @@ class StoredObject:
 
 @dataclass(frozen=True)
 class StoredObjectCopy:
-    """Opaque provider identity for precisely deleting a copied object."""
-
     deletion_token: str | None
 
 
 class ObjectStore(Protocol):
-    """Object transfers using opaque, store-relative keys and prefixes."""
-
     async def put_bytes(self, key: str, content: bytes) -> None:
         raise NotImplementedError  # pragma: no cover
 
@@ -36,7 +28,6 @@ class ObjectStore(Protocol):
         should_continue: Callable[[], bool] | None = None,
         overwrite: bool = True,
     ) -> int:
-        """Store all chunks and return their total byte count."""
         raise NotImplementedError  # pragma: no cover
 
     async def get_bytes(self, key: str) -> bytes:
@@ -58,23 +49,18 @@ class ObjectStore(Protocol):
         raise NotImplementedError  # pragma: no cover
 
     async def stat(self, key: str) -> StoredObject:
-        """Return metadata for one existing object."""
         raise NotImplementedError  # pragma: no cover
 
     async def list_objects_page(
         self, prefix: str, *, cursor: str | None, limit: int
     ) -> tuple[list[StoredObject], str | None]:
-        """List one bounded page, preserving the provider's continuation cursor."""
         raise NotImplementedError  # pragma: no cover
 
     async def temporary_download_url(self, key: str, *, expires_in: int) -> str | None:
-        """Return a signed URL, or None when callers must transfer the object bytes."""
         raise NotImplementedError  # pragma: no cover
 
 
 class ArtifactLocations(Protocol):
-    """Provider-native artifact locations for display or navigation."""
-
     def object_location(self, key: str) -> str:
         raise NotImplementedError  # pragma: no cover
 

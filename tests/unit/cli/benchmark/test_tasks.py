@@ -1,7 +1,4 @@
-"""Tests for benchmark task-ID export commands.
-
-Run: uv run pytest tests/unit/cli/benchmark/test_tasks.py
-"""
+import pytest
 
 import json
 from pathlib import Path
@@ -14,9 +11,11 @@ from valkyrie.cli.benchmark.tasks import tasks
 from tests.unit.cli.conftest import MockTracker
 
 
+@pytest.mark.description("Task export contents, request options, and failure safety.")
 class TestBenchmarkTasksCommand:
-    """Task export contents, request options, and failure safety."""
-
+    @pytest.mark.description(
+        "Task export writes the task IDs to a file and sends `--header` values and `ignore_custom_services`."
+    )
     def test_export_writes_task_ids_and_sends_the_headers_and_service_choice(
         self, tracker: MockTracker, tmp_path: Path, cli_runner: CliRunner
     ) -> None:
@@ -39,6 +38,7 @@ class TestBenchmarkTasksCommand:
             "ignore_custom_services": True,
         }
 
+    @pytest.mark.description("A Tracker failure creates no output file.")
     def test_tracker_failure_does_not_create_output(
         self, tracker: MockTracker, tmp_path: Path, cli_runner: CliRunner
     ) -> None:

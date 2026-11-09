@@ -5,7 +5,7 @@ from valkyrie.sdk import ValkyrieClient
 from valkyrie.sdk.models import BenchmarkStatusEntry
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, progress_percent
+from valkyrie.cli.display import format_option, format_table, progress_percent
 from valkyrie.cli.run.progress import styled_status
 from valkyrie.cli.run.snapshot import format_run_status_json
 
@@ -15,10 +15,10 @@ _STATUS_BATCH_SIZE = 50
 @click.command(
     name="status",
     help=(
-        "Fetch lightweight status for multiple run IDs.\n\n"
+        "Show the status of several runs at once.\n"
+        "\n"
         "Example:\n"
-        "valkyrie run status --ids "
-        "123e4567-e89b-12d3-a456-426614174000,123e4567-e89b-12d3-a456-426614174001 --format json"
+        "    valkyrie run status --ids 123e4567-e89b-12d3-a456-426614174000,123e4567-e89b-12d3-a456-426614174001 --format json"
     ),
 )
 @click.option(
@@ -27,16 +27,8 @@ _STATUS_BATCH_SIZE = 50
     required=True,
     help="Comma-separated run UUIDs. Duplicates are ignored while preserving order.",
 )
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
-)
+@format_option()
 def status_runs(run_ids_value: str, output_format: str) -> None:
-    """Fetch lightweight progress for a deterministic set of run IDs."""
     run_ids = parse_run_ids(run_ids_value)
 
     entries = call(lambda client: fetch_status_entries(client, run_ids))
@@ -61,26 +53,20 @@ def status_runs(run_ids_value: str, output_format: str) -> None:
 
 
 def parse_run_ids(value: str) -> list[UUID]:
-    """Parse comma-separated UUIDs and de-duplicate them in input order."""
     raw_ids = [part.strip() for part in value.split(",") if part.strip()]
     if not raw_ids:
         raise click.BadParameter("provide at least one run UUID", param_hint="--ids")
 
     run_ids: list[UUID] = []
-    seen: set[UUID] = set()
     for raw_id in raw_ids:
         try:
-            run_id = UUID(raw_id)
+            run_ids.append(UUID(raw_id))
         except ValueError as e:
             raise click.BadParameter(f"invalid run UUID: {raw_id}", param_hint="--ids") from e
-        if run_id not in seen:
-            seen.add(run_id)
-            run_ids.append(run_id)
-    return run_ids
+    return list(dict.fromkeys(run_ids))
 
 
 async def fetch_status_entries(client: ValkyrieClient, run_ids: list[UUID]) -> list[BenchmarkStatusEntry]:
-    """Fetch status entries in URL-safe batches without writing partial output."""
     entries: list[BenchmarkStatusEntry] = []
     for start in range(0, len(run_ids), _STATUS_BATCH_SIZE):
         response = await client.benchmarks.statuses(run_ids[start : start + _STATUS_BATCH_SIZE])
@@ -89,7 +75,6 @@ async def fetch_status_entries(client: ValkyrieClient, run_ids: list[UUID]) -> l
 
 
 def format_status_table(entries: list[BenchmarkStatusEntry]) -> None:
-    """Render lightweight multi-run status for humans."""
     rows: list[dict[str, str]] = []
     for entry in entries:
         percent = progress_percent(entry.finished_tasks, entry.total_tasks)

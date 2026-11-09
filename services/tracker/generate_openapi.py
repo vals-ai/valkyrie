@@ -1,5 +1,3 @@
-"""Generate the committed Tracker API contract."""
-
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -38,4 +36,4 @@ def build_openapi() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    OPENAPI_PATH.write_text(json.dumps(build_openapi(), indent=2, sort_keys=True) + "\n")
+    OPENAPI_PATH.write_text(json.dumps(build_openapi(), indent=2) + "\n")

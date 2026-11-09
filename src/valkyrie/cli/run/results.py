@@ -16,10 +16,10 @@ def _format_expiration(seconds: int) -> str:
 @click.command(
     name="results",
     help=(
-        "Retrieve run results by its run id. \n\n"
+        "Save a run's results by its ID.\n"
+        "\n"
         "Example:\n"
-        "valkyrie run results 123e4567-e89b-12d3-a456-426614174000 "
-        "--path ./results-123e4567-e89b-12d3-a456-426614174000.json"
+        "    valkyrie run results 123e4567-e89b-12d3-a456-426614174000 --path ./results-123e4567-e89b-12d3-a456-426614174000.json"
     ),
 )
 @click.argument("run_id", type=UUID)
@@ -28,14 +28,14 @@ def _format_expiration(seconds: int) -> str:
     type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
     default=None,
     required=False,
-    help="Path to save the results (default: ./results-<run_id>.json)",
+    help="Path to save the results (default: ./results-<run_id>.json).",
 )
 @click.option(
     "--s3",
     is_flag=True,
     default=False,
     required=False,
-    help="Saves results to s3 instead of downloading them locally. Can be found at bucket://benchmarks/run_id/<benchmark>.json",
+    help="Saves results to s3 instead of downloading them locally. Can be found at bucket://benchmarks/run_id/<benchmark>.json.",
 )
 @click.option(
     "--preview",
@@ -55,8 +55,9 @@ def _format_expiration(seconds: int) -> str:
     type=str,
     required=False,
     default=None,
-    help="Path or http(s) URL to a text file with one task ID per line",
+    help="Path or http(s) URL to a text file with one task ID per line.",
 )
+@click.option("--yes", "-y", is_flag=True, help="Overwrite existing results without prompting.")
 def results(
     run_id: UUID,
     path: Path | None,
@@ -64,13 +65,8 @@ def results(
     preview: bool,
     task_ids: str | None,
     task_ids_file: str | None,
+    yes: bool,
 ):
-    """
-    Retrieve the results of a run by its run id.
-
-    Example:
-        valkyrie run results e532551e-d51b-4912-983d-47695bd24174 --path ./results-e532551e-d51b-4912-983d-47695bd24174.json
-    """
     if preview and path:
         raise click.UsageError("--preview cannot be combined with --path")
 
@@ -82,7 +78,7 @@ def results(
         if preview:
             return await client.runs.preview(run_id, task_ids=subset_task_ids)
         if s3 and (await client.runs.results_exist(run_id)).exists:
-            if not click.confirm("Results already exist in S3. Overwrite?"):
+            if not yes and not click.confirm("Results already exist in S3. Overwrite?"):
                 raise click.Abort()
         return await client.runs.results(run_id, task_ids=subset_task_ids, upload_to_s3=s3)
 
@@ -96,7 +92,7 @@ def results(
                     fg="yellow" if scored < len(subset_task_ids) else "green",
                 )
             )
-        download_final_view(path or Path(f"./results-{run_id}.json"), results_response)
+        download_final_view(path or Path(f"./results-{run_id}.json"), results_response, overwrite=yes)
     else:
         click.echo(
             click.style(
@@ -111,11 +107,11 @@ def results(
         click.echo(f"  {results_response.console_url}")
 
 
-def download_final_view(path: Path, final_view: FinalViewResponse) -> None:
+def download_final_view(path: Path, final_view: FinalViewResponse, overwrite: bool) -> None:
     if not path.parent.exists():
         raise click.ClickException(f"'{path.parent}' directory does not exist! Please create it first.")
 
-    if path.exists():
+    if path.exists() and not overwrite:
         if not click.confirm(f"File '{path}' already exists. Overwrite?"):
             raise click.Abort()
 

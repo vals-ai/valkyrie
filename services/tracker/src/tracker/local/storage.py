@@ -1,5 +1,3 @@
-"""Filesystem artifacts with atomic publication and operation-scoped cleanup."""
-
 import asyncio
 import os
 import tempfile
@@ -18,7 +16,6 @@ T = TypeVar("T")
 
 
 def local_path(root: Path, key: str, *, prefix: bool = False) -> Path:
-    """Resolve a store key without allowing traversal or escaped symlinks."""
     parts = PurePosixPath(key).parts
     if (not key and not prefix) or key.startswith("/") or ".." in parts or "\x00" in key:
         raise ValueError("Local artifact keys must be relative paths without traversal")
@@ -30,18 +27,14 @@ def local_path(root: Path, key: str, *, prefix: bool = False) -> Path:
 
 
 async def _io(operation: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-    # Do not close or unlink a temporary file while a cancelled thread still uses it.
     return await finish_cleanup(asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs)))
 
 
 class FilesystemObjectStore:
-    """Store complete files under stable keys in a shared local directory."""
-
     def __init__(self, root: Path, staging: Path) -> None:
         if not root.is_absolute():
             raise ValueError("Local artifact root must be absolute")
         self.root = root.resolve()
-        # Staging shares the root's filesystem so rename and link stay atomic, but never its key space.
         self.staging = staging.resolve()
         if self.staging.is_relative_to(self.root):
             raise ValueError("Local staging directory must sit outside the artifact root")
@@ -117,7 +110,6 @@ class FilesystemObjectStore:
         await _io(lambda: local_path(self.root, key).unlink(missing_ok=True))
 
     async def copy(self, source_key: str, destination_key: str) -> StoredObjectCopy:
-        # Admission copies into a new run ID; local files do not have versions.
         await self.put_bytes(destination_key, await self.get_bytes(source_key))
         return StoredObjectCopy(deletion_token=None)
 

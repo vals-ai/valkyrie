@@ -1,13 +1,3 @@
-"""Stop, resume, or retry an existing Valkyrie run.
-
-After installing valkyrie-sdk, run:
-
-    python docs/sdk/examples/manage_run.py stop RUN_ID
-    python docs/sdk/examples/manage_run.py stop RUN_ID --task-id TASK_ID
-    python docs/sdk/examples/manage_run.py resume RUN_ID --concurrency 10
-    python docs/sdk/examples/manage_run.py retry RUN_ID --task-id TASK_ID
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -19,22 +9,32 @@ from valkyrie.sdk import ValkyrieClient, ValkyrieSDKError
 
 
 def add_retry_options(parser: argparse.ArgumentParser) -> None:
-    """Add options shared by resume and retry operations."""
-    parser.add_argument("run_id", type=UUID, help="Run UUID")
-    parser.add_argument("--concurrency", type=int, help="Override concurrent tasks")
-    parser.add_argument("--task-id", action="append", dest="task_ids", help="Task ID; repeat for multiple tasks")
-    parser.add_argument("--from-scratch", action="store_true", help="Restart selected work from scratch")
+    parser.add_argument("run_id", type=UUID, help="Run UUID.")
+    parser.add_argument("--concurrency", type=int, help="Override concurrent tasks.")
+    parser.add_argument("--task-id", action="append", dest="task_ids", help="Task ID. Repeat for multiple tasks.")
+    parser.add_argument("--from-scratch", action="store_true", help="Restart selected work from scratch.")
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse one explicit run-management action."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stop, resume, or retry an existing Valkyrie run.\n"
+            "\n"
+            "After installing valkyrie-sdk, run:\n"
+            "\n"
+            "    python docs/sdk/examples/manage_run.py stop RUN_ID\n"
+            "    python docs/sdk/examples/manage_run.py stop RUN_ID --task-id TASK_ID\n"
+            "    python docs/sdk/examples/manage_run.py resume RUN_ID --concurrency 10\n"
+            "    python docs/sdk/examples/manage_run.py retry RUN_ID --task-id TASK_ID\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     actions = parser.add_subparsers(dest="action", required=True)
 
     stop_parser = actions.add_parser("stop", help="Stop a running run")
-    stop_parser.add_argument("run_id", type=UUID, help="Run UUID")
-    stop_parser.add_argument("--force", action="store_true", help="Terminate active sandboxes")
-    stop_parser.add_argument("--task-id", action="append", dest="task_ids", help="Task ID; repeat for multiple tasks")
+    stop_parser.add_argument("run_id", type=UUID, help="Run UUID.")
+    stop_parser.add_argument("--force", action="store_true", help="Terminate active sandboxes.")
+    stop_parser.add_argument("--task-id", action="append", dest="task_ids", help="Task ID. Repeat for multiple tasks.")
 
     add_retry_options(actions.add_parser("resume", help="Resume unfinished work"))
     add_retry_options(actions.add_parser("retry", help="Retry failed or selected work"))
@@ -42,7 +42,6 @@ def parse_args() -> argparse.Namespace:
 
 
 async def manage_run(args: argparse.Namespace) -> None:
-    """Fetch a run and perform the selected management action."""
     async with ValkyrieClient() as client:
         current = await client.runs.fetch(args.run_id)
         print(f"{current.benchmark_id} is {current.details.status.value}")
@@ -68,7 +67,6 @@ async def manage_run(args: argparse.Namespace) -> None:
 
 
 async def main(args: argparse.Namespace) -> int:
-    """Run the example and convert SDK errors into a concise CLI failure."""
     try:
         await manage_run(args)
     except ValkyrieSDKError as exc:

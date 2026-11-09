@@ -1,8 +1,3 @@
-"""Unit tests for tracker Lambda invocation.
-
-Run: uv run pytest tests/unit/aws/test_lambda.py
-"""
-
 import json
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +11,7 @@ from tracker.aws.clients import AWSClientProvider
 from tracker.exceptions import LambdaError
 
 
+@pytest.mark.description("`invoke_lambda` calls the configured function and returns the decoded JSON payload.")
 async def test_invoke_lambda_uses_provider_config_and_returns_parsed_payload() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -47,6 +43,7 @@ async def test_invoke_lambda_uses_provider_config_and_returns_parsed_payload() -
     }
 
 
+@pytest.mark.description("A Lambda dry run uses the provider's client.")
 async def test_dry_run_lambda_uses_provider_client() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -59,6 +56,7 @@ async def test_dry_run_lambda_uses_provider_client() -> None:
     client.invoke.assert_awaited_once_with(FunctionName="benchmark-function", InvocationType="DryRun")
 
 
+@pytest.mark.description("A Lambda dry run maps client errors.")
 async def test_dry_run_lambda_maps_client_errors() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -73,6 +71,7 @@ async def test_dry_run_lambda_maps_client_errors() -> None:
         await dry_run_lambda(cast(AWSClientProvider, provider), "benchmark-function")
 
 
+@pytest.mark.description("A Lambda function error raises.")
 async def test_invoke_lambda_raises_for_function_error() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -92,6 +91,7 @@ async def test_invoke_lambda_raises_for_function_error() -> None:
         )
 
 
+@pytest.mark.description("A Lambda error status raises.")
 async def test_invoke_lambda_raises_for_error_status() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -112,6 +112,7 @@ async def test_invoke_lambda_raises_for_error_status() -> None:
         )
 
 
+@pytest.mark.description("A Lambda payload that is not an object is returned as is.")
 async def test_invoke_lambda_returns_non_object_payload() -> None:
     client = AsyncMock()
     client.__aenter__.return_value = client

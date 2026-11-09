@@ -1,5 +1,3 @@
-"""Compose local runtime services from process configuration."""
-
 from asyncio import to_thread
 from dataclasses import dataclass
 from uuid import UUID
@@ -19,12 +17,9 @@ from tracker.types import FinalViewResponse, StartBenchmarkRequest
 
 @dataclass(kw_only=True)
 class LocalRuntimeServices(RuntimeServices):
-    """Filesystem storage and logs with secrets from a local file or AWS Secrets Manager."""
-
     resources: LocalResources
 
     async def prepare_execution(self, request: StartBenchmarkRequest, benchmark_id: UUID) -> None:
-        """Initialize the run log file."""
         await self.logs.create_benchmark(str(benchmark_id), retention_days=0)
 
     async def get_sandbox_provider_config(self) -> SandboxProviderConfig:
@@ -39,8 +34,6 @@ class LocalRuntimeServices(RuntimeServices):
 
 
 class LocalRuntimeFactory:
-    """Scope local storage by organization and credentials by operation."""
-
     @staticmethod
     def create_runtime(
         resources: LocalResources,

@@ -1,5 +1,3 @@
-"""Runtime composition and lazy sandbox configuration."""
-
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,11 +11,11 @@ from tracker.exceptions import InvalidSandboxConfigurationError
 from tracker.aws.secrets import SecretsManagerStore
 
 
+@pytest.mark.description("Read the persisted secret only when sandbox configuration is needed.")
 async def test_runtime_resolves_provider_configuration_when_requested(
     monkeypatch: pytest.MonkeyPatch,
     aws_runtime: AWSRuntime,
 ) -> None:
-    """Read the persisted secret only when sandbox configuration is needed."""
     resolve = AsyncMock(return_value={"MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"})
     monkeypatch.setattr(SecretsManagerStore, "get", resolve)
     runtime = CloudRuntimeFactory.create_runtime(
@@ -35,8 +33,8 @@ async def test_runtime_resolves_provider_configuration_when_requested(
     assert config.MODAL_TOKEN_SECRET == "secret"
 
 
+@pytest.mark.description("Artifact locations work without touching AWS or sandbox credentials.")
 async def test_read_only_runtime_needs_no_provider_credentials() -> None:
-    """Artifact locations work without touching AWS or sandbox credentials."""
     clients = MagicMock(spec=AWSClientProvider)
     aws_runtime = AWSRuntime(AWSResources("us-east-1", "bucket", "logs", 30), cast(AWSClientProvider, clients))
     runtime = CloudRuntimeFactory.create_runtime(aws_runtime)

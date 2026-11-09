@@ -1,13 +1,10 @@
-"""Keep each user's default sandbox provider and benchmark services."""
-
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, col, select
 
 from tracker.api.secrets import require_own_secret
 from tracker.auth import RequestIdentity, get_current_identity
 from tracker.config import AUTH_REQUIRED
 from tracker.database.models import UserBenchmarkService, UserDefaultProvider
-from tracker.database.session import get_session
+from tracker.repositories.run_settings import RunSettingsRepository, RunSettingsRepositoryDependency
 from tracker.outbound_security import validate_custom_service_destination
 from tracker.types import BenchmarkName, BenchmarkServiceRequest, DefaultProviderRequest, RunSettingsResponse
 
@@ -16,14 +13,12 @@ _LOGIN_ONLY = {"description": "Only a signed-in user can change run settings"}
 
 
 def _user_id(identity: RequestIdentity) -> str | None:
-    """A Tracker without auth keeps one local user's settings."""
     if identity.user_id is None and not AUTH_REQUIRED:
         return "local"
     return identity.user_id
 
 
 def _require_user_id(identity: RequestIdentity) -> str:
-    """Keys follow their creator's settings but can't change them."""
     user_id = _user_id(identity)
     if user_id is None or identity.access_key_id is not None:
         raise HTTPException(
@@ -34,16 +29,12 @@ def _require_user_id(identity: RequestIdentity) -> str:
     return user_id
 
 
-def user_run_settings(session: Session, identity: RequestIdentity) -> RunSettingsResponse:
+def user_run_settings(repository: RunSettingsRepository, identity: RequestIdentity) -> RunSettingsResponse:
     user_id = _user_id(identity)
     if user_id is None:
         return RunSettingsResponse(default_provider=None, benchmark_services={})
-    default = session.get(UserDefaultProvider, (identity.org.id, user_id))
-    services = session.exec(
-        select(UserBenchmarkService).where(
-            col(UserBenchmarkService.org_id) == identity.org.id, col(UserBenchmarkService.user_id) == user_id
-        )
-    )
+    default = repository.get_default_provider(identity.org.id, user_id)
+    services = repository.list_benchmark_services(identity.org.id, user_id)
     return RunSettingsResponse.model_validate(
         {
             "default_provider": default.provider if default else None,
@@ -52,26 +43,32 @@ def user_run_settings(session: Session, identity: RequestIdentity) -> RunSetting
     )
 
 
-@router.get("", response_model=RunSettingsResponse)
+@router.get(
+    "",
+    response_model=RunSettingsResponse,
+    description="Show the caller's default sandbox provider and benchmark services. Keys without a user get an empty result.",
+)
 def get_run_settings(
-    identity: RequestIdentity = Depends(get_current_identity), session: Session = Depends(get_session)
+    repository: RunSettingsRepositoryDependency, identity: RequestIdentity = Depends(get_current_identity)
 ) -> RunSettingsResponse:
-    """Show the caller's default sandbox provider and benchmark services; empty for keys without a user."""
-    return user_run_settings(session, identity)
+    return user_run_settings(repository, identity)
 
 
-@router.put("/default-provider", response_model=RunSettingsResponse, responses={403: _LOGIN_ONLY})
+@router.put(
+    "/default-provider",
+    response_model=RunSettingsResponse,
+    responses={403: _LOGIN_ONLY},
+    description="Run on this sandbox provider unless a run names another.",
+)
 def set_default_provider(
+    repository: RunSettingsRepositoryDependency,
     body: DefaultProviderRequest,
     identity: RequestIdentity = Depends(get_current_identity),
-    session: Session = Depends(get_session),
 ) -> RunSettingsResponse:
-    """Run on this sandbox provider unless a run names another."""
-    session.merge(
+    repository.save(
         UserDefaultProvider(org_id=identity.org.id, user_id=_require_user_id(identity), provider=body.provider)
     )
-    session.commit()
-    return user_run_settings(session, identity)
+    return user_run_settings(repository, identity)
 
 
 @router.put(
@@ -81,14 +78,14 @@ def set_default_provider(
         403: {"description": "Not a signed-in user, or the URL is not an allowed destination"},
         404: {"description": "Secret does not exist"},
     },
+    description="Use this benchmark service URL for the benchmark's runs, sending the named secret's value as a header.",
 )
 async def set_benchmark_service(
+    repository: RunSettingsRepositoryDependency,
     benchmark: BenchmarkName,
     body: BenchmarkServiceRequest,
     identity: RequestIdentity = Depends(get_current_identity),
-    session: Session = Depends(get_session),
 ) -> RunSettingsResponse:
-    """Use this benchmark service URL for the benchmark's runs, sending the named secret's value as a header."""
     user_id = _require_user_id(identity)
     try:
         validate_custom_service_destination(body.url, org_name=identity.org.name, auth_required=AUTH_REQUIRED)
@@ -96,27 +93,23 @@ async def set_benchmark_service(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if body.auth_secret_name is not None:
         await require_own_secret(body.auth_secret_name, identity.org)
-    session.merge(
+    repository.save(
         UserBenchmarkService(org_id=identity.org.id, user_id=user_id, benchmark=benchmark, **body.model_dump())
     )
-    session.commit()
-    return user_run_settings(session, identity)
+    return user_run_settings(repository, identity)
 
 
 @router.delete(
     "/benchmark-services/{benchmark}",
     response_model=RunSettingsResponse,
     responses={403: _LOGIN_ONLY, 404: {"description": "No URL is saved for the benchmark"}},
+    description="Stop using a saved benchmark service URL.",
 )
 def remove_benchmark_service(
+    repository: RunSettingsRepositoryDependency,
     benchmark: BenchmarkName,
     identity: RequestIdentity = Depends(get_current_identity),
-    session: Session = Depends(get_session),
 ) -> RunSettingsResponse:
-    """Stop using a saved benchmark service URL."""
-    row = session.get(UserBenchmarkService, (identity.org.id, _require_user_id(identity), benchmark))
-    if row is None:
+    if not repository.delete_benchmark_service(identity.org.id, _require_user_id(identity), benchmark):
         raise HTTPException(status_code=404, detail=f"Benchmark '{benchmark}' has no saved URL")
-    session.delete(row)
-    session.commit()
-    return user_run_settings(session, identity)
+    return user_run_settings(repository, identity)

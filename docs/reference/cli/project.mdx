@@ -13,6 +13,12 @@ Create a project that runs can be started in with `valkyrie run start --project 
 
 HANDLE is the project's permanent handle: lowercase letters, digits and hyphens (e.g., my-project).
 
+Development subcategories: `new_benchmark_generation`, `new_benchmark_launch_runs`, `post_launch_benchmark_update`.
+
+Customer subcategories: `report`, `paid_run`, `eval_server`, `platform`.
+
+Internal subcategories: `unpaid_leaderboard_run`, `other_unpaid_run`, `fellows_interns`, `blog`, `miscellaneous`.
+
 ```bash Syntax
 valkyrie project create \
   <HANDLE> \
@@ -20,7 +26,9 @@ valkyrie project create \
   --spend-type <CHOICE> \
   --subcategory <CHOICE> \
   [--customer <TEXT>] \
-  [--tag <TEXT>...]
+  [--tag <TEXT>...] \
+  [--budget <AMOUNT>] \
+  [--budget-reason <TEXT>]
 ```
 
 ```bash Example
@@ -29,7 +37,9 @@ valkyrie project create \
   my-project \
   --name "My Project" \
   --spend-type development \
-  --subcategory new_benchmark_generation
+  --subcategory new_benchmark_generation \
+  --budget 300 \
+  --budget-reason "3 runs, about 100 each"
 ```
 
 **Arguments**
@@ -42,27 +52,37 @@ valkyrie project create \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--name"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Name people read (e.g., \"My Project\"); the HANDLE is what runs are started with and never changes"}</p>
+  <p className="mb-0 mt-1">{"Name people read (e.g., \"My Project\"). The HANDLE is what runs are started with and never changes."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--spend-type"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"choice"}</code> · constraints: {"one of development, internal, customer"}</span></div>
-  <p className="mb-0 mt-1">{"Why this project's runs spend money: development, internal, or customer"}</p>
+  <p className="mb-0 mt-1">{"Why this project's runs spend money: development, internal, or customer."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--subcategory"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"choice"}</code> · constraints: {"one of new_benchmark_generation, new_benchmark_launch_runs, post_launch_benchmark_update, report, paid_run, eval_server, platform, unpaid_leaderboard_run, other_unpaid_run, fellows_interns, blog, miscellaneous"}</span></div>
-  <p className="mb-0 mt-1">{"development: New Benchmark Generation (new_benchmark_generation), New Benchmark Launch Runs (new_benchmark_launch_runs), Post-Launch Benchmark Update (post_launch_benchmark_update); customer: Report (report), Paid Run (paid_run), Eval Server (eval_server), Platform (platform); internal: Unpaid Leaderboard Run (unpaid_leaderboard_run), Other Unpaid Run (other_unpaid_run), Fellows/Interns (fellows_interns), Blog (blog), Miscellaneous (miscellaneous)"}</p>
+  <p className="mb-0 mt-1">{"Kind of spend within `--spend-type`. The command help lists the subcategories for each spend type."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--customer"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Customer the project is for; required with --spend-type customer"}</p>
+  <p className="mb-0 mt-1">{"Customer the project is for. Required with --spend-type customer."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--tag"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · constraints: {"repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Extra tag as key=value, repeatable (e.g., --tag engagement=q4)"}</p>
+  <p className="mb-0 mt-1">{"Extra tag as key=value, repeatable (e.g., --tag engagement=q4)."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--budget"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"amount"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Budget the project's main Model Gateway key asks for (e.g., 300). Required where projects get a Gateway key."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--budget-reason"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Why the project needs that budget (e.g., \"3 runs, about 100 each\"). Required where projects get a Gateway key."}</p>
 </div>
 
 Task guidance: [Project guides](/runs/start#put-the-run-in-a-project).
@@ -140,7 +160,7 @@ valkyrie project update \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--tag"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · constraints: {"repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Replace all extra tags with key=value values; repeatable."}</p>
+  <p className="mb-0 mt-1">{"Replace all extra tags with key=value values. Repeatable."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

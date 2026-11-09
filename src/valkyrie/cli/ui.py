@@ -1,13 +1,9 @@
-"""Defines `valk ui`, which opens the terminal UI."""
-
 import click
 
 
-@click.command()
+@click.command(help="Browse runs, tasks and logs in a terminal UI.")
 @click.option("--fake", is_flag=True, help="Use built-in sample data instead of the tracker.")
 def ui(fake: bool) -> None:
-    """Browse runs, tasks and logs in a terminal UI."""
-    # Textual loads when the UI opens, not for `valk ui --help` or the reference docs.
     from valkyrie.sdk.errors import ValkyrieConfigError
     from valkyrie.tui.app import ValkyrieApp
     from valkyrie.tui.fake import FakeSource

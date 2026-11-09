@@ -1,13 +1,10 @@
-"""Per-task drill-in endpoints."""
-
 from __future__ import annotations
 
-from typing import cast
 from uuid import UUID
 
 from benchmark_service.sandbox.types import SandboxNotFoundError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlmodel import Session, col, desc, select
+from sqlmodel import Session
 
 from tracker.api.dependencies import (
     RunBenchmarkDependency,
@@ -23,15 +20,12 @@ from tracker.aws.services import CloudRuntimeServices
 from tracker.database.models import (
     ActiveNativeOutput,
     Benchmark,
-    ErrorResult,
-    EvaluationResult,
-    FailureCategory,
     Org,
     Task,
     TaskStatus,
-    TaskBreakdown as TaskBreakdownRow,
 )
-from tracker.database.session import get_session
+from tracker.database.session import database_call, get_session
+from tracker.repositories.benchmark import BenchmarkRepository, BenchmarkRepositoryDependency
 from tracker.types import (
     NativeOutputFile,
     NativeOutputFilesResponse,
@@ -45,67 +39,37 @@ from tracker.sandbox import runtime_sandbox
 router = APIRouter(prefix="/benchmarks")
 
 
-def _load_task_or_404(benchmark_id: UUID, task_id: str, org: Org, session: Session) -> tuple[Benchmark, Task]:
-    """Return (benchmark, task) scoped to org, 404 if either is missing."""
-    benchmark = session.exec(
-        select(Benchmark).where(Benchmark.id == benchmark_id).where(Benchmark.org_id == org.id)
-    ).first()
+def _load_task_or_404(
+    benchmark_id: UUID, task_id: str, org: Org, repository: BenchmarkRepository
+) -> tuple[Benchmark, Task]:
+    benchmark = repository.get(org.id, benchmark_id)
 
     if benchmark is None:
         raise HTTPException(status_code=404, detail="Benchmark not found")
 
-    return benchmark, load_task_for_benchmark_or_404(benchmark, task_id, org, session)
+    return benchmark, load_task_for_benchmark_or_404(benchmark, task_id, org, repository)
 
 
 def _task_prefix(benchmark_id: UUID, task_id: str) -> str:
-    """S3 prefix for a task's artifacts (presigned URLs + run outputs)."""
     return f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/{task_id}/"
-
-
-def _fetch_result_objects(
-    session: Session, task: Task, org: Org
-) -> tuple[EvaluationResult | None, tuple[str, FailureCategory | None] | None]:
-    """Fetches a task's evaluation result or error message depending on its status."""
-    if task.status not in (TaskStatus.FINISHED, TaskStatus.ERROR):
-        return None, None
-
-    result_model = EvaluationResult if task.status == TaskStatus.FINISHED else ErrorResult
-    result_filters = (
-        result_model.task == task.id,
-        result_model.org_id == org.id,
-    )
-    result_order = desc(result_model.created_at)
-
-    if task.status == TaskStatus.FINISHED:
-        result_select = select(EvaluationResult)
-    else:
-        result_select = select(ErrorResult.error_message, ErrorResult.category).where(
-            col(ErrorResult.retry_scheduled).is_(False)
-        )
-
-    result = session.exec(result_select.where(*result_filters).order_by(result_order)).first()
-
-    if task.status == TaskStatus.FINISHED:
-        return cast(EvaluationResult | None, result), None
-
-    return None, cast(tuple[str, FailureCategory | None] | None, result)
 
 
 @router.get(
     "/{benchmark_id}/tasks/{task_id}",
     response_model=SingleTaskResponse,
+    description="Return a task's status and evaluation result.",
 )
 def get_single_task(
+    repository: BenchmarkRepositoryDependency,
     benchmark_id: TrackedBenchmarkId,
     task_id: str,
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> SingleTaskResponse:
-    """Fetch a single task's status + evaluation result for the SingleTask page."""
-    _, task = _load_task_or_404(benchmark_id, task_id, org, session)
+    _, task = _load_task_or_404(benchmark_id, task_id, org, repository)
 
-    eval_row, error = _fetch_result_objects(session, task, org)
-    task_breakdown_row = session.get(TaskBreakdownRow, task.task_breakdown) if task.task_breakdown is not None else None
+    eval_row = repository.latest_evaluation(org.id, task.id) if task.status == TaskStatus.FINISHED else None
+    error = repository.latest_error(org.id, task.id) if task.status == TaskStatus.ERROR else None
+    task_breakdown_row = repository.get_task_breakdown(task.task_breakdown) if task.task_breakdown is not None else None
 
     return SingleTaskResponse(
         id=task.id,
@@ -128,18 +92,18 @@ def get_single_task(
 @router.get(
     "/{benchmark_id}/tasks/{task_id}/artifacts",
     response_model=TaskArtifactsResponse,
+    description="Return log and agent output locations for the task detail page.",
 )
 async def get_task_artifacts(
+    repository: BenchmarkRepositoryDependency,
     benchmark_id: TrackedBenchmarkId,
     task_id: str,
     benchmark: RunBenchmarkDependency,
     runtime: RunRuntimeDependency,
     request: Request,
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> TaskArtifactsResponse:
-    """Return log and agent output locations for the task detail page."""
-    task = load_task_for_benchmark_or_404(benchmark, task_id, org, session)
+    task = load_task_for_benchmark_or_404(benchmark, task_id, org, repository)
     cloudwatch_url: str | None
     if benchmark.arguments.environment == "local":
         cloudwatch_url = str(
@@ -150,7 +114,6 @@ async def get_task_artifacts(
     ):
         cloudwatch_url = None
     elif any(character in task.task_id for character in ":*%"):
-        # Renamed streams may use either encoding; link to the run without guessing.
         cloudwatch_url = runtime.log_locations.benchmark_location(str(benchmark_id))
     else:
         cloudwatch_url = runtime.log_locations.task_location(
@@ -190,10 +153,9 @@ def _active_native_output(task: Task) -> ActiveNativeOutput | None:
 
 
 def _recheck_native_generation(session: Session, task: Task, generation: str) -> None:
-    """Check the current attempt in a new read transaction, without holding it across sandbox I/O."""
     try:
-        session.refresh(task)
-        current = _active_native_output(task)
+        current_task = BenchmarkRepository(session).get_task(task.org_id, task.benchmark, task.task_id, refresh=True)
+        current = _active_native_output(current_task) if current_task is not None else None
         if current is None or current.generation != generation:
             raise HTTPException(status_code=409, detail="Native output generation changed")
     finally:
@@ -208,8 +170,10 @@ def _recheck_native_generation(session: Session, task: Task, generation: str) ->
         404: {"description": "Task not found"},
         409: {"description": "Native output generation changed"},
     },
+    description="List current native files directly from the exact execution sandbox.",
 )
 async def get_native_output_files(
+    repository: BenchmarkRepositoryDependency,
     benchmark_id: TrackedBenchmarkId,
     task_id: str,
     benchmark: RunBenchmarkDependency,
@@ -218,13 +182,11 @@ async def get_native_output_files(
     org: Org = Depends(get_current_org),
     session: Session = Depends(get_session),
 ) -> NativeOutputFilesResponse | Response:
-    """List current native files directly from the exact execution sandbox."""
-    task = load_task_for_benchmark_or_404(benchmark, task_id, org, session)
+    task = await database_call(lambda: load_task_for_benchmark_or_404(benchmark, task_id, org, repository))
     descriptor = _active_native_output(task)
     if descriptor is None:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
-    # The descriptor is a value object; no ORM state is needed during sandbox I/O.
-    session.rollback()
+    await database_call(session.rollback)
 
     config = await runtime.get_sandbox_provider_config()
     try:
@@ -233,7 +195,7 @@ async def get_native_output_files(
             files = await discover_native_files(sandbox, descriptor.output_path)
     except SandboxNotFoundError:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
-    _recheck_native_generation(session, task, descriptor.generation)
+    await database_call(lambda: _recheck_native_generation(session, task, descriptor.generation))
     if files is None:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
@@ -257,8 +219,10 @@ async def get_native_output_files(
         404: {"description": "Task or native file not found"},
         409: {"description": "Native output generation changed"},
     },
+    description="Read one allowed file and discard bytes if its execution generation changes.",
 )
 async def get_native_output_file(
+    repository: BenchmarkRepositoryDependency,
     benchmark_id: TrackedBenchmarkId,
     task_id: str,
     path: str,
@@ -268,8 +232,7 @@ async def get_native_output_file(
     org: Org = Depends(get_current_org),
     session: Session = Depends(get_session),
 ) -> Response:
-    """Read one allowed file and discard bytes if its execution generation changes."""
-    task = load_task_for_benchmark_or_404(benchmark, task_id, org, session)
+    task = await database_call(lambda: load_task_for_benchmark_or_404(benchmark, task_id, org, repository))
     if not valid_native_path(path):
         raise HTTPException(status_code=400, detail="Expected a nonempty POSIX-relative file path")
     descriptor = _active_native_output(task)
@@ -277,14 +240,14 @@ async def get_native_output_file(
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
     if descriptor.generation != generation:
         raise HTTPException(status_code=409, detail="Native output generation changed")
-    session.rollback()
+    await database_call(session.rollback)
 
     config = await runtime.get_sandbox_provider_config()
     try:
         async with config.create_provider() as provider:
             sandbox = runtime_sandbox(await provider.get_sandbox(descriptor.sandbox_id), descriptor.runtime_source)
             files = await discover_native_files(sandbox, descriptor.output_path)
-            _recheck_native_generation(session, task, generation)
+            await database_call(lambda: _recheck_native_generation(session, task, generation))
             if files is None:
                 return Response(status_code=204, headers={"Cache-Control": "no-store"})
             if path not in files:
@@ -292,7 +255,7 @@ async def get_native_output_file(
             content = await sandbox.download_file(files[path].remote_path)
     except SandboxNotFoundError:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
-    _recheck_native_generation(session, task, generation)
+    await database_call(lambda: _recheck_native_generation(session, task, generation))
 
     return Response(
         content=content,

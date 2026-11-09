@@ -1,8 +1,3 @@
-"""Queue CLI behavior through the real SDK and an HTTP mock transport.
-
-Run: uv run pytest tests/unit/cli/test_queue.py
-"""
-
 import json
 from collections.abc import Callable
 from uuid import UUID
@@ -22,7 +17,6 @@ _TASK_ID = UUID("123e4567-e89b-12d3-a456-426614174001")
 
 @pytest.fixture
 def overview() -> dict[str, object]:
-    """Return a capped snapshot with totals larger than the visible entries."""
     return {
         "observed_at": "2026-09-10T12:02:00+00:00",
         "summary": {"waiting": 12, "building": 2, "in_progress": 3, "evaluating": 1},
@@ -65,10 +59,10 @@ def invoke_queue(tracker: MockTracker) -> Callable[..., Result]:
     return invoke
 
 
+@pytest.mark.description("Show pool positions, priorities, wait time, and active states without hiding caps.")
 def test_status_shows_queue_details_and_capped_totals(
     invoke_queue: Callable[..., Result], overview: dict[str, object]
 ) -> None:
-    """Show pool positions, priorities, wait time, and active states without hiding caps."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=overview)
@@ -90,6 +84,7 @@ def test_status_shows_queue_details_and_capped_totals(
     assert "Pages are live" in result.output
 
 
+@pytest.mark.description("Queue status shows a paging hint only when more pages exist.")
 @pytest.mark.parametrize(("exhausted", "remaining"), [("waiting", "active"), ("active", "waiting")])
 def test_status_guides_only_lists_with_more_pages(
     invoke_queue: Callable[..., Result], overview: dict[str, object], exhausted: str, remaining: str
@@ -107,10 +102,10 @@ def test_status_guides_only_lists_with_more_pages(
     assert f"Next {remaining} page: --{remaining}-offset" in result.output
 
 
+@pytest.mark.description("Serialize the SDK snapshot while forwarding both limits and API-key authentication.")
 def test_status_json_preserves_entries_and_limits(
     invoke_queue: Callable[..., Result], overview: dict[str, object]
 ) -> None:
-    """Serialize the SDK snapshot while forwarding both limits and API-key authentication."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -150,8 +145,8 @@ def test_status_json_preserves_entries_and_limits(
     assert payload["active_next_offset"] == 4
 
 
+@pytest.mark.description("Escape pool and task control characters in tables, but preserve JSON values.")
 def test_status_escapes_terminal_controls(invoke_queue: Callable[..., Result], overview: dict[str, object]) -> None:
-    """Escape pool and task control characters in tables, but preserve JSON values."""
     snapshot = SchedulerOverviewResponse.model_validate(overview)
     unsafe_pool = "pool\x1b]52;c;dGVzdA==\x07\nforged-pool"
     unsafe_task = "task\x1b]52;c;dGVzdA==\x07\nforged-task"
@@ -178,8 +173,8 @@ def test_status_escapes_terminal_controls(invoke_queue: Callable[..., Result], o
     assert payload["active_entries"][0]["external_task_id"] == unsafe_task
 
 
+@pytest.mark.description("An empty snapshot succeeds without claiming queueing is disabled.")
 def test_status_empty_queue(invoke_queue: Callable[..., Result]) -> None:
-    """An empty snapshot succeeds without claiming queueing is disabled."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -208,13 +203,13 @@ def test_status_empty_queue(invoke_queue: Callable[..., Result]) -> None:
     assert "Next active page" not in result.output
 
 
+@pytest.mark.description("Reject out-of-range limits before loading credentials or contacting the tracker.")
 @pytest.mark.parametrize(
     ("flag", "value"),
     [(flag, value) for flag in ("--waiting-limit", "--active-limit") for value in ("0", "201")]
     + [(flag, value) for flag in ("--waiting-offset", "--active-offset") for value in ("-1", "1.5")],
 )
 def test_status_rejects_invalid_limits(flag: str, value: str) -> None:
-    """Reject out-of-range limits before loading credentials or contacting the tracker."""
     result = CliRunner().invoke(cli, ["queue", "status", flag, value])
 
     assert result.exit_code == 2

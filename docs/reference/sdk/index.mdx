@@ -11,6 +11,8 @@ This reference follows the tested `valkyrie.sdk` public contract. Internal model
 
 Use [`ValkyrieClient`](/reference/sdk/client) to configure the async client and access resource namespaces.
 
+Use [`device_login`](/reference/sdk/login) to sign in with a browser and save a login the client can use.
+
 ## Resource namespaces
 
 <CardGroup cols={2}>
@@ -29,6 +31,15 @@ Use [`ValkyrieClient`](/reference/sdk/client) to configure the async client and 
   <Card title="Benchmark services" icon="server" href="/reference/sdk/services">
     4 methods for discovering service catalogs, deployments, and task IDs.
   </Card>
+  <Card title="Benchmark definitions" icon="book-open" href="/reference/sdk/benchmark-definitions">
+    6 methods for creating, updating, archiving, and restoring the benchmarks your datasets belong to.
+  </Card>
+  <Card title="Datasets" icon="database" href="/reference/sdk/datasets">
+    6 methods for creating, updating, archiving, and restoring benchmark datasets.
+  </Card>
+  <Card title="Dataset tasks" icon="file-archive" href="/reference/sdk/datasets-tasks">
+    6 methods for uploading, listing, downloading, and removing dataset tasks.
+  </Card>
   <Card title="Logs" icon="scroll-text" href="/reference/sdk/logs">
     5 methods for fetching, filtering, and following benchmark logs.
   </Card>
@@ -46,6 +57,9 @@ Use [`ValkyrieClient`](/reference/sdk/client) to configure the async client and 
   </Card>
   <Card title="Settings" icon="sliders-horizontal" href="/reference/sdk/settings">
     4 methods for choosing your default provider and saving benchmark service URLs.
+  </Card>
+  <Card title="Account" icon="user-round" href="/reference/sdk/account">
+    10 methods for checking who you are, and managing access keys and organizations.
   </Card>
 </CardGroup>
 

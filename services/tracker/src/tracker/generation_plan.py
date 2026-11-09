@@ -1,5 +1,3 @@
-"""Normalize per-task generation allowance and orchestration settings."""
-
 from dataclasses import dataclass
 
 from benchmark_service.schemas import Episode, RetrieveTaskResponse

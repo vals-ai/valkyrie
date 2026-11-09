@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
+_COLLISION_ERRORS = (FileExistsError, NotADirectoryError)
+
 
 def extract_output_archive(stream: BinaryIO, output_dir: Path, *, max_expanded_bytes: int, max_entries: int) -> Path:
     """Extract regular files and directories, including one layer of task tarballs."""
@@ -37,9 +39,10 @@ def extract_output_archive(stream: BinaryIO, output_dir: Path, *, max_expanded_b
                     raise ValueError(f"Unsafe output archive member: {member.name!r}")
                 seen.add(str(path).casefold())
                 target = destination / path
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                else:
+                try:
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
                     target.parent.mkdir(parents=True, exist_ok=True)
                     content = archive.extractfile(member)
                     if content is None:
@@ -47,7 +50,9 @@ def extract_output_archive(stream: BinaryIO, output_dir: Path, *, max_expanded_b
                     with content, target.open("xb") as output:
                         while chunk := content.read(1024 * 1024):
                             output.write(chunk)
-                    target.chmod(member.mode & 0o777)
+                except _COLLISION_ERRORS as error:
+                    raise ValueError(f"Output archive member collides with another path: {member.name!r}") from error
+                target.chmod(member.mode & 0o777 | 0o600)
 
     with tempfile.TemporaryDirectory(dir=output_dir.parent) as temporary:
         staging = Path(temporary) / "outputs"
@@ -55,7 +60,12 @@ def extract_output_archive(stream: BinaryIO, output_dir: Path, *, max_expanded_b
         extract(stream, staging)
         for nested in list(staging.rglob("agent_output.tar.gz")):
             destination = nested.parent / nested.name.removesuffix(".tar.gz")
-            destination.mkdir(exist_ok=True)
+            if not nested.is_file():
+                raise ValueError(f"Output archive member collides with another path: {nested.name!r}")
+            try:
+                destination.mkdir(exist_ok=True)
+            except FileExistsError as error:
+                raise ValueError(f"Output archive member collides with another path: {destination.name!r}") from error
             with nested.open("rb") as source:
                 extract(source, destination)
             nested.unlink()

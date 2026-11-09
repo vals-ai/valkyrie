@@ -1,5 +1,3 @@
-"""Generation deadline proof at the controlled sandbox boundary."""
-
 from __future__ import annotations
 
 import json
@@ -13,7 +11,6 @@ import benchmark_service
 import pytest
 
 
-# The child calls run_agent with a controlled sandbox at the external service boundary.
 _CHILD_PROBE = """
 import asyncio
 import json
@@ -87,6 +84,7 @@ async def controlled_probe(*, benchmark_id_str, executor_dispatch_id, **_kwargs)
         object_store=None,
         plan=GenerationPlan(allowance_seconds=0.05, staged=False, episode=None),
         deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=0.05),
+        log_line=messages.append,
     )
     Path(os.environ["CONTROLLED_PROBE_RESULT"]).write_text(json.dumps({
         "benchmark_id": benchmark_id_str,
@@ -103,6 +101,9 @@ async def controlled_probe(*, benchmark_id_str, executor_dispatch_id, **_kwargs)
 """
 
 
+@pytest.mark.description(
+    "The agent child is stopped at the selected generation deadline without a shell `timeout` wrapper."
+)
 def test_run_agent_child_enforces_selected_generation_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source_root = Path(__file__).resolve().parents[3] / "src"
     probe_dir = tmp_path / "child-probe"

@@ -1,17 +1,12 @@
-"""GET /benchmarks/filter-options — distinct values for filter dropdowns."""
-
 from __future__ import annotations
 
-from typing import Any, NamedTuple, Sequence, cast
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import JSON, type_coerce
-from sqlmodel import Session, col, select
 
 from tracker.auth import get_current_org
-from tracker.database.models import Benchmark, Org
-from tracker.database.session import get_session
+from tracker.database.models import Org
+from tracker.repositories.benchmark import BenchmarkRepositoryDependency
 
 router = APIRouter(prefix="/benchmarks")
 
@@ -24,34 +19,17 @@ class FilterOptionsResponse(BaseModel):
     started_by_emails: list[str]
 
 
-class _FilterRow(NamedTuple):
-    benchmark_name: str
-    agent_name: str
-    model: str | None
-    dataset: str | None
-    email: str | None
-
-
-@router.get("/filter-options", response_model=FilterOptionsResponse)
+@router.get(
+    "/filter-options",
+    response_model=FilterOptionsResponse,
+    description="List the distinct benchmark, agent, model, dataset, and starter values in this organization's runs, for the runs-list filters.",
+)
 def get_filter_options(
+    repository: BenchmarkRepositoryDependency,
     org: Org = Depends(get_current_org),
-    session: Session = Depends(get_session),
 ) -> FilterOptionsResponse:
-    """Distinct benchmark, agent, model, dataset, and starter values in this org, for the runs-list filter dropdowns."""
 
-    arguments = type_coerce(col(Benchmark.arguments), JSON)
-    statement = (
-        cast(Any, select)(
-            col(Benchmark.name).label("benchmark_name"),
-            arguments["contract"]["name"].as_string().label("agent_name"),
-            arguments["contract"]["model"].as_string().label("model"),
-            arguments["dataset"].as_string().label("dataset"),
-            col(Benchmark.started_by_email).label("email"),
-        )
-        .where(Benchmark.org_id == org.id)
-        .distinct()
-    )
-    rows = cast(Sequence[_FilterRow], cast(Any, session.exec(statement)).all())
+    rows = repository.filter_rows(org.id)
     return FilterOptionsResponse(
         benchmark_names=sorted({row.benchmark_name for row in rows}),
         agent_names=sorted({row.agent_name for row in rows}),

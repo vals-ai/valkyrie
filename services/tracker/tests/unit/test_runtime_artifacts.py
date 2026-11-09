@@ -1,5 +1,4 @@
-"""Behavioral tests for provider-neutral artifact policy."""
-
+import pytest
 from datetime import UTC, datetime
 from typing import cast
 
@@ -8,8 +7,6 @@ from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
 
 
 class RecordingStore:
-    """Small artifact-store double that exposes policy inputs and outputs."""
-
     def __init__(self, *, exists: bool, objects: list[StoredObject] | None = None) -> None:
         self._exists = exists
         self._objects = objects or []
@@ -31,6 +28,7 @@ class RecordingStore:
             yield stored_object
 
 
+@pytest.mark.description("Copying an agent to a run keeps an existing bundle.")
 async def test_copy_agent_to_benchmark_does_not_replace_existing_bundle() -> None:
     recording_store = RecordingStore(exists=True)
 
@@ -45,6 +43,7 @@ async def test_copy_agent_to_benchmark_does_not_replace_existing_bundle() -> Non
     assert recording_store.copies == []
 
 
+@pytest.mark.description("Copying an agent freezes a missing bundle with the provider token.")
 async def test_copy_agent_to_benchmark_freezes_missing_bundle_with_provider_token() -> None:
     recording_store = RecordingStore(exists=False)
 
@@ -57,6 +56,7 @@ async def test_copy_agent_to_benchmark_freezes_missing_bundle_with_provider_toke
     assert recording_store.copies == [("agents/agent-a.zip", "benchmarks/benchmark-1/agent-a.zip")]
 
 
+@pytest.mark.description("Listing agents keeps zip bundles and their last modified time.")
 async def test_list_agents_keeps_zip_bundles_and_last_modified_metadata() -> None:
     timestamp = datetime(2025, 1, 1, tzinfo=UTC)
     recording_store = RecordingStore(

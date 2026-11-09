@@ -1,8 +1,3 @@
-"""Tests for the run logs command.
-
-Run: uv run pytest tests/unit/cli/run/test_run_logs.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -31,6 +26,7 @@ def _stream(*events: dict[str, object], end: bool = True) -> httpx.Response:
     )
 
 
+@pytest.mark.description("`run logs` reads the chosen stream with the given filters and prints lines as text or JSON.")
 @pytest.mark.parametrize(
     ("arguments", "path", "task_id"),
     [
@@ -65,6 +61,7 @@ def test_logs_select_the_stream_and_forward_filters(
         assert result.output == "2026-01-01T00:00:00Z [task-1] hello\n"
 
 
+@pytest.mark.description("Text logs keep each record on one escaped line.")
 def test_text_output_keeps_each_record_on_one_escaped_line(tracker: MockTracker, cli_runner: CliRunner) -> None:
     event = _event("\x1b[31mfirst\nFORGED\tfield\r", task_id="task\nFORGED")
     tracker.reply("GET", _LOGS_PATH, httpx.Response(200, json={"events": [event]}))
@@ -75,8 +72,8 @@ def test_text_output_keeps_each_record_on_one_escaped_line(tracker: MockTracker,
     assert result.output == "2026-01-01T00:00:00Z [task\\nFORGED] \\u001b[31mfirst\\nFORGED\\tfield\\r\n"
 
 
+@pytest.mark.description("A failure on the second page still leaves the first page's records on stdout.")
 def test_logs_write_each_page_before_fetching_the_next(tracker: MockTracker, cli_runner: CliRunner) -> None:
-    """A failure on the second page still leaves the first page's records on stdout."""
     tracker.reply(
         "GET",
         _LOGS_PATH,
@@ -90,6 +87,7 @@ def test_logs_write_each_page_before_fetching_the_next(tracker: MockTracker, cli
     assert result.output.index("first") < result.output.index("tracker went away")
 
 
+@pytest.mark.description("`run logs --follow` exits 1 when the stream closes before its end event.")
 def test_follow_fails_when_the_stream_ends_without_its_end_event(tracker: MockTracker, cli_runner: CliRunner) -> None:
     tracker.reply("GET", f"{_LOGS_PATH}/stream", _stream(_event("final"), end=False))
 
@@ -100,6 +98,7 @@ def test_follow_fails_when_the_stream_ends_without_its_end_event(tracker: MockTr
     assert "ended before its end event" in result.output
 
 
+@pytest.mark.description("Pressing Ctrl-C during `run logs --follow` exits 0 with no output.")
 def test_ctrl_c_while_following_exits_quietly(tracker: MockTracker, cli_runner: CliRunner) -> None:
     tracker.reply("GET", f"{_LOGS_PATH}/stream", KeyboardInterrupt())
 
@@ -109,6 +108,7 @@ def test_ctrl_c_while_following_exits_quietly(tracker: MockTracker, cli_runner: 
     assert result.output == ""
 
 
+@pytest.mark.description("Invalid follow, query, and timestamp combinations must fail before network access.")
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -120,7 +120,6 @@ def test_ctrl_c_while_following_exits_quietly(tracker: MockTracker, cli_runner: 
     ],
 )
 def test_logs_rejects_invalid_modes_and_bounds(arguments: list[str], message: str) -> None:
-    """Invalid follow, query, and timestamp combinations must fail before network access."""
     result = CliRunner().invoke(logs, [str(_RUN_ID), *arguments])
 
     assert result.exit_code == 2

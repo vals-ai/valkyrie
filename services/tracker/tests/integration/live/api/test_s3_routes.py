@@ -1,7 +1,4 @@
-"""Live S3 coverage for tracker API routes.
-
-Run: uv run pytest tests/integration/live/api/test_s3_routes.py
-"""
+import pytest
 
 from io import BytesIO
 from uuid import uuid4
@@ -17,18 +14,21 @@ from tracker.aws.s3 import delete_from_s3, upload_to_s3
 from tracker.database.models import AgentContractRequest, Benchmark, AWSBenchmarkArguments, Task
 
 
+@pytest.mark.description(
+    (
+        "Agent listing and download signing must agree on the seeded S3 object.\n"
+        "\n"
+        "Test cases:\n"
+        "- The live catalog contains the uniquely seeded agent with its last-modified value.\n"
+        "- The route's five-minute presigned URL downloads that valid agent archive.\n"
+        "- A name absent from the real bucket returns 404."
+    )
+)
 async def test_agent_catalog_and_download_url_round_trip_real_s3(
     live_api_client: TestClient,
     seeded_test_agent_artifact: str,
     api_headers: dict[str, str],
 ) -> None:
-    """Agent listing and download signing must agree on the seeded S3 object.
-
-    Test cases:
-    - The live catalog contains the uniquely seeded agent with its last-modified value.
-    - The route's five-minute presigned URL downloads that valid agent archive.
-    - A name absent from the real bucket returns 404.
-    """
     catalog_response = live_api_client.get("/agents", headers=api_headers)
 
     assert catalog_response.status_code == 200
@@ -59,18 +59,21 @@ async def test_agent_catalog_and_download_url_round_trip_real_s3(
     assert missing_response.status_code == 404
 
 
+@pytest.mark.description(
+    (
+        "Task artifact signing must expose existing output and suppress missing output.\n"
+        "\n"
+        "Test cases:\n"
+        "- A real output object is discovered, signed for five minutes, and downloaded byte-for-byte.\n"
+        "- Deleting the object makes the same route return no output URL."
+    )
+)
 async def test_task_artifact_route_round_trips_real_s3_and_handles_missing_output(
     live_api_client: TestClient,
     database_session: Session,
     live_aws_runtime: AWSRuntime,
     api_headers: dict[str, str],
 ) -> None:
-    """Task artifact signing must expose existing output and suppress missing output.
-
-    Test cases:
-    - A real output object is discovered, signed for five minutes, and downloaded byte-for-byte.
-    - Deleting the object makes the same route return no output URL.
-    """
     benchmark = Benchmark(
         org_id=TEST_ORG_ID,
         name="swebench",

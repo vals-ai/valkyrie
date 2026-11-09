@@ -27,31 +27,18 @@ Classify the changed surfaces before opening or updating a PR, then run every ap
 | --- | --- |
 | Root CLI/tracker client (`src/valkyrie/cli/**`) | Repo root `make test` |
 | Standalone Python SDK or Tracker SDK contract | `uv run pytest tests/unit/sdk tests/contract -q` |
-| SDK package, version, build, or release tooling | Local executable checks through artifact/install validation in `.github/workflows/sdk-package.yml`; final-head CI must pass the complete workflow, including compatibility jobs |
+| SDK package, version, build, or release tooling | Local executable checks through artifact/install validation in the `sdk-package` job of `.github/workflows/ci.yaml`; final-head CI must pass that complete job, including its newer-Python install checks |
 | Tracker API/worker/database only | `(cd services/tracker && make test)` |
 | Infrastructure/CDK (`infra/**`) | `(cd infra && make lint && make test && make typecheck)` |
 | AWS/benchmark-service/sandbox/external boundary | Applicable local proof, then the smallest existing path under `services/tracker/tests/integration/live/`, its named smoke, or the full tracker live target when the scope requires it—agent-triggered/manual execution needs exact approval |
 
-A cross-layer change owns the union of its rows. Reuse or extend existing behavioral coverage; add a test only where existing coverage cannot prove the changed boundary. Regardless of semantic classification, any changed path matched by `.github/workflows/sdk-package.yml` also owns the SDK package row; one SDK/contract run may satisfy both SDK rows. For local SDK package proof, use the PR base SHA as `BASE_SHA`; do not duplicate CI-only upload work locally. Live proof never substitutes for required local proof.
+A cross-layer change owns the union of its rows. Reuse or extend existing behavioral coverage; add a test only where existing coverage cannot prove the changed boundary. Regardless of semantic classification, any changed path matched by the SDK paths in `.github/workflows/ci.yaml` also owns the SDK package row; one SDK/contract run may satisfy both SDK rows. For local SDK package proof, use the PR base SHA as `BASE_SHA`; do not duplicate CI-only upload work locally. Live proof never substitutes for required local proof.
 
 Record the clean final PR HEAD SHA, changed surfaces, commands, results, and durations. A later PR commit, rebase, or dirty-tree change invalidates the evidence. If a live workflow intentionally starts red until manually authorized, treat that as a sentinel, not as a product failure or proof that a later head passed.
 
 Do not use broad pytest discovery as a substitute for routing. In particular, from `services/tracker`, `uv run pytest` or `uv run pytest tests/integration` can collect credentialed live tests; use the table's explicit target or path.
 
-Prefer a specific test name over prose. Add a one-sentence test docstring only when the name cannot explain the scenario; do not enumerate test cases that the assertions already show. Add inline comments only for non-obvious intent or constraints, not to narrate arrange/act/assert.
-
-### Module docstrings
-
-Every `test_*.py` module needs a module-level docstring at the top of the file. It must contain the pytest command to run that file, followed by one or two short sentences describing what the module tests. Keep it tight: a one-line summary plus the run command is usually enough. Do not pad it with "add cases here…" / "keep X elsewhere" boilerplate.
-
-```python
-"""Tests for command-argument parsing.
-
-Run: pytest tests/unit/cli/command_1/test_command_argument.py
-
-Covers CLI command-argument parsing: flag resolution, defaults, and validation errors.
-"""
-```
+Prefer a specific test name over prose. Python files carry no comments or docstrings, and `scripts/check_no_comments.py` fails `make lint` on them. Describe each test in `@pytest.mark.description("...")` using the formula in the root `AGENTS.md`: state the behavior the test protects as a fact. Add a `Test cases:` list only when the test covers several separate outcomes.
 
 ### Test naming
 
@@ -69,12 +56,10 @@ def test_deploy_command_returns_completed_status() -> None: ...
 
 ### Grouping tests into classes
 
-Group tests that exercise the same unit into a `Test*` class so related cases live together and share fixtures. The class name names the unit under test; a one-line class docstring states its scope. Do not add `__init__` or inheritance — pytest collects plain classes.
+Group tests that exercise the same unit into a `Test*` class so related cases live together and share fixtures. The class name names the unit under test. Do not add `__init__` or inheritance — pytest collects plain classes.
 
 ```python
 class TestValidateKwargs:
-    """Validation of agent kwargs against the contract schema."""
-
     def test_applies_default_when_value_omitted(self) -> None:
         ...
 
@@ -86,11 +71,11 @@ class TestValidateKwargs:
 
 Local integration tests must not require credentials. For a live test, reuse the existing non-secret variable name from the nearest fixture/workflow and document any new name in `services/tracker/README.md` plus the relevant CI secret mapping. Keep values only in the untracked local environment or approved secret store; do not invent a second `TEST_*` alias or a new committed env template.
 
-### Spacing and inline comments
+### Spacing
 
 Structure each test as **arrange, act, assert**: set up the inputs and context, perform the single action under test, then assert on the outcome.
 
-Separate logical steps with a blank line so each reads as a distinct unit. **This is independent of comments** — insert the blank line whenever a new step begins, even when there is no comment to introduce it. A new step includes performing the action, starting a fresh group of assertions, or pulling a value out of a result to assert on next. In particular, a statement that sets up the following assertions (for example, extracting a nested value before checking it) begins a new step: put a blank line before it instead of sandwiching it against the previous `assert`.
+Separate logical steps with a blank line so each reads as a distinct unit. Insert the blank line whenever a new step begins. A new step includes performing the action, starting a fresh group of assertions, or pulling a value out of a result to assert on next. In particular, a statement that sets up the following assertions (for example, extracting a nested value before checking it) begins a new step: put a blank line before it instead of sandwiching it against the previous `assert`.
 
 ```python
 # Avoid: a new step (extract, then assert on it) is sandwiched against the prior assert.
@@ -101,7 +86,7 @@ def test_start_benchmark_sets_provider_secret(...) -> None:
     assert isinstance(harness_config, dict)
     assert harness_config["sandbox_provider_secret_name"] == "DaytonaSecrets"
 
-# Prefer: a blank line before each new step, with or without a comment.
+# Prefer: a blank line before each new step.
 def test_start_benchmark_sets_provider_secret(...) -> None:
     tracker.start_benchmark(...)
 
@@ -131,19 +116,7 @@ def get(self, url: str) -> httpx.Response:
     return httpx.Response(200, json={"status": "success"})
 ```
 
-When you do add an inline comment, put it on its own line directly above the code it describes, with a blank line above the comment. Never trail a comment on the end of a code line.
-
-```python
-# Prefer: comments introduce steps that are already separated by blank lines.
-def test_deploy_command(api_client: ApiClient) -> None:
-    # Run the command exactly as the CLI would invoke it.
-    result = run_cli(["deploy", "--name", "svc"])
-    assert result.status == "completed"
-
-    # Confirm the resource is retrievable through the real API.
-    fetched = api_client.get_service("svc")
-    assert fetched.name == "svc"
-```
+Do not add inline comments to explain steps. Blank lines and specific names carry the structure. The only comments allowed are tool pragmas such as `# type: ignore` or `# noqa`, and the typing section below discourages those too.
 
 ### Async tests
 
@@ -164,7 +137,6 @@ async def test_fetch_service_returns_payload():
 
 # Prefer: no marker needed; the async test is collected automatically.
 async def test_fetch_service_returns_payload() -> None:
-    # Await the real coroutine under test.
     result = await fetch_service("svc")
     assert result.name == "svc"
 ```
@@ -183,7 +155,6 @@ def test_token_is_unique():
 
 # Prefer: control the inputs so the output is fixed and assertable.
 def test_token_encodes_seeded_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Pin the clock and the random source the generator reads from.
     monkeypatch.setattr("valkyrie.tokens.now", lambda: FIXED_TIMESTAMP)
     monkeypatch.setattr("valkyrie.tokens.random_suffix", lambda: "abc123")
 
@@ -194,7 +165,6 @@ When the code under test sleeps (a retry or backoff loop, for example), patch `t
 
 ```python
 def test_fetch_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Skip the real backoff delay so the test does not actually wait.
     monkeypatch.setattr("valkyrie.client.time.sleep", lambda _seconds: None)
 
     result = fetch_with_retry(attempts=3)
@@ -212,12 +182,10 @@ Reach for pytest's built-in fixtures before writing your own setup or teardown. 
 
 ```python
 def test_writes_config_to_disk(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    # tmp_path is a unique directory, removed automatically after the test.
     config_path = tmp_path / "valkyrie.toml"
 
     write_config(config_path)
 
-    # capsys captures what the function printed.
     assert "wrote config" in capsys.readouterr().out
 ```
 
@@ -233,7 +201,6 @@ def sandbox() -> Iterator[Sandbox]:
     try:
         yield sb
     finally:
-        # Runs even if the test fails.
         sb.cleanup()
 
 def test_upload(sandbox: Sandbox) -> None:
@@ -271,11 +238,10 @@ def test_dispatch_sends_payload(monkeypatch: pytest.MonkeyPatch) -> None:
 
     dispatch_event({"id": 1})
 
-    # Cast the mock to the interface it replaces so attribute access is checked.
     cast(Client, mock_client).send.assert_called_once_with({"id": 1})
 ```
 
-Avoid `# type: ignore` and `# noqa` / `# ruff: noqa`. Fix the underlying issue instead — add the annotation, cast the value, or restructure the code. Reach for an ignore only when a rule is genuinely wrong for a line, and when you must, scope it to the specific rule (`# type: ignore[reason]`, `# noqa: RULE`) and add a short comment explaining why.
+Avoid `# type: ignore` and `# noqa` / `# ruff: noqa`. Fix the underlying issue instead — add the annotation, cast the value, or restructure the code. Reach for an ignore only when a rule is genuinely wrong for a line, and when you must, scope it to the specific rule (`# type: ignore[reason]`, `# noqa: RULE`). Put any reason after the pragma on the same line, since a comment on its own line fails `make lint`.
 
 ### Unused arguments
 
@@ -318,7 +284,6 @@ Assert the observable outcome of the finished behavior, not that a specific line
 def test_run_start_creates_sandbox() -> None:
     result = start_run(cfg)
 
-    # The behavior led to this object being instantiated.
     assert isinstance(result.sandbox, Sandbox)
 ```
 
@@ -334,7 +299,6 @@ def test_build_status_command(monkeypatch: pytest.MonkeyPatch) -> None:
 
     run_cli(["build-status", "--run-id", "run-1"])
 
-    # Only proves the CLI forwarded these arguments — a change-detector.
     assert calls == [("run-1", Path("/tmp/harbor"))]
 
 # Prefer: drive the command and assert the observable result (its output contract, a
@@ -482,7 +446,7 @@ Rule of thumb: split by **directory** → nested `conftest.py`; split by **topic
 
 ## Running the suites
 
-A test's suite is determined by its root and directory, not by a marker. Use the pre-PR routing table above. Root `make test` does not collect `tests/unit/sdk` or `tests/contract`; SDK package/release changes must mirror every local check in `.github/workflows/sdk-package.yml`, not only pytest. Credentialed live tests are separately owned by `.github/workflows/tracker-integration-tests.yaml`; agent-triggered/manual execution requires exact approval, while automatic CI follows that workflow's protected-branch gate. Do not park required local proof behind `skip`/`xfail`.
+A test's suite is determined by its root and directory, not by a marker. Use the pre-PR routing table above. Root `make test` does not collect `tests/unit/sdk` or `tests/contract`; SDK package/release changes must mirror every local check in the `sdk-package` job of `.github/workflows/ci.yaml`, not only pytest. Credentialed live tests are separately owned by `.github/workflows/tracker-integration-tests.yaml`; agent-triggered/manual execution requires exact approval, while automatic CI follows that workflow's protected-branch gate. Do not park required local proof behind `skip`/`xfail`.
 
 Behavior changes need existing or focused proof, and coverage should not regress. Registry, documentation, generated-output-only, and refactor-only changes need no new test when existing checks already prove them.
 
@@ -506,7 +470,6 @@ When creating unit tests, follow these rubrics.
    def test_user_display_name_falls_back_to_email_when_name_missing() -> None:
        user = User(email="ada@example.com")
 
-       # Display name should derive from the email local-part when no name is set.
        assert user.display_name == "ada"
    ```
 
@@ -520,7 +483,6 @@ When creating unit tests, follow these rubrics.
 
    # Prefer (in conftest.py)
    class MockClient:
-       """Records calls so tests can assert on dispatch behavior."""
 
        def __init__(self) -> None:
            self.sent_payloads: list[dict[str, object]] = []
@@ -551,7 +513,6 @@ When creating unit tests, follow these rubrics.
 
    @pytest.fixture
    def command_argument() -> CommandArgument:
-       """A baseline command argument other tests can adjust as needed."""
        return CommandArgument(name="deploy", flags={"force": False})
    ```
 
@@ -585,27 +546,24 @@ When creating unit tests, follow these rubrics.
 
 9. **Consolidate related tests.** A single test can cover more than one case. If a feature adds an object or attribute, extend an existing test with a few lines rather than creating a new one. Tests accumulate coverage over time and become more thorough than many small, shallow ones.
 
-10. **Prefer one test covering multiple cases over many single-case tests.** This follows from rule 9. Use the docstring's "Test cases" section to make the covered cases explicit.
+10. **Prefer one test covering multiple cases over many single-case tests.** This follows from rule 9. Use the description marker's `Test cases:` list to make the covered cases explicit.
 
     ```python
+    @pytest.mark.description(
+        "Command arguments are parsed and validated.\n"
+        "\n"
+        "Test cases:\n"
+        "- A well-formed argument parses and keeps its flag.\n"
+        "- A missing required name raises `ValidationError`.\n"
+        "- An unknown flag raises `ValidationError`."
+    )
     def test_command_argument_validation() -> None:
-        """
-        Validate command-argument parsing across valid and invalid inputs.
-
-        Test cases:
-        - A well-formed argument parses successfully.
-        - A missing required field raises ValidationError.
-        - An unknown flag raises ValidationError.
-        """
-        # Well-formed input parses and preserves the flag.
         parsed = parse_argument({"name": "deploy", "force": True})
         assert parsed.flags["force"] is True
 
-        # Missing the required name is rejected.
         with pytest.raises(ValidationError):
             parse_argument({"force": True})
 
-        # Unknown flags are rejected.
         with pytest.raises(ValidationError):
             parse_argument({"name": "deploy", "unknown": True})
     ```
@@ -613,17 +571,17 @@ When creating unit tests, follow these rubrics.
 11. **Use `@pytest.mark.parametrize` for independent input/output pairs.** Rules 9–10 are about consolidating a *flow* into one test body. When the cases are independent variations of the same call — different inputs producing different outputs — parametrize instead, so each case is reported separately and a failure points to the exact input.
 
     ```python
+    @pytest.mark.description("The `force` flag resolves from each argument set.")
     @pytest.mark.parametrize(
         ("raw_argument", "expected_force"),
         [
             ({"name": "deploy", "force": True}, True),
-            ({"name": "deploy"}, False),  # default applied when omitted
+            ({"name": "deploy"}, False),
         ],
     )
     def test_parse_argument_resolves_force_flag(
         raw_argument: dict[str, object], expected_force: bool
     ) -> None:
-        """Each input/output pair is reported as its own case."""
         assert parse_argument(raw_argument).flags["force"] is expected_force
     ```
 
@@ -631,13 +589,11 @@ When creating unit tests, follow these rubrics.
 
     ```python
     def test_dispatch_sends_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-        # Replace the network method where the dispatcher imports it.
         mock_client = MagicMock()
         monkeypatch.setattr("valkyrie.dispatch.client", mock_client)
 
         dispatch_event({"id": 1})
 
-        # Assert on the call made to the mocked object.
         mock_client.send.assert_called_once_with({"id": 1})
     ```
 
@@ -705,15 +661,13 @@ When creating integration tests, follow these rubrics.
 
    ```python
    # Lives under services/tracker/tests/integration/live/; no decorator is needed.
+   @pytest.mark.description("A valid deploy completes and can be fetched back through the live API.")
    def test_deploy_command_runs_against_live_api(
        api_client: ApiClient, unique_service_name: str
    ) -> None:
-       """A valid deploy is completed and retrievable through the live API."""
-       # Run the command exactly as the CLI would invoke it.
        result = run_cli(["deploy", "--name", unique_service_name])
        assert result.status == "completed"
 
-       # Confirm the resource exists by fetching it back through the real API.
        fetched = api_client.get_service(unique_service_name)
        assert fetched.name == unique_service_name
    ```
@@ -728,14 +682,11 @@ When creating integration tests, follow these rubrics.
 
    @pytest.fixture
    def api_client(api_key: str) -> Iterator[ApiClient]:
-       """Provide a live API client and guarantee it is closed after the test."""
        client = ApiClient(api_key=api_key)
 
-       # Yield the connected client to the test.
        try:
            yield client
        finally:
-           # Always close the client, even if the test raises.
            client.close()
    ```
 
@@ -750,18 +701,15 @@ When creating integration tests, follow these rubrics.
 
    @pytest.fixture
    def unique_service_name() -> str:
-       """A collision-free name so repeated and parallel runs do not clash."""
        return f"integration-test-{uuid.uuid4().hex[:8]}"
 
    @pytest.fixture
    def created_service(api_client: ApiClient, unique_service_name: str) -> Iterator[Service]:
-       """Create a service for the test and always remove it afterward."""
        service = api_client.create_service(unique_service_name)
 
        try:
            yield service
        finally:
-           # Delete the resource even if the test fails midway.
            api_client.delete_service(unique_service_name)
    ```
 
@@ -774,10 +722,8 @@ When creating integration tests, follow these rubrics.
 
    @pytest.fixture(scope="session")
    def api_key() -> str:
-       """Source and validate the API key once per selected live-test session."""
        value = os.environ.get("BENCHMARK_SERVICE_AUTH_KEY")
 
-       # Fail fast (never skip) when the key is missing.
        if not value:
            pytest.fail("BENCHMARK_SERVICE_AUTH_KEY must be set to run this live suite.")
 
@@ -788,15 +734,12 @@ When creating integration tests, follow these rubrics.
 
    ```python
    def wait_for_service_ready(api_client: ApiClient, name: str, timeout_seconds: float = 30.0) -> None:
-       """Poll until the service reports ready or the timeout elapses."""
        deadline = time.monotonic() + timeout_seconds
 
-       # Re-check the real status until it is ready or time runs out.
        while time.monotonic() < deadline:
            if api_client.get_service(name).status == "ready":
                return
 
-           # Small backoff between polls, not a fixed guess at the total wait.
            time.sleep(0.5)
 
        pytest.fail(f"Service {name} was not ready within {timeout_seconds}s.")

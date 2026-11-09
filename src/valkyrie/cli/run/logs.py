@@ -1,5 +1,3 @@
-"""Fetch and follow provider-neutral benchmark logs."""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -9,23 +7,17 @@ import click
 from valkyrie.sdk import LogEvent, ValkyrieClient, ValkyrieStreamError
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import format_option
 
 
 @click.command(help="Fetch or follow logs for a run or one task.")
 @click.argument("run_id", type=UUID)
-@click.option("--task-id", help="Limit logs to one task's current stream; IDs may contain '/'.")
+@click.option("--task-id", help="Limit logs to one task's current stream. IDs may contain '/'.")
 @click.option("--query", help="Match literal text in log messages.")
 @click.option("--since", "since_value", help="Inclusive RFC 3339 start time with a timezone offset.")
 @click.option("--until", "until_value", help="Inclusive RFC 3339 end time with a timezone offset.")
 @click.option("--follow", is_flag=True, help="Follow one task stream until interrupted.")
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "jsonl"], case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
-)
+@format_option(choices=("text", "jsonl"))
 def logs(
     run_id: UUID,
     task_id: str | None,
@@ -35,7 +27,6 @@ def logs(
     follow: bool,
     output_format: str,
 ) -> None:
-    """Fetch logs for a run, or select one task with ``--task-id``."""
     if follow and task_id is None:
         raise click.UsageError("--follow requires --task-id")
     if query is not None and not query.strip():
@@ -58,7 +49,6 @@ def logs(
         cursor: str | None = None
         seen_cursors: set[str] = set()
         while True:
-            # Pages are written as they arrive so long runs start printing before pagination ends.
             if task_id is not None:
                 page = await client.logs.page_task(
                     run_id, task_id, query=query, start_time=start_time, end_time=end_time, cursor=cursor

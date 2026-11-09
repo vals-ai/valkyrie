@@ -1,5 +1,3 @@
-"""Local agent-library storage at the AWS client boundary."""
-
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -12,7 +10,6 @@ from tracker.aws.clients import AWSClientProvider
 
 @pytest.fixture
 def agent_library(monkeypatch: pytest.MonkeyPatch) -> dict[str, bytes]:
-    """Exercise CLI, SDK, Tracker, and S3 helpers with local object storage."""
     objects: dict[str, bytes] = {}
     parts: list[bytes] = []
     client = AsyncMock()
@@ -78,15 +75,17 @@ def agent_library(monkeypatch: pytest.MonkeyPatch) -> dict[str, bytes]:
     def s3_client(_provider: AWSClientProvider) -> AsyncMock:
         return client
 
-    async def download(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "download.test"
+    tracker = httpx.ASGITransport.handle_async_request
+
+    async def download(transport: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
+        if request.url.host != "download.test":
+            return await tracker(transport, request)
         assert "authorization" not in request.headers
         assert "x-api-key" not in request.headers
 
         return httpx.Response(200, content=objects[request.url.path.lstrip("/")])
 
     monkeypatch.setattr(AWSClientProvider, "s3_client", s3_client)
-    # Presigned downloads use their own HTTP client, outside the CLI's Tracker transport.
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", download)
+    monkeypatch.setattr(httpx.ASGITransport, "handle_async_request", download)
 
     return objects

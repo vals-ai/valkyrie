@@ -1,8 +1,3 @@
-"""Run with `uv run pytest tests/integration/live/orchestration/test_process_benchmark.py`.
-
-Exercise tracker orchestration against real services and sandboxes.
-"""
-
 from __future__ import annotations
 
 from asyncio import gather
@@ -15,7 +10,6 @@ from benchmark_service.schemas import SetupTaskResponse
 import pytest
 from sqlmodel import Session, select
 
-import tracker.utils as tracker_utils
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSRuntime
@@ -29,10 +23,10 @@ from tracker.database.models import (
     TaskBreakdown,
     TaskStatus,
 )
+from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
-from tracker.utils import start_benchmark_request_to_benchmark
-
-process_benchmark = getattr(tracker_utils, "process_benchmark")
+from tracker.services.benchmarks import start_benchmark_request_to_benchmark
+from tracker.services.runs.start import process_benchmark
 
 _TASK_ID: str = "astropy__astropy-12907"
 _TASK_IDS: list[str] = ["astropy__astropy-12907", "astropy__astropy-13033"]
@@ -43,7 +37,6 @@ pytestmark = pytest.mark.usefixtures("tracker_database", "live_deployment")
 
 @pytest.fixture
 async def frozen_contract_keys(live_aws_runtime: AWSRuntime) -> AsyncGenerator[set[str], None]:
-    """Delete benchmark-scoped contract copies created by each live test."""
     keys: set[str] = set()
     try:
         yield keys
@@ -99,7 +92,7 @@ def _task_rows(benchmark: Benchmark, session: Session) -> list[Task]:
 
 
 def _assert_no_task_errors(benchmark: Benchmark, session: Session) -> None:
-    assert benchmark.fetch_tasks_with_errors(session) is None
+    assert not BenchmarkRepository(session).task_failures(benchmark)
 
 
 def _assert_task_breakdown_complete(task_breakdown: TaskBreakdown) -> None:
@@ -109,9 +102,17 @@ def _assert_task_breakdown_complete(task_breakdown: TaskBreakdown) -> None:
     assert task_breakdown.sandbox_run_duration is not None
 
 
+@pytest.mark.description("Live benchmark orchestration success, failure, and concurrency flows.")
 class TestProcessBenchmark:
-    """Live benchmark orchestration success, failure, and concurrency flows."""
-
+    @pytest.mark.description(
+        (
+            "Multiple tasks run concurrently and produce a complete benchmark result.\n"
+            "\n"
+            "Test cases:\n"
+            "- Every task finishes without a captured task error.\n"
+            "- Evaluation results, task breakdowns, and final evaluation exist for the completed benchmark."
+        )
+    )
     async def test_process_benchmark(
         self,
         contract: AgentContractRequest,
@@ -122,12 +123,6 @@ class TestProcessBenchmark:
         daytona_secret_name: str,
         executor_authority_kwargs: Any,
     ) -> None:
-        """Multiple tasks run concurrently and produce a complete benchmark result.
-
-        Test cases:
-        - Every task finishes without a captured task error.
-        - Evaluation results, task breakdowns, and final evaluation exist for the completed benchmark.
-        """
         benchmark, request = await _create_benchmark(
             contract,
             live_aws_runtime,
@@ -161,6 +156,15 @@ class TestProcessBenchmark:
 
         assert benchmark.final_evaluation is not None
 
+    @pytest.mark.description(
+        (
+            "Benchmark-level errors set the benchmark status and error message.\n"
+            "\n"
+            "Test cases:\n"
+            "- A database commit failure during benchmark startup marks the benchmark as ERROR.\n"
+            "- The benchmark error message includes the underlying failure."
+        )
+    )
     async def test_process_benchmark_error(
         self,
         contract: AgentContractRequest,
@@ -172,12 +176,6 @@ class TestProcessBenchmark:
         daytona_secret_name: str,
         executor_authority_kwargs: Any,
     ) -> None:
-        """Benchmark-level errors set the benchmark status and error message.
-
-        Test cases:
-        - A database commit failure during benchmark startup marks the benchmark as ERROR.
-        - The benchmark error message includes the underlying failure.
-        """
         benchmark, request = await _create_benchmark(
             contract,
             live_aws_runtime,
@@ -210,6 +208,15 @@ class TestProcessBenchmark:
         assert benchmark.status == BenchmarkStatus.ERROR
         assert "Simulated database error" in (benchmark.error_message or "")
 
+    @pytest.mark.description(
+        (
+            "One task can fail setup while the other still completes through the real service path.\n"
+            "\n"
+            "Test cases:\n"
+            "- The patched setup failure marks only the targeted task as ERROR.\n"
+            "- The non-failing task still finishes, evaluates, and has no captured error."
+        )
+    )
     async def test_process_task_error(
         self,
         contract: AgentContractRequest,
@@ -221,12 +228,6 @@ class TestProcessBenchmark:
         daytona_secret_name: str,
         executor_authority_kwargs: Any,
     ) -> None:
-        """One task can fail setup while the other still completes through the real service path.
-
-        Test cases:
-        - The patched setup failure marks only the targeted task as ERROR.
-        - The non-failing task still finishes, evaluates, and has no captured error.
-        """
         failing_task = "astropy__astropy-13033"
         task_ids = [_TASK_ID, failing_task]
 
@@ -278,9 +279,9 @@ class TestProcessBenchmark:
         ).all()
         assert len(error_tasks) == 1
         assert error_tasks[0].task_id == failing_task
-        task_errors = benchmark.fetch_tasks_with_errors(database_session)
-        assert task_errors is not None
-        assert "Simulated setup failure" in task_errors[failing_task]
+        assert (
+            "Simulated setup failure" in BenchmarkRepository(database_session).task_failures(benchmark)[failing_task][0]
+        )
 
         finished_tasks = database_session.exec(
             select(Task).where(Task.benchmark == benchmark.id).where(Task.status == TaskStatus.FINISHED)
@@ -293,6 +294,15 @@ class TestProcessBenchmark:
         assert _TASK_ID in results
         assert failing_task not in results
 
+    @pytest.mark.description(
+        (
+            "A run with no successful task results fails before final scoring.\n"
+            "\n"
+            "Test cases:\n"
+            "- A missing declared output artifact marks the task as ERROR through the real sandbox path.\n"
+            "- The benchmark is marked ERROR instead of attempting final scoring with only failed task inputs."
+        )
+    )
     async def test_process_benchmark_errors_when_all_tasks_fail_before_evaluation(
         self,
         contract: AgentContractRequest,
@@ -303,12 +313,6 @@ class TestProcessBenchmark:
         daytona_secret_name: str,
         executor_authority_kwargs: Any,
     ) -> None:
-        """A run with no successful task results fails before final scoring.
-
-        Test cases:
-        - A missing declared output artifact marks the task as ERROR through the real sandbox path.
-        - The benchmark is marked ERROR instead of attempting final scoring with only failed task inputs.
-        """
         failing_contract = contract.model_copy(update={"output_artifacts": ["missing-artifact.json"]})
         benchmark, request = await _create_benchmark(
             failing_contract,
@@ -335,11 +339,21 @@ class TestProcessBenchmark:
         tasks = _task_rows(benchmark, database_session)
         assert len(tasks) == 1
         assert tasks[0].status == TaskStatus.ERROR
-        task_errors = benchmark.fetch_tasks_with_errors(database_session)
-        assert task_errors is not None
-        assert "Required output artifact missing" in task_errors[_TASK_ID]
+        assert (
+            "Required output artifact missing"
+            in BenchmarkRepository(database_session).task_failures(benchmark)[_TASK_ID][0]
+        )
         assert benchmark.fetch_evaluation_results(database_session) == {}
 
+    @pytest.mark.description(
+        (
+            "Same task ID can run across two separate benchmarks concurrently without result collisions.\n"
+            "\n"
+            "Test cases:\n"
+            "- Both benchmarks finish without benchmark or task errors.\n"
+            "- Each benchmark has its own task row, evaluation result, and final evaluation."
+        )
+    )
     async def test_concurrent_benchmarks_same_task(
         self,
         contract: AgentContractRequest,
@@ -350,12 +364,6 @@ class TestProcessBenchmark:
         daytona_secret_name: str,
         executor_authority_kwargs: Any,
     ) -> None:
-        """Same task ID can run across two separate benchmarks concurrently without result collisions.
-
-        Test cases:
-        - Both benchmarks finish without benchmark or task errors.
-        - Each benchmark has its own task row, evaluation result, and final evaluation.
-        """
         benchmark_requests = [
             await _create_benchmark(
                 contract,
@@ -394,7 +402,7 @@ class TestProcessBenchmark:
             assert len(tasks) == 1
             assert tasks[0].task_id == _TASK_ID
             assert tasks[0].status == TaskStatus.FINISHED
-            assert benchmark.fetch_tasks_with_errors(database_session) is None
+            assert not BenchmarkRepository(database_session).task_failures(benchmark)
 
             results = benchmark.fetch_evaluation_results(database_session)
             assert set(results.keys()) == {_TASK_ID}

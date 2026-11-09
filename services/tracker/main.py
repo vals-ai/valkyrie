@@ -1,8 +1,7 @@
 import asyncio
 import io
-import logging
 import tarfile
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Buffer, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import json
@@ -13,21 +12,21 @@ from uuid import UUID, uuid4
 import httpx
 import logfire
 import sentry_sdk
+from benchmark_service import BenchmarkServiceClient
 from benchmark_service.client import BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from benchmark_service.schemas import VerifyTaskIdsResponse
 from benchmark_service.schemas import DatasetVersion
 from botocore.config import Config
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from opentelemetry.propagate import inject
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.orm import joinedload
-from sqlmodel import Session, col, select, update
+from sqlmodel import Session
 
-from tracker._lambda import invoke_lambda
+from tracker._lambda import dry_run_lambda, invoke_lambda
 from tracker.api.login import router as login_router
 from tracker.api.organizations import router as organizations_router
 from tracker.api.agents import router as agents_router
@@ -37,14 +36,30 @@ from tracker.api.dependencies import TrackedBenchmarkId, bind_benchmark_id
 from tracker.api.dependencies import RunBenchmarkDependency, RunRuntimeDependency
 from tracker.api.costs import router as costs_router
 from tracker.api.filter_options import router as filter_options_router
+from tracker.api.logs import monitor_router
 from tracker.api.logs import router as logs_router
 from tracker.api.scheduler_overview import router as scheduler_overview_router
 from tracker.api.single_benchmark import router as single_benchmark_router
 from tracker.api.single_task import router as single_task_router
 from tracker.api.run_artifacts import router as run_artifacts_router
-from tracker.api.providers import provider_secrets, router as providers_router
+from tracker.api.providers import router as providers_router
+from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.api.run_settings import router as run_settings_router, user_run_settings
-from tracker.api.projects import find_project, router as projects_router
+from tracker.api.benchmark_definitions import router as benchmark_definitions_router
+from tracker.api.dataset_tasks import router as dataset_tasks_router
+from tracker.api.datasets import router as datasets_router
+from tracker.repositories.benchmark import BenchmarkRepository, BenchmarkRepositoryDependency, Order
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.organization import OrganizationRepository
+from tracker.repositories.project import ProjectRepository, ProjectRepositoryDependency
+from tracker.repositories.run_settings import RunSettingsRepository
+from tracker.repositories.scheduler import SchedulerRepository
+from tracker.api.projects import (
+    find_project,
+    reject_archived_project,
+    reject_missing_project,
+    router as projects_router,
+)
 from tracker.api.secrets import router as secrets_router, secret_store
 from tracker.auth import (
     RequestIdentity,
@@ -70,6 +85,7 @@ from tracker.aws.s3 import (
     s3_object_exists,
 )
 from tracker.aws.runtime import AWSResources, AWSRuntime
+from tracker.project_gateway import prepare_project_gateway_key, selects_project_gateway_key
 from tracker.runtime.artifacts import (
     agent_bundle_key,
     benchmark_agent_bundle_key,
@@ -94,17 +110,17 @@ from tracker.database.models import (
     BenchmarkStatus,
     DocentReadingStatus,
     ExecutorDispatch,
-    ExecutorDispatchPayload,
     ExecutorDispatchKind,
+    ExecutorDispatchPayload,
     FinalEvaluation,
     Org,
     RetryMode,
     RunAccessKey,
+    RunMonitoringRules,
     RunProject,
-    Task,
     TaskStatus,
 )
-from tracker.database.scoping import assert_org, get_scoped
+from tracker.database.scoping import assert_org
 from tracker.executor.dispatch_control import (
     EnqueueFailureResolution,
     admit_recovery_dispatch,
@@ -114,11 +130,16 @@ from tracker.executor.dispatch_control import (
 )
 from tracker.executor.dispatch_payload import PayloadKey, generate_payload_key, seal_payload
 from tracker.executor.launcher import launch_dispatch
-from tracker.database.session import check_database_connection, get_session
+from tracker.database.session import check_database_connection, database_call, get_session
 from tracker.docent_analysis import (
     analyze_event_stream,
 )
-from tracker.exceptions import InvalidSandboxConfigurationError, SecretNotFoundError, TrackerServiceError
+from tracker.exceptions import (
+    InvalidSandboxConfigurationError,
+    LambdaError,
+    SecretNotFoundError,
+    TrackerServiceError,
+)
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.local.runtime import LocalRuntimeFactory
@@ -126,6 +147,8 @@ from executor_protocol import ExecutorTelemetryContext
 from tracker.logging import configure_logging, get_logger, request_id_var
 from tracker.executor.release_control import MaintenanceModeError, ReleaseControlError, lock_executor_admission
 from tracker.executor.dispatch_recovery import AutomaticDispatchRecovery
+from tracker.scheduler.coordinator import SharedPoolScheduler
+from tracker.scheduler.service_capacity import API_WAKE_SECONDS, ServiceCapacityScheduler, wake_benchmark_service
 from tracker.executor.release_retirement import AutomaticReleaseRetirement
 from tracker.middleware import LocalTrustedHostMiddleware, RequestContextMiddleware, RunRequestSizeLimitMiddleware
 from tracker.observability import configure_observability
@@ -137,7 +160,7 @@ from tracker.outbound_security import (
     validate_service_headers,
     validate_service_url_syntax,
 )
-from tracker.scheduler.store import queue_pool_id, try_task_evaluation_transaction_lock
+from tracker.scheduler.store import queue_pool_id
 from tracker.types import (
     AnalyzeBenchmarkRequest,
     AWSRuntimeResponse,
@@ -148,7 +171,6 @@ from tracker.types import (
     FetchBenchmarkTasksRequest,
     FinalViewResponse,
     ManagedExecutionContext,
-    Order,
     ProjectResponse,
     RetrieveResultsResponse,
     RunExecutionRequest,
@@ -164,28 +186,28 @@ from tracker.types import (
     UpdateBenchmarkConcurrencyResponse,
     validate_managed_execution_request,
 )
-from tracker.utils import (
+from tracker.services.benchmarks import (
     BenchmarkConcurrencyUpdate,
-    fetch_benchmark_response,
-    YieldingWriter,
-    build_benchmark_table_rows,
-    create_benchmark_service_client,
-    create_final_view,
     fetch_benchmark_row,
-    fetch_filtered_benchmark_rows,
-    fetch_final_score_inputs,
-    final_view_s3_key,
-    force_stop_sandboxes,
-    initiate_stop_benchmark,
-    reset_to_in_progress_status,
     start_benchmark_request_to_benchmark,
-    stream_benchmark_results,
-    upload_final_view,
     update_benchmark_concurrency,
     update_benchmark_resume_arguments,
 )
-from tracker.utils.resources import fetch_sandbox_provider_config
-from tracker.utils.run_control import RetryState, apply_shed_benchmark, prepare_retry_state
+from tracker.clients.benchmark_service import create_benchmark_service_client, fetch_sandbox_provider_config
+from tracker.services.results import (
+    InvalidCursorError,
+    fetch_benchmark_response,
+    build_benchmark_table_rows,
+    fetch_filtered_benchmark_rows,
+    stream_benchmark_results,
+)
+from tracker.services.failures import is_rejected_request
+from tracker.services.final_views import create_final_view, final_view_s3_key, upload_final_view
+from tracker.services.runs.finalize import fetch_final_score_inputs
+from tracker.services.runs.retry import RetryState, prepare_retry_state, reset_to_in_progress_status
+from tracker.services.runs.stop import apply_shed_benchmark, initiate_stop_benchmark
+from tracker.services.sandboxes import ForceStopError, capture_stop_sandboxes, force_stop_sandboxes, sandbox_generator
+from tracker.services.tasks.execute import task_attempt_id
 
 configure_logging()
 configure_observability("valkyrie-tracker", environment=ENVIRONMENT)
@@ -198,8 +220,6 @@ _TaskResult = TypeVar("_TaskResult")
 
 
 def _operation_id(route: APIRoute) -> str:
-    """Use route function name as operation_id so generated client hooks are short.
-    E.g. `list_agents` (not `list_agents_agents_get`)."""
     return route.name
 
 
@@ -208,12 +228,18 @@ async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     retirement = AutomaticReleaseRetirement()
     dispatch_recovery = AutomaticDispatchRecovery()
     sandbox_cost = AutomaticSandboxCost()
+    scheduler = SharedPoolScheduler()
+    service_capacity = ServiceCapacityScheduler()
     retirement.start()
     dispatch_recovery.start()
     sandbox_cost.start()
+    scheduler.start()
+    service_capacity.start()
     try:
         yield
     finally:
+        await service_capacity.stop()
+        await scheduler.stop()
         sandbox_cost.stop()
         dispatch_recovery.stop()
         retirement.stop()
@@ -235,6 +261,7 @@ app.include_router(benchmarks_status_router)
 app.include_router(costs_router)
 app.include_router(filter_options_router)
 app.include_router(logs_router)
+app.include_router(monitor_router)
 app.include_router(scheduler_overview_router)
 app.include_router(single_benchmark_router)
 app.include_router(single_task_router)
@@ -243,19 +270,14 @@ app.include_router(providers_router)
 app.include_router(run_settings_router)
 app.include_router(secrets_router)
 app.include_router(projects_router)
-
-
-# Preserve health check log suppression after configure_logging() replaced handlers
-class HealthCheckFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.getMessage().find("/health") == -1
-
-
-logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+v1 = APIRouter(prefix="/v1")
+v1.include_router(benchmark_definitions_router)
+v1.include_router(datasets_router)
+v1.include_router(dataset_tasks_router)
+app.include_router(v1)
 
 
 def _executor_telemetry_context() -> ExecutorTelemetryContext:
-    """Capture request and distributed trace context for the executor process."""
     trace_headers: dict[str, str] = {}
     inject(trace_headers)
     return {
@@ -287,7 +309,7 @@ def _persist_dispatch_payload(
     payload_key: PayloadKey,
 ) -> None:
     sealed = seal_payload(dispatch.id, {**payload, "telemetry_context_json": telemetry_context}, payload_key)
-    session.add(
+    BenchmarkRepository(session).save(
         ExecutorDispatchPayload(
             dispatch_id=dispatch.id,
             ciphertext=sealed.ciphertext,
@@ -318,7 +340,6 @@ async def _await_before_cancellation(
     task: asyncio.Task[_TaskResult],
     cancellation: asyncio.CancelledError | None = None,
 ) -> tuple[_TaskResult, asyncio.CancelledError | None]:
-    """Observe task completion before propagating pending cancellation."""
     while not task.done():
         try:
             await asyncio.shield(task)
@@ -326,7 +347,6 @@ async def _await_before_cancellation(
             if cancellation is None:
                 cancellation = error
         except Exception:
-            # Read the completed task below so cancellation keeps precedence.
             pass
     try:
         result = task.result()
@@ -398,11 +418,10 @@ def _start_admission_is_absent(
     benchmark_id: UUID,
     dispatch_id: UUID,
 ) -> bool:
-    """Return whether a fresh database read proves the start admission was not committed."""
     try:
         with Session(bind) as verification_session:
-            benchmark = verification_session.get(Benchmark, benchmark_id)
-            dispatch = verification_session.get(ExecutorDispatch, dispatch_id)
+            benchmark = BenchmarkRepository(verification_session).get_by_id(benchmark_id)
+            dispatch = ExecutorDispatchRepository(verification_session).get(dispatch_id)
     except Exception:
         logger.exception(
             "Could not verify failed benchmark admission; retaining its agent copy",
@@ -450,10 +469,10 @@ async def secret_not_found_handler(_request: Request, exc: SecretNotFoundError):
 
 
 @app.exception_handler(TrackerServiceError)
-async def tracker_service_error_handler(_request: Request, exc: TrackerServiceError):
-    logger.error(exc, exc_info=True)
+async def tracker_service_error_handler(request: Request, exc: TrackerServiceError):
+    logger.error("Tracker service operation failed on %s %s: %s", request.method, request.url.path, exc, exc_info=exc)
     sentry_sdk.capture_exception(exc)
-    raise HTTPException(status_code=500, detail="Tracker service operation failed") from exc
+    return JSONResponse(status_code=500, content={"detail": "Tracker service operation failed"})
 
 
 @app.exception_handler(BenchmarkServiceUnauthenticatedError)
@@ -463,45 +482,58 @@ async def benchmark_service_unauth_error_handler(_request: Request, exc: Benchma
 
 
 @app.exception_handler(BenchmarkServiceError)
-async def benchmark_service_error_handler(_request: Request, exc: BenchmarkServiceError):
-    logger.error(exc, exc_info=True)
+async def benchmark_service_error_handler(request: Request, exc: BenchmarkServiceError):
+    logger.error("Benchmark service request failed on %s %s: %s", request.method, request.url.path, exc, exc_info=exc)
     sentry_sdk.capture_exception(exc)
-    raise HTTPException(status_code=500, detail="Benchmark service request failed") from exc
+    return JSONResponse(status_code=502, content={"detail": "Benchmark service request failed"})
+
+
+async def _monitoring_rules(
+    benchmark_service: BenchmarkServiceClient, task_ids: list[str], dataset: str | None
+) -> RunMonitoringRules | None:
+    try:
+        rules = await benchmark_service.monitoring_requirements(task_ids, dataset=dataset)
+    except BenchmarkServiceError as exc:
+        if exc.status_code == 404:
+            return None
+        raise HTTPException(status_code=502, detail="Failed to read the benchmark's monitoring rules") from exc
+    return RunMonitoringRules(**rules.model_dump())
+
+
+def _verify_task_ids_failure(benchmark_name: str, exc: Exception) -> HTTPException:
+    if isinstance(exc, BenchmarkServiceError) and is_rejected_request(exc.status_code):
+        logger.warning("Benchmark service rejected the task ids for %s: %s", benchmark_name, exc)
+        return HTTPException(
+            status_code=400,
+            detail=exc.detail if isinstance(exc.detail, str) else "Benchmark service rejected the task IDs",
+        )
+    logger.error("Failed to verify task ids for %s", benchmark_name, exc_info=exc)
+    return HTTPException(status_code=502, detail="Failed to verify task ids")
 
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(request: Request, exc: RequestValidationError):
-    """Keep submitted secret values out of the 422 for secret routes."""
     if request.url.path.startswith(f"{secrets_router.prefix}/"):
         exc = RequestValidationError([{k: v for k, v in error.items() if k != "input"} for error in exc.errors()])
     return await request_validation_exception_handler(request, exc)
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    description="Report whether the Tracker and its database are up. Returns 503 when the database is unreachable.",
+)
 def health_check() -> dict[str, str]:
-    """
-    Health check to ensure that the tracker service is running correctly.
-
-    Usage:
-    curl -X GET http://<endpoint>/health
-
-    Returns:
-    {
-        "status": "ok"
-    }
-
-    Returns:
-    - 200 OK if the server is running and database is accessible
-    - 503 Service Unavailable if the database is not accessible
-    """
     if not check_database_connection():
         raise HTTPException(status_code=503, detail="Database is not accessible")
     return {"status": "ok"}
 
 
-@app.get("/aws-runtime", response_model=AWSRuntimeResponse)
+@app.get(
+    "/aws-runtime",
+    response_model=AWSRuntimeResponse,
+    description="Return managed AWS resource locations without credential material.",
+)
 def fetch_aws_runtime_metadata(org: Org = Depends(get_current_org)) -> AWSRuntimeResponse:
-    """Return managed AWS resource locations without credential material."""
     resources = resolve_start_aws_runtime(org).resources
     return AWSRuntimeResponse(
         mode="managed",
@@ -511,7 +543,6 @@ def fetch_aws_runtime_metadata(org: Org = Depends(get_current_org)) -> AWSRuntim
 
 
 async def _resolve_contract_from_s3(request: StartBenchmarkRequest, object_store: ObjectStore) -> AgentContractRequest:
-    """Resolve the published agent contract from the configured object store."""
     try:
         zip_bytes = await object_store.get_bytes(agent_bundle_key(request.contract.name))
     except FileNotFoundError as error:
@@ -520,7 +551,6 @@ async def _resolve_contract_from_s3(request: StartBenchmarkRequest, object_store
     resolved = get_contract_from_zip_bytes(request.contract.name, zip_bytes, agent_config)
     if request.contract.secrets:
         resolved.secrets = {**resolved.secrets, **request.contract.secrets}
-    # Kwargs were validated against the bundle's schema and retained for launch-time binding.
     resolved.inference_settings_attested = True
     return resolved
 
@@ -537,7 +567,6 @@ def _authorize_custom_benchmark_destination(url: str, org: Org) -> None:
 
 
 def _replace_headers(headers: Mapping[str, str], replacements: Mapping[str, str]) -> dict[str, str]:
-    """Add these headers, dropping any request header of the same name in another capitalization."""
     names = {name.lower() for name in replacements}
     return {name: value for name, value in headers.items() if name.lower() not in names} | dict(replacements)
 
@@ -547,7 +576,6 @@ def _resolve_secret_name(name: str, org: Org) -> str:
 
 
 def _authorize_secret_names(request: StartBenchmarkRequest, org: Org) -> StartBenchmarkRequest:
-    """Resolve the request's secret names for the organization, then check it may use them."""
     secrets = {env_name: _resolve_secret_name(name, org) for env_name, name in request.contract.secrets.items()}
     request = request.model_copy(
         update={
@@ -567,13 +595,42 @@ def _authorize_secret_names(request: StartBenchmarkRequest, org: Org) -> StartBe
     return request
 
 
+async def _with_project_gateway_secrets(
+    request: StartBenchmarkRequest, project_id: UUID, org: Org, bind: Engine | Connection
+) -> StartBenchmarkRequest:
+    references = await prepare_project_gateway_key(bind, project_id, org, secret_store(org))
+    return request.model_copy(
+        update={"contract": request.contract.model_copy(update={"secrets": request.contract.secrets | references})}
+    )
+
+
+async def _wake_hosted_service(
+    benchmark_name: str,
+    custom_benchmark_service: str | None,
+    client: BenchmarkServiceClient,
+) -> None:
+    if (
+        classify_benchmark_service_destination(benchmark_name, custom_benchmark_service).value
+        != BenchmarkServiceDestination.HOSTED.value
+    ):
+        return
+    try:
+        await wake_benchmark_service(benchmark_name, client, timeout_seconds=API_WAKE_SECONDS)
+    except TrackerServiceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Benchmark service '{benchmark_name}' is starting, retry in a minute",
+            headers={"Retry-After": "60"},
+        ) from exc
+
+
 def _reject_docker_with_hosted_service(sandbox_provider: str, destination: BenchmarkServiceDestination) -> None:
     if sandbox_provider == "docker" and destination == BenchmarkServiceDestination.HOSTED:
         raise HTTPException(status_code=400, detail="The Docker sandbox provider requires a local benchmark service")
 
 
 class _StartAdmissionRollbackError(Exception):
-    """Rollback was not confirmed; the copied agent must be retained."""
+    pass
 
 
 def _validate_start_release(bind: Engine | Connection) -> None:
@@ -589,25 +646,33 @@ def _commit_start(
     task_ids: list[str],
     queue_pool_id: str | None,
     telemetry_context: ExecutorTelemetryContext,
-    issued_keys: Sequence[IssuedRunKey] = (),
-    project_id: UUID | None = None,
+    issued_keys: Sequence[IssuedRunKey],
+    project_id: UUID | None,
+    selected_project_gateway_root: bool,
 ) -> tuple[str, "AdmissionResult"]:
     payload_key = generate_payload_key(dispatch_id)
     with Session(bind, expire_on_commit=False) as session:
         benchmark = Benchmark.model_validate(json.loads(benchmark_json))
-        # API serialization deliberately excludes internal scheduler admission fields.
         benchmark.arguments = benchmark.arguments.model_copy(
-            update={"priority": request.priority, "queue_pool_id": queue_pool_id}
+            update={
+                "priority": request.priority,
+                "queue_pool_id": queue_pool_id,
+                "selected_project_gateway_secret_ref": (
+                    request.contract.secrets["MODEL_GATEWAY_API_KEY"] if selected_project_gateway_root else None
+                ),
+            }
         )
         try:
-            for task_id in task_ids:
-                session.add(Task(org_id=benchmark.org_id, benchmark=benchmark.id, task_id=task_id))
+            if project_id is not None:
+                reject_archived_project(ProjectRepository(session).lock(project_id))
+            repository = BenchmarkRepository(session)
+            repository.add_tasks(benchmark.org_id, benchmark.id, task_ids)
             dispatch = admit_start_dispatch(session, benchmark=benchmark, dispatch_id=dispatch_id, task_ids=task_ids)
             payload = _process_benchmark_kwargs(benchmark, request, task_ids)
             _persist_dispatch_payload(session, dispatch, payload, telemetry_context, payload_key)
-            session.add_all(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark.id) for key in issued_keys)
+            repository.save(*(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark.id) for key in issued_keys))
             if project_id is not None:
-                session.add(
+                repository.save(
                     RunProject(
                         benchmark_id=benchmark.id,
                         project_id=project_id,
@@ -625,7 +690,7 @@ def _commit_start(
             raise
 
 
-@app.post("/start-benchmark")
+@app.post("/start-benchmark", description="Start a benchmark run from an uploaded agent or a complete contract.")
 async def start_benchmark(
     http_request: Request,
     request: StartBenchmarkRequest,
@@ -633,9 +698,10 @@ async def start_benchmark(
     session: Session = Depends(get_session),
     run_starter: RequestIdentity = Depends(get_current_runner),
 ) -> StartBenchmarkResponse:
-    """Start a benchmark run from an uploaded agent or a complete contract."""
-    settings = await asyncio.to_thread(user_run_settings, session, run_starter)
-    request.use_settings(settings, await asyncio.to_thread(provider_secrets, session, run_starter.org.id))
+    settings = await asyncio.to_thread(user_run_settings, RunSettingsRepository(session), run_starter)
+    request.use_settings(
+        settings, await asyncio.to_thread(ProviderSecretRepository(session).list_all, run_starter.org.id)
+    )
     if request.custom_benchmark_service is not None:
         _authorize_custom_benchmark_destination(request.custom_benchmark_service, run_starter.org)
     try:
@@ -643,7 +709,13 @@ async def start_benchmark(
         validate_service_headers(request.service_headers)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    project = find_project(session, run_starter.org.id, request.project) if request.project is not None else None
+    reject_missing_project(run_starter.org, request.project)
+    project = (
+        find_project(ProjectRepository(session), run_starter.org.id, request.project)
+        if request.project is not None
+        else None
+    )
+    selected_project_gateway_root = False
 
     bind = session.get_bind()
     session.close()
@@ -663,6 +735,9 @@ async def start_benchmark(
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         if not reads_secrets_file(local_config.resources):
+            if project is not None and selects_project_gateway_key(run_starter.org):
+                request = await _with_project_gateway_secrets(request, project.id, run_starter.org, bind)
+                selected_project_gateway_root = True
             request = _authorize_secret_names(request, run_starter.org)
         runtime = LocalRuntimeFactory.create_runtime(
             local_config.resources,
@@ -696,6 +771,9 @@ async def start_benchmark(
             validate_managed_execution_request(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if project is not None and selects_project_gateway_key(run_starter.org):
+            request = await _with_project_gateway_secrets(request, project.id, run_starter.org, bind)
+            selected_project_gateway_root = True
         request = _authorize_secret_names(request, run_starter.org)
 
         try:
@@ -727,7 +805,6 @@ async def start_benchmark(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # A caller cannot declare its own inference settings trusted.
     request = request.model_copy(
         update={"contract": request.contract.model_copy(update={"inference_settings_attested": False})}
     )
@@ -762,7 +839,6 @@ async def start_benchmark(
         finally:
             await provider.close()
 
-        # Admission identity is configured per provider secret; unmanaged credentials remain direct.
         if provider_pool_id is not None:
             if request.priority is None:
                 request = request.model_copy(update={"priority": 3})
@@ -789,16 +865,19 @@ async def start_benchmark(
         if not reads_secrets_file(request.properties):
             request = _authorize_secret_names(request, run_starter.org)
 
-    logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
+    logger.info("Starting benchmark run - contract: %s, benchmark: %s", request.contract.name, request.benchmark_name)
 
     benchmark_service = request.benchmark_service
     execution_request = RunExecutionRequest.model_validate(request.model_dump(mode="python"))
 
-    # Validate benchmark service is reachable + tasks resolve BEFORE creating the DB row,
-    # so failed auth / unreachable services don't pollute the benchmark list.
     try:
         try:
-            _ = await benchmark_service.health_check()
+            await _wake_hosted_service(
+                request.benchmark_name,
+                request.custom_benchmark_service,
+                benchmark_service,
+            )
+            await benchmark_service.health_check()
         except httpx.ConnectError as exc:
             raise HTTPException(
                 status_code=502,
@@ -841,9 +920,13 @@ async def start_benchmark(
         except BenchmarkServiceUnauthenticatedError as exc:
             logger.warning("Benchmark service authentication failed for %s: %s", request.benchmark_name, exc)
             raise HTTPException(status_code=502, detail="Benchmark service authentication failed") from exc
-        except Exception as exc:
-            logger.error("Failed to verify task ids for %s", request.benchmark_name, exc_info=True)
-            raise HTTPException(status_code=502, detail="Failed to verify task ids") from exc
+        except (BenchmarkServiceError, httpx.HTTPError, ValueError) as exc:
+            raise _verify_task_ids_failure(request.benchmark_name, exc) from exc
+
+        if execution_request.monitoring is not None:
+            execution_request.monitoring_rules = await _monitoring_rules(
+                benchmark_service, verify_response.task_ids, execution_request.dataset
+            )
     finally:
         try:
             await benchmark_service.close()
@@ -876,6 +959,7 @@ async def start_benchmark(
                 telemetry_context,
                 issued_keys,
                 project.id if project is not None else None,
+                selected_project_gateway_root,
             )
         )
         (benchmark_json, result), cancellation = await _await_before_cancellation(commit_task)
@@ -903,6 +987,8 @@ async def start_benchmark(
             raise cancellation_after_failure from exc
         if isinstance(exc, ReleaseControlError):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if isinstance(exc, HTTPException):
+            raise exc
         raise TrackerServiceError("Failed to admit benchmark execution") from exc
     bind_failure: Exception | None = None
     try:
@@ -970,7 +1056,7 @@ async def start_benchmark(
     )
 
 
-@app.post("/fetch-benchmark-tasks")
+@app.post("/fetch-benchmark-tasks", description="List every task ID in a benchmark's dataset.")
 async def fetch_benchmark_tasks(
     http_request: Request,
     request: FetchBenchmarkTasksRequest,
@@ -978,10 +1064,9 @@ async def fetch_benchmark_tasks(
     identity: RequestIdentity = Depends(get_current_identity),
     session: Session = Depends(get_session),
 ) -> VerifyTaskIdsResponse:
-    """
-    Fetch all task ids for a benchmark dataset.
-    """
-    credential = request.use_saved_service(await asyncio.to_thread(user_run_settings, session, identity))
+    credential = request.use_saved_service(
+        await asyncio.to_thread(user_run_settings, RunSettingsRepository(session), identity)
+    )
     session.close()
     if request.custom_benchmark_service is not None:
         _authorize_custom_benchmark_destination(request.custom_benchmark_service, identity.org)
@@ -1009,6 +1094,11 @@ async def fetch_benchmark_tasks(
             service_headers=forward_tracker_api_key(service_headers, service_key, destination=destination),
         )
         try:
+            await _wake_hosted_service(
+                request.benchmark_name,
+                request.custom_benchmark_service,
+                benchmark_service,
+            )
             return await benchmark_service.verify_task_ids(
                 task_ids=None,
                 slice_str=None,
@@ -1021,7 +1111,14 @@ async def fetch_benchmark_tasks(
         raise HTTPException(status_code=502, detail="Failed to fetch task ids from benchmark service") from exc
 
 
-@app.get("/fetch-benchmark", response_model=None)
+@app.get(
+    "/fetch-benchmark",
+    response_model=None,
+    description=(
+        "Return a run with its progress by its ID. With `connect`, it streams the run's updates as server-sent events "
+        "instead. Returns 404 when the run does not exist."
+    ),
+)
 async def fetch_benchmark(
     http_request: Request,
     benchmark_id: TrackedBenchmarkId,
@@ -1031,27 +1128,12 @@ async def fetch_benchmark(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> FetchBenchmarkResponse | StreamingResponse:
-    """
-    Fetch a benchmark by its id.
-
-    Usage:
-    curl -X GET http://<endpoint>/fetch-benchmark/<benchmark_id>?connect=true
-
-    Returns:
-        FetchBenchmarkResponse
-
-    Returns:
-    - 200 OK if benchmark is found
-    - 404 Not Found if benchmark is not found
-    """
     s3_bucket_url = (
         str(http_request.url_for("list_run_artifacts", benchmark_id=benchmark_row.id))
         if benchmark_row.arguments.environment == "local"
         else runtime.artifacts.prefix_location(benchmark_artifact_prefix(str(benchmark_row.id)))
     )
     storage_bucket = runtime.aws_runtime.resources.s3_bucket if isinstance(runtime, CloudRuntimeServices) else None
-    # When we connect to the client every 60 seconds we send the latest benchmark status
-    # and additional updates about the tasks completed
     if connect:
         bind = session.bind
         org_id = org.id
@@ -1066,10 +1148,18 @@ async def fetch_benchmark(
             },
         )
 
-    return fetch_benchmark_response(benchmark_row, session, org.id, s3_bucket_url, storage_bucket)
+    return fetch_benchmark_response(benchmark_row, session, s3_bucket_url, storage_bucket)
 
 
-@app.post("/analyze-benchmark/{benchmark_id}", response_model=None)
+@app.post(
+    "/analyze-benchmark/{benchmark_id}",
+    response_model=None,
+    description=(
+        "Analyze a run with Docent and stream progress as server-sent events. The last event is `done` with the reading plan URL, or `error` with a message.\n"
+        "\n"
+        "A run that was already analyzed returns its existing reading plan URL unless no_cache is set."
+    ),
+)
 async def analyze_benchmark(
     benchmark_id: TrackedBenchmarkId,
     benchmark_row: RunBenchmarkDependency,
@@ -1077,14 +1167,6 @@ async def analyze_benchmark(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> dict[str, str] | StreamingResponse:
-    """
-    Invoke the Docent analyzer Lambda for a benchmark and emit SSE-formatted progress events
-    (started/heartbeat/done/error) that clients consume as buffered text (the response is read
-    in full; the terminal done/error event carries the result).
-
-    Cache short-circuit: when the benchmark already has docent_reading_status=DONE and
-    no_cache=false, returns the existing reading_plan_url without invoking the Lambda.
-    """
     if isinstance(benchmark_row.arguments.properties, LocalResources):
         raise HTTPException(status_code=400, detail="Docent analysis requires S3 storage")
     aws_runtime = resolve_run_aws_runtime(
@@ -1171,6 +1253,11 @@ async def _recompute_final_evaluation(
         service_headers=forward_tracker_api_key(None, service_key, destination=destination)
     )
     try:
+        await _wake_hosted_service(
+            benchmark_row.name,
+            benchmark_row.custom_benchmark_service,
+            benchmark_service,
+        )
         response = await benchmark_service.final_score(
             evaluation_results=scored_results,
             dataset=benchmark_row.arguments.dataset,
@@ -1209,7 +1296,6 @@ async def _invoke_preview_lambda(benchmark_row: Benchmark, aws_runtime: AWSRunti
 
 
 async def _archive_final_view(benchmark_row: Benchmark, aws_runtime: AWSRuntime) -> None:
-    """Copy the current canonical final view under archive/<timestamp>/ before it is overwritten."""
     s3_key = final_view_s3_key(benchmark_row)
     if not await s3_object_exists(s3_key, aws_runtime):
         return
@@ -1238,21 +1324,14 @@ async def _retrieve_results(
     session: Session,
     org: Org,
 ) -> RetrieveResultsResponse:
-    benchmark_row = assert_org(
-        session.get(Benchmark, benchmark_id, options=[joinedload(Benchmark.final_evaluation)]),
-        org,
-    )
+    repository = BenchmarkRepository(session)
+    benchmark_row = assert_org(repository.get(org.id, benchmark_id), org)
 
     final_view = create_final_view(benchmark_row, session, org)
     task_ids_set = set(task_ids) if task_ids else None
 
     if task_ids_set is not None:
-        run_task_ids = set(
-            session.exec(
-                select(col(Task.task_id)).where(col(Task.benchmark) == benchmark_id).where(col(Task.org_id) == org.id)
-            ).all()
-        )
-        unknown_task_ids = task_ids_set - run_task_ids
+        unknown_task_ids = task_ids_set - repository.task_ids(org.id, benchmark_id)
         if unknown_task_ids:
             raise HTTPException(
                 status_code=400,
@@ -1289,7 +1368,9 @@ async def _retrieve_results(
     return await _s3_results_response(s3_key, aws_runtime)
 
 
-@app.get("/retrieve-results")
+@app.get(
+    "/retrieve-results", description="Retrieve a benchmark's current results, optionally filtered or uploaded to S3."
+)
 async def retrieve_results(
     benchmark_id: TrackedBenchmarkId,
     http_request: Request,
@@ -1299,11 +1380,13 @@ async def retrieve_results(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> RetrieveResultsResponse:
-    """Retrieve a benchmark's current results, optionally filtered or uploaded to S3."""
     return await _retrieve_results(benchmark_id, http_request, issued_keys, s3, False, task_ids, session, org)
 
 
-@app.get("/preview-results")
+@app.get(
+    "/preview-results",
+    description="Archive the current S3 final view, replace it with a recomputed one, and run the completion callback.",
+)
 async def preview_results(
     benchmark_id: TrackedBenchmarkId,
     http_request: Request,
@@ -1312,26 +1395,19 @@ async def preview_results(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> S3UploadResultsResponse:
-    """Archive the current S3 final view, replace it with a recomputed one, and run the completion callback."""
     response = await _retrieve_results(benchmark_id, http_request, issued_keys, True, True, task_ids, session, org)
     return cast(S3UploadResultsResponse, response)
 
 
-@app.get("/check-results-exist")
+@app.get(
+    "/check-results-exist",
+    description="Report whether a run's final results already exist in S3.",
+)
 async def check_results_exist(
     benchmark_id: TrackedBenchmarkId,
     runtime: RunRuntimeDependency,
     benchmark_row: RunBenchmarkDependency,
 ) -> dict[str, bool]:
-    """
-    Check if the benchmark's final view already exists in S3.
-
-    Usage:
-    curl -X GET http://<endpoint>/check-results-exist?benchmark_id=<uuid>
-
-    Returns:
-        {"exists": true/false}
-    """
     s3_key = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/{benchmark_row.name}.json"
     exists = await runtime.objects.exists(s3_key)
     return {"exists": exists}
@@ -1343,18 +1419,12 @@ async def validate_tasks_exist(
     session: Session,
     org: Org,
 ) -> list[str]:
-    """Validate that selected tasks belong to the run."""
     if not task_ids:
         raise HTTPException(status_code=400, detail="task_ids cannot be empty")
 
     requested_task_ids = list(dict.fromkeys(task_ids))
-    existing_task_ids = set(
-        session.exec(
-            select(Task.task_id)
-            .where(col(Task.benchmark) == benchmark_row.id)
-            .where(col(Task.org_id) == org.id)
-            .where(col(Task.task_id).in_(requested_task_ids))
-        ).all()
+    existing_task_ids = await database_call(
+        lambda: BenchmarkRepository(session).task_ids(org.id, benchmark_row.id, requested_task_ids)
     )
     missing_task_ids = [task_id for task_id in requested_task_ids if task_id not in existing_task_ids]
     if missing_task_ids:
@@ -1373,34 +1443,75 @@ def _resolve_force_stop_provider_secret_name(benchmark_row: Benchmark) -> str:
     raise HTTPException(status_code=400, detail="The run does not have a sandbox provider secret name.")
 
 
-@app.post("/stop-benchmark/{benchmark_id}")
+@app.get(
+    "/benchmarks/{benchmark_id}/monitor/stop-receipt",
+    description="Report whether any provider sandbox labeled for the task remains, for a current attempt.",
+)
+async def monitor_stop_receipt(
+    benchmark_id: TrackedBenchmarkId,
+    task_id: str = Query(min_length=1),
+    expected_attempt_id: str = Query(min_length=1),
+    session: Session = Depends(get_session),
+    org: Org = Depends(get_current_org),
+) -> dict[str, str]:
+    repository = BenchmarkRepository(session)
+    benchmark_row = assert_org(repository.get(org.id, benchmark_id), org)
+    task = repository.get_task(org.id, benchmark_id, task_id)
+    if task is None or task_attempt_id(task.id, task.started_at) != expected_attempt_id:
+        raise HTTPException(status_code=409, detail="Task attempt has changed")
+
+    async def inspect() -> str:
+        runtime = _force_stop_runtime(benchmark_row, org)
+        config = await runtime.get_sandbox_provider_config()
+        async with config.create_provider() as provider:
+            sandboxes = [sandbox async for sandbox in sandbox_generator(benchmark_row, provider, [task_id])]
+        return "tracked_sandboxes_present" if sandboxes else "tracked_sandboxes_absent"
+
+    try:
+        state = await asyncio.wait_for(inspect(), timeout=15)
+    except Exception:
+        logger.warning("Provider inventory inspection failed", exc_info=True)
+        raise HTTPException(status_code=503, detail="Provider inventory unavailable") from None
+    session.expire_all()
+    current = repository.get_task(org.id, benchmark_id, task_id, refresh=True)
+    if current is None or task_attempt_id(current.id, current.started_at) != expected_attempt_id:
+        raise HTTPException(status_code=409, detail="Task attempt has changed")
+    return {"state": state}
+
+
+@app.post(
+    "/stop-benchmark/{benchmark_id}",
+    description=(
+        "Stop a run by its ID.\n"
+        "\n"
+        "With force, the run stops right away and sandboxes are killed without waiting for teardown."
+    ),
+)
 async def stop_benchmark(
     benchmark_id: TrackedBenchmarkId,
     http_request: Request,
     force: bool = Query(default=False),
     task_ids: list[str] | None = Body(default=None, embed=True),
+    expected_attempt_ids: dict[str, str] | None = Body(default=None, embed=True),
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> StopBenchmarkResponse:
-    """
-    Stop a benchmark by its id.
-    If force is True, the database run is stopped immediately and provider kill signals are sent
-    without waiting for provider teardown to complete.
+    benchmark_row = assert_org(await database_call(lambda: BenchmarkRepository(session).get(org.id, benchmark_id)), org)
 
-    Usage:
-    curl -X POST http://<endpoint>/stop-benchmark/<benchmark_id>?force=true
-
-    Returns:
-        StopBenchmarkResponse
-    """
-    benchmark_row = get_scoped(Benchmark, benchmark_id, session, org)
+    if expected_attempt_ids is not None:
+        if not task_ids or set(expected_attempt_ids) != set(task_ids):
+            raise HTTPException(status_code=422, detail="expected_attempt_ids must cover exactly the selected task_ids")
+        if any(not attempt.strip() for attempt in expected_attempt_ids.values()):
+            raise HTTPException(status_code=422, detail="expected_attempt_ids values must not be blank")
 
     valid_stop_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPING]
+    if force and expected_attempt_ids is not None:
+        valid_stop_states.append(BenchmarkStatus.STOPPED)
 
     if benchmark_row.status not in valid_stop_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress or error run.",
+            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state. Can only pause an in progress or error run.",
         )
 
     selected_task_ids = (
@@ -1409,17 +1520,46 @@ async def stop_benchmark(
 
     runtime = _force_stop_runtime(benchmark_row, org) if force else None
 
-    benchmark_row = fetch_benchmark_row(benchmark_id, session, org, for_update=True)
+    benchmark_row = await database_call(lambda: fetch_benchmark_row(benchmark_id, session, org, for_update=True))
     if benchmark_row.status not in valid_stop_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress or error run.",
+            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state. Can only pause an in progress or error run.",
         )
+
+    captured_sandboxes = None
+    if expected_attempt_ids is not None:
+        tasks = await database_call(
+            lambda: BenchmarkRepository(session).lock_tasks(org.id, benchmark_id, task_ids=selected_task_ids or [])
+        )
+        if len(tasks) != len(expected_attempt_ids) or any(
+            task_attempt_id(task.id, task.started_at) != expected_attempt_ids[task.task_id] for task in tasks
+        ):
+            raise HTTPException(status_code=409, detail="Task attempt has changed")
+        if runtime is not None:
+            try:
+                captured_sandboxes = await capture_stop_sandboxes(
+                    benchmark_row, runtime, selected_task_ids or [], strict=True
+                )
+            except ForceStopError:
+                raise HTTPException(
+                    status_code=503, detail="Unable to capture force-stop targets; retry the request"
+                ) from None
 
     await initiate_stop_benchmark(benchmark_row, session, force, org, task_ids=selected_task_ids)
 
     if runtime is not None:
-        await force_stop_sandboxes(benchmark_row, runtime, org, task_ids=selected_task_ids)
+        if expected_attempt_ids is None:
+            await force_stop_sandboxes(benchmark_row, runtime, org, task_ids=selected_task_ids)
+        else:
+            try:
+                await force_stop_sandboxes(
+                    benchmark_row, runtime, org, task_ids=selected_task_ids, sandboxes=captured_sandboxes, strict=True
+                )
+            except ForceStopError:
+                raise HTTPException(
+                    status_code=503, detail="Unable to send force-stop signals; retry the request"
+                ) from None
 
     return StopBenchmarkResponse(status="success")
 
@@ -1443,13 +1583,12 @@ def _update_benchmark_concurrency(
     if benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
         raise HTTPException(
             status_code=409,
-            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status} state.",
+            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state.",
         )
     return benchmark_row
 
 
 def _force_stop_runtime(benchmark_row: Benchmark, org: Org) -> RuntimeServices:
-    """Resolve the runtime that can send force-stop signals to the run's sandboxes."""
     if benchmark_row.arguments.environment == "local":
         return LocalRuntimeFactory.create_runtime(
             benchmark_row.arguments.properties,
@@ -1474,9 +1613,8 @@ def _commit_shed(
     benchmark_id: UUID,
     request: ShedBenchmarkRequest,
 ) -> list[str]:
-    """Lower the limit and stop the newest tasks above it in one admission-locked transaction."""
     with Session(bind) as session:
-        org = session.get(Org, org_id)
+        org = OrganizationRepository(session).get(org_id)
         assert org is not None
         try:
             with session.no_autoflush:
@@ -1487,7 +1625,7 @@ def _commit_shed(
         if benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
             raise HTTPException(
                 status_code=409,
-                detail=f"Run {benchmark_id} is currently in the {benchmark_row.status} state.",
+                detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state.",
             )
         current = benchmark_row.arguments.concurrency
         if request.concurrency >= current:
@@ -1502,7 +1640,10 @@ def _commit_shed(
         return task_ids
 
 
-@app.post("/benchmarks/{benchmark_id}/shed")
+@app.post(
+    "/benchmarks/{benchmark_id}/shed",
+    description="Lower an active run's concurrency and force stop the newest tasks above the new limit.",
+)
 async def shed_benchmark(
     benchmark_id: TrackedBenchmarkId,
     request: ShedBenchmarkRequest,
@@ -1510,17 +1651,16 @@ async def shed_benchmark(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> ShedBenchmarkResponse:
-    """Lower an active run's concurrency and force stop the newest tasks above the new limit."""
-    benchmark_row = get_scoped(Benchmark, benchmark_id, session, org)
+    benchmark_row = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
     runtime = None if request.dry_run else _force_stop_runtime(benchmark_row, org)
-    session.close()  # End the auth read transaction before waiting on the admission lock.
+    session.close()
     task_ids = await asyncio.to_thread(_commit_shed, session.get_bind(), org.id, benchmark_id, request)
     if runtime is not None and task_ids:
         await force_stop_sandboxes(benchmark_row, runtime, org, task_ids=task_ids)
     return ShedBenchmarkResponse(benchmark_id=benchmark_id, concurrency=request.concurrency, task_ids=task_ids)
 
 
-@app.patch("/benchmarks/{benchmark_id}/concurrency")
+@app.patch("/benchmarks/{benchmark_id}/concurrency", description="Set how many of a run's tasks may execute at once.")
 def patch_benchmark_concurrency(
     benchmark_id: TrackedBenchmarkId,
     request: UpdateBenchmarkConcurrencyRequest,
@@ -1535,17 +1675,21 @@ def patch_benchmark_concurrency(
     )
 
 
-@app.post("/benchmarks/{benchmark_id}/project")
+@app.post(
+    "/benchmarks/{benchmark_id}/project",
+    description="Put a run in another project, in any run state, by adding a link. Earlier links are kept.",
+)
 def retag_benchmark(
     benchmark_id: TrackedBenchmarkId,
     request: RunProjectRequest,
     session: Session = Depends(get_session),
     identity: RequestIdentity = Depends(get_current_starter),
 ) -> ProjectResponse:
-    """Put a run in another project, in any run state, by adding a link; earlier links are kept."""
-    benchmark_row = get_scoped(Benchmark, benchmark_id, session, identity.org)
-    project = find_project(session, identity.org.id, request.project)
-    session.add(RunProject(benchmark_id=benchmark_row.id, project_id=project.id, created_by_email=identity.email))
+    benchmark_row = assert_org(BenchmarkRepository(session).get(identity.org.id, benchmark_id), identity.org)
+    project = find_project(ProjectRepository(session), identity.org.id, request.project)
+    BenchmarkRepository(session).save(
+        RunProject(benchmark_id=benchmark_row.id, project_id=project.id, created_by_email=identity.email)
+    )
     session.commit()
     return ProjectResponse.from_row(project)
 
@@ -1585,15 +1729,15 @@ def _prepare_recovery(
     secrets: dict[str, str],
 ) -> RecoveryPreparation:
     with Session(bind) as session:
-        org = session.get(Org, org_id)
+        org = OrganizationRepository(session).get(org_id)
         assert org is not None
-        benchmark = get_scoped(Benchmark, benchmark_id, session, org)
+        benchmark = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
         if benchmark.arguments.dataset_version is not None and benchmark_url is not None:
             raise HTTPException(status_code=400, detail="A pinned run cannot change its benchmark service URL")
         if benchmark.status == BenchmarkStatus.STOPPING:
             raise HTTPException(
                 status_code=400,
-                detail=f"Run {benchmark_id} is in the {benchmark.status} state. Cannot continue a run that is stopping.",
+                detail=f"Run {benchmark_id} is in the {benchmark.status.value} state. Cannot continue a run that is stopping.",
             )
         if benchmark.status == BenchmarkStatus.IN_PROGRESS and not retry and secrets:
             raise HTTPException(
@@ -1644,7 +1788,7 @@ def _commit_recovery(
     update_agent: bool = False,
 ) -> AdmissionResult | None:
     with Session(bind, expire_on_commit=False) as session:
-        org = session.get(Org, org_id)
+        org = OrganizationRepository(session).get(org_id)
         assert org is not None
         return _apply_recovery(
             benchmark_id,
@@ -1666,7 +1810,6 @@ def _commit_recovery(
         )
 
 
-# Tasks download the bundle when their sandbox starts, so a refresh during a run would mix agents within it.
 _UPDATE_AGENT_IN_PROGRESS = "Updating the agent of an in-progress run requires stopping the run first."
 
 
@@ -1678,7 +1821,6 @@ async def _refresh_recovered_agent(
     session: Session,
     admission: AdmissionResult,
 ) -> None:
-    """Replace the run's agent bundle after recovery admission and before its runner launches."""
     try:
         await copier.copy(agent_bundle_key(agent_name), benchmark_agent_bundle_key(str(benchmark_id), agent_name))
     except Exception as exc:
@@ -1704,7 +1846,15 @@ async def _refresh_recovered_agent(
         ) from exc
 
 
-@app.post("/retry-or-resume-benchmark/{benchmark_id}", dependencies=[Depends(get_current_runner)])
+@app.post(
+    "/retry-or-resume-benchmark/{benchmark_id}",
+    dependencies=[Depends(get_current_runner)],
+    description=(
+        "Retry a run's errored tasks or resume its stopped ones.\n"
+        "\n"
+        "The request can change concurrency, refresh the agent, pick task IDs, or replace the benchmark URL. A valid task ID with no row yet gets a new pending task."
+    ),
+)
 async def retry_or_resume_benchmark(
     benchmark_id: TrackedBenchmarkId,
     http_request: Request,
@@ -1721,31 +1871,16 @@ async def retry_or_resume_benchmark(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> RetryOrResumeBenchmarkResponse:
-    """
-    Retry or resume a benchmark run by its id.
-
-    Usage:
-    curl -X POST http://<endpoint>/retry-or-resume-benchmark/<benchmark_id>?retry=true&concurrency=20
-      -d '{"task_ids": ["task_id_1", "task_id_2"]}'
-
-    Args:
-        benchmark_id: The benchmark ID to retry/resume
-        retry: If true, retry failed tasks. If false, resume from where it left off
-        update_agent: Refresh the saved agent bundle before recovering the run.
-        concurrency: Optional new concurrency level (overrides original value)
-        task_ids: Optional list of specific task IDs to run. If a task id is not yet
-            registered but is valid in the current dataset, a fresh PENDING row is created.
-        benchmark_url: Optional replacement benchmark service URL stored on the run.
-
-    Returns:
-        RetryOrResumeBenchmarkResponse
-    """
     org_id, bind = org.id, session.get_bind()
     try:
         validate_service_headers(service_headers)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # Authentication shares this dependency Session; end its read transaction too.
+    project = ProjectRepository(session).get_for_run(
+        assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org).id
+    )
+    if project is not None:
+        reject_archived_project(project)
     session.close()
     if benchmark_url is not None:
         try:
@@ -1777,6 +1912,11 @@ async def retry_or_resume_benchmark(
             org=org,
         )
         preparation = replace(preparation, resolved_properties=aws_runtime.resources)
+        if lambda_function:
+            try:
+                await dry_run_lambda(aws_runtime.clients, lambda_function)
+            except LambdaError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
     destination = classify_benchmark_service_destination(preparation.benchmark_name, preparation.benchmark_url)
     _reject_docker_with_hosted_service(preparation.sandbox_provider, destination)
     run_key = await run_service_key(http_request, org, destination, service_headers, issued_keys)
@@ -1790,10 +1930,19 @@ async def retry_or_resume_benchmark(
             sandbox_provider=preparation.sandbox_provider,
         )
         try:
+            await _wake_hosted_service(
+                preparation.benchmark_name,
+                preparation.benchmark_url,
+                service,
+            )
             verified = await service.verify_task_ids(
                 task_ids=verified_task_ids, slice_str=None, dataset=preparation.dataset
             )
             verified_task_ids = verified.task_ids
+        except BenchmarkServiceUnauthenticatedError:
+            raise
+        except (BenchmarkServiceError, httpx.HTTPError, ValueError) as exc:
+            raise _verify_task_ids_failure(preparation.benchmark_name, exc) from exc
         finally:
             await service.close()
     telemetry_context = _executor_telemetry_context()
@@ -1802,7 +1951,6 @@ async def retry_or_resume_benchmark(
         if isinstance(preparation.properties, LocalResources):
             from tracker.local.runtime import LocalRuntimeFactory
 
-            # A local run's agent aliases and frozen bundle share its data root.
             library_store = LocalRuntimeFactory.create_runtime(preparation.properties, org_id).objects
         else:
             assert aws_runtime is not None
@@ -1838,7 +1986,6 @@ async def retry_or_resume_benchmark(
     except _TaskFailedAfterCancellation as failure:
         raise failure.cancellation from failure.task_error
     if result is not None:
-        # A rejected recovery never reaches this copy, and the runner cannot read the bundle before launch.
         if library_store is not None:
             refresh_task = asyncio.create_task(
                 _refresh_recovered_agent(
@@ -1888,16 +2035,25 @@ def _apply_recovery(
     *,
     update_agent: bool = False,
 ) -> AdmissionResult | None:
-    benchmark_row = get_scoped(Benchmark, benchmark_id, session, org)
+    benchmark_row = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
+    current_project = ProjectRepository(session).get_for_run(benchmark_row.id)
+    if current_project is not None:
+        reject_archived_project(ProjectRepository(session).lock(current_project.id))
+    if selects_project_gateway_key(org) and not reads_secrets_file(benchmark_row.arguments.properties):
+        if current_project is not None:
+            secrets = {
+                env_name: name
+                for env_name, name in secrets.items()
+                if env_name not in {"MODEL_GATEWAY_API_KEY", "MODEL_GATEWAY_URL"}
+            }
     secrets = {env_name: _resolve_secret_name(name, org) for env_name, name in secrets.items()}
 
     if benchmark_row.status == BenchmarkStatus.STOPPING:
         raise HTTPException(
             status_code=400,
-            detail=f"Run {benchmark_id} is in the {benchmark_row.status} state. Cannot continue a run that is stopping.",
+            detail=f"Run {benchmark_id} is in the {benchmark_row.status.value} state. Cannot continue a run that is stopping.",
         )
 
-    # A later status change fails the locked comparison with the prepared state.
     if update_agent and benchmark_row.status == BenchmarkStatus.IN_PROGRESS:
         raise HTTPException(status_code=409, detail=_UPDATE_AGENT_IN_PROGRESS)
 
@@ -1931,7 +2087,7 @@ def _apply_recovery(
         and concurrency is None
         and not queued_running_recovery
     ):
-        if secrets or benchmark_url is not None:
+        if secrets or benchmark_url is not None or lambda_function is not None:
             update_benchmark_resume_arguments(
                 benchmark_id,
                 session,
@@ -1939,6 +2095,7 @@ def _apply_recovery(
                 secrets=secrets,
                 concurrency=None,
                 benchmark_url=benchmark_url,
+                lambda_function=lambda_function,
             )
             session.commit()
         return None
@@ -1953,7 +2110,7 @@ def _apply_recovery(
         and concurrency is not None
     ):
         _update_benchmark_concurrency(benchmark_id, concurrency, session, org)
-        if secrets or benchmark_url is not None:
+        if secrets or benchmark_url is not None or lambda_function is not None:
             update_benchmark_resume_arguments(
                 benchmark_id,
                 session,
@@ -1961,6 +2118,7 @@ def _apply_recovery(
                 secrets=secrets,
                 concurrency=None,
                 benchmark_url=benchmark_url,
+                lambda_function=lambda_function,
             )
             session.commit()
         return None
@@ -1978,7 +2136,7 @@ def _apply_recovery(
         if benchmark_row.status == BenchmarkStatus.STOPPING:
             raise HTTPException(
                 status_code=400,
-                detail=f"Run {benchmark_id} is in the {benchmark_row.status} state. Cannot continue a run that is stopping.",
+                detail=f"Run {benchmark_id} is in the {benchmark_row.status.value} state. Cannot continue a run that is stopping.",
             )
         pre_action_status = benchmark_row.status
 
@@ -1999,23 +2157,11 @@ def _apply_recovery(
         if current_state != preparation.state:
             raise HTTPException(status_code=409, detail="Run changed during task verification; retry the request.")
         if queued_running_recovery and pre_action_status == BenchmarkStatus.IN_PROGRESS:
-            scheduler_rows = session.exec(
-                select(Task)
-                .where(Task.benchmark == benchmark_row.id)
-                .where(Task.org_id == org.id)
-                .where(
-                    col(Task.status).in_(
-                        [
-                            TaskStatus.PENDING,
-                            TaskStatus.BUILDING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    )
-                )
-                .order_by(col(Task.started_at), col(Task.id))
-                .with_for_update()
-            ).all()
+            scheduler_rows = BenchmarkRepository(session).lock_tasks(
+                org.id,
+                benchmark_row.id,
+                statuses=[TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING],
+            )
             if any(
                 task_row.status == TaskStatus.IN_PROGRESS
                 or (task_row.status == TaskStatus.EVALUATING and task_row.eval_resume_state is None)
@@ -2057,7 +2203,7 @@ def _apply_recovery(
             )
 
         if pre_action_status == BenchmarkStatus.IN_PROGRESS and not verified_task_ids and recovery_task_ids is None:
-            if secrets or concurrency is not None or benchmark_url is not None:
+            if secrets or concurrency is not None or benchmark_url is not None or lambda_function is not None:
                 update_benchmark_resume_arguments(
                     benchmark_id,
                     session,
@@ -2065,29 +2211,28 @@ def _apply_recovery(
                     secrets=secrets,
                     concurrency=concurrency,
                     benchmark_url=benchmark_url,
+                    lambda_function=lambda_function,
                 )
                 session.commit()
             else:
                 session.rollback()
             return None
 
-        resumable_evaluations = session.exec(
-            select(Task)
-            .where(Task.benchmark == benchmark_row.id)
-            .where(Task.org_id == org.id)
-            .where(col(Task.task_id).in_(verified_task_ids))
-            .where(col(Task.status) == TaskStatus.EVALUATING)
-            .with_for_update()
-        ).all()
-        resumable_evaluations = [task for task in resumable_evaluations if task.eval_resume_state is not None]
+        resumable_evaluations = [
+            task
+            for task in BenchmarkRepository(session).lock_tasks(
+                org.id, benchmark_row.id, task_ids=verified_task_ids, statuses=[TaskStatus.EVALUATING]
+            )
+            if task.eval_resume_state is not None
+        ]
         for task in resumable_evaluations:
-            if not try_task_evaluation_transaction_lock(session, task.id):
+            if not SchedulerRepository(session).try_task_evaluation_transaction_lock(task.id):
                 raise HTTPException(
                     status_code=409,
                     detail="Run has an evaluation that is already owned by an active executor",
                 )
 
-        if secrets or concurrency is not None or benchmark_url is not None:
+        if secrets or concurrency is not None or benchmark_url is not None or lambda_function is not None:
             benchmark_row = update_benchmark_resume_arguments(
                 benchmark_id,
                 session,
@@ -2095,10 +2240,8 @@ def _apply_recovery(
                 secrets=secrets,
                 concurrency=concurrency,
                 benchmark_url=benchmark_url,
+                lambda_function=lambda_function,
             )
-
-        if lambda_function is not None:
-            benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"lambda_function": lambda_function})
 
         if benchmark_row.arguments.environment == "local":
             resume_request = benchmark_row.local_start_benchmark_request(service_headers=service_headers)
@@ -2123,17 +2266,16 @@ def _apply_recovery(
             task_ids=verified_task_ids,
         )
         if resumable_evaluations:
-            transferred = session.exec(
-                update(Task)
-                .where(col(Task.id).in_([task.id for task in resumable_evaluations]))
-                .where(col(Task.status) == TaskStatus.EVALUATING)
-                .values(started_at=executor_dispatch.created_at)
+            transferred = BenchmarkRepository(session).restart_evaluations(
+                [task.id for task in resumable_evaluations], executor_dispatch.created_at
             )
-            if transferred.rowcount != len(resumable_evaluations):
+            if transferred != len(resumable_evaluations):
                 raise TrackerServiceError("Recovery evaluation ownership changed before dispatch admission")
         executor_payload = _process_benchmark_kwargs(benchmark_row, resume_request, verified_task_ids)
         _persist_dispatch_payload(session, executor_dispatch, executor_payload, telemetry_context, payload_key)
-        session.add_all(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark_row.id) for key in issued_keys)
+        BenchmarkRepository(session).save(
+            *(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark_row.id) for key in issued_keys)
+        )
         session.commit()
     except ReleaseControlError as exc:
         session.rollback()
@@ -2150,8 +2292,11 @@ def _apply_recovery(
     return _admission_result(executor_dispatch, verified_task_ids)
 
 
-@app.get("/fetch-benchmarks")
-async def fetch_benchmarks(
+@app.get(
+    "/fetch-benchmarks",
+    description="List runs that match the filters, a page at a time.",
+)
+def fetch_benchmarks(
     agent_name: list[str] | None = Query(default=None),
     benchmark_name: list[str] | None = Query(default=None),
     status: list[BenchmarkStatus] | None = Query(default=None),
@@ -2168,14 +2313,10 @@ async def fetch_benchmarks(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> FetchBenchmarksResponse:
-    """
-    Fetch benchmarks based on the request parameters.
+    text_filters = [model, dataset, label, *(agent_name or []), *(benchmark_name or []), *(started_by or [])]
+    if any("\x00" in value for value in text_filters if value is not None):
+        raise HTTPException(status_code=400, detail="Filters must not contain NUL characters")
 
-    Usage:
-    curl -X GET http://<endpoint>/fetch-benchmarks?agent_name=claude_code&benchmark_name=swebench&status=IN_PROGRESS&order_by=DESC&limit=5&offset=0
-    """
-    # Inline Query params (not `request: PydanticModel = Depends()`) so FastAPI doesn't
-    # emit a requestBody on this GET — browsers reject GET-with-body.
     request = FetchBenchmarksRequest(
         agent_name=agent_name,
         benchmark_name=benchmark_name,
@@ -2192,7 +2333,10 @@ async def fetch_benchmarks(
         offset=offset,
     )
 
-    benchmark_rows, total_count, next_cursor = fetch_filtered_benchmark_rows(request, session, org)
+    try:
+        benchmark_rows, total_count, next_cursor = fetch_filtered_benchmark_rows(request, session, org)
+    except InvalidCursorError as error:
+        raise HTTPException(status_code=400, detail="Invalid cursor") from error
 
     return FetchBenchmarksResponse(
         benchmarks=build_benchmark_table_rows(benchmark_rows, session),
@@ -2201,23 +2345,18 @@ async def fetch_benchmarks(
     )
 
 
-@app.get("/fetch-benchmark-metadata/{benchmark_id}")
-async def fetch_benchmark_metadata(
+@app.get(
+    "/fetch-benchmark-metadata/{benchmark_id}",
+    description="Return a run's metadata by its ID.",
+)
+def fetch_benchmark_metadata(
     benchmark_id: TrackedBenchmarkId,
-    session: Session = Depends(get_session),
+    benchmarks: BenchmarkRepositoryDependency,
+    projects: ProjectRepositoryDependency,
     org: Org = Depends(get_current_org),
 ) -> FetchBenchmarkMetadataResponse:
-    """
-    Fetch benchmark metadata by its id.
-
-    Usage:
-    curl -X GET http://<endpoint>/fetch-benchmark-metadata/<benchmark_id>
-
-    Returns:
-        FetchBenchmarkMetadataResponse
-    """
-    benchmark_row = get_scoped(Benchmark, benchmark_id, session, org)
-    project = benchmark_row.fetch_project(session)
+    benchmark_row = assert_org(benchmarks.get(org.id, benchmark_id), org)
+    project = projects.get_for_run(benchmark_row.id)
     metadata = benchmark_row.benchmark_metadata.model_copy(
         update={"project": ProjectResponse.from_row(project) if project is not None else None}
     )
@@ -2236,7 +2375,6 @@ async def fetch_benchmark_metadata(
 
 
 def _safe_output_tar_member(s3_key: str, benchmark_prefix: str) -> str | None:
-    """Return a safe relative tar member name for an object under a benchmark prefix."""
     if not s3_key.startswith(benchmark_prefix):
         return None
 
@@ -2275,6 +2413,30 @@ async def _output_keys_with_first(first_key: str, keys: AsyncIterator[str]) -> A
         yield key
 
 
+class YieldingWriter(io.RawIOBase):
+    def __init__(self):
+        super().__init__()
+        self._buffer: bytearray = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Buffer) -> int:
+        data = bytes(b)
+        self._buffer.extend(data)
+
+        return len(data)
+
+    def pop(self) -> bytes:
+        if not self._buffer:
+            return b""
+
+        chunk = bytes(self._buffer)
+        self._buffer.clear()
+
+        return chunk
+
+
 async def _tar_output_stream(
     keys: AsyncIterator[str],
     benchmark_prefix: str,
@@ -2282,8 +2444,6 @@ async def _tar_output_stream(
 ) -> AsyncIterator[bytes]:
     writer: YieldingWriter = YieldingWriter()
 
-    # ObjectStore.get_many reuses a provider-owned resource scope across all keys,
-    # and reads one object into memory at a time (bounded by the largest object).
     with tarfile.open(fileobj=writer, mode="w|") as tar:
         async for s3_key, data in object_store.get_many(keys):
             relative_path = s3_key.removeprefix(benchmark_prefix)
@@ -2300,7 +2460,11 @@ async def _tar_output_stream(
         yield final_chunk
 
 
-@app.get("/fetch-run-outputs/{benchmark_id}", response_model=None)
+@app.get(
+    "/fetch-run-outputs/{benchmark_id}",
+    response_model=None,
+    description="Stream a run's outputs as a tar file.",
+)
 async def fetch_run_outputs(
     benchmark_id: TrackedBenchmarkId,
     runtime: RunRuntimeDependency,
@@ -2308,20 +2472,10 @@ async def fetch_run_outputs(
     org: Org = Depends(get_current_org),
     task_ids: list[str] | None = Query(default=None),
 ) -> StreamingResponse:
-    """
-    Stream a tar file with run outputs to the client.
-
-    Usage:
-    curl -X GET http://<endpoint>/fetch-run-outputs/<benchmark_id>
-
-    Returns:
-        StreamingResponse
-    """
     object_store = runtime.objects
 
     benchmark_prefix = benchmark_artifact_prefix(str(benchmark_id))
 
-    # Peek a single key so an empty result still returns 404 before the stream starts.
     keys = _output_keys(benchmark_prefix, task_ids, object_store, benchmark_id)
     first_key = await anext(keys, None)
     if first_key is None:

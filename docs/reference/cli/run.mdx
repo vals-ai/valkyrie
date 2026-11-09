@@ -9,7 +9,7 @@ This page documents all 21 commands in the `run` group in registration order. Us
 
 ## `valkyrie run analyze` {#analyze}
 
-Trigger Docent ingestion + error analysis for a finished run.
+Analyze a finished run's errors with Docent.
 
 ```bash Syntax
 valkyrie run analyze \
@@ -67,7 +67,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run fetch` {#fetch}
 
-Fetch a run by its run id.
+Show a run by its ID.
 
 ```bash Syntax
 valkyrie run fetch \
@@ -92,7 +92,7 @@ valkyrie run fetch \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--connect"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates"}</p>
+  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -117,6 +117,7 @@ valkyrie run filter-options \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Print as text or JSON."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -125,7 +126,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run list` {#list}
 
-List runs by providing filter values.
+List runs that match the filters.
 
 ```bash Syntax
 valkyrie run list \
@@ -153,37 +154,37 @@ valkyrie run list \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-name"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Agent name (e.g., claude_code)"}</p>
+  <p className="mb-0 mt-1">{"Agent name (e.g., claude_code)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--benchmark-name"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Benchmark name (e.g., swebench)"}</p>
+  <p className="mb-0 mt-1">{"Benchmark name (e.g., swebench)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--model"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Model name (e.g., anthropic/claude-sonnet-4-20250514)"}</p>
+  <p className="mb-0 mt-1">{"Model name (e.g., anthropic/claude-sonnet-4-20250514)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--dataset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Dataset name (e.g., default, terminal-bench-2.1)"}</p>
+  <p className="mb-0 mt-1">{"Dataset name (e.g., default, terminal-bench-2.1)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--label, -l"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Run label"}</p>
+  <p className="mb-0 mt-1">{"Run label."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--status"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"None"}</code> · constraints: {"one of IN_PROGRESS, STOPPING, STOPPED, FINISHED, ERROR; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Status of the benchmarks to fetch (e.g., in_progress, finished, error)"}</p>
+  <p className="mb-0 mt-1">{"Status of the benchmarks to fetch (e.g., in_progress, finished, error)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--order-by"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'desc'"}</code> · constraints: {"one of asc, desc; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Order by the benchmarks to fetch (e.g., desc, asc)"}</p>
+  <p className="mb-0 mt-1">{"Order by the benchmarks to fetch (e.g., desc, asc)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -230,7 +231,7 @@ valkyrie run logs \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-id"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Limit logs to one task's current stream; IDs may contain '/'."}</p>
+  <p className="mb-0 mt-1">{"Limit logs to one task's current stream. IDs may contain '/'."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -295,10 +296,12 @@ valkyrie run artifacts \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--limit"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"100"}</code> · constraints: {">= 1; <= 1000"}</span></div>
+  <p className="mb-0 mt-1">{"Most artifact paths to list."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Print as text or JSON."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -307,7 +310,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run output` {#output}
 
-Download files from a benchmark run by its ID.
+Download files from a run by its ID.
 
 ```bash Syntax
 valkyrie run output \
@@ -330,7 +333,7 @@ valkyrie run output \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"-o, --output-dir"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"readable"}</span></div>
-  <p className="mb-0 mt-1">{"Directory to save downloaded files (defaults to ./<benchmark_id>)"}</p>
+  <p className="mb-0 mt-1">{"Directory to save downloaded files (defaults to ./<benchmark_id>)."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -339,7 +342,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run outputs` {#outputs}
 
-Fetch run outputs by run id.
+Download a run's outputs by its ID.
 
 ```bash Syntax
 valkyrie run outputs \
@@ -364,12 +367,12 @@ valkyrie run outputs \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--output-dir"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"readable"}</span></div>
-  <p className="mb-0 mt-1">{"Directory to save run outputs (defaults to ./<benchmark>_<agent>_<run-id>)"}</p>
+  <p className="mb-0 mt-1">{"Directory to save run outputs (defaults to ./<benchmark>_<agent>_<run-id>)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Comma-separated list of task IDs to download (e.g., astropy__astropy-7606,django__django-10880)"}</p>
+  <p className="mb-0 mt-1">{"Comma-separated list of task IDs to download (e.g., astropy__astropy-7606,django__django-10880)."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -378,7 +381,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run results` {#results}
 
-Retrieve run results by its run id.
+Save a run's results by its ID.
 
 ```bash Syntax
 valkyrie run results \
@@ -387,7 +390,8 @@ valkyrie run results \
   [--s3] \
   [--preview] \
   [--task-ids <TEXT>] \
-  [--task-ids-file <TEXT>]
+  [--task-ids-file <TEXT>] \
+  [--yes|-y]
 ```
 
 ```bash Example
@@ -406,12 +410,12 @@ valkyrie run results \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--path"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"file; readable"}</span></div>
-  <p className="mb-0 mt-1">{"Path to save the results (default: ./results-<run_id>.json)"}</p>
+  <p className="mb-0 mt-1">{"Path to save the results (default: ./results-<run_id>.json)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--s3"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Saves results to s3 instead of downloading them locally. Can be found at bucket://benchmarks/run_id/<benchmark>.json"}</p>
+  <p className="mb-0 mt-1">{"Saves results to s3 instead of downloading them locally. Can be found at bucket://benchmarks/run_id/<benchmark>.json."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -426,7 +430,12 @@ valkyrie run results \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids-file"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line"}</p>
+  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Overwrite existing results without prompting."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -460,7 +469,7 @@ valkyrie run retag \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--project"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Handle of the project this run is for (e.g., router-bench); create one with `valkyrie project create`"}</p>
+  <p className="mb-0 mt-1">{"Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -469,7 +478,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run resume` {#resume}
 
-Resume a run by its run id.
+Resume a run's stopped tasks by its ID.
 
 ```bash Syntax
 valkyrie run resume \
@@ -505,32 +514,32 @@ valkyrie run resume \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--retry"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Retry tasks with the status error"}</p>
+  <p className="mb-0 mt-1">{"Retry tasks with the status error."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"None"}</code> · constraints: {">= 1"}</span></div>
-  <p className="mb-0 mt-1">{"Override concurrency level (e.g., 20)"}</p>
+  <p className="mb-0 mt-1">{"Override concurrency level (e.g., 20)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)"}</p>
+  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids-file"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line"}</p>
+  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--secret, -s"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)"}</p>
+  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--header, -H"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)"}</p>
+  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -550,7 +559,7 @@ valkyrie run resume \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--connect"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after resuming"}</p>
+  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after resuming."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -564,7 +573,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run retry` {#retry}
 
-Retry a run's errored tasks by its run id.
+Retry a run's errored tasks by its ID.
 
 ```bash Syntax
 valkyrie run retry \
@@ -600,27 +609,27 @@ valkyrie run retry \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"None"}</code> · constraints: {">= 1"}</span></div>
-  <p className="mb-0 mt-1">{"Override concurrency level (e.g., 20)"}</p>
+  <p className="mb-0 mt-1">{"Override concurrency level (e.g., 20)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)"}</p>
+  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids-file"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line"}</p>
+  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--secret, -s"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)"}</p>
+  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--header, -H"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)"}</p>
+  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -640,7 +649,7 @@ valkyrie run retry \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--connect"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after resuming"}</p>
+  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after resuming."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -660,7 +669,8 @@ Lower concurrency for an active run, then force stop the newest building or in-p
 valkyrie run shed \
   <RUN_ID> \
   --concurrency <INTEGER> \
-  [--dry-run]
+  [--dry-run] \
+  [--yes|-y]
 ```
 
 ```bash Example
@@ -681,12 +691,17 @@ valkyrie run shed \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"integer"}</code> · constraints: {">= 1"}</span></div>
-  <p className="mb-0 mt-1">{"New maximum number of concurrent tasks; must be below the run's current limit"}</p>
+  <p className="mb-0 mt-1">{"New maximum number of concurrent tasks. Must be below the run's current limit."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--dry-run"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Show the tasks that would be stopped without changing the run"}</p>
+  <p className="mb-0 mt-1">{"Show the tasks that would be stopped without changing the run."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -695,7 +710,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run start` {#start}
 
-Start a run.
+Start a run of an agent on a benchmark.
 
 ```bash Syntax
 valkyrie run start \
@@ -712,12 +727,13 @@ valkyrie run start \
   [--provider <TEXT>] \
   [--priority <INTEGER>] \
   [--label|-l <TEXT>] \
-  --project <TEXT> \
+  [--project <TEXT>] \
   [--kwarg|-k <TEXT> <TEXT>...] \
   [--secret|-s <TEXT> <TEXT>...] \
   [--header|-H <TEXT> <TEXT>...] \
   [--ignore-custom-services|--ics] \
   [--connect] \
+  [--monitor] \
   [--count|-n <INTEGER>]
 ```
 
@@ -734,87 +750,87 @@ valkyrie run start \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path to local agent directory or S3 agent name (e.g., agents/claude_code or claude_code)"}</p>
+  <p className="mb-0 mt-1">{"Published agent name, or a local agent directory given as a path (e.g., claude_code or ./claude_code)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--model"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Model key (e.g., openai/gpt-4o)"}</p>
+  <p className="mb-0 mt-1">{"Model key (e.g., openai/gpt-4o)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--benchmark"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Name of the benchmark to run (e.g., swebench, finance)"}</p>
+  <p className="mb-0 mt-1">{"Name of the benchmark to run (e.g., swebench, finance)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"5"}</code> · constraints: {">= 1"}</span></div>
-  <p className="mb-0 mt-1">{"Maximum concurrent tasks; defaults to 5"}</p>
+  <p className="mb-0 mt-1">{"Maximum concurrent tasks. Defaults to 5."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--lambda"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Lambda function to invoke at the end of the benchmark run"}</p>
+  <p className="mb-0 mt-1">{"Lambda function to invoke at the end of the benchmark run."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)"}</p>
+  <p className="mb-0 mt-1">{"Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids-file"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line"}</p>
+  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--slice"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10)"}</p>
+  <p className="mb-0 mt-1">{"Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--dataset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Dataset name to use from the benchmark service (defaults to 'default')"}</p>
+  <p className="mb-0 mt-1">{"Dataset name to use from the benchmark service (defaults to 'default')."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--dataset-version"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Fixed dataset version to use for this run"}</p>
+  <p className="mb-0 mt-1">{"Fixed dataset version to use for this run."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--provider"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Sandbox provider (e.g., daytona, modal); defaults to your default provider, then daytona"}</p>
+  <p className="mb-0 mt-1">{"Sandbox provider (e.g., daytona, modal). Defaults to your default provider, then daytona."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--priority"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"None"}</code> · constraints: {">= 0; <= 4"}</span></div>
-  <p className="mb-0 mt-1">{"Override configured queue priority: 0 (highest) through 4 (lowest); default is 3"}</p>
+  <p className="mb-0 mt-1">{"Override configured queue priority: 0 (highest) through 4 (lowest). Default is 3."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--label, -l"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Label to attach to the run"}</p>
+  <p className="mb-0 mt-1">{"Label to attach to the run."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--project"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
-  <p className="mb-0 mt-1">{"Handle of the project this run is for (e.g., router-bench); create one with `valkyrie project create`"}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--project"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Handle of the project this run is for (e.g., router-bench). Optional unless your organization requires one."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--kwarg, -k"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000)"}</p>
+  <p className="mb-0 mt-1">{"Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--secret, -s"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)"}</p>
+  <p className="mb-0 mt-1">{"Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY AnthropicApiKey)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--header, -H"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"tuple[text, text]"}</code> · constraints: {"2 values; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)"}</p>
+  <p className="mb-0 mt-1">{"Custom header for benchmark service requests (e.g., -H Authorization my-credential)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -824,12 +840,17 @@ valkyrie run start \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--connect"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after starting"}</p>
+  <p className="mb-0 mt-1">{"Connect to the tracker service to stream run updates after starting."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--monitor"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Enroll the run in the external run monitor, including its network requests."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--count, -n"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"1"}</code> · constraints: {">= 1; <= 10"}</span></div>
-  <p className="mb-0 mt-1">{"Number of independent runs to start"}</p>
+  <p className="mb-0 mt-1">{"Number of independent runs to start."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -838,7 +859,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run status` {#status}
 
-Fetch lightweight status for multiple run IDs.
+Show the status of several runs at once.
 
 ```bash Syntax
 valkyrie run status \
@@ -870,14 +891,15 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run stop` {#stop}
 
-Stop a run by its run id.
+Stop a run by its ID.
 
 ```bash Syntax
 valkyrie run stop \
   <RUN_ID> \
   [--task-ids <TEXT>] \
   [--task-ids-file <TEXT>] \
-  [--force]
+  [--force] \
+  [--yes|-y]
 ```
 
 ```bash Example
@@ -895,17 +917,22 @@ valkyrie run stop $RUN_ID
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Comma-separated list of task IDs to stop"}</p>
+  <p className="mb-0 mt-1">{"Comma-separated list of task IDs to stop."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-ids-file"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line"}</p>
+  <p className="mb-0 mt-1">{"Path or http(s) URL to a text file with one task ID per line."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--force"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
-  <p className="mb-0 mt-1">{"Force stop the benchmark run"}</p>
+  <p className="mb-0 mt-1">{"Force stop the benchmark run."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -914,7 +941,7 @@ Task guidance: [Run guides](/runs/start).
 
 ## `valkyrie run update` {#update}
 
-Update concurrency for an active run.
+Change an active run's concurrency.
 
 ```bash Syntax
 valkyrie run update \
@@ -939,7 +966,7 @@ valkyrie run update \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"integer"}</code> · constraints: {">= 1"}</span></div>
-  <p className="mb-0 mt-1">{"New maximum number of concurrent tasks"}</p>
+  <p className="mb-0 mt-1">{"New maximum number of concurrent tasks."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -972,7 +999,7 @@ valkyrie run tasks \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--status"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · constraints: {"one of PENDING, BUILDING, IN_PROGRESS, EVALUATING, STOPPED, FINISHED, ERROR; case-insensitive; repeatable"}</span></div>
-  <p className="mb-0 mt-1">{"Filter by task status; repeat for multiple statuses."}</p>
+  <p className="mb-0 mt-1">{"Filter by task status. Repeat for multiple statuses."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -982,22 +1009,27 @@ valkyrie run tasks \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--sort"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'started_at'"}</code> · constraints: {"one of task_id, started_at, duration, status"}</span></div>
+  <p className="mb-0 mt-1">{"Field to sort tasks by."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--order-by"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'desc'"}</code> · constraints: {"one of asc, desc; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Sort direction."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--limit"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"50"}</code> · constraints: {">= 1; <= 500"}</span></div>
+  <p className="mb-0 mt-1">{"Most tasks to list."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--offset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"0"}</code> · constraints: {">= 0"}</span></div>
+  <p className="mb-0 mt-1">{"Tasks to skip before listing."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Print as text or JSON."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -1029,6 +1061,7 @@ valkyrie run task \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Print as text or JSON."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).
@@ -1060,6 +1093,7 @@ valkyrie run task-artifacts \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
+  <p className="mb-0 mt-1">{"Print as text or JSON."}</p>
 </div>
 
 Task guidance: [Run guides](/runs/start).

@@ -1,7 +1,6 @@
-"""Provides the `/` filter, the `?` keys overlay, Esc and command copying that every list screen shares."""
-
 from __future__ import annotations
 
+import shlex
 from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
 from rich.text import Text
@@ -9,20 +8,25 @@ from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.messages import Prune
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Input, Static
+from textual.worker import Worker, WorkType
 
+from valkyrie.sdk.errors import ValkyrieAPIError, ValkyrieSDKError
 from valkyrie.tui.theme import palette
-from valkyrie.tui.widgets import CommandLine, KeyBar, Table
+from valkyrie.tui.widgets import CommandLine, KeyBar, Table, TopBar
 
 if TYPE_CHECKING:
     from valkyrie.tui.app import ValkyrieApp
 
 ResultT = TypeVar("ResultT")
+WorkResultT = TypeVar("WorkResultT")
+
+SHARED_KEYS = [("t", "light or dark theme"), ("?", "these keys"), ("q", "quit")]
 
 
 def matches(query: str, *fields: str | None) -> bool:
-    """Return whether every term in the query appears in one of the fields, ignoring case."""
     haystack = " ".join(field for field in fields if field).lower()
     return all(term in haystack for term in query.lower().split())
 
@@ -35,8 +39,6 @@ class FilterInput(Input):
 
 
 class BrowseScreen(Screen[ResultT]):
-    """Base class for screens built around one table. Subclasses set `KEYS` and implement `refilter()`."""
-
     BINDINGS = [
         Binding("slash", "open_filter", "filter"),
         Binding("question_mark", "keys", "keys"),
@@ -49,7 +51,6 @@ class BrowseScreen(Screen[ResultT]):
     filter = ""
 
     def footer(self) -> ComposeResult:
-        """Yield the screen's bottom two lines, the key bar (or the filter while it's open) and the command line."""
         with Horizontal(id="filter-bar"):
             yield Static("/", id="filter-prompt")
             yield FilterInput()
@@ -57,14 +58,15 @@ class BrowseScreen(Screen[ResultT]):
         yield CommandLine()
 
     def refilter(self) -> None:
-        """Redraw the table with only the rows matching `self.filter`."""
         raise NotImplementedError
 
     def restyle(self) -> None:
-        """Redraw everything after a theme switch, since table cells hold text colored with the old palette."""
         self.refilter()
         for widget in self.walk_children():
             widget.refresh()
+
+    def filter_count(self, visible: int, total: int) -> str:
+        return f"{visible}/{total}" if self.filter else str(total)
 
     def filter_label(self) -> str:
         return f" · /{self.filter}" if self.filter else ""
@@ -94,17 +96,52 @@ class BrowseScreen(Screen[ResultT]):
         self.query_one(Table).focus()
 
     def action_keys(self) -> None:
-        self.app.push_screen(KeysScreen(self.KEYS))
+        self.app.push_screen(KeysScreen([*self.KEYS, *SHARED_KEYS]))
 
     def action_copy_command(self) -> None:
         command_line = self.query_one(CommandLine)
         cast("ValkyrieApp", self.app).copy(command_line.command)
         command_line.flash_copied()
 
+    @on(Prune)
+    def _cancel_workers(self) -> None:
+        self.workers.cancel_node(self)
+
+    def run_worker(
+        self,
+        work: WorkType[WorkResultT],
+        name: str | None = "",
+        group: str = "default",
+        description: str = "",
+        exit_on_error: bool = True,
+        start: bool = True,
+        exclusive: bool = False,
+        thread: bool = False,
+    ) -> Worker[WorkResultT]:
+        worker = super().run_worker(work, name, group, description, exit_on_error, start, exclusive, thread)
+        if self._closing:
+            worker.cancel()
+        return worker
+
+    def busy(self, group: str) -> bool:
+        return any(worker.node is self and worker.group == group and not worker.is_finished for worker in self.workers)
+
+    def fresh(self) -> None:
+        self.query_one(TopBar).status = ("● live", "accent")
+
+    def report(self, error: ValkyrieSDKError) -> None:
+        top_bar = self.query_one(TopBar)
+        if isinstance(error, ValkyrieAPIError) and error.status_code == 401:
+            url = shlex.quote(top_bar.environment.url)
+            top_bar.status = ("⚠ not logged in", "warning")
+            message = f"{error}\nLog in with `VALKYRIE_URL={url} valk login`, or set VALKYRIE_API_KEY."
+            self.notify(message, title="Not logged in", severity="error")
+            return
+        top_bar.status = ("⚠ tracker unreachable, retrying", "warning")
+        self.notify(str(error), title="Tracker error", severity="error")
+
 
 class KeysScreen(ModalScreen[None]):
-    """Lists the screen's keys. Any key or click closes it, and the key does nothing else."""
-
     def __init__(self, keys: list[tuple[str, str]]) -> None:
         super().__init__()
         self.keys = keys

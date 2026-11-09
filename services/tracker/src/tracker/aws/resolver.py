@@ -1,5 +1,3 @@
-"""Resolve deployment-owned AWS authority for hosted requests."""
-
 import re
 from dataclasses import replace
 
@@ -13,19 +11,18 @@ from tracker.secret_access import may_use_shared_secrets
 
 
 class ManagedAWSError(ValueError):
-    """Base error for deployment-managed AWS resolution."""
+    pass
 
 
 class ManagedAWSConfigurationError(ManagedAWSError):
-    """The deployment's managed AWS configuration is invalid."""
+    pass
 
 
 class ManagedAWSStorageUnavailableError(ManagedAWSError):
-    """A saved run points at a bucket its organization no longer uses."""
+    pass
 
 
 def _managed_resources(s3_bucket: str) -> AWSResources:
-    """Combine an organization's bucket with the deployment's region and log settings."""
     missing = [
         name
         for name, value in (
@@ -56,7 +53,6 @@ def _managed_resources(s3_bucket: str) -> AWSResources:
 
 
 def _deployment_account_id() -> str:
-    """Return the trusted account that owns deployment-managed buckets."""
     account_id = config.AWS_DEPLOYMENT_ACCOUNT_ID or ""
     if not re.fullmatch(r"[0-9]{12}", account_id):
         raise ManagedAWSConfigurationError("AWS_DEPLOYMENT_ACCOUNT_ID must be a 12-digit AWS account ID")
@@ -65,7 +61,6 @@ def _deployment_account_id() -> str:
 
 
 def _org_bucket(org: Org) -> str | None:
-    """Return the organization's bucket; a self-hosted Tracker serves its one organization from the deployment bucket."""
     if org.storage_key:
         return org.storage_key
     if not config.AUTH_REQUIRED:
@@ -74,7 +69,6 @@ def _org_bucket(org: Org) -> str | None:
 
 
 def deployment_aws_runtime(org: Org, properties: AWSResources | None = None) -> AWSRuntime:
-    """Build a default-chain runtime for the organization's own bucket."""
     bucket = _org_bucket(org)
     if not bucket:
         raise ManagedAWSConfigurationError("This organization has no storage bucket")
@@ -104,7 +98,6 @@ def _client_provider(org: Org, region: str) -> AWSClientProvider:
 
 
 def _http_deployment_runtime(org: Org, properties: AWSResources | None = None) -> AWSRuntime:
-    """Translate managed-runtime configuration failures into HTTP errors."""
     try:
         return deployment_aws_runtime(org, properties)
     except ManagedAWSStorageUnavailableError as exc:
@@ -113,9 +106,11 @@ def _http_deployment_runtime(org: Org, properties: AWSResources | None = None) -
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _deployment_runtime_with_submission_properties(org: Org, properties: AWSResources | None) -> AWSRuntime:
+def resolve_start_aws_runtime(
+    org: Org,
+    properties: AWSResources | None = None,
+) -> AWSRuntime:
     runtime = _http_deployment_runtime(org)
-    # Only new runs get a tenant prefix; legacy rows without properties keep the deployment prefix.
     runtime = replace(
         runtime,
         resources=replace(
@@ -128,19 +123,6 @@ def _deployment_runtime_with_submission_properties(org: Org, properties: AWSReso
             status_code=400, detail="Managed run properties must match the organization's AWS resources"
         )
     return runtime
-
-
-def resolve_start_aws_runtime(
-    org: Org,
-    properties: AWSResources | None = None,
-) -> AWSRuntime:
-    if not config.AWS_MANAGED_SUBMISSIONS_ENABLED:
-        raise HTTPException(
-            status_code=503,
-            detail="Managed AWS submissions are temporarily unavailable. Try again later or contact Vals support.",
-        )
-
-    return _deployment_runtime_with_submission_properties(org, properties)
 
 
 def resolve_run_aws_runtime(
@@ -156,7 +138,6 @@ def resolve_run_metadata_aws_runtime(
     org: Org,
     properties: AWSResources | None = None,
 ) -> AWSRuntime | None:
-    """Return the run's runtime for storage links, or None when the organization can't reach the run's storage."""
     try:
         return deployment_aws_runtime(org, properties)
     except ManagedAWSStorageUnavailableError:

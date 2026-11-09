@@ -27,7 +27,9 @@ TopBar {
     border-title-style: bold;
 }
 
-#runs {
+#runs,
+#datasets,
+#dataset-tasks {
     width: 1fr;
     height: 1fr;
     padding: 0;

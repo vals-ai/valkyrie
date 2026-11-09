@@ -1,6 +1,14 @@
 """Public interface for the async Valkyrie SDK."""
 
 from valkyrie.sdk.models import (
+    AccessKeyResponse,
+    IdentityResponse,
+    InviteResponse,
+    MemberEntry,
+    MembersResponse,
+    OrganizationEntry,
+    OrganizationResponse,
+    OrganizationsResponse,
     AgentContract,
     AgentContractRequest,
     AgentDownloadURLResponse,
@@ -23,13 +31,19 @@ from valkyrie.sdk.models import (
     FilterOptionsResponse,
     FetchTasksRequest,
     FinalViewResponse,
+    LogEvent,
+    LogPage,
     Order,
     Parameter,
+    NewProjectRequest,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
     RetryMode,
     RetryOrResumeBenchmarkResponse,
+    RunArtifactDownloadResponse,
+    RunArtifactEntry,
+    RunArtifactsResponse,
     RunStreamEvent,
     ResultsExistResponse,
     S3UploadResultsResponse,
@@ -53,6 +67,8 @@ from valkyrie.sdk.models import (
     ShedBenchmarkResponse,
     SPEND_SUBCATEGORIES,
     SpendType,
+    RunMonitoring,
+    RunMonitoringRules,
     StartBenchmarkResponse,
     StopBenchmarkResponse,
     UpdateBenchmarkConcurrencyRequest,
@@ -65,18 +81,27 @@ from valkyrie.sdk.models import (
 
 from valkyrie.sdk.client import ValkyrieClient
 from valkyrie.sdk.config import ValkyrieConfig
+from valkyrie.sdk.login import LoginSession, SessionAuth, device_login
 from valkyrie.sdk.errors import (
     ValkyrieAPIError,
     ValkyrieConfigError,
     ValkyrieContractError,
+    ValkyrieInputError,
     ValkyrieRunError,
     ValkyrieSDKError,
     ValkyrieStreamError,
     ValkyrieTransportError,
 )
-from .models.logs import LogEvent, LogPage
 
 __all__ = [
+    "AccessKeyResponse",
+    "IdentityResponse",
+    "InviteResponse",
+    "MemberEntry",
+    "MembersResponse",
+    "OrganizationEntry",
+    "OrganizationResponse",
+    "OrganizationsResponse",
     "RunArtifactEntry",
     "RunArtifactsResponse",
     "RunArtifactDownloadResponse",
@@ -104,8 +129,10 @@ __all__ = [
     "FinalViewResponse",
     "LogEvent",
     "LogPage",
+    "LoginSession",
     "Order",
     "Parameter",
+    "NewProjectRequest",
     "ProjectCreateRequest",
     "ProjectResponse",
     "ProjectsResponse",
@@ -128,12 +155,15 @@ __all__ = [
     "ProvidersResponse",
     "RunSettingsResponse",
     "SavedBenchmarkService",
+    "SessionAuth",
     "SingleBenchmarkResponse",
     "SingleTaskResponse",
     "ShedBenchmarkRequest",
     "ShedBenchmarkResponse",
     "SPEND_SUBCATEGORIES",
     "SpendType",
+    "RunMonitoring",
+    "RunMonitoringRules",
     "StartBenchmarkResponse",
     "StopBenchmarkResponse",
     "UpdateBenchmarkConcurrencyRequest",
@@ -147,10 +177,10 @@ __all__ = [
     "ValkyrieConfig",
     "ValkyrieConfigError",
     "ValkyrieContractError",
+    "ValkyrieInputError",
     "ValkyrieRunError",
     "ValkyrieSDKError",
     "ValkyrieStreamError",
     "ValkyrieTransportError",
+    "device_login",
 ]
-
-from valkyrie.sdk.models.artifacts import RunArtifactEntry, RunArtifactsResponse, RunArtifactDownloadResponse

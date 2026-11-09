@@ -1,5 +1,3 @@
-"""Run a provider-style shell in a fresh process with its own controlling terminal."""
-
 import errno
 import os
 import pty

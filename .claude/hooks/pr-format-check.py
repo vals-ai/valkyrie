@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""PreToolUse hook for Bash: block a pull request description that breaks the template rules.
-
-Runs before `gh pr create`, before `gh pr edit` and `gh api .../pulls/N` calls that set a body,
-and checks the body against .github/PULL_REQUEST_TEMPLATE.md:
-
-- The headings appear in the template's order. Related Issues may be left out.
-- Summary is 3 to 4 sentences.
-- Changes is short bullets: at most 10, each at most 250 characters.
-- Related Issues, when present, links an issue.
-- The template's checklist sections (Type of Change, Testing, Checklist) hold only checklist
-  items, and Type of Change has one checked.
-
-A failing body exits 2, which blocks the call and shows Claude what to fix.
-"""
 
 import json
 import os
@@ -51,7 +37,6 @@ def _value(match: re.Match[str]) -> str:
 
 
 def extract_body(subcommand: str, args: str, cwd: Path) -> str | None:
-    """Return the body the command sets, None when it sets one we can't read, or "" for none."""
     heredoc = re.search(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\1\b", args, re.S)
     if subcommand == "api":
         field = re.search(r"(?:-F|-f|--field|--raw-field)\s+(?:\"body=([^\"]*)\"|'body=([^']*)'|body=(\S+))", args)

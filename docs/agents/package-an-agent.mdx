@@ -63,7 +63,8 @@ defaults:
 Valkyrie fills in `{problem_statement_path}`, `{task_id}`, and `{model}` before it runs
 `run_cmd`. The command runs from the benchmark's working directory, so call your script by
 its full path under `/bundle/AGENT_NAME/`, where *`AGENT_NAME`* is the contract's `name`.
-The following sections cover `secrets` and `defaults`, and the reference lists [when each field is used](/agents/agent-contract#order-of-a-task).
+The following sections cover `secrets` and `defaults`, and the reference lists
+[when each field is used](/agents/agent-contract#order-of-a-task).
 
 ## Install dependencies
 
@@ -90,8 +91,8 @@ WRAPPER
 chmod +x /usr/local/bin/my-agent
 ```
 
-See [`install_cmd` field](/agents/agent-contract#install-cmd) for its time limit and the files that
-uploading leaves out.
+See the [`install_cmd` field](/agents/agent-contract#install-cmd) for its time limit and the
+files that uploading leaves out.
 
 ## Give the agent its API keys
 
@@ -119,8 +120,8 @@ kwargs:
     default: 0.7
 ```
 
-Use each one in `run_cmd` as `{temperature}`. See [Parameters](/agents/agent-contract#parameters)
-for the types and checks.
+Use each one in `run_cmd` as `{temperature}`. See
+[Parameters](/agents/agent-contract#parameters) for the types and checks.
 
 ## Keep more output files
 
@@ -169,5 +170,5 @@ If the task fails, `valkyrie run errors RUN_ID` shows why, and
 `valkyrie agent push` again to replace it, and rerun the task with
 `valkyrie run retry RUN_ID`.
 
-To run the agent on benchmarks that start it several times per task, add
+To run the agent on benchmarks that start it several times per task, add the
 [`turns` field](/agents/agent-contract#turns).

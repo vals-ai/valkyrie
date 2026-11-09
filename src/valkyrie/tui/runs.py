@@ -1,8 +1,5 @@
-"""Shows recent runs with live status, and a preview of the highlighted one."""
-
 from __future__ import annotations
 
-import shlex
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.console import Group, RenderableType
@@ -18,10 +15,11 @@ from textual.reactive import reactive
 from textual.markup import escape
 from textual.widget import Widget
 
-from valkyrie.sdk.errors import ValkyrieAPIError, ValkyrieSDKError
+from valkyrie.sdk.errors import ValkyrieSDKError
 from valkyrie.sdk.models import BenchmarkStatusEntry, BenchmarkTableRow, TaskStatus
 from valkyrie.tui.theme import palette
 from valkyrie.tui.browse import BrowseScreen, matches
+from valkyrie.tui.datasets import DatasetsScreen
 from valkyrie.tui.run import RunScreen
 from valkyrie.tui.source import FINAL_STATUSES, Environment, RunSource
 from valkyrie.tui.widgets import (
@@ -45,7 +43,6 @@ if TYPE_CHECKING:
 RUN_LIMIT = 50
 STATUS_POLL_SECONDS = 3
 LIST_REFRESH_SECONDS = 30
-# Same order as the progress bar's segments.
 COUNT_ORDER = [
     TaskStatus.FINISHED,
     TaskStatus.ERROR,
@@ -58,8 +55,6 @@ COUNT_ORDER = [
 
 
 class RunPreview(Widget):
-    """Shows the highlighted run's details, progress and per-state counts."""
-
     run: reactive[BenchmarkTableRow | None] = reactive(None)
 
     def render(self) -> RenderableType:
@@ -113,8 +108,6 @@ def _counts(run: BenchmarkTableRow) -> list[Text]:
 
 
 class EnvironmentScreen(ModalScreen[str | None]):
-    """Lists the Trackers to switch to by URL. Dismisses with the picked URL."""
-
     BINDINGS = [Binding("escape,q,c", "dismiss", show=False)]
 
     def __init__(self, choices: list[Environment], current: str) -> None:
@@ -150,7 +143,11 @@ class EnvironmentScreen(ModalScreen[str | None]):
 
 
 class RunsScreen(BrowseScreen[None]):
-    BINDINGS = [Binding("r", "reload", "reload"), Binding("c", "switch_environment", "tracker")]
+    BINDINGS = [
+        Binding("r", "reload", "reload"),
+        Binding("c", "switch_environment", "tracker"),
+        Binding("d", "open_datasets", show=False),
+    ]
     KEYS: ClassVar[list[tuple[str, str]]] = [
         ("j k ↑ ↓", "move"),
         ("g G", "top, bottom"),
@@ -160,9 +157,6 @@ class RunsScreen(BrowseScreen[None]):
         ("y", "copy the command on the bottom line"),
         ("r", "reload the list"),
         ("c", "switch to another Tracker you've logged in to; clicking its name does too"),
-        ("t", "light or dark theme"),
-        ("?", "these keys"),
-        ("q", "quit"),
     ]
 
     def __init__(self, source: RunSource) -> None:
@@ -189,8 +183,8 @@ class RunsScreen(BrowseScreen[None]):
         )
         self.query_one(CommandLine).show("valk run list")
         self.load_runs()
-        self.set_interval(STATUS_POLL_SECONDS, self.poll_statuses)
-        self.set_interval(LIST_REFRESH_SECONDS, self.load_runs)
+        self.set_interval(STATUS_POLL_SECONDS, self._poll_statuses_when_idle)
+        self.set_interval(LIST_REFRESH_SECONDS, self._load_runs_when_idle)
 
     def action_switch_environment(self) -> None:
         app = cast("ValkyrieApp", self.app)
@@ -213,6 +207,14 @@ class RunsScreen(BrowseScreen[None]):
         if url is not None and url != self.source.environment.url:
             cast("ValkyrieApp", self.app).switch_environment(url)
 
+    def _load_runs_when_idle(self) -> None:
+        if not self.busy("runs"):
+            self.load_runs()
+
+    def _poll_statuses_when_idle(self) -> None:
+        if not self.busy("statuses"):
+            self.poll_statuses()
+
     @work(exclusive=True, group="runs")
     async def load_runs(self) -> None:
         if self.rows and not self.is_current:
@@ -220,17 +222,17 @@ class RunsScreen(BrowseScreen[None]):
         try:
             runs = await self.source.runs(RUN_LIMIT)
         except ValkyrieSDKError as error:
-            self._report(error)
+            self.report(error)
             return
         self.rows = {str(run.id): run for run in runs}
         self.refilter()
-        self._fresh()
+        self.fresh()
 
     def refilter(self) -> None:
         table = self.query_one(Table)
         visible = {key: run for key, run in self.rows.items() if self._matches(run)}
         table.show_rows({key: self._cells(run) for key, run in visible.items()})
-        count = f"{len(visible)}/{len(self.rows)}" if self.filter else str(len(self.rows))
+        count = self.filter_count(len(visible), len(self.rows))
         table.border_title = f"Runs · {count}{self.filter_label()}"
         self._show_highlighted()
 
@@ -246,12 +248,12 @@ class RunsScreen(BrowseScreen[None]):
         try:
             entries = await self.source.statuses(live)
         except ValkyrieSDKError as error:
-            self._report(error)
+            self.report(error)
             return
         for entry in entries:
             self._apply_status(entry)
         self.refilter()
-        self._fresh()
+        self.fresh()
 
     def _apply_status(self, entry: BenchmarkStatusEntry) -> None:
         key = str(entry.id)
@@ -296,6 +298,9 @@ class RunsScreen(BrowseScreen[None]):
     def action_reload(self) -> None:
         self.load_runs()
 
+    def action_open_datasets(self) -> None:
+        self.app.push_screen(DatasetsScreen(self.source))
+
     def _show_highlighted(self) -> None:
         key = self.query_one(Table).highlighted_key()
         run = self.rows.get(key) if key else None
@@ -303,17 +308,3 @@ class RunsScreen(BrowseScreen[None]):
         preview.run = run
         preview.border_title = f"{short_id(run.id)} · {escape(shown(run.name))}" if run else ""
         self.query_one(CommandLine).show(f"valk run fetch {run.id} --connect" if run else "valk run list")
-
-    def _fresh(self) -> None:
-        self.query_one(TopBar).status = ("● live", "accent")
-
-    def _report(self, error: ValkyrieSDKError) -> None:
-        # A local Tracker can run without authentication, so the Tracker, not the UI, says when a login is needed.
-        if isinstance(error, ValkyrieAPIError) and error.status_code == 401:
-            url = shlex.quote(self.source.environment.url)
-            self.query_one(TopBar).status = ("⚠ not logged in", "warning")
-            message = f"{error}\nLog in with `VALKYRIE_URL={url} valk login`, or set VALKYRIE_API_KEY."
-            self.notify(message, title="Not logged in", severity="error")
-            return
-        self.query_one(TopBar).status = ("⚠ tracker unreachable, retrying", "warning")
-        self.notify(str(error), title="Tracker error", severity="error")

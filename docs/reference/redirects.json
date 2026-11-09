@@ -452,6 +452,78 @@
     "destination": "/reference/sdk/services#task-ids"
   },
   {
+    "source": "/reference/sdk/benchmark-definitions/create",
+    "destination": "/reference/sdk/benchmark-definitions#create"
+  },
+  {
+    "source": "/reference/sdk/benchmark-definitions/list",
+    "destination": "/reference/sdk/benchmark-definitions#list"
+  },
+  {
+    "source": "/reference/sdk/benchmark-definitions/get",
+    "destination": "/reference/sdk/benchmark-definitions#get"
+  },
+  {
+    "source": "/reference/sdk/benchmark-definitions/update",
+    "destination": "/reference/sdk/benchmark-definitions#update"
+  },
+  {
+    "source": "/reference/sdk/benchmark-definitions/remove",
+    "destination": "/reference/sdk/benchmark-definitions#remove"
+  },
+  {
+    "source": "/reference/sdk/benchmark-definitions/restore",
+    "destination": "/reference/sdk/benchmark-definitions#restore"
+  },
+  {
+    "source": "/reference/sdk/datasets/create",
+    "destination": "/reference/sdk/datasets#create"
+  },
+  {
+    "source": "/reference/sdk/datasets/list",
+    "destination": "/reference/sdk/datasets#list"
+  },
+  {
+    "source": "/reference/sdk/datasets/get",
+    "destination": "/reference/sdk/datasets#get"
+  },
+  {
+    "source": "/reference/sdk/datasets/update",
+    "destination": "/reference/sdk/datasets#update"
+  },
+  {
+    "source": "/reference/sdk/datasets/remove",
+    "destination": "/reference/sdk/datasets#remove"
+  },
+  {
+    "source": "/reference/sdk/datasets/restore",
+    "destination": "/reference/sdk/datasets#restore"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/put",
+    "destination": "/reference/sdk/datasets-tasks#put"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/list",
+    "destination": "/reference/sdk/datasets-tasks#list"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/list_all",
+    "destination": "/reference/sdk/datasets-tasks#list-all"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/get",
+    "destination": "/reference/sdk/datasets-tasks#get"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/download",
+    "destination": "/reference/sdk/datasets-tasks#download"
+  },
+  {
+    "source": "/reference/sdk/datasets-tasks/remove",
+    "destination": "/reference/sdk/datasets-tasks#remove"
+  },
+  {
     "source": "/reference/sdk/logs/page_task",
     "destination": "/reference/sdk/logs#page-task"
   },
@@ -530,6 +602,78 @@
   {
     "source": "/reference/sdk/settings/remove_benchmark_service",
     "destination": "/reference/sdk/settings#remove-benchmark-service"
+  },
+  {
+    "source": "/reference/sdk/account/identity",
+    "destination": "/reference/sdk/account#identity"
+  },
+  {
+    "source": "/reference/sdk/account/create_access_key",
+    "destination": "/reference/sdk/account#create-access-key"
+  },
+  {
+    "source": "/reference/sdk/account/revoke_access_key",
+    "destination": "/reference/sdk/account#revoke-access-key"
+  },
+  {
+    "source": "/reference/sdk/account/organizations",
+    "destination": "/reference/sdk/account#organizations"
+  },
+  {
+    "source": "/reference/sdk/account/create_organization",
+    "destination": "/reference/sdk/account#create-organization"
+  },
+  {
+    "source": "/reference/sdk/account/accept_invitation",
+    "destination": "/reference/sdk/account#accept-invitation"
+  },
+  {
+    "source": "/reference/sdk/account/decline_invitation",
+    "destination": "/reference/sdk/account#decline-invitation"
+  },
+  {
+    "source": "/reference/sdk/account/members",
+    "destination": "/reference/sdk/account#members"
+  },
+  {
+    "source": "/reference/sdk/account/invite",
+    "destination": "/reference/sdk/account#invite"
+  },
+  {
+    "source": "/reference/sdk/account/remove_member",
+    "destination": "/reference/sdk/account#remove-member"
+  },
+  {
+    "source": "/reference/sdk/models/account/access-key-response",
+    "destination": "/reference/sdk/models/account#access-key-response"
+  },
+  {
+    "source": "/reference/sdk/models/account/identity-response",
+    "destination": "/reference/sdk/models/account#identity-response"
+  },
+  {
+    "source": "/reference/sdk/models/account/invite-response",
+    "destination": "/reference/sdk/models/account#invite-response"
+  },
+  {
+    "source": "/reference/sdk/models/account/member-entry",
+    "destination": "/reference/sdk/models/account#member-entry"
+  },
+  {
+    "source": "/reference/sdk/models/account/members-response",
+    "destination": "/reference/sdk/models/account#members-response"
+  },
+  {
+    "source": "/reference/sdk/models/account/organization-entry",
+    "destination": "/reference/sdk/models/account#organization-entry"
+  },
+  {
+    "source": "/reference/sdk/models/account/organization-response",
+    "destination": "/reference/sdk/models/account#organization-response"
+  },
+  {
+    "source": "/reference/sdk/models/account/organizations-response",
+    "destination": "/reference/sdk/models/account#organizations-response"
   },
   {
     "source": "/reference/sdk/models/artifacts/run-artifact-entry",
@@ -640,12 +784,20 @@
     "destination": "/reference/sdk/models/logs#log-page"
   },
   {
+    "source": "/reference/sdk/models/login/login-session",
+    "destination": "/reference/sdk/models/login#login-session"
+  },
+  {
     "source": "/reference/sdk/models/runs/order",
     "destination": "/reference/sdk/models/runs#order"
   },
   {
     "source": "/reference/sdk/models/agents/parameter",
     "destination": "/reference/sdk/models/agents#parameter"
+  },
+  {
+    "source": "/reference/sdk/models/projects/new-project-request",
+    "destination": "/reference/sdk/models/projects#new-project-request"
   },
   {
     "source": "/reference/sdk/models/projects/project-create-request",
@@ -754,6 +906,14 @@
   {
     "source": "/reference/sdk/models/projects/spend-type",
     "destination": "/reference/sdk/models/projects#spend-type"
+  },
+  {
+    "source": "/reference/sdk/models/runs/run-monitoring",
+    "destination": "/reference/sdk/models/runs#run-monitoring"
+  },
+  {
+    "source": "/reference/sdk/models/runs/run-monitoring-rules",
+    "destination": "/reference/sdk/models/runs#run-monitoring-rules"
   },
   {
     "source": "/reference/sdk/models/runs/start-benchmark-response",

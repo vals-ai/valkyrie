@@ -1,17 +1,22 @@
 [
   "reference/sdk/index",
   "reference/sdk/client",
+  "reference/sdk/login",
   "reference/sdk/artifacts",
   "reference/sdk/runs",
   "reference/sdk/benchmarks",
   "reference/sdk/agents",
   "reference/sdk/services",
+  "reference/sdk/benchmark-definitions",
+  "reference/sdk/datasets",
+  "reference/sdk/datasets-tasks",
   "reference/sdk/logs",
   "reference/sdk/scheduler",
   "reference/sdk/secrets",
   "reference/sdk/projects",
   "reference/sdk/providers",
   "reference/sdk/settings",
+  "reference/sdk/account",
   {
     "group": "Types",
     "pages": [
@@ -27,6 +32,8 @@
       "reference/sdk/models/projects",
       "reference/sdk/models/secrets",
       "reference/sdk/models/settings",
+      "reference/sdk/models/account",
+      "reference/sdk/models/login",
       "reference/sdk/errors"
     ]
   }

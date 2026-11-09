@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field as PydanticField,
     SerializerFunctionWrapHandler,
     TypeAdapter,
@@ -30,9 +31,7 @@ from sqlmodel import (
     SQLModel,
     TypeDecorator,
     UniqueConstraint,
-    col,
     func,
-    select,
 )
 
 from tracker.aws.runtime import AWSResources
@@ -45,7 +44,6 @@ if TYPE_CHECKING:
     from benchmark_service.client import BenchmarkServiceClient
 
     from tracker.types import (
-        BenchmarkTableRow,
         FetchBenchmarkMetadataResponse,
         RunExecutionRequest,
     )
@@ -58,6 +56,10 @@ class Org(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str = Field(unique=True, index=True)
     storage_key: str | None = Field(default=None, unique=True)
+    requires_project: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
 
 
 class TaskStatus(str, Enum):
@@ -76,6 +78,9 @@ class BenchmarkStatus(str, Enum):
     STOPPED = "STOPPED"
     FINISHED = "FINISHED"
     ERROR = "ERROR"
+
+
+FINISHED_BENCHMARK_STATUSES = (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED)
 
 
 class ExecutorReleaseStatus(str, Enum):
@@ -99,15 +104,11 @@ class DocentReadingStatus(str, Enum):
 
 
 class AgentCausedExitReason(str, Enum):
-    """Exit reasons caused by the agent that continue to evaluation"""
-
     TIMEOUT = "TIMEOUT"
     OS_KILLED = "OS_KILLED"
 
 
 class FailureCategory(str, Enum):
-    """Coarse classification of a task or run failure, decided where the failure is caught."""
-
     INFRASTRUCTURE = "infrastructure"
     BENCHMARK_SERVICE = "benchmark_service"
     AGENT = "agent"
@@ -115,14 +116,10 @@ class FailureCategory(str, Enum):
     UNKNOWN = "unknown"
 
 
+FailureCategory.__doc__ = "Coarse classification of a task or run failure, decided where the failure is caught."
+
+
 class FailurePhase(str, Enum):
-    """Marks how far a task attempt got before it failed.
-
-    ADMISSION, SANDBOX and SETUP come before the agent runs, so a retry from one of them
-    costs no model spend. AGENT and EVALUATION have already paid for generation, and a
-    retry from scratch pays for it again.
-    """
-
     ADMISSION = "admission"
     SANDBOX = "sandbox"
     SETUP = "setup"
@@ -204,9 +201,9 @@ class AgentContractRequest(BaseModel):
     output_artifacts: list[OutputArtifactSpec] = []
     egress_allowlist: list[str] = []
     install_egress: EgressPolicy | None = None
+    allow_provider_tools: bool = False
     secrets: dict[str, str] = {}
     kwargs: dict[str, str] = {}
-    # Set only by the tracker, after rebuilding this contract from the bundle.
     inference_settings_attested: bool = False
 
     @model_validator(mode="before")
@@ -247,6 +244,25 @@ class AgentContractRequest(BaseModel):
         return normalized_artifacts
 
 
+class RunMonitoring(BaseModel):
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={"description": "Opt-in external monitoring requested by whoever starts the run."},
+    )
+
+
+class RunMonitoringRules(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"description": "Monitor rules the benchmark service declares for its runs."},
+    )
+
+    policy: str | None = None
+    watcher_policy_pack: str | None = None
+    allowed_cidrs: list[str] = []
+    allowed_hosts: list[str] = []
+
+
 class _BenchmarkArguments(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -254,6 +270,7 @@ class _BenchmarkArguments(BaseModel):
     concurrency: int
     priority: int | None = PydanticField(default=None, exclude=True, strict=True, ge=0, le=4)
     queue_pool_id: str | None = Field(default=None, exclude=True)
+    selected_project_gateway_secret_ref: str | None = PydanticField(default=None, exclude=True)
     task_ids: list[str] | None = None
     slice_str: str | None = None
     lambda_function: str | None = None
@@ -261,18 +278,22 @@ class _BenchmarkArguments(BaseModel):
     dataset_version: DatasetVersion | None = None
     sandbox_provider: str = "daytona"
     sandbox_provider_secret_name: str | None = None
+    monitoring: RunMonitoring | None = None
+    monitoring_rules: RunMonitoringRules | None = None
 
 
 class AWSBenchmarkArguments(_BenchmarkArguments):
-    """Stored arguments for an AWS run, including legacy rows without resources."""
-
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Stored arguments for an AWS run, including legacy rows without resources."}
+    )
     environment: Literal["aws"] = "aws"
     properties: AWSResources | None = None
 
 
 class LocalBenchmarkArguments(_BenchmarkArguments):
-    """Stored arguments with the filesystem resources selected at admission."""
-
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Stored arguments with the filesystem resources selected at admission."}
+    )
     environment: Literal["local"] = "local"
     properties: LocalResources
 
@@ -289,7 +310,6 @@ class FinalEvaluation(SQLModel, table=True):
     org_id: UUID = Field(foreign_key="org.id")
     benchmark: UUID = Field(foreign_key="benchmark.id")
     final_score: float = Field(nullable=False)
-    # NOTE: metadata was reserved by alchemy
     properties: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 
     @field_serializer("id", "benchmark")
@@ -297,29 +317,19 @@ class FinalEvaluation(SQLModel, table=True):
         return str(value)
 
     def fetch_evaluation_results(self, session: Session) -> dict[str, dict[str, Any]]:
-        from tracker.utils import fetch_evaluation_results
+        from tracker.services.results import fetch_evaluation_results
 
         return fetch_evaluation_results(self.benchmark, session, self.org_id)
 
 
 class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
-    """
-    Hook for converting benchmark arguments to an object and back again.
-    Allows us to use the type without manually serializing and deserializing.
-    NOTE: We do this because the field is not relevant enough to be a separate table and we want it created with the benchmark row
-
-    Related Documentation:
-        - https://docs.sqlalchemy.org/en/20/core/custom_types.html#sqlalchemy.types.TypeDecorator
-    """
-
     impl = JSON
     cache_ok = True
 
     def process_bind_param(self, value: BenchmarkArguments | None, dialect: Dialect) -> dict[str, Any] | None:
-        """Runs when we save the value to the database."""
         if value is None:
             return None
-        excluded_fields = {"priority", "queue_pool_id"}
+        excluded_fields = {"priority", "queue_pool_id", "selected_project_gateway_secret_ref"}
         if value.dataset_version is None:
             excluded_fields.add("dataset_version")
         serialized = value.model_dump(mode="json", exclude=excluded_fields)
@@ -327,11 +337,12 @@ class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
             serialized["priority"] = value.priority
         if value.queue_pool_id is not None:
             serialized["queue_pool_id"] = value.queue_pool_id
+        if value.selected_project_gateway_secret_ref is not None:
+            serialized["selected_project_gateway_secret_ref"] = value.selected_project_gateway_secret_ref
 
         return serialized
 
     def process_result_value(self, value: dict[str, Any] | None, dialect: Dialect) -> BenchmarkArguments | None:
-        """Runs when we fetch the value from the database."""
         if value is None:
             return None
         return benchmark_arguments_adapter.validate_python({"environment": "aws", **value})
@@ -359,8 +370,6 @@ class ExecutorAdmission(SQLModel, table=True):
 
 
 class ExecutorDispatch(SQLModel, table=True):
-    """Immutable release identity and lifecycle for one executor invocation."""
-
     __table_args__ = (
         Index("ix_executordispatch_release_status", "executor_release_id", "status"),
         Index("ix_executordispatch_benchmark_kind", "benchmark_id", "kind"),
@@ -408,9 +417,27 @@ class RunAccessKey(SQLModel, table=True):
     last_attempt_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
-class SandboxRecord(SQLModel, table=True):
-    """One sandbox a task attempt created, kept so the provider's bill for it can be joined to its run."""
+class EgressProxyPolicy(SQLModel, table=True):
+    __tablename__ = "egress_proxy_policy"
 
+    key_id: str = Field(primary_key=True)
+    benchmark_id: UUID = Field(foreign_key="benchmark.id", index=True)
+    token_sha256: str
+    methods: list[str] = Field(sa_column=Column(JSON, nullable=False))
+    domains: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+    inspect_domains: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default=text("'[]'")),
+    )
+    gateway_url: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
+
+
+class SandboxRecord(SQLModel, table=True):
     __tablename__ = "sandbox"
     __table_args__ = (Index("ix_sandbox_benchmark_id", "benchmark_id"),)
 
@@ -420,13 +447,6 @@ class SandboxRecord(SQLModel, table=True):
 
 
 class RunCost(SQLModel, table=True):
-    """One charge to a run.
-
-    `source_id` traces the charge to what made it when there is one, e.g. the sandbox id for a sandbox.
-    Only sandbox rows are deduplicated, by (provider, source_id); other cost types choose their own rule
-    when they are added.
-    """
-
     __tablename__ = "run_cost"
     __table_args__ = (
         Index("ix_run_cost_benchmark_id", "benchmark_id"),
@@ -446,6 +466,15 @@ class RunCost(SQLModel, table=True):
     source_id: str | None = None
     provider: str
     amount_usd: float
+    usage_end: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class SandboxCostCursor(SQLModel, table=True):
+    __tablename__ = "sandbox_cost_cursor"
+
+    org_id: UUID = Field(foreign_key="org.id", primary_key=True)
+    secret_name: str = Field(primary_key=True)
+    next_hour: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
 
 
 class OrgProviderSecret(SQLModel, table=True):
@@ -489,8 +518,6 @@ class ExecutorDispatchPayload(SQLModel, table=True):
 
 
 class SandboxBuildReservation(SQLModel, table=True):
-    """Capacity held while one exact task attempt is building."""
-
     __table_args__ = (
         CheckConstraint(
             "requested_vcpu >= 0 AND requested_memory >= 0 AND requested_disk >= 0 AND requested_gpu >= 0",
@@ -504,6 +531,8 @@ class SandboxBuildReservation(SQLModel, table=True):
     attempt_started_at: datetime = Field(primary_key=True)
     reserved_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     released_at: datetime | None = None
+    executor_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
+    accepted_at: datetime | None = None
     pool_id: str
     target_id: str
     sandbox_class: str
@@ -513,15 +542,20 @@ class SandboxBuildReservation(SQLModel, table=True):
     requested_gpu: float
 
 
-class SandboxAdmissionCandidate(SQLModel, table=True):
-    """Resolved demand and provider readiness for one executor's pending attempt."""
+class BenchmarkServiceWake(SQLModel, table=True):
+    name: str = Field(primary_key=True)
+    requested_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
 
+
+class SandboxAdmissionCandidate(SQLModel, table=True):
     __table_args__ = (Index("ix_sandboxadmissioncandidate_pool", "pool_id"),)
 
     task_row_id: UUID = Field(primary_key=True, foreign_key="task.id")
     attempt_started_at: datetime = Field(primary_key=True)
     executor_dispatch_id: UUID = Field(foreign_key="executordispatch.id")
     admission_ready: bool
+    readiness_checked_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
+    readiness_requested_at: datetime | None = None
     pool_id: str
     target_id: str
     sandbox_class: str
@@ -579,40 +613,9 @@ class Benchmark(SQLModel, table=True):
     )
 
     def fetch_evaluation_results(self, session: Session) -> dict[str, dict[str, Any]]:
-        from tracker.utils import fetch_evaluation_results
+        from tracker.services.results import fetch_evaluation_results
 
         return fetch_evaluation_results(self.id, session, self.org_id)
-
-    def fetch_tasks_with_errors(self, session: Session) -> dict[str, str] | None:
-        errors = self.fetch_task_failures(session)
-        if errors is None:
-            return None
-        return {task_id: message for task_id, (message, _category) in errors.items()}
-
-    def fetch_task_failures(self, session: Session) -> dict[str, tuple[str, FailureCategory | None]] | None:
-        """Latest terminal error message and category keyed by task ID for errored tasks."""
-        error_rows = session.exec(
-            select(Task.task_id, col(ErrorResult.error_message), col(ErrorResult.category))
-            .outerjoin(
-                ErrorResult,
-                (col(ErrorResult.task) == col(Task.id))
-                & (col(ErrorResult.org_id) == self.org_id)
-                & col(ErrorResult.retry_scheduled).is_(False),
-            )
-            .where(Task.benchmark == self.id)
-            .where(Task.org_id == self.org_id)
-            .where(Task.status == TaskStatus.ERROR)
-            .order_by(col(Task.id), col(ErrorResult.created_at).desc())
-        ).all()
-
-        if not error_rows:
-            return None
-
-        errors_by_task_id: dict[str, tuple[str, FailureCategory | None]] = {}
-        for task_id, error_message, category in error_rows:
-            errors_by_task_id.setdefault(task_id, (error_message or "No error message was provided", category))
-
-        return errors_by_task_id
 
     def local_start_benchmark_request(self, service_headers: dict[str, str]) -> "RunExecutionRequest":
         from tracker.types import RunExecutionRequest
@@ -657,7 +660,7 @@ class Benchmark(SQLModel, table=True):
         benchmark_url: str | None = None,
     ) -> "BenchmarkServiceClient":
         from tracker.config import create_benchmark_service_url
-        from tracker.utils import create_benchmark_service_client
+        from tracker.clients.benchmark_service import create_benchmark_service_client
 
         url = (
             benchmark_url
@@ -688,85 +691,12 @@ class Benchmark(SQLModel, table=True):
             executor_protocol_version=self.executor_protocol_version,
         )
 
-    def create_benchmark_table_row(self, session: Session) -> "BenchmarkTableRow":
-        """
-        Creates a benchmark table row object used to display the current data from this benchmark row.
-        Used in a table like feature amongst other benchmarks rows.
-
-        Args:
-            session: Session to use to fetch the total and finished tasks
-
-        Returns:
-            BenchmarkTableRow
-        """
-        from tracker.types import BenchmarkTableRow
-
-        task_state_counts = self.fetch_task_state_counts(session)
-        total_tasks = sum(task_state_counts.values())
-        finished_tasks = (
-            task_state_counts.get(TaskStatus.FINISHED, 0)
-            + task_state_counts.get(TaskStatus.ERROR, 0)
-            + task_state_counts.get(TaskStatus.STOPPED, 0)
-        )
-
-        return BenchmarkTableRow(
-            id=self.id,
-            name=self.name,
-            agent_name=self.arguments.contract.name,
-            model=self.arguments.contract.model,
-            dataset=self.arguments.dataset or "default",
-            executor_release_id=self.executor_release_id,
-            current_execution_release_id=self.current_execution_release_id,
-            executor_artifact_digest=self.executor_artifact_digest,
-            executor_protocol_version=self.executor_protocol_version,
-            started_by_email=self.started_by_email,
-            started_at=self.started_at,
-            finished_at=self.finished_at,
-            status=self.status,
-            total_tasks=total_tasks,
-            finished_tasks=finished_tasks,
-            task_state_counts={k.value: v for k, v in task_state_counts.items()},
-            final_score=(self.final_evaluation.final_score if self.final_evaluation else None),
-            label=self.label,
-        )
-
-    def fetch_task_state_counts(self, session: Session) -> dict[TaskStatus, int]:
-        """Count this benchmark's tasks grouped by TaskStatus."""
-        rows = session.exec(
-            select(col(Task.status), func.count(col(Task.task_id)))
-            .where(col(Task.benchmark) == self.id)
-            .where(col(Task.org_id) == self.org_id)
-            .group_by(col(Task.status))
-        ).all()
-        return {status: count for status, count in rows}
-
-    def fetch_final_score(self, session: Session) -> float | None:
-        """Return the FinalEvaluation.final_score for this benchmark, or None if no row exists."""
-        row = session.exec(
-            select(FinalEvaluation.final_score)
-            .where(col(FinalEvaluation.benchmark) == self.id)
-            .where(col(FinalEvaluation.org_id) == self.org_id)
-        ).first()
-        return row if row is not None else None
-
-    def fetch_project(self, session: Session) -> "Project | None":
-        """Return the project of this run's last-appended project link, or None if the run was started without one."""
-        return session.exec(
-            select(Project)
-            .join(RunProject, col(RunProject.project_id) == col(Project.id))
-            .where(col(RunProject.benchmark_id) == self.id)
-            .order_by(col(RunProject.id).desc())
-            .limit(1)
-        ).first()
-
 
 class Project(SQLModel, table=True):
-    """A piece of work runs spend money on, with the spend type and tags every run in it shares.
-
-    ``handle`` is the immutable string people type (``my-project``) and ``name`` is the label they read (``My Project``).
-    """
-
-    __table_args__ = (UniqueConstraint("org_id", "handle", name="unique_project_handle_per_org"),)
+    __table_args__ = (
+        UniqueConstraint("org_id", "handle", name="unique_project_handle_per_org"),
+        Index("uq_project_org_name", "org_id", text("lower(btrim(name))"), unique=True),
+    )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     org_id: UUID = Field(foreign_key="org.id")
@@ -776,20 +706,17 @@ class Project(SQLModel, table=True):
     subcategory: str | None = None
     customer: str | None = None
     extra_tags: dict[str, str] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    gateway_request_id: UUID | None = None
+    gateway_key_id: UUID | None = None
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(ZoneInfo("UTC")),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
     created_by_email: str | None = None
+    archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
 class RunProject(SQLModel, table=True):
-    """One link from a run to a project; the link with the highest ``id`` is the run's current project.
-
-    The database assigns ``id`` in insert order, so it is the append order even when two links share a timestamp.
-    ``created_at`` and ``created_by_email`` record when the run was moved and who moved it; they never decide the order.
-    """
-
     __tablename__ = "run_project"
 
     id: int | None = Field(default=None, sa_column=Column(Integer, Identity(), primary_key=True))
@@ -802,33 +729,58 @@ class RunProject(SQLModel, table=True):
     created_by_email: str | None = None
 
 
+class BenchmarkDefinition(SQLModel, table=True):
+    __tablename__ = "benchmark_definition"
+    __table_args__ = (Index("uq_benchmark_definition_org_name", "org_id", "name", unique=True),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    org_id: UUID = Field(foreign_key="org.id")
+    name: str
+    description: str = ""
+    created_by_email: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
+class Dataset(SQLModel, table=True):
+    __table_args__ = (Index("uq_dataset_benchmark_name", "benchmark_definition_id", "name", unique=True),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    benchmark_definition_id: UUID = Field(foreign_key="benchmark_definition.id")
+    name: str
+    description: str = ""
+    created_by_email: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+
+
 @event.listens_for(Benchmark, "before_insert")
 @event.listens_for(Benchmark, "before_update")
 def set_finished_at_when_benchmark_finished(_mapper: Mapper[Benchmark], _connection: Connection, target: Benchmark):
-    """
-    Automatically set the finished_at timestamp when the benchmark is finished.
 
-    Prevents situations where the benchmark can be finished but we never set the finished_at timestamp.
-
-    Related Documentation:
-        - https://docs.sqlalchemy.org/en/20/orm/events.html#mapper-events
-        - https://docs.sqlalchemy.org/en/13/orm/session_api.html#sqlalchemy.orm.attributes.get_history
-    """
-
-    # Benchmark statuses we want the finished_at timestamp to be set when updated to
     finished_states = [BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR]
 
-    # Check that the status has actually changed between the current and previous state
     status_changed = has_field_changed(target, "status")
 
-    # If the status has changed and the new status is in a finished state, set the finished_at timestamp
     if status_changed and target.status in finished_states:
         target.finished_at = datetime.now(ZoneInfo("UTC"))
 
 
 class ActiveNativeOutput(BaseModel):
-    """Internal attachment to one task attempt's actual sandbox, without credentials."""
-
     attempt_started_at: datetime
     sandbox_id: str
     runtime_source: SandboxSource
@@ -850,8 +802,6 @@ class ActiveNativeOutput(BaseModel):
 
 
 class ActiveNativeOutputType(TypeDecorator[ActiveNativeOutput]):
-    """The single serialization owner for the internal JSON descriptor."""
-
     impl = JSON
     cache_ok = True
 
@@ -897,17 +847,11 @@ class Task(SQLModel, table=True):
 @event.listens_for(Task, "before_insert")
 @event.listens_for(Task, "before_update")
 def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Connection, target: Task):
-    """
-    Serves the same purpose as @set_finished_at_when_benchmark_finished, but for the task model.
-    """
 
-    # Task statuses we want the finished_at timestamp to be set when updated to
     finished_states = [TaskStatus.FINISHED, TaskStatus.ERROR]
 
-    # Check that the status has actually changed between the current and previous state
     status_changed = has_field_changed(target, "status")
 
-    # If the status has changed and the new status is in a finished state, set the finished_at timestamp
     if status_changed and target.status in finished_states:
         target.finished_at = datetime.now(ZoneInfo("UTC"))
 

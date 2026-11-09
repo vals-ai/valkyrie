@@ -1,8 +1,3 @@
-"""Unit tests for tracker Sentry configuration.
-
-Run: uv run pytest tests/unit/observability/test_sentry.py
-"""
-
 import asyncio
 import json
 from collections.abc import Callable, Iterator
@@ -16,6 +11,8 @@ from uuid import UUID
 
 import pytest
 import sentry_sdk
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 import sentry_sdk.scope as sentry_scope
 from opentelemetry import trace
 from opentelemetry.context import Context
@@ -28,8 +25,9 @@ from sentry_sdk.types import Event, Hint, Log
 
 import tracker.observability.sentry as sentry_module
 import tracker.observability.tracing as tracing_module
-import tracker.utils.run_orchestration as run_orchestration
-import tracker.utils.task_execution as task_execution
+import tracker.services.runs.start as run_orchestration
+import tracker.services.tasks.execute as task_execution
+import tracker.services.tasks.monitor as task_monitor_module
 from tracker.database.models import FailureCategory, Org, Task
 from tracker.executor.execution_authority import ExecutionAuthority
 from tracker.exceptions import SandboxError, SandboxSetupError, SSLConnectionError
@@ -55,14 +53,13 @@ def _before_send_log() -> BeforeSendLog:
 
 @pytest.fixture(autouse=True)
 def isolated_sentry_scopes() -> Iterator[None]:
-    """Direct process-task tests must not supply tags to these scope assertions."""
     with sentry_scope.use_isolation_scope(sentry_sdk.Scope()), sentry_scope.use_scope(sentry_sdk.Scope()):
         yield
 
 
+@pytest.mark.description("Sentry event grouping and context filtering.")
 class TestBeforeSend:
-    """Sentry event grouping and context filtering."""
-
+    @pytest.mark.description("SSL connection errors are fingerprinted into one Sentry issue.")
     def test_before_send_fingerprints_ssl_connection_errors(self) -> None:
         exc = SSLConnectionError("curl failed with exit code 35")
         event = _before_send()({}, {"exc_info": (type(exc), exc, None)})
@@ -70,6 +67,7 @@ class TestBeforeSend:
         assert event is not None
         assert event.get("fingerprint") == ["{{ default }}", "SSLConnectionError"]
 
+    @pytest.mark.description("Other errors keep their grouping, and empty context tags are dropped.")
     def test_before_send_preserves_non_grouped_errors_and_filters_empty_context_tags(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -90,6 +88,7 @@ class TestBeforeSend:
         assert "fingerprint" not in event
         assert event.get("tags") == {"benchmark_id": "benchmark-123"}
 
+    @pytest.mark.description("Events without exception info pass through `before_send`.")
     def test_before_send_handles_events_without_exception_info(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_context_tags() -> dict[str, str]:
             return {}
@@ -101,9 +100,9 @@ class TestBeforeSend:
         assert event == {"message": "log event", "tags": {}}
 
 
+@pytest.mark.description("Only captured OTel root identities are promoted.")
 class TestBeforeSendTransaction:
-    """Only captured OTel root identities are promoted."""
-
+    @pytest.mark.description("Only captured owned attributes become tags, and other tags are kept.")
     def test_promotes_only_captured_owned_attributes_and_preserves_other_tags(self) -> None:
         event: Event = {
             "type": "transaction",
@@ -121,6 +120,7 @@ class TestBeforeSendTransaction:
             "http.method": "POST",
         }
 
+    @pytest.mark.description("Native transactions without OpenTelemetry context are unchanged.")
     @pytest.mark.parametrize(
         "event",
         [
@@ -145,9 +145,11 @@ class TestBeforeSendTransaction:
         assert event == expected
 
 
+@pytest.mark.description("Sentry initialization and log context behavior.")
 class TestSentrySetup:
-    """Sentry initialization and log context behavior."""
-
+    @pytest.mark.description(
+        "`init_sentry` adds the OTLP integration with its trace exporter and propagator turned off."
+    )
     def test_init_sentry_registers_otlp_integration_without_exporter_or_propagator(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -168,10 +170,42 @@ class TestSentrySetup:
         otlp_integrations = [i for i in integrations if isinstance(i, OTLPIntegration)]
         assert len(otlp_integrations) == 1, "expected exactly one OTLPIntegration in integrations="
         otlp = otlp_integrations[0]
-        # Both flags must be False; defaults would double-publish spans and replace the global propagator.
         assert otlp.setup_otlp_traces_exporter is False
         assert otlp.setup_propagator is False
 
+    @pytest.mark.description(
+        "A raised 500 `HTTPException` reaches Sentry, and 502 and 503 responses for upstream failures do not."
+    )
+    def test_init_sentry_reports_only_internal_error_http_exceptions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        init_mock = Mock()
+        monkeypatch.setenv("SENTRY_DSN", "https://public@example.com/1")
+        monkeypatch.setattr(sentry_sdk, "init", init_mock)
+        sentry_module.init_sentry("valkyrie-tracker", environment="test")
+        options = init_mock.call_args.kwargs
+        monkeypatch.undo()
+
+        app = FastAPI()
+
+        @app.get("/status/{status_code}")
+        async def fail(status_code: int) -> None:
+            raise HTTPException(status_code=status_code, detail="failed")
+
+        events: list[Event] = []
+        with sentry_sdk.init(
+            dsn=options["dsn"],
+            integrations=options["integrations"],
+            transport=events.append,
+        ):
+            client = TestClient(app)
+            statuses = [client.get(f"/status/{code}").status_code for code in (500, 502, 503)]
+            sentry_sdk.flush()
+
+        assert statuses == [500, 502, 503]
+        assert [event["request"]["url"] for event in events if event.get("exception")] == [
+            "http://testserver/status/500"
+        ]
+
+    @pytest.mark.description("Sentry logs carry the sandbox fields and prefer the current OpenTelemetry trace context.")
     def test_before_send_log_prefers_current_otel_trace_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         trace_id = "019e04c6fbf0397e32a8d9601f98e45c"
         span_id = "a1f0f4fc15b83e82"
@@ -189,11 +223,16 @@ class TestSentrySetup:
                 "span_id": None,
             },
         )
-        monkeypatch.setattr(sentry_module, "get_current_span", lambda: span)
+        monkeypatch.setattr("tracker.logging.context.trace.get_current_span", lambda: span)
         monkeypatch.setattr(
             sentry_module,
             "get_context_tags",
             lambda: {"request_id": "request-123", "benchmark_id": "benchmark-123", "task_id": ""},
+        )
+        monkeypatch.setattr(
+            sentry_module,
+            "get_sandbox_fields",
+            lambda: {"sandbox_id": "sandbox-123", "sandbox_provider": "docker"},
         )
 
         result = _before_send_log()(log, {})
@@ -204,8 +243,11 @@ class TestSentrySetup:
         assert log["attributes"] == {
             "request_id": "request-123",
             "benchmark_id": "benchmark-123",
+            "sandbox_id": "sandbox-123",
+            "sandbox_provider": "docker",
         }
 
+    @pytest.mark.description("A failed Sentry setup logs a warning.")
     def test_init_sentry_logs_warning_when_initialization_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         warnings: list[tuple[str, tuple[object, ...]]] = []
 
@@ -223,6 +265,7 @@ class TestSentrySetup:
         assert warnings[0][1][:1] == ("RuntimeError",)
         assert str(warnings[0][1][1]) == "bad dsn"
 
+    @pytest.mark.description("Sentry setup is skipped when the production DSN is missing.")
     def test_init_sentry_skips_missing_production_dsn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         init_mock = Mock()
         monkeypatch.delenv("SENTRY_DSN", raising=False)
@@ -233,13 +276,13 @@ class TestSentrySetup:
         init_mock.assert_not_called()
 
 
+@pytest.mark.description("Characterize SDK serialization, not Logfire registration or backend indexing.")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_is_root", [True, False], ids=["client-root", "client-child"])
 async def test_sentry_export_captures_task_identities_on_roots_and_children(
     monkeypatch: pytest.MonkeyPatch,
     client_is_root: bool,
 ) -> None:
-    """Characterize SDK serialization, not Logfire registration or backend indexing."""
     transactions: list[dict[str, Any]] = []
 
     class CaptureTransport(Transport):
@@ -248,8 +291,6 @@ async def test_sentry_export_captures_task_identities_on_roots_and_children(
                 if item.type == "transaction":
                     transactions.append(json.loads(item.get_bytes()))
 
-    # SentrySpanProcessor registers a global error processor on construction.
-    # Keep that registration local to this test; all test-owned spans finish normally.
     monkeypatch.setattr(sentry_scope, "global_event_processors", list(sentry_scope.global_event_processors))
     provider = TracerProvider()
     provider.add_span_processor(tracing_module._ContextVarSpanProcessor())
@@ -257,7 +298,6 @@ async def test_sentry_export_captures_task_identities_on_roots_and_children(
     tracer = provider.get_tracer(__name__)
     client = sentry_sdk.Client(
         dsn="https://public@example.com/1",
-        # Let the SDK pass DSN options into Transport.__init__; the processor checks parsed_dsn.
         transport=CaptureTransport,
         default_integrations=False,
         traces_sample_rate=1.0,
@@ -307,7 +347,6 @@ async def test_sentry_export_captures_task_identities_on_roots_and_children(
                     await release.wait()
                     with tracer.start_as_current_span("response.process") as response:
                         response_ids[task_id] = f"{response.get_span_context().span_id:016x}"
-                    # Root export must use the captured identities, not this later context.
                     request_id_var.set("finishing-request")
                     benchmark_id_var.set("finishing-benchmark")
                     executor_dispatch_id_var.set("finishing-dispatch")
@@ -326,8 +365,6 @@ async def test_sentry_export_captures_task_identities_on_roots_and_children(
             parent = nullcontext() if client_is_root else tracer.start_as_current_span("dispatch", context=Context())
             with parent:
                 await asyncio.gather(request("task-a"), request("task-b"))
-                # A shared transaction finishes after both isolated tasks have left.
-                # Its finishing scope must not replace the identities captured on children.
                 scope.set_tag("task_id", "finishing-scope-task")
     finally:
         provider.shutdown()
@@ -367,6 +404,7 @@ async def test_sentry_export_captures_task_identities_on_roots_and_children(
         assert transactions[0]["tags"]["task_id"] == "finishing-scope-task"
 
 
+@pytest.mark.description("Each task scope keeps its sandbox events apart from other tasks and the outer scope.")
 @pytest.mark.asyncio
 async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
     monkeypatch: pytest.MonkeyPatch,
@@ -393,8 +431,14 @@ async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
         return rows[str(task_id)]
 
     monkeypatch.setattr(task_execution, "Session", FakeSession)
+    monkeypatch.setattr("tracker.services.tasks.monitor.Session", FakeSession)
+    monkeypatch.setattr("tracker.services.tasks.status.Session", FakeSession)
     monkeypatch.setattr(task_execution, "fetch_task_row", fetch_task)
+    monkeypatch.setattr("tracker.services.tasks.monitor.fetch_task_row", fetch_task)
+    monkeypatch.setattr("tracker.services.tasks.status.fetch_task_row", fetch_task)
     monkeypatch.setattr(task_execution, "commit_task_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tracker.services.tasks.monitor.commit_task_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tracker.services.tasks.status.commit_task_error", lambda *_args, **_kwargs: None)
 
     async def run_tasks() -> None:
         ready = 0
@@ -419,13 +463,13 @@ async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
                 started_at=attempt_starts[task_id],
             )
 
-        task_a = task_execution.TrackedTask(
+        task_a = task_monitor_module.TrackedTask(
             body("task-a", "sandbox-a", fail=False),
             cast(Org, object()),
             cast(ExecutionAuthority, object()),
             attempt_starts["task-a"],
         )
-        task_b = task_execution.TrackedTask(
+        task_b = task_monitor_module.TrackedTask(
             body("task-b", "sandbox-b", fail=True),
             cast(Org, object()),
             cast(ExecutionAuthority, object()),
@@ -464,6 +508,9 @@ async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
     assert events[-1].get("tags") == {}
 
 
+@pytest.mark.description(
+    "Events from a retry carry the new attempt tags and no sandbox context from the earlier attempt."
+)
 @pytest.mark.asyncio
 async def test_retry_attempt_clears_previous_sandbox_identity(
     monkeypatch: pytest.MonkeyPatch,
@@ -533,6 +580,9 @@ async def test_retry_attempt_clears_previous_sandbox_identity(
     assert "sandbox" not in retry_event.get("contexts", {})
 
 
+@pytest.mark.description(
+    "An unhandled task error tags the Sentry event and the log record with the stored `failure_category`."
+)
 @pytest.mark.asyncio
 async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -559,8 +609,14 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
         return row
 
     monkeypatch.setattr(task_execution, "Session", FakeSession)
+    monkeypatch.setattr("tracker.services.tasks.monitor.Session", FakeSession)
+    monkeypatch.setattr("tracker.services.tasks.status.Session", FakeSession)
     monkeypatch.setattr(task_execution, "fetch_task_row", fetch_task)
+    monkeypatch.setattr("tracker.services.tasks.monitor.fetch_task_row", fetch_task)
+    monkeypatch.setattr("tracker.services.tasks.status.fetch_task_row", fetch_task)
     monkeypatch.setattr(task_execution, "commit_task_error", commit_task_error)
+    monkeypatch.setattr("tracker.services.tasks.monitor.commit_task_error", commit_task_error)
+    monkeypatch.setattr("tracker.services.tasks.status.commit_task_error", commit_task_error)
 
     async def body() -> dict[str, dict[str, object] | None]:
         raise SandboxSetupError("provider rejected the sandbox request")
@@ -571,14 +627,14 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
         default_integrations=False,
         before_send=_before_send(),
     ):
-        task_execution.logger.addHandler(caplog.handler)
+        task_monitor_module.logger.addHandler(caplog.handler)
         try:
-            tracked = task_execution.TrackedTask(
+            tracked = task_monitor_module.TrackedTask(
                 body(), cast(Org, object()), cast(ExecutionAuthority, object()), row.started_at
             )
             await tracked.run(None, cast(Task, row))
         finally:
-            task_execution.logger.removeHandler(caplog.handler)
+            task_monitor_module.logger.removeHandler(caplog.handler)
 
     stored_category = committed["category"]
     assert stored_category == FailureCategory.INFRASTRUCTURE
@@ -588,6 +644,7 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
     assert getattr(record, "failure_category") == stored_category.value
 
 
+@pytest.mark.description("The `failure_category` tag set for a run error is absent from the next Sentry event.")
 def test_run_error_failure_category_tag_does_not_leak_to_later_events() -> None:
     events: list[Event] = []
 

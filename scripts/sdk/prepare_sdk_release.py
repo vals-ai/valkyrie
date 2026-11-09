@@ -1,5 +1,3 @@
-"""Prepare and preflight a hash-bound Valkyrie SDK release."""
-
 from __future__ import annotations
 
 import argparse
@@ -24,13 +22,11 @@ INDEX_API = {
 
 
 class ReleaseError(RuntimeError):
-    """A release artifact or target failed preflight validation."""
+    pass
 
 
 @dataclass(frozen=True)
 class ReleaseManifest:
-    """Identity and hashes for one wheel/sdist release pair."""
-
     name: str
     version: str
     files: dict[str, str]
@@ -58,7 +54,6 @@ def _sha256(path: Path) -> str:
 
 
 def build_manifest(dist: Path) -> ReleaseManifest:
-    """Build a release manifest from exactly one wheel and one sdist."""
     wheels = sorted(dist.glob("*.whl"))
     sdists = sorted(dist.glob("*.tar.gz"))
     if len(wheels) != 1 or len(sdists) != 1:
@@ -73,7 +68,6 @@ def build_manifest(dist: Path) -> ReleaseManifest:
 
 
 def write_checksums(manifest: ReleaseManifest, dist: Path, destination: Path) -> None:
-    """Write sha256sum-compatible paths relative to the manifest directory."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     for filename, digest in sorted(manifest.files.items()):
@@ -89,7 +83,6 @@ def ensure_index_version_available(
     *,
     opener: Callable[[Request], AbstractContextManager[Any]] = urlopen,
 ) -> None:
-    """Fail if a release version already exists on the selected index."""
     try:
         base_url = INDEX_API[target]
     except KeyError as exc:
@@ -140,8 +133,7 @@ def write_summary(path: Path, manifest: ReleaseManifest, target: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Validate release availability and emit hashes for GitHub Actions."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Prepare and preflight a hash-bound Valkyrie SDK release.")
     parser.add_argument("--target", choices=sorted(INDEX_API), required=True)
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)

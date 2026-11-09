@@ -1,7 +1,4 @@
-"""Run with `uv run pytest tests/integration/local/api/test_filter_options.py`.
-
-Exercise benchmark filter options through the real app and local database.
-"""
+import pytest
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session
@@ -10,16 +7,18 @@ from tests.factories import make_benchmark
 from tracker.database.models import BenchmarkStatus
 
 
+@pytest.mark.description("Filter option responses and authentication.")
 class TestFilterOptions:
-    """Filter option responses and authentication."""
-
+    @pytest.mark.description(
+        (
+            "Filter options must collapse repeated benchmark metadata into distinct values.\n"
+            "\n"
+            "Test cases:\n"
+            "- Authenticated results contain each available filter value once.\n"
+            '- Runs without a dataset are listed under "default", matching the run list and its dataset filter.'
+        )
+    )
     def test_filter_options_returns_distinct(self, client: TestClient, database_session: Session) -> None:
-        """Filter options must collapse repeated benchmark metadata into distinct values.
-
-        Test cases:
-        - Authenticated results contain each available filter value once.
-        - Runs without a dataset are listed under "default", matching the run list and its dataset filter.
-        """
         for benchmark_name, agent_name, model, dataset, email in [
             ("swebench", "mini_sweagent", "gateway/openai/gpt-5", "verified", "a@vals.ai"),
             ("swebench", "claude_code", "gateway/anthropic/claude-opus-5", None, "b@vals.ai"),
@@ -50,12 +49,15 @@ class TestFilterOptions:
         assert response_body["datasets"] == ["default", "lite", "verified"]
         assert response_body["started_by_emails"] == ["a@vals.ai", "b@vals.ai"]
 
+    @pytest.mark.description(
+        (
+            "Benchmark filter metadata must require authentication.\n"
+            "\n"
+            "Test cases:\n"
+            "- A request without a bearer session receives 401."
+        )
+    )
     def test_filter_options_unauth_401(self, client: TestClient) -> None:
-        """Benchmark filter metadata must require authentication.
-
-        Test cases:
-        - A request without a bearer session receives 401.
-        """
         response = client.get("/benchmarks/filter-options")
 
         assert response.status_code == 401

@@ -1,15 +1,14 @@
-"""Sentry metric helpers with low-cardinality attribute normalization."""
-
 import logging
 from collections.abc import Mapping
+from enum import StrEnum
 from typing import Any
 
 from sentry_sdk import metrics as _sentry_metrics
 
+from tracker.logging.context import sandbox_provider_var
+
 logger = logging.getLogger(__name__)
 
-# High-cardinality diagnostic fields belong in logs, spans, or Sentry context,
-# not metric attributes where they create one time series per task/session/etc.
 _BANNED_TAG_KEYS = {
     "benchmark_id",
     "command",
@@ -22,9 +21,17 @@ _BANNED_TAG_KEYS = {
     "task_id",
 }
 
+TASK_OUTCOME_METRIC = "valkyrie.task.outcome"
+
+
+class TaskOutcome(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNHANDLED_ERROR = "unhandled_error"
+
 
 def _normalize(tags: Mapping[str, Any] | None) -> dict[str, str]:
-    """Convert metric tags to low-cardinality Sentry metric attributes."""
     if not tags:
         return {}
 
@@ -44,7 +51,6 @@ def _normalize(tags: Mapping[str, Any] | None) -> dict[str, str]:
 
 
 def incr(name: str, value: float = 1, tags: Mapping[str, Any] | None = None) -> None:
-    """Increment a Sentry counter metric without letting metric failures escape."""
     try:
         _sentry_metrics.count(name, value, attributes=_normalize(tags))
     except Exception as e:
@@ -52,7 +58,6 @@ def incr(name: str, value: float = 1, tags: Mapping[str, Any] | None = None) -> 
 
 
 def distribution(name: str, value: float, tags: Mapping[str, Any] | None = None) -> None:
-    """Record a Sentry distribution metric without letting metric failures escape."""
     try:
         _sentry_metrics.distribution(name, value, attributes=_normalize(tags))
     except Exception as e:
@@ -60,8 +65,14 @@ def distribution(name: str, value: float, tags: Mapping[str, Any] | None = None)
 
 
 def gauge(name: str, value: float, tags: Mapping[str, Any] | None = None) -> None:
-    """Record a Sentry gauge metric without letting metric failures escape."""
     try:
         _sentry_metrics.gauge(name, value, attributes=_normalize(tags))
     except Exception as e:
         logger.warning("metric gauge(%s) failed: %s: %s", name, type(e).__name__, e)
+
+
+def record_task_outcome(outcome: TaskOutcome, tags: Mapping[str, Any] | None = None) -> None:
+    incr(
+        TASK_OUTCOME_METRIC,
+        tags={"outcome": outcome, "sandbox_provider": sandbox_provider_var.get() or None, **(tags or {})},
+    )

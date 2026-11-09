@@ -1,5 +1,4 @@
-"""One-task launcher idempotency and failure classification."""
-
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -24,6 +23,9 @@ def ecs_launcher_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.description(
+    "After an ambiguous ECS error, `RunTask` is retried with the same client token and one task ARN is recorded."
+)
 @pytest.mark.asyncio
 async def test_ecs_retries_ambiguous_error_with_same_token_and_records_one_arn(
     monkeypatch: pytest.MonkeyPatch, ecs_launcher_env: None
@@ -59,6 +61,7 @@ async def test_ecs_retries_ambiguous_error_with_same_token_and_records_one_arn(
     assert recorded == [(dispatch_id, "arn:task:runner")]
 
 
+@pytest.mark.description("A definite ECS launch failure records no ARN.")
 @pytest.mark.asyncio
 async def test_ecs_rejects_definitive_failure_without_recording_arn(
     monkeypatch: pytest.MonkeyPatch, ecs_launcher_env: None
@@ -75,6 +78,7 @@ async def test_ecs_rejects_definitive_failure_without_recording_arn(
     record.assert_not_called()
 
 
+@pytest.mark.description("An accepted ECS launch survives a failure to save its ARN.")
 @pytest.mark.asyncio
 async def test_ecs_accepted_launch_survives_arn_write_failure(
     monkeypatch: pytest.MonkeyPatch, ecs_launcher_env: None
@@ -95,10 +99,14 @@ async def test_ecs_accepted_launch_survives_arn_write_failure(
     assert "arn:task:accepted" in log_exception.call_args.args
 
 
+@pytest.mark.description(
+    "The local launcher starts one detached executor process with the Tracker environment off the event loop thread."
+)
 @pytest.mark.asyncio
 async def test_local_launcher_spawns_one_detached_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
-    popen = Mock()
+    spawn_threads: list[int] = []
+    popen = Mock(side_effect=lambda *_args, **_kwargs: spawn_threads.append(threading.get_ident()))
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
     dispatch_id = uuid4()
 
@@ -109,8 +117,10 @@ async def test_local_launcher_spawns_one_detached_executor(monkeypatch: pytest.M
         start_new_session=True,
         env=launcher.os.environ,
     )
+    assert spawn_threads != [threading.get_ident()]
 
 
+@pytest.mark.description("The launched ECS task ARN is stored in `ExecutorDispatch.ecs_task_arn`.")
 @pytest.mark.asyncio
 async def test_ecs_task_arn_persists_on_dispatch_row(
     monkeypatch: pytest.MonkeyPatch,
@@ -152,6 +162,7 @@ async def test_ecs_task_arn_persists_on_dispatch_row(
         assert stored.ecs_task_arn == "arn:task:persisted"
 
 
+@pytest.mark.description("A launch needs the release's task definition.")
 def test_launch_requires_the_release_task_definition(
     monkeypatch: pytest.MonkeyPatch,
     database_session: Session,

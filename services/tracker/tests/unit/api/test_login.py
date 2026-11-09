@@ -47,6 +47,7 @@ def access_keys(monkeypatch: pytest.MonkeyPatch) -> _LoadableAccessKeys:
     return fake
 
 
+@pytest.mark.description("Login settings need a configured CLI client.")
 def test_login_settings_need_a_cli_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("tracker.api.login.AUTH_REQUIRED", True)
     monkeypatch.setattr("tracker.api.login.DESCOPE_PROJECT_ID", "P123")
@@ -66,6 +67,7 @@ def test_login_settings_need_a_cli_client(monkeypatch: pytest.MonkeyPatch) -> No
     }
 
 
+@pytest.mark.description("`whoami` reports the credential in use.")
 @pytest.mark.parametrize(
     ("identity", "credential"),
     [({}, "login"), ({"access_key_id": "K1"}, "access_key")],
@@ -87,6 +89,7 @@ def test_whoami_reports_the_credential(
     }
 
 
+@pytest.mark.description("Logged in users create expiring keys scoped to their org.")
 def test_logged_in_users_create_org_scoped_expiring_keys(access_keys: _LoadableAccessKeys) -> None:
     response = _client.post("/access-keys", json={"name": "ci", "expires_in_days": 7})
 
@@ -99,6 +102,23 @@ def test_logged_in_users_create_org_scoped_expiring_keys(access_keys: _LoadableA
     assert created["expire_time"] == pytest.approx(time.time() + 7 * 86400, abs=60)
 
 
+@pytest.mark.description("A key created read-only carries the read-only claim.")
+def test_read_only_keys_carry_the_read_only_claim(access_keys: _LoadableAccessKeys) -> None:
+    response = _client.post("/access-keys", json={"name": "dashboard", "read_only": True})
+
+    assert response.status_code == 200, response.text
+    [created] = access_keys.created
+    assert created["custom_claims"] == {
+        "user_id": "U-alice",
+        "valkyrie_user_key": True,
+        "email": "alice@example.com",
+        "valkyrie_read_only": True,
+    }
+
+
+@pytest.mark.description(
+    "Deleting another user's or a missing access key fails, and deleting one's own key returns 204."
+)
 @pytest.mark.parametrize("descope_status", [404, 503])
 def test_users_revoke_only_their_own_keys(access_keys: _LoadableAccessKeys, descope_status: int) -> None:
     access_keys.missing_status = descope_status

@@ -1,8 +1,3 @@
-"""Secret storage SDK requests and typed responses.
-
-Run: uv run pytest tests/unit/sdk/test_secrets_resource.py
-"""
-
 import json
 from collections.abc import Callable
 
@@ -14,6 +9,7 @@ from valkyrie.sdk import SecretEntry, SecretsResponse, ValkyrieClient
 _REFERENCE = "valkyrie/tenants/00000000-0000-0000-0000-000000000001/daytona"
 
 
+@pytest.mark.description("Secret methods send the value only in the body and raise for an invalid name.")
 async def test_requests_send_the_value_in_the_body_and_reject_bad_names(
     make_client: Callable[..., ValkyrieClient],
 ) -> None:

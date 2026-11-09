@@ -1,5 +1,3 @@
-"""PostgreSQL protection for project deletion races."""
-
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -20,6 +18,7 @@ from tracker.database.models import DEFAULT_ORG_NAME, Org, Project, RunProject, 
 from tracker.database.session import get_session
 
 
+@pytest.mark.description("A project can be created, edited, and deleted over HTTP against Postgres.")
 def test_project_create_edit_delete_http_lifecycle_uses_postgres(
     monkeypatch: pytest.MonkeyPatch,
     postgres_session: Session,
@@ -68,6 +67,7 @@ def test_project_create_edit_delete_http_lifecycle_uses_postgres(
     assert listed.json() == {"projects": []}
 
 
+@pytest.mark.description("When a concurrent run link wins, the project delete returns 409.")
 def test_concurrent_link_wins_and_project_delete_returns_conflict(
     monkeypatch: pytest.MonkeyPatch,
     postgres_engine: Engine,
@@ -114,6 +114,9 @@ def test_concurrent_link_wins_and_project_delete_returns_conflict(
         assert len(session.exec(select(RunProject)).all()) == 1
 
 
+@pytest.mark.description(
+    "When a project delete commits first, a concurrent run link fails and no `RunProject` row is left."
+)
 def test_project_delete_wins_and_concurrent_link_cannot_commit(postgres_engine: Engine) -> None:
     _, benchmark_id, project_id = _seed_linkable_project(postgres_engine)
     start = Event()

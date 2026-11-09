@@ -1,8 +1,3 @@
-"""Sandbox provider and run settings SDK requests and typed responses.
-
-Run: uv run pytest tests/unit/sdk/test_settings_resource.py
-"""
-
 import json
 from collections.abc import Callable
 
@@ -20,6 +15,7 @@ _SETTINGS = {
 }
 
 
+@pytest.mark.description("Settings requests use the settings routes and reject dot names.")
 async def test_requests_hit_the_settings_routes_and_reject_dot_names(
     make_client: Callable[..., ValkyrieClient],
 ) -> None:

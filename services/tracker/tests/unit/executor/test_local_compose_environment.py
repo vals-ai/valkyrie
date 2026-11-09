@@ -1,5 +1,4 @@
-"""Local Compose must supply the executor's required environment."""
-
+import pytest
 import ast
 from pathlib import Path
 
@@ -25,14 +24,13 @@ def _environment_keys(source: Path) -> set[str]:
     }
 
 
+@pytest.mark.description("The compose file's `tracker` service defines every setting the local executor needs.")
 def test_compose_tracker_supplies_local_executor_environment() -> None:
     executor_keys = _environment_keys(EXECUTOR_SOURCE / "entrypoint.py")
     launcher_keys = _environment_keys(EXECUTOR_SOURCE / "launcher.py")
-    # ECS-only override settings are not needed on the local launch path.
     required = (executor_keys - {"ECS_CONTAINER_METADATA_URI_V4"}) | {
         key for key in launcher_keys if not key.startswith("EXECUTOR_RUNNER_")
     }
-    # The local payload key is read with .get(), but is required for the local encryption mode.
     required.add("EXECUTOR_PAYLOAD_LOCAL_KEY")
 
     compose = yaml.safe_load((TRACKER_ROOT / "docker-compose.yml").read_text())

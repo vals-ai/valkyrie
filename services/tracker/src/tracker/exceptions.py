@@ -1,5 +1,3 @@
-"""Custom exceptions for the tracker service."""
-
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -9,10 +7,7 @@ if TYPE_CHECKING:
 
 
 class TrackerServiceError(Exception):
-    """Base exception for all tracker service errors."""
-
     include_cause_in_task_error = True
-    #: Whether a retry is expected to succeed. ``None`` when the raiser cannot tell.
     transient: bool | None = None
 
     def __init__(self, *args: object, transient: bool | None = None) -> None:
@@ -22,22 +17,18 @@ class TrackerServiceError(Exception):
 
 
 class CreditedTaskWallTimeExceeded(TrackerServiceError):
-    """A task exceeded its whole-task wall deadline."""
+    pass
 
 
 class ExecutionAuthorityRevoked(TrackerServiceError):
-    """The executor dispatch no longer owns benchmark execution."""
+    pass
 
 
 class BundlerError(Exception):
-    """Exception raised for agent contract bundler errors."""
-
     pass
 
 
 class ContractValidationError(ValueError):
-    """Formats a Pydantic ValidationError into user-friendly messages."""
-
     FORMATTERS: dict[str, str] = {
         "missing": "'{field}' is required but was not provided",
         "literal_error": "'{field}' has an invalid value. {msg}",
@@ -58,97 +49,83 @@ class ContractValidationError(ValueError):
 
 
 class SandboxError(TrackerServiceError):
-    """Exception raised for sandbox-related errors."""
-
     def __str__(self) -> str:
         return "Sandbox error: " + super().__str__()
 
 
 class InvalidSandboxConfigurationError(SandboxError):
-    """Exception raised for deterministic sandbox configuration errors."""
-
     transient = False
 
 
 class OutputArtifactError(TrackerServiceError):
-    """Exception raised when a declared output artifact is missing or invalid."""
-
     transient = False
+
+    def __init__(self, *args: object, missing: bool = False, transient: bool | None = None) -> None:
+        super().__init__(*args, transient=transient)
+        self.missing = missing
 
     def __str__(self) -> str:
         return "Output artifact error: " + super().__str__()
 
 
 class AgentRunFailedError(SandboxError):
-    """Exception raised when the agent process inside a healthy sandbox exits non-zero.
-
-    Distinct from infra-caused SandboxErrors. Sandbox retries don't help these
-    and they should be triaged separately from real infra failures.
-    """
-
     transient = False
 
 
+class EpisodeOrchestratorFailedError(AgentRunFailedError):
+    pass
+
+
 class ControlledGenerationError(SandboxError):
-    """Controlled generation failed after workload construction and is not retryable."""
+    pass
 
 
 class ControlledGenerationTerminationUnconfirmedError(ControlledGenerationError):
-    """Controlled generation termination could not be positively confirmed."""
+    pass
 
 
 class GenerationTerminationUnconfirmedError(ControlledGenerationTerminationUnconfirmedError):
-    """The generation deadline expired without confirmed workload termination."""
+    pass
+
+
+class GenerationContainmentUnavailableError(SandboxError):
+    transient = True
 
 
 class SandboxDNSResolutionError(SandboxError):
-    """The sandbox could not resolve the agent's model gateway after the agent failed."""
-
     transient = True
 
 
 class SandboxSetupError(SandboxError):
-    """Exception raised when sandbox setup fails after all retry attempts — triggers a new sandbox."""
-
     transient = True
-    #: Phase the attempt had reached, set by the task loop when it hands the task back for a fresh sandbox.
     phase: "FailurePhase | None" = None
-    #: Cause of the failure that triggered the fresh sandbox, carried to the retry and final error rows.
     cause_code: str | None = None
 
 
 class DependencySetupExhaustedError(SandboxSetupError):
-    """Dependency setup exhausted in-place retries and needs one clean sandbox."""
+    pass
 
 
 class SSLConnectionError(SandboxSetupError):
-    """Exception raised when a sandbox command fails due to an SSL/TLS connection error (curl exit code 35)."""
+    pass
 
 
 class S3Error(TrackerServiceError):
-    """Exception raised for S3 storage operation errors."""
-
     def __str__(self) -> str:
         return "S3 error: " + super().__str__()
 
 
 class CloudWatchError(TrackerServiceError):
-    """Exception raised for CloudWatch operation errors."""
-
     def __str__(self) -> str:
         return "CloudWatch error: " + super().__str__()
 
 
 class LambdaError(TrackerServiceError):
-    """Exception raised for Lambda operation errors."""
-
     def __str__(self) -> str:
         return "Lambda error: " + super().__str__()
 
 
 class SecretsError(TrackerServiceError):
-    """Exception raised for Secret operation errors."""
-
     include_cause_in_task_error = False
 
     def __str__(self) -> str:
@@ -156,4 +133,36 @@ class SecretsError(TrackerServiceError):
 
 
 class SecretNotFoundError(SecretsError):
-    """The named secret doesn't exist, or the caller may not read it."""
+    pass
+
+
+class ProjectHandleTakenError(TrackerServiceError):
+    def __init__(self, handle: str) -> None:
+        super().__init__(f"Project '{handle}' already exists")
+
+
+class ProjectNameTakenError(TrackerServiceError):
+    def __init__(self, holder_name: str, holder_handle: str) -> None:
+        super().__init__(
+            f"A project named '{holder_name}' already exists (handle {holder_handle}). Choose another name."
+        )
+
+
+class BenchmarkNameTakenError(TrackerServiceError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"Benchmark '{name}' already exists")
+
+
+class BenchmarkHasDatasetsError(TrackerServiceError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"Benchmark '{name}' still has active datasets")
+
+
+class ResourceArchivedError(TrackerServiceError):
+    def __init__(self, kind: str, name: str) -> None:
+        super().__init__(f"{kind} '{name}' is archived; restore it first")
+
+
+class DatasetNameTakenError(TrackerServiceError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"Dataset '{name}' already exists")

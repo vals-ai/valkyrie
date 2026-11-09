@@ -1,8 +1,3 @@
-"""Secret CLI behavior through the real SDK and a mock Tracker.
-
-Run: uv run pytest tests/unit/cli/test_secret.py
-"""
-
 import io
 import json
 from collections.abc import Callable
@@ -37,6 +32,9 @@ def requests(tracker: MockTracker) -> list[httpx.Request]:
     return tracker.requests
 
 
+@pytest.mark.description(
+    "`secret set` sends the trimmed value in the body only and prints the reference, not the value."
+)
 @pytest.mark.parametrize("stdin", ['{"api_key": "s3cret"}\n', '  {"api_key": "s3cret"}\r\n\n'])
 def test_set_sends_the_trimmed_value_only_in_the_body(
     invoke: Callable[..., Result], requests: list[httpx.Request], stdin: str
@@ -52,6 +50,7 @@ def test_set_sends_the_trimmed_value_only_in_the_body(
     assert _REFERENCE in result.output
 
 
+@pytest.mark.description("On a terminal, `secret set` reads the value from a hidden prompt and never echoes it.")
 def test_set_reads_a_hidden_prompt_on_a_terminal(
     invoke: Callable[..., Result], requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -68,6 +67,7 @@ def test_set_reads_a_hidden_prompt_on_a_terminal(
     assert "tok-123" not in result.output
 
 
+@pytest.mark.description("`secret set` with an empty value or bad name exits nonzero and sends nothing.")
 @pytest.mark.parametrize(("name", "stdin"), [("daytona", " \n"), ("..", "value"), ("a/b", "value")])
 def test_set_rejects_empty_values_and_bad_names_without_a_request(
     invoke: Callable[..., Result], requests: list[httpx.Request], name: str, stdin: str
@@ -78,6 +78,7 @@ def test_set_rejects_empty_values_and_bad_names_without_a_request(
     assert requests == []
 
 
+@pytest.mark.description("`secret list` prints each secret's name and store reference.")
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_list_shows_names_and_references(invoke: Callable[..., Result], output_format: str) -> None:
     result = invoke("list", "--format", output_format)
@@ -89,6 +90,7 @@ def test_list_shows_names_and_references(invoke: Callable[..., Result], output_f
         assert "daytona" in result.output and _REFERENCE in result.output
 
 
+@pytest.mark.description("`secret remove` sends the DELETE only after the user confirms.")
 @pytest.mark.parametrize(
     ("arguments", "answer", "deleted"), [(["-y"], None, True), ([], "y\n", True), ([], "n\n", False)]
 )

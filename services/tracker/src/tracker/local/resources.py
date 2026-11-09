@@ -1,5 +1,3 @@
-"""Persisted resource locations for local execution."""
-
 from pathlib import Path
 
 from pydantic import BaseModel, field_validator, model_validator
@@ -25,5 +23,4 @@ class LocalResources(BaseModel, frozen=True):
 
 
 def reads_secrets_file(properties: object) -> bool:
-    """Return whether a run reads secret values from a local file instead of named secrets in a store."""
     return isinstance(properties, LocalResources) and properties.secrets_manager_region is None

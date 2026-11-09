@@ -7,7 +7,12 @@ from valkyrie.cli.client import call
 
 @click.command(
     name="tasks",
-    help="Save task IDs for a benchmark dataset. \n\nExample:\nvalkyrie benchmark tasks swebench --dataset default",
+    help=(
+        "Export the task IDs of a benchmark dataset.\n"
+        "\n"
+        "Example:\n"
+        "    valkyrie benchmark tasks swebench --dataset default"
+    ),
 )
 @click.argument("benchmark_name", type=str)
 @click.option(
@@ -15,7 +20,7 @@ from valkyrie.cli.client import call
     type=str,
     required=False,
     default=None,
-    help="Dataset name to fetch from the benchmark service (defaults to 'default')",
+    help="Dataset name to fetch from the benchmark service (defaults to 'default').",
 )
 @click.option(
     "--header",
@@ -24,7 +29,7 @@ from valkyrie.cli.client import call
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential)",
+    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential).",
 )
 @click.option(
     "--ignore-custom-services",
@@ -47,9 +52,6 @@ def tasks(
     ignore_custom_services: bool,
     output: Path | None,
 ):
-    """
-    Save task IDs for a benchmark dataset.
-    """
     task_ids = call(
         lambda client: client.services.task_ids(
             benchmark_name,

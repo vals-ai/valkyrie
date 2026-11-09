@@ -1,5 +1,3 @@
-"""Exercise the real install wrapper, output streaming, and exit handling in a terminal."""
-
 import asyncio
 import os
 import shutil
@@ -53,6 +51,7 @@ def terminal_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
                 os.killpg(child_group, signal.SIGKILL)
 
 
+@pytest.mark.description("The agent installer ends at a terminal state or its deadline.")
 @pytest.mark.skipif(shutil.which("timeout") is None, reason="GNU timeout is required")
 @pytest.mark.parametrize(
     "install_command, expected_error",
@@ -76,11 +75,19 @@ async def test_installer_terminal_and_deadline(
         message = "exit code 7" if expected_error is AgentRunFailedError else "timed out after 1 seconds"
         with pytest.raises(expected_error, match=message):
             await install_agent_dependencies(
-                terminal_sandbox, contract, lambda _message: None, DependencySetupMode.FINAL_FRESH_SANDBOX
+                terminal_sandbox,
+                contract,
+                lambda _message: None,
+                DependencySetupMode.FINAL_FRESH_SANDBOX,
+                log_line=lambda _message: None,
             )
     else:
         await install_agent_dependencies(
-            terminal_sandbox, contract, lambda _message: None, DependencySetupMode.FINAL_FRESH_SANDBOX
+            terminal_sandbox,
+            contract,
+            lambda _message: None,
+            DependencySetupMode.FINAL_FRESH_SANDBOX,
+            log_line=lambda _message: None,
         )
         assert (tmp_path / "installed.txt").read_text() == "installed"
 

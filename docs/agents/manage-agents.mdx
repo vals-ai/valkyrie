@@ -13,8 +13,9 @@ from the library with `--agent`. Every agent needs a valid
 valkyrie agent push ./agents/my-agent
 ```
 
-The agent is saved under the `name` in its contract. To save it under another name, for example to keep two versions, pass `--name`. Uploading to a name that exists replaces that agent,
-and runs that start afterwards use the new version.
+The agent is saved under the `name` in its contract. To save it under another name, for
+example to keep two versions, pass `--name`. Uploading to a name that exists replaces that
+agent, and runs that start afterwards use the new version.
 
 ## Install an agent from GitHub
 
@@ -23,8 +24,8 @@ valkyrie agent install https://github.com/acme/my-agent
 ```
 
 The Valkyrie CLI clones the repository on your machine with Git, including submodules, and
-uploads it. A `/tree/BRANCH/FOLDER` URL installs only *`FOLDER`* from branch *`BRANCH`*. Submodules must be HTTPS
-GitHub repositories, and the branch name can't contain `/`.
+uploads it. A `/tree/BRANCH/FOLDER` URL installs only *`FOLDER`* from branch *`BRANCH`*.
+Submodules must be HTTPS GitHub repositories.
 
 ## List agents
 
@@ -32,7 +33,8 @@ GitHub repositories, and the branch name can't contain `/`.
 valkyrie agent list
 ```
 
-Page through the list with **h** and **l**, and quit with **q**. To print every agent without paging, add `--all`. For scripts, add `--format json`.
+Page through the list with **h** and **l**, and quit with **q**. To print every agent
+without paging, add `--all`. For scripts, add `--format json`.
 
 ## Download an agent
 
@@ -62,6 +64,10 @@ confirm first.
 - An agent can be at most 1 GiB compressed, 5 GiB extracted, and 100,000 files and
   directories. A larger upload fails with HTTP 413.
 - `valkyrie run start --agent ./path` uploads a local directory under its contract name, and
-  fails if an agent of that name exists. To replace one, use `valkyrie agent push`.
+  fails if an agent of that name exists. To test a local copy, publish it under another name
+  with `valkyrie agent push ./path --name NEW_NAME`, where *`NEW_NAME`* is a name not in
+  your library. Plain `valkyrie agent push ./path` replaces the published agent.
+- A bare name such as `--agent my-agent` always runs the published agent, even when a
+  directory of that name exists, so give a local directory as a path.
 
 To manage agents from Python, use [`client.agents`](/reference/sdk/agents).

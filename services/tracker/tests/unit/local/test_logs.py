@@ -1,10 +1,6 @@
-"""Local logs survive reopening and retain earlier task attempts.
-
-Run: pytest tests/unit/local/test_logs.py
-"""
-
 import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
@@ -13,9 +9,20 @@ from uuid import uuid4
 import pytest
 
 from tracker.local.logs import FilesystemLogs
-from tracker.runtime.logs import LogProviderError, RunLogReference, TaskLogReference, task_log_stream_name
+from tracker.runtime.logs import (
+    LogProviderError,
+    RunLogReference,
+    TaskLogLine,
+    TaskLogReference,
+    task_log_stream_name,
+)
 
 
+def _lines(*messages: str) -> list[TaskLogLine]:
+    return [TaskLogLine(received_at=time.time(), message=message, fields={}) for message in messages]
+
+
+@pytest.mark.description("Local logs page by attempt, apply filters, and reopen cleanly.")
 async def test_attempts_pagination_filters_and_reopening(tmp_path: Path) -> None:
     logs = FilesystemLogs(tmp_path)
     run_id = uuid4()
@@ -23,8 +30,8 @@ async def test_attempts_pagination_filters_and_reopening(tmp_path: Path) -> None
     await logs.create_benchmark(str(run_id), retention_days=30)
     for index in range(3):
         stream = task_log_stream_name("group/task:one", started + timedelta(seconds=index))
-        logs.write(f"{run_id}:{stream}", f"attempt {index}")
-    logs.write(f"{run_id}:{task_log_stream_name('other', started)}", "another task")
+        logs.write(f"{run_id}:{stream}", _lines(f"attempt {index}"))
+    logs.write(f"{run_id}:{task_log_stream_name('other', started)}", _lines("another task"))
 
     reopened = FilesystemLogs(tmp_path)
     reference = TaskLogReference(run_id, "group/task:one", started + timedelta(seconds=2))
@@ -41,31 +48,35 @@ async def test_attempts_pagination_filters_and_reopening(tmp_path: Path) -> None
     assert reopened.benchmark_location(str(run_id)) == str(tmp_path / str(run_id) / "logs.jsonl")
 
 
+@pytest.mark.description("Concurrent log writes are all read, including while following.")
 async def test_concurrent_writes_and_follow(tmp_path: Path) -> None:
     logs = FilesystemLogs(tmp_path)
     run_id = uuid4()
     started = datetime.now(UTC)
     await logs.create_benchmark(str(run_id), retention_days=30)
     stream_key = f"{run_id}:{task_log_stream_name('task', started)}"
-    await asyncio.gather(*(asyncio.to_thread(logs.write, stream_key, str(index)) for index in range(20)))
+    await asyncio.gather(*(asyncio.to_thread(logs.write, stream_key, _lines(str(index))) for index in range(20)))
     reference = TaskLogReference(run_id, "task", started)
     iterator = logs.stream_task(reference, poll_interval=0.01)
     received = [await anext(iterator) for _ in range(20)]
     assert {event.message for event in received} == {str(index) for index in range(20)}
-    logs.write(stream_key, "new output")
+    logs.write(stream_key, _lines("new output"))
     assert (await asyncio.wait_for(anext(iterator), timeout=2)).message == "new output"
     await iterator.aclose()
 
 
+@pytest.mark.description(
+    "Local log cursors resume after filtered lines and skip partial records until they are complete."
+)
 async def test_byte_cursors_skip_filtered_logs_and_wait_for_complete_records(tmp_path: Path) -> None:
     logs = FilesystemLogs(tmp_path)
     run_id = uuid4()
     started = datetime.now(UTC)
     await logs.create_benchmark(str(run_id), retention_days=0)
     stream_key = f"{run_id}:{task_log_stream_name('task', started)}"
-    logs.write(stream_key, "match café\nsecond line")
-    logs.write(stream_key, "filtered out")
-    logs.write(stream_key, "match again")
+    logs.write(stream_key, _lines("match café\nsecond line"))
+    logs.write(stream_key, _lines("filtered out"))
+    logs.write(stream_key, _lines("match again"))
     path = Path(logs.benchmark_location(str(run_id)))
     records = path.read_bytes().splitlines(keepends=True)
     path.write_bytes(b"".join(records[:-1]) + records[-1][:-1])
@@ -86,6 +97,7 @@ async def test_byte_cursors_skip_filtered_logs_and_wait_for_complete_records(tmp
     assert len((await logs.fetch(reference, start_time=started)).events) == 3
 
 
+@pytest.mark.description("A malformed local log cursor raises `LogProviderError`.")
 @pytest.mark.parametrize("cursor", ["-1", "not-a-byte-offset"])
 async def test_invalid_cursors_are_reported_as_log_errors(tmp_path: Path, cursor: str) -> None:
     logs = FilesystemLogs(tmp_path)
@@ -94,6 +106,7 @@ async def test_invalid_cursors_are_reported_as_log_errors(tmp_path: Path, cursor
         await logs.fetch(RunLogReference(uuid4()), cursor=cursor)
 
 
+@pytest.mark.description("Missing and corrupt log files are handled without crashing the read.")
 async def test_missing_and_corrupt_log_files(tmp_path: Path) -> None:
     logs = FilesystemLogs(tmp_path)
     run_id = uuid4()
@@ -108,6 +121,7 @@ async def test_missing_and_corrupt_log_files(tmp_path: Path) -> None:
         await logs.fetch(reference)
 
 
+@pytest.mark.description("Following logs filters by task, text, and time until the run finishes.")
 async def test_follow_filters_tasks_text_and_time_before_finishing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -152,3 +166,26 @@ async def test_follow_filters_tasks_text_and_time_before_finishing(
     ]
 
     assert [event.message for event in events] == ["wanted result"]
+
+
+@pytest.mark.description(
+    "A strict task stream returns only the current attempt's lines and raises when its source is missing."
+)
+async def test_strict_attempt_reads_only_current_stream_and_reports_missing_source(tmp_path: Path) -> None:
+    logs = FilesystemLogs(tmp_path)
+    run_id = uuid4()
+    started = datetime.now(UTC)
+    reference = TaskLogReference(run_id, "task", started, strict_attempt=True)
+    assert (await logs.fetch(reference)).available is False
+    with pytest.raises(LogProviderError, match="unavailable"):
+        await anext(logs.stream_task(reference))
+
+    await logs.create_benchmark(str(run_id), retention_days=0)
+    logs.write(f"{run_id}:{task_log_stream_name('task', started - timedelta(seconds=1))}", _lines("old attempt"))
+    logs.write(f"{run_id}:{task_log_stream_name('task', started)}", _lines("current attempt"))
+    page = await logs.fetch(reference)
+    assert page.available is True
+    assert [event.message for event in page.events] == ["current attempt"]
+    iterator = logs.stream_task(reference)
+    assert (await anext(iterator)).message == "current attempt"
+    await iterator.aclose()

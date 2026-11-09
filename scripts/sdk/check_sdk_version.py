@@ -1,5 +1,3 @@
-"""Require an SDK version bump when publishable package files change."""
-
 from __future__ import annotations
 
 import argparse
@@ -15,21 +13,18 @@ PACKAGE_ROOT = PACKAGE_PYPROJECT.parent
 
 
 class VersionError(RuntimeError):
-    """The SDK version does not satisfy the release policy."""
+    pass
 
 
 def read_version(contents: bytes) -> Version:
-    """Read a PEP 440 version from pyproject bytes."""
     return Version(tomllib.loads(contents.decode())["project"]["version"])
 
 
 def current_version() -> Version:
-    """Read the SDK version from the working tree."""
     return read_version(PACKAGE_PYPROJECT.read_bytes())
 
 
 def base_version(base_sha: str) -> Version | None:
-    """Read the SDK version at a Git revision, if the package existed."""
     result = subprocess.run(
         ["git", "show", f"{base_sha}:{PACKAGE_PYPROJECT.as_posix()}"],
         check=False,
@@ -41,7 +36,6 @@ def base_version(base_sha: str) -> Version | None:
 
 
 def package_changed(base_sha: str) -> bool:
-    """Return whether publishable SDK files changed from the base revision."""
     result = subprocess.run(
         ["git", "diff", "--name-only", f"{base_sha}..HEAD", "--", PACKAGE_ROOT.as_posix()],
         check=True,
@@ -52,7 +46,6 @@ def package_changed(base_sha: str) -> bool:
 
 
 def validate_version_change(*, base: Version | None, current: Version, distribution_changed: bool) -> None:
-    """Apply initial-release and subsequent semantic version rules."""
     if not distribution_changed:
         return
     if base is None:
@@ -64,8 +57,7 @@ def validate_version_change(*, base: Version | None, current: Version, distribut
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Validate the SDK version against a pull request base SHA."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Require an SDK version bump when publishable package files change.")
     parser.add_argument("base_sha")
     args = parser.parse_args(argv)
 

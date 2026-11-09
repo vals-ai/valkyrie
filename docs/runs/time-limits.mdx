@@ -14,25 +14,20 @@ The benchmark service sets each task's generation limit, usually through `agent_
 [`retrieve_task`](/benchmarks/convert-a-benchmark#describe-the-sandbox). A task with no
 limit can generate for as long as the wall limit allows.
 
-For an ordinary run, the generation interval ends when the sandbox provider confirms the
-agent's process group is absent, not when its result, output, or cleanup arrives. This is
-an observed confirmation, not the physical exit time: it can lag exit, and some providers
-cannot confirm natural absence until their full wait finishes. Creating the sandbox,
-installing the agent, setting the task up, and grading it don't count. In a benchmark that
-[runs the agent several times](/agents/agent-contract#turns), the benchmark reports
-when the agent is working, and slots running side by side share one limit.
+Generation time ends when the sandbox provider confirms the agent's processes have exited,
+not when its output arrives or cleanup ends. The confirmation can come after the actual
+exit, and some providers can't confirm it until their full wait finishes. Creating the
+sandbox, installing the agent, setting the task up, and grading it don't count. In a
+benchmark that [runs the agent several times](/agents/agent-contract#turns), the benchmark
+reports when the agent is working, and slots running side by side share one limit.
 
-At a finite limit, if absence was confirmed strictly before the effective cutoff but
-collection is still pending, Valkyrie waits for the actual result, output, and normal
-run cleanup through the captured cutoff plus 20 seconds. It uses the actual exit status;
-if collection is incomplete by then, the task fails without grading. This window does
-not add another kill grace or bound how long provider teardown can take.
+If the agent exits before the limit while its result and output are still being collected,
+Valkyrie waits up to 20 seconds past the limit for them and keeps the agent's own exit
+status. If collection isn't done by then, the task fails without grading.
 
-Otherwise, including confirmation exactly at the cutoff, Valkyrie stops the agent and
-grades whatever it left after confirming the stop and draining output. The task finishes
-with exit reason `TIMEOUT` and can still pass. Internal control-file cleanup may finish
-asynchronously after a confirmed timeout stop; if the stop cannot be confirmed, the task
-fails without grading.
+Otherwise, including an exit confirmed exactly at the limit, Valkyrie stops the agent and
+grades whatever it left. The task finishes with exit reason `TIMEOUT` and can still pass.
+If Valkyrie can't confirm the agent stopped, the task fails without grading.
 
 ## Wall limit
 

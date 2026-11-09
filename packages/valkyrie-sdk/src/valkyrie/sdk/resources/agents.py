@@ -6,10 +6,11 @@ import asyncio
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, BinaryIO
+from typing import TYPE_CHECKING
 
 import httpx
 
+from valkyrie.sdk._transfer import file_chunks
 from valkyrie.sdk.agent_bundle import (
     DEFAULT_MAX_ARCHIVE_BYTES,
     DEFAULT_MAX_ENTRIES,
@@ -20,16 +21,11 @@ from valkyrie.sdk.agent_bundle import (
     validate_agent_name,
 )
 from valkyrie.sdk.agent_install import checkout_agent
-from valkyrie.sdk.errors import ValkyrieTransportError
+from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieTransportError
 from valkyrie.sdk.models import AgentDownloadURLResponse, AgentEntry, AgentsResponse
 
 if TYPE_CHECKING:
     from valkyrie.sdk.client import ValkyrieClient
-
-
-async def _file_chunks(stream: BinaryIO) -> AsyncIterator[bytes]:
-    while chunk := await asyncio.to_thread(stream.read, 1024 * 1024):
-        yield chunk
 
 
 class AgentsResource:
@@ -68,7 +64,7 @@ class AgentsResource:
                 f"/agents/{agent_name}",
                 AgentEntry,
                 params={"overwrite": overwrite},
-                content=_file_chunks(stream),
+                content=file_chunks(stream),
                 headers={"Content-Type": "application/zip", "Content-Length": str(size)},
             )
 
@@ -92,39 +88,32 @@ class AgentsResource:
         """
         validate_agent_name(name)
         if min(max_archive_bytes, max_expanded_bytes, max_entries) <= 0:
-            raise ValueError("Agent archive limits must be positive")
+            raise ValkyrieInputError("Agent archive limits must be positive")
         directory = Path(output_dir) if output_dir is not None else Path.cwd()
         target = directory / name
         if target.is_symlink() or (target.exists() and (not overwrite or not target.is_dir())):
             raise FileExistsError(f"Target already exists: {target}; use overwrite for an existing directory")
         response = await self.download_url(name)
         try:
-            # A separate client must never inherit Tracker credentials for presigned transfers.
-            async with httpx.AsyncClient(timeout=120) as client:
-                with tempfile.TemporaryFile() as stream:
-                    auth = self._sdk.download_auth(response.download_url)
-                    async with client.stream(
-                        "GET", response.download_url, auth=auth, follow_redirects=auth is None
-                    ) as download:
-                        download.raise_for_status()
-                        downloaded_bytes = 0
-                        async for chunk in download.aiter_bytes(chunk_size=1024 * 1024):
-                            downloaded_bytes += len(chunk)
-                            if downloaded_bytes > max_archive_bytes:
-                                raise ValueError("Agent archive exceeds max_archive_bytes")
-                            await asyncio.to_thread(stream.write, chunk)
-                    await asyncio.to_thread(stream.seek, 0)
+            with tempfile.TemporaryFile() as stream:
+                await self._sdk.download(
+                    response.download_url,
+                    stream,
+                    max_bytes=max_archive_bytes,
+                    too_large="Agent archive exceeds max_archive_bytes",
+                )
+                await asyncio.to_thread(stream.seek, 0)
 
-                    return await asyncio.to_thread(
-                        extract_agent_archive,
-                        stream,
-                        name,
-                        directory,
-                        overwrite=overwrite,
-                        max_archive_bytes=max_archive_bytes,
-                        max_expanded_bytes=max_expanded_bytes,
-                        max_entries=max_entries,
-                    )
+                return await asyncio.to_thread(
+                    extract_agent_archive,
+                    stream,
+                    name,
+                    directory,
+                    overwrite=overwrite,
+                    max_archive_bytes=max_archive_bytes,
+                    max_expanded_bytes=max_expanded_bytes,
+                    max_entries=max_entries,
+                )
         except httpx.HTTPError as error:
             raise ValkyrieTransportError("Agent archive download failed") from error
 
@@ -135,7 +124,7 @@ class AgentsResource:
         return await self._sdk.request_model("DELETE", f"/agents/{name}", AgentEntry)
 
     async def install(self, github_url: str, *, name: str | None = None) -> AgentEntry:
-        """Use local Git to clone an HTTPS GitHub repository or /tree/branch/subfolder URL and push it.
+        """Use local Git to clone an HTTPS GitHub repository or /tree/ref[/subfolder] URL and push it.
 
         name defaults to the contract name and replaces that library alias if it exists.
         """

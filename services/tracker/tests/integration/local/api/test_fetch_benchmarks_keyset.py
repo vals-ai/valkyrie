@@ -1,7 +1,4 @@
-"""Run with `uv run pytest tests/integration/local/api/test_fetch_benchmarks_keyset.py`.
-
-Exercise benchmark keyset pagination through the real app and local database.
-"""
+import pytest
 
 from datetime import datetime, timedelta, timezone
 
@@ -21,7 +18,6 @@ def _seed_benchmarks(
     started_by_email: str | None = None,
     start_status: BenchmarkStatus | None = None,
 ) -> list[Benchmark]:
-    """Persist ordered benchmarks for pagination and filter scenarios."""
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     benchmarks: list[Benchmark] = []
     for benchmark_index in range(count):
@@ -42,19 +38,21 @@ def _seed_benchmarks(
     return benchmarks
 
 
+@pytest.mark.description("Benchmark listing pagination, filters, and response fields.")
 class TestFetchBenchmarks:
-    """Benchmark listing pagination, filters, and response fields."""
-
+    @pytest.mark.description(
+        (
+            "Cursor pagination must return every benchmark once in stable order.\n"
+            "\n"
+            "Test cases:\n"
+            "- Following the next cursor returns the remaining rows without overlap."
+        )
+    )
     def test_keyset_paginates_with_cursor(
         self,
         access_key_client: TestClient,
         database_session: Session,
     ) -> None:
-        """Cursor pagination must return every benchmark once in stable order.
-
-        Test cases:
-        - Following the next cursor returns the remaining rows without overlap.
-        """
         seeded_benchmarks = _seed_benchmarks(database_session, 5)
         first_response = access_key_client.get(
             "/fetch-benchmarks?limit=2&cursor=",
@@ -91,12 +89,40 @@ class TestFetchBenchmarks:
         }
         assert returned_ids == {str(benchmark.id) for benchmark in seeded_benchmarks}
 
-    def test_filter_by_status(self, access_key_client: TestClient, database_session: Session) -> None:
-        """Benchmark listing must apply status filters before pagination.
+    @pytest.mark.description(
+        (
+            "A malformed cursor is a client error.\n"
+            "\n"
+            "Test cases:\n"
+            "- A cursor that does not decode returns 400 instead of a server error."
+        )
+    )
+    def test_invalid_cursor_is_rejected(self, access_key_client: TestClient) -> None:
+        response = access_key_client.get(
+            "/fetch-benchmarks?limit=2&cursor=garbage",
+            headers={"x-api-key": "fake-key"},
+        )
 
-        Test cases:
-        - A status query returns only matching benchmark rows.
-        """
+        assert response.status_code == 400, response.text
+        assert response.json() == {"detail": "Invalid cursor"}
+
+    @pytest.mark.description("A NUL byte in a text filter is a client error, not a Postgres failure.")
+    @pytest.mark.parametrize("query", ["label=%00", "model=gpt%00", "agent_name=a%00b", "started_by=%00"])
+    def test_nul_in_filter_is_rejected(self, access_key_client: TestClient, query: str) -> None:
+        response = access_key_client.get(f"/fetch-benchmarks?{query}", headers={"x-api-key": "fake-key"})
+
+        assert response.status_code == 400, response.text
+        assert response.json() == {"detail": "Filters must not contain NUL characters"}
+
+    @pytest.mark.description(
+        (
+            "Benchmark listing must apply status filters before pagination.\n"
+            "\n"
+            "Test cases:\n"
+            "- A status query returns only matching benchmark rows."
+        )
+    )
+    def test_filter_by_status(self, access_key_client: TestClient, database_session: Session) -> None:
         seeded_benchmarks = _seed_benchmarks(database_session, 4)
         response = access_key_client.get(
             "/fetch-benchmarks?status=IN_PROGRESS",
@@ -110,15 +136,17 @@ class TestFetchBenchmarks:
         }
         assert all(benchmark["status"] == "IN_PROGRESS" for benchmark in response_body["benchmarks"])
 
+    @pytest.mark.description(
+        (
+            "Benchmark listing must exclude rows older than the requested start boundary.\n"
+            "\n"
+            "Test cases:\n"
+            "- The started-after filter returns only newer runs."
+        )
+    )
     def test_filter_by_started_after(self, access_key_client: TestClient, database_session: Session) -> None:
-        """Benchmark listing must exclude rows older than the requested start boundary.
-
-        Test cases:
-        - The started-after filter returns only newer runs.
-        """
         seeded_benchmarks = _seed_benchmarks(database_session, 5)
 
-        # Let HTTPX encode the plus sign in the timezone offset.
         response = access_key_client.get(
             "/fetch-benchmarks",
             params={"started_after": "2026-01-01T00:02:00+00:00"},
@@ -130,16 +158,19 @@ class TestFetchBenchmarks:
             str(benchmark.id) for benchmark in seeded_benchmarks[3:]
         }
 
+    @pytest.mark.description(
+        (
+            "Existing offset clients must keep working alongside cursor pagination.\n"
+            "\n"
+            "Test cases:\n"
+            "- Offset and limit select the expected legacy page."
+        )
+    )
     def test_legacy_offset_limit_still_works(
         self,
         access_key_client: TestClient,
         database_session: Session,
     ) -> None:
-        """Existing offset clients must keep working alongside cursor pagination.
-
-        Test cases:
-        - Offset and limit select the expected legacy page.
-        """
         _seed_benchmarks(database_session, 3)
         response = access_key_client.get(
             "/fetch-benchmarks?offset=0&limit=10",
@@ -150,16 +181,19 @@ class TestFetchBenchmarks:
         assert len(response_body["benchmarks"]) == 3
         assert response_body["total_count"] == 3
 
+    @pytest.mark.description(
+        (
+            "Run attribution must survive the benchmark list serialization path.\n"
+            "\n"
+            "Test cases:\n"
+            "- A persisted starter email is returned in its benchmark table row."
+        )
+    )
     def test_table_row_includes_started_by_email(
         self,
         access_key_client: TestClient,
         database_session: Session,
     ) -> None:
-        """Run attribution must survive the benchmark list serialization path.
-
-        Test cases:
-        - A persisted starter email is returned in its benchmark table row.
-        """
         _seed_benchmarks(database_session, 1, started_by_email="emailtest@x.com")
 
         response = access_key_client.get("/fetch-benchmarks", headers={"x-api-key": "fake-key"})

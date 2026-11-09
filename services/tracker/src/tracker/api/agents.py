@@ -1,5 +1,3 @@
-"""Manage the shared agents/ library through the configured runtime."""
-
 from __future__ import annotations
 
 import asyncio
@@ -70,11 +68,10 @@ async def _file_chunks(stream: BinaryIO) -> AsyncIterator[bytes]:
         yield chunk
 
 
-@router.get("", response_model=AgentsResponse)
+@router.get("", response_model=AgentsResponse, description="List agent zips in the organization's agent library.")
 async def list_agents_endpoint(
     runtime: AgentLibraryRuntimeDependency,
 ) -> AgentsResponse:
-    """List agent zips in the organization's agent library."""
     with _storage_errors():
         agents = await list_agents(runtime.objects)
 
@@ -86,14 +83,17 @@ async def list_agents_endpoint(
     )
 
 
-@router.get("/{name}/download-url", response_model=AgentDownloadURLResponse)
+@router.get(
+    "/{name}/download-url",
+    response_model=AgentDownloadURLResponse,
+    description="Return a download URL for the authorized agent.",
+)
 async def get_agent_download_url(
     name: str,
     runtime: AgentLibraryRuntimeDependency,
     request: Request,
     download: bool = False,
 ) -> AgentDownloadURLResponse | FileResponse:
-    """Return a download URL for the authorized agent."""
     key = _agent_key(name)
     with _storage_errors():
         if not await runtime.objects.exists(key):
@@ -133,6 +133,7 @@ async def get_agent_download_url(
         409: {"description": "Agent already exists"},
         413: {"description": "Configured archive limit exceeded"},
     },
+    description="Validate and publish an agent ZIP, optionally refusing to replace an existing alias.",
 )
 async def push_agent_endpoint(
     name: str,
@@ -140,7 +141,6 @@ async def push_agent_endpoint(
     runtime: AgentLibraryRuntimeDependency,
     overwrite: bool = True,
 ) -> AgentEntry:
-    """Validate and publish an agent ZIP, optionally refusing to replace an existing alias."""
     key = _agent_key(name)
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/zip":
         raise HTTPException(status_code=415, detail="Expected application/zip")
@@ -184,12 +184,12 @@ async def push_agent_endpoint(
     "/{name}",
     response_model=AgentEntry,
     responses={403: {"description": "Storage permission denied"}, 404: {"description": "Agent not found"}},
+    description="Remove an existing ZIP from the organization's agent library.",
 )
 async def remove_agent_endpoint(
     name: str,
     runtime: AgentLibraryRuntimeDependency,
 ) -> AgentEntry:
-    """Remove an existing ZIP from the organization's agent library."""
     key = _agent_key(name)
     with _storage_errors():
         if not await runtime.objects.exists(key):

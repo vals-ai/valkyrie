@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
-from urllib.parse import quote
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 import click
 
-from valkyrie.cli.client import request_tracker
+from valkyrie.cli.client import call
 from valkyrie.cli.display import format_table
 from valkyrie.cli.login import show_organizations
-from valkyrie.sdk import ValkyrieConfig
-from valkyrie.sdk.errors import ValkyrieConfigError
-from valkyrie.sdk.login import LoginSession, SessionAuth
+from valkyrie.sdk import LoginSession, SessionAuth, ValkyrieClient, ValkyrieConfig
+
+Result = TypeVar("Result")
 
 
 def _saved_login() -> LoginSession:
@@ -20,8 +20,8 @@ def _saved_login() -> LoginSession:
     return session
 
 
-def _as_login(method: str, path: str, **kwargs: Any) -> Any:
-    return request_tracker(method, path, auth=SessionAuth(_saved_login()), **kwargs)
+def _as_login(operation: Callable[[ValkyrieClient], Awaitable[Result]]) -> Result:
+    return call(operation, auth=SessionAuth(_saved_login()))
 
 
 def _switch_organization(organization: str) -> None:
@@ -29,8 +29,8 @@ def _switch_organization(organization: str) -> None:
     switched = session.model_copy(update={"tenant": organization, "expires_at": 0.0})
     switched.save()
     try:
-        request_tracker("GET", "/auth/me", auth=SessionAuth(switched))
-    except (click.ClickException, ValkyrieConfigError):
+        call(lambda client: client.account.identity(), auth=SessionAuth(switched))
+    except click.ClickException:
         current = LoginSession.load(session.tracker_url)
         if current is None or current.access_token == session.access_token:
             current = session
@@ -38,84 +38,84 @@ def _switch_organization(organization: str) -> None:
         raise
 
 
-@click.group()
+@click.group(help="Create, join and switch organizations, and manage their members.")
 def org() -> None:
-    """Create, join and switch organizations, and manage their members."""
+    pass
 
 
-@org.command("list")
+@org.command(
+    "list", help="List the organizations your login belongs to. The one marked * is the one your requests act for."
+)
 def org_list() -> None:
-    """List the organizations your login belongs to; * marks the one your requests act for."""
-    show_organizations(_as_login("GET", "/orgs"))
+    show_organizations(_as_login(lambda client: client.account.organizations()))
 
 
-@org.command("create")
+@org.command(
+    "create",
+    help=(
+        "Create an organization, make yourself its admin, and switch to it.\n"
+        "\n"
+        "ORGANIZATION is its ID: 3 to 63 lowercase letters, digits, dots or hyphens."
+    ),
+)
 @click.argument("organization")
-@click.option("--name", "display_name", help="Display name; defaults to the organization ID.")
+@click.option("--name", "display_name", help="Display name. Defaults to the organization ID.")
 def org_create(organization: str, display_name: str | None) -> None:
-    """Create an organization, make yourself its admin, and switch to it.
-
-    ORGANIZATION is its ID: 3 to 63 lowercase letters, digits, dots or hyphens.
-    """
-    created = _as_login("POST", "/orgs", json={"id": organization, "name": display_name})
-    _switch_organization(created["id"])
-    click.echo(f"Created {created['id']} and switched to it. You're its admin.")
+    created = _as_login(lambda client: client.account.create_organization(organization, name=display_name))
+    _switch_organization(created.id)
+    click.echo(f"Created {created.id} and switched to it. You're its admin.")
 
 
-@org.command("use")
+@org.command("use", help="Act for another organization your login belongs to.")
 @click.argument("organization")
 def org_use(organization: str) -> None:
-    """Act for another organization your login belongs to."""
     _switch_organization(organization)
     click.echo(f"Now acting for {organization}.")
 
 
-@org.command("invite")
+@org.command("invite", help="Invite someone to your current organization. Only admins can invite.")
 @click.argument("email")
 def org_invite(email: str) -> None:
-    """Invite someone to your current organization. Only admins can invite."""
-    invited = _as_login("POST", "/orgs/members", json={"email": email})
+    invited = _as_login(lambda client: client.account.invite(email))
     click.echo(
-        f"Invited {invited['email']}. They can join by signing in with `valkyrie login` using that address "
-        f"and running `valkyrie org accept {invited['organization']}`."
+        f"Invited {invited.email}. They can join by signing in with `valkyrie login` using that address "
+        f"and running `valkyrie org accept {invited.organization}`."
     )
 
 
-@org.command("accept")
+@org.command("accept", help="Join an organization that invited you, and switch to it.")
 @click.argument("organization")
 def org_accept(organization: str) -> None:
-    """Join an organization that invited you, and switch to it."""
-    _as_login("POST", f"/orgs/invitations/{quote(organization, safe='')}/accept")
+    _as_login(lambda client: client.account.accept_invitation(organization))
     _switch_organization(organization)
     click.echo(f"Joined {organization} and switched to it.")
 
 
-@org.command("decline")
+@org.command("decline", help="Decline an invitation to an organization.")
 @click.argument("organization")
 def org_decline(organization: str) -> None:
-    """Decline an invitation to an organization."""
-    _as_login("DELETE", f"/orgs/invitations/{quote(organization, safe='')}")
+    _as_login(lambda client: client.account.decline_invitation(organization))
     click.echo(f"Declined the invitation to {organization}.")
 
 
-@org.command("members")
+@org.command("members", help="List the members and pending invitations of your current organization.")
 def org_members() -> None:
-    """List the members and pending invitations of your current organization."""
     rows = [
         {
-            "Email": member.get("email") or "",
-            "Name": member.get("name") or "",
-            "Role": "admin" if member["admin"] else "member",
-            "Status": member["status"],
+            "Email": member.email or "",
+            "Name": member.name or "",
+            "Role": "admin" if member.admin else "member",
+            "Status": member.status,
         }
-        for member in _as_login("GET", "/orgs/members")["members"]
+        for member in _as_login(lambda client: client.account.members()).members
     ]
     format_table(rows, ["Email", "Name", "Role", "Status"], item_name="member")
 
 
-@org.command("remove")
+@org.command(
+    "remove", help="Remove someone from your current organization, or cancel their invitation. Only admins can remove."
+)
 @click.argument("email")
 def org_remove(email: str) -> None:
-    """Remove someone from your current organization, or cancel their invitation. Only admins can remove."""
-    _as_login("DELETE", f"/orgs/members/{quote(email, safe='')}")
+    _as_login(lambda client: client.account.remove_member(email))
     click.echo(f"Removed {email}.")

@@ -1,5 +1,3 @@
-"""Tests for hosted benchmark and task inspection workflows."""
-
 from __future__ import annotations
 
 from uuid import uuid4
@@ -10,6 +8,7 @@ import pytest
 from valkyrie.sdk.models import FetchTasksRequest, Order, TaskStatus
 
 
+@pytest.mark.description("Fetch returns a typed run detail.")
 async def test_fetch_returns_typed_benchmark_detail(make_client) -> None:
     run_id = uuid4()
 
@@ -47,6 +46,9 @@ async def test_fetch_returns_typed_benchmark_detail(make_client) -> None:
     assert result.task_state_counts == {"FINISHED": 1, "IN_PROGRESS": 1}
 
 
+@pytest.mark.description(
+    "`statuses` sends run IDs as one comma-separated value and returns no entries for an empty list."
+)
 async def test_statuses_serializes_ids_as_csv_and_accepts_an_empty_list(make_client) -> None:
     first_id = uuid4()
     second_id = uuid4()
@@ -78,6 +80,7 @@ async def test_statuses_serializes_ids_as_csv_and_accepts_an_empty_list(make_cli
     assert empty.entries == []
 
 
+@pytest.mark.description("Tasks sends typed filters and pagination.")
 async def test_tasks_serializes_typed_filters_and_pagination(make_client) -> None:
     run_id = uuid4()
     task_row_id = uuid4()
@@ -124,6 +127,7 @@ async def test_tasks_serializes_typed_filters_and_pagination(make_client) -> Non
     assert result.tasks[0].status is TaskStatus.ERROR
 
 
+@pytest.mark.description("Task and artifact requests escape the task ID path segment.")
 async def test_task_and_artifacts_escape_task_id_path_segment(make_client) -> None:
     run_id = uuid4()
     task_row_id = uuid4()
@@ -166,6 +170,7 @@ async def test_task_and_artifacts_escape_task_id_path_segment(make_client) -> No
     assert artifacts.agent_output_expires_in == 300
 
 
+@pytest.mark.description("Task methods raise `ValueError` for a blank task ID before any request.")
 @pytest.mark.parametrize("method_name", ["task", "artifacts"])
 async def test_task_methods_reject_blank_task_ids(make_client, method_name: str) -> None:
     async with make_client(lambda _request: pytest.fail("request should not be sent")) as client:
@@ -174,6 +179,7 @@ async def test_task_methods_reject_blank_task_ids(make_client, method_name: str)
             await method(uuid4(), "  ")
 
 
+@pytest.mark.description("Task methods raise `ValueError` for a task ID containing `/`.")
 @pytest.mark.parametrize("method_name", ["task", "artifacts"])
 async def test_task_methods_reject_path_separators(make_client, method_name: str) -> None:
     async with make_client(lambda _request: pytest.fail("request should not be sent")) as client:
@@ -182,6 +188,7 @@ async def test_task_methods_reject_path_separators(make_client, method_name: str
             await method(uuid4(), "suite/task")
 
 
+@pytest.mark.description("Task methods reject dot segments after normalization.")
 @pytest.mark.parametrize("method_name", ["task", "artifacts"])
 @pytest.mark.parametrize("task_id", [".", ".."])
 async def test_task_methods_reject_normalized_dot_segments(make_client, method_name: str, task_id: str) -> None:

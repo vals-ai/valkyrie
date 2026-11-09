@@ -164,21 +164,22 @@ run at once, and the run takes about as long as its slowest task.
 
 ## Where Valkyrie runs
 
-- **Hosted by Vals AI.** This is the default: `valkyrie login` signs you in, and Vals AI runs
-  the Tracker and stores your organization's results. Sandboxes run on your own provider
-  account. To get access, send an email to [contact@vals.ai](mailto:contact@vals.ai).
+- **Hosted by Vals AI.** This is the default: `valkyrie login` signs you in, and Vals AI
+  runs the Tracker and stores your organization's results. Sandboxes run on your own
+  provider account. To get access, send an email to
+  [contact@vals.ai](mailto:contact@vals.ai).
 - **On your machine.** Run the Tracker yourself with no AWS account. See
   [Run Tracker locally](/self-hosting/local-tracker).
 
 ## Paper
 
-Valkyrie is described in
-[Valkyrie: A Microservice-Based Framework for Scalable Evaluation of AI Agents](https://doi.org/10.1145/3786335.3813231)
-(CAIS '26). A reading copy is on [alphaXiv](https://www.alphaxiv.org/abs/valkyrie).
+Valkyrie is described in [Valkyrie: A Microservice-Based Framework for Scalable Evaluation
+of AI Agents](https://doi.org/10.1145/3786335.3813231) (CAIS '26). A reading copy is on
+[alphaXiv](https://www.alphaxiv.org/abs/valkyrie).
 
-The paper ran four agents on SWE-bench Verified and Terminal-Bench 2.0 through Valkyrie, with
-the same sandbox settings for every run and no per-run setup. Their accuracy is consistent
-with the scores on each benchmark's public leaderboard:
+The paper ran four agents on SWE-bench Verified and Terminal-Bench 2.0 through Valkyrie,
+with the same sandbox settings for every run and no per-run setup. Their accuracy is
+consistent with the scores on each benchmark's public leaderboard:
 
 | Agent | SWE-bench Verified | Terminal-Bench 2.0 |
 | --- | --- | --- |

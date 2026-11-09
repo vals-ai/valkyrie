@@ -5,9 +5,9 @@ description: "Require a credential in your benchmark service, and have Valkyrie 
 ---
 
 To keep a deployed benchmark service private, have it answer only callers that hold its
-credential. You set the check in the service, and save the credential in Valkyrie, which sends it with every
-request to that service. This credential is separate from your Valkyrie login and access
-keys.
+credential. You set the check in the service, and save the credential in Valkyrie, which
+sends it with every request to that service. This credential is separate from your
+Valkyrie login and access keys.
 
 Services that Vals AI hosts need none of this: Valkyrie authenticates to them for you.
 
@@ -29,13 +29,15 @@ class MyBenchmark(BenchmarkService):
 ```
 
 Header names arrive in lowercase. Requests that fail the check get `401 Unauthorized`. The
-[create-benchmark-service README](https://github.com/vals-ai/create-benchmark-service#authentication)
-shows how to allow some callers only some datasets.
+[create-benchmark-service
+README](https://github.com/vals-ai/create-benchmark-service#authentication) shows how to
+allow some callers only some datasets.
 
 ## Save the credential with the service
 
 Store the credential as a secret of your organization, exactly as the header carries
-it, such as `Bearer TOKEN`, where *`TOKEN`* is the service's token. Then name the secret when you save the service URL:
+it, such as `Bearer TOKEN`, where *`TOKEN`* is the service's token. Then name the secret
+when you save the service URL:
 
 ```bash
 valkyrie secret set swebench-token

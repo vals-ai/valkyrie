@@ -38,9 +38,9 @@ provider use the mapping.
 
 ## Set up Modal
 
-1. [Create an API token](https://modal.com/docs/reference/modal.config#authentication) under
-   **Settings > Tokens > API tokens**, in the Modal workspace where you want the sandboxes to run.
-   Modal shows the token once, as a command:
+1. [Create an API token](https://modal.com/docs/reference/modal.config#authentication)
+   under **Settings > Tokens > API tokens**, in the Modal workspace where you want the
+   sandboxes to run. Modal shows the token once, as a command:
 
    ```bash
    modal token set --token-id ak-... --token-secret as-...
@@ -72,7 +72,8 @@ A run uses the provider you pass with `--provider`, otherwise your default provi
 otherwise `daytona`:
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --provider modal --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --provider modal \
+  --project my-project
 ```
 
 Set your own default with `valkyrie provider default modal`. The default is yours alone in
@@ -81,12 +82,15 @@ provider's secret and marks your default.
 
 ## Rotate or remove credentials
 
-To replace the credentials, run `valkyrie secret set` again with the new file. The mapping keeps pointing at the same secret. Remove a mapping with `valkyrie provider remove modal`.
+To replace the credentials, run `valkyrie secret set` again with the new file. The mapping
+keeps pointing at the same secret. Remove a mapping with `valkyrie provider remove modal`.
 A run on a provider with no mapping fails with `No secret is set for provider modal`.
 
 ## Limits
 
 - Modal sandboxes last at most 24 hours, so a longer task fails on Modal.
-- Benchmark services built with a create-benchmark-service version earlier than v0.14.0 can't create
-  Modal sandboxes. Their runs fail with `Modal sandbox provider is not implemented`.
-- Docker sandboxes are available only on a [local Tracker](/self-hosting/local-tracker#docker-sandboxes).
+- Benchmark services built with a create-benchmark-service version earlier than v0.14.0
+  can't create Modal sandboxes. Their runs fail with
+  `Modal sandbox provider is not implemented`.
+- Docker sandboxes are available only on a [local
+  Tracker](/self-hosting/local-tracker#docker-sandboxes).

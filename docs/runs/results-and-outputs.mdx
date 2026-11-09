@@ -32,7 +32,8 @@ valkyrie run results RUN_ID --task-ids task_1,task_2
 <Warning>
 
 `--s3` saves the results to the run's storage instead of downloading them. Combined with
-`--task-ids`, it replaces the run's stored result with the subset. To restore the full result, run it again without `--task-ids`.
+`--task-ids`, it replaces the run's stored result with the subset. To restore the full
+result, run it again without `--task-ids`.
 
 </Warning>
 
@@ -42,10 +43,10 @@ valkyrie run results RUN_ID --task-ids task_1,task_2
 valkyrie run outputs RUN_ID
 ```
 
-This downloads and extracts each task's [`final_output` and output artifacts](/agents/agent-contract#output-files)
-into a new directory named after the benchmark, the agent, and the run, such as
-`./swebench_my-agent_RUN_ID`. Choose the directory with `--output-dir`, or only some
-tasks with `--task-ids`:
+This downloads and extracts each task's [`final_output` and output
+artifacts](/agents/agent-contract#output-files) into a new directory named after the
+benchmark, the agent, and the run, such as `./swebench_my-agent_RUN_ID`. Choose the
+directory with `--output-dir`, or only some tasks with `--task-ids`:
 
 ```bash
 valkyrie run outputs RUN_ID --output-dir ./outputs \

@@ -5,7 +5,8 @@ description: "Install the async Python client, list your runs, and handle its er
 ---
 
 The Valkyrie SDK is an async Python client for starting and inspecting runs from your own
-code. It needs Python 3.12 or later, and uses the same login and Tracker as the Valkyrie CLI.
+code. It needs Python 3.12 or later, and uses the same login and Tracker as the Valkyrie
+CLI.
 
 ## Install
 
@@ -16,8 +17,9 @@ uv pip install --exclude-newer "7 days" --exclude-newer-package certifi=false \
   "valkyrie-sdk @ git+https://github.com/vals-ai/Valkyrie@prod#subdirectory=packages/valkyrie-sdk"
 ```
 
-The SDK doesn't install the CLI. Sign in once with [`valkyrie login`](/get-started/configuration#sign-in),
-or set `VALKYRIE_API_KEY` to an [access key](/get-started/configuration#create-an-access-key-for-ci).
+The SDK doesn't install the CLI. Sign in once with
+[`valkyrie login`](/get-started/configuration#sign-in), or set `VALKYRIE_API_KEY` to an
+[access key](/get-started/configuration#create-an-access-key-for-ci).
 
 ## List your runs
 
@@ -37,8 +39,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`ValkyrieClient()` sends requests to the Tracker you last signed in to. To pick the Tracker
-or access key in code, see [Configure the Python SDK](/get-started/configuration#configure-the-python-sdk).
+`ValkyrieClient()` sends requests to the Tracker you last signed in to. To pick the
+Tracker or access key in code, see [Configure the Python
+SDK](/get-started/configuration#configure-the-python-sdk).
 
 ## Handle errors
 
@@ -73,5 +76,6 @@ python docs/sdk/examples/manage_run.py --help
 ## Next steps
 
 - [Manage runs with Python](/sdk/runs) to start, watch, recover, and download runs
-- [Inspect resources with Python](/sdk/resources) for tasks, logs, agents, secrets, and services
+- [Inspect resources with Python](/sdk/resources) for tasks, logs, agents, secrets, and
+  services
 - [Python SDK reference](/reference/sdk) for every method, model, and field

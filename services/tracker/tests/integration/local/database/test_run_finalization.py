@@ -1,13 +1,9 @@
-"""Exercise run-finalization concurrency against disposable Postgres.
-
-Run: uv run pytest tests/integration/local/database/test_run_finalization.py
-"""
-
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from benchmark_service.client import BenchmarkServiceClient
@@ -19,10 +15,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
-import tracker.utils.run_control as run_control_module
-import tracker.utils.run_orchestration as run_orchestration_module
+import tracker.services.runs.stop as run_control_module
+import tracker.services.runs.finalize as run_finalization_module
+import tracker.services.runs.start as run_orchestration_module
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
-from tests.factories import make_benchmark, make_task
+from tests.factories import make_benchmark, make_evaluation_result, make_task
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.database.models import (
@@ -45,16 +42,32 @@ from tracker.executor.dispatch_control import admit_recovery_dispatch, terminali
 from tracker.executor.execution_authority import ExecutionAuthority
 from tracker.executor.release_control import promote_release
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
-from tracker.utils import initiate_stop_benchmark, process_benchmark, reset_to_in_progress_status
-from tracker.utils.reporting import create_final_view
-from tracker.utils.resources import fetch_benchmark_row
-from tracker.utils.task_error_summary import summarize_task_errors
-from tracker.utils.task_execution import TaskMonitor
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.services.runs.start import process_benchmark
+from tracker.services.runs.finalize import fetch_final_score_inputs
+from tracker.services.runs.stop import initiate_stop_benchmark
+from tracker.services.runs.retry import reset_to_in_progress_status
+from tracker.services.final_views import create_final_view
+from tracker.services.benchmarks import fetch_benchmark_row
+from tracker.services.tasks.error_summary import summarize_task_errors
+from tracker.services.tasks.monitor import TaskMonitor
 
 
 @pytest.fixture(autouse=True)
 def managed_execution_runtime(monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime) -> None:
     monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", lambda *_args: aws_runtime)
+
+
+async def _service_ready(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+@pytest.fixture(autouse=True)
+def benchmark_service_ready(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    wait = AsyncMock(side_effect=_service_ready)
+    monkeypatch.setattr(run_orchestration_module, "wait_for_benchmark_service", wait)
+    monkeypatch.setattr(run_orchestration_module, "was_woken", lambda *_args: True)
+    return wait
 
 
 def _execution_context(request: StartBenchmarkRequest, benchmark: Benchmark) -> dict[str, Any]:
@@ -89,14 +102,24 @@ def _patch_process_dependencies(
     upload: Any = _skip_cloud_operation,
 ) -> None:
     monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
+    monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
     monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", _skip_log_group)
     monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", _provider_config)
     monkeypatch.setattr(run_orchestration_module, "upload_final_view", upload)
 
 
+@pytest.mark.description("Run finalization and concurrent retry behavior.")
 class TestRunFinalization:
-    """Run finalization and concurrent retry behavior."""
-
+    @pytest.mark.description(
+        (
+            "All-error finalization must preserve status changes made while errors are summarized.\n"
+            "\n"
+            "Test cases:\n"
+            "- A concurrent retry leaves the run in progress and defers finalization.\n"
+            "- A resumed evaluation that finishes leaves the run in progress for fresh finalization.\n"
+            "- A concurrent stop marks the run stopped without committing an error summary."
+        )
+    )
     async def test_all_error_finalization_honors_concurrent_status_changes(
         self,
         postgres_engine: Engine,
@@ -104,13 +127,6 @@ class TestRunFinalization:
         monkeypatch: pytest.MonkeyPatch,
         executor_authority_kwargs: Any,
     ) -> None:
-        """All-error finalization must preserve status changes made while errors are summarized.
-
-        Test cases:
-        - A concurrent retry leaves the run in progress and defers finalization.
-        - A resumed evaluation that finishes leaves the run in progress for fresh finalization.
-        - A concurrent stop marks the run stopped without committing an error summary.
-        """
         org = Org(id=uuid4(), name=f"error-finalization-race-{uuid4()}")
         contract = AgentContractRequest(name="error-race-agent", install_cmd="true", run_cmd="true")
         target_statuses = {
@@ -160,7 +176,8 @@ class TestRunFinalization:
             return summarize_task_errors(task_errors)
 
         monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr(run_orchestration_module, "summarize_task_errors", change_status_during_summary)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
+        monkeypatch.setattr(run_finalization_module, "summarize_task_errors", change_status_during_summary)
 
         authorities = [
             ExecutionAuthority(
@@ -172,7 +189,7 @@ class TestRunFinalization:
             for benchmark in benchmarks
         ]
         deferred_results = [
-            await run_orchestration_module.finalize_all_error_run(
+            await run_finalization_module.finalize_all_error_run(
                 benchmark.id,
                 org,
                 authority=authority,
@@ -192,6 +209,9 @@ class TestRunFinalization:
         ]
         assert all(benchmark.error_message is None for benchmark in persisted_benchmarks if benchmark)
 
+    @pytest.mark.description(
+        "A dispatch whose authority was revoked by a retry raises `ExecutionAuthorityRevoked` and uploads no final view."
+    )
     async def test_retry_before_final_view_upload_skips_stale_publication(
         self,
         postgres_engine: Engine,
@@ -244,6 +264,7 @@ class TestRunFinalization:
             upload_calls.append(benchmark.id)
 
         monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", record_upload)
 
         runtime = CloudRuntimeFactory.create_runtime(aws_runtime, sandbox_provider_secret_name="test-provider-secret")
@@ -255,20 +276,24 @@ class TestRunFinalization:
         postgres_session.refresh(retry_dispatch)
         assert retry_dispatch.status == ExecutorDispatchStatus.RUNNING
 
+    @pytest.mark.description(
+        (
+            "A retry finishing during finalization must leave the run active without a stale score.\n"
+            "\n"
+            "Test cases:\n"
+            "- A task advances attempt and writes a new result while final_score awaits.\n"
+            "- The old worker leaves the benchmark in progress without writing its stale final score."
+        )
+    )
     async def test_concurrent_retry_prevents_stale_final_evaluation(
         self,
         postgres_engine: Engine,
         postgres_session: Session,
         aws_runtime: AWSRuntime,
         monkeypatch: pytest.MonkeyPatch,
+        benchmark_service_ready: AsyncMock,
         executor_authority_kwargs: Any,
     ) -> None:
-        """A retry finishing during finalization must leave the run active without a stale score.
-
-        Test cases:
-        - A task advances attempt and writes a new result while final_score awaits.
-        - The old worker leaves the benchmark in progress without writing its stale final score.
-        """
         org = Org(id=uuid4(), name=f"finalization-race-{uuid4()}")
         contract = AgentContractRequest(name="race-agent", install_cmd="true", run_cmd="true")
         benchmark = make_benchmark(
@@ -367,6 +392,7 @@ class TestRunFinalization:
             return FinalScoreResponse(tasks_evaluated=[scored_task.task_id], final_score=0.25, metadata={})
 
         monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", skip_cloud_operation)
@@ -398,7 +424,11 @@ class TestRunFinalization:
         assert retry_dispatch is not None
         assert retry_dispatch.status == ExecutorDispatchStatus.QUEUED
         assert final_evaluation is None
+        benchmark_service_ready.assert_awaited_once()
 
+    @pytest.mark.description(
+        "Concurrent additive dispatches compute the final score and upload the final view once, and the run ends `FINISHED`."
+    )
     async def test_only_one_additive_dispatch_calls_final_score(
         self,
         postgres_engine: Engine,
@@ -479,6 +509,7 @@ class TestRunFinalization:
             await both_monitors_arrived.wait()
 
         monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", skip_cloud_operation)
@@ -508,6 +539,7 @@ class TestRunFinalization:
         assert persisted_benchmark.status == BenchmarkStatus.FINISHED
         assert len(final_evaluations) == 1
 
+    @pytest.mark.description("Terminal side effects run while holding the run lock.")
     async def test_terminal_side_effects_hold_benchmark_lock(
         self,
         postgres_engine: Engine,
@@ -593,12 +625,12 @@ class TestRunFinalization:
             return FinalScoreResponse(tasks_evaluated=[task.task_id], final_score=1.0, metadata={})
 
         monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", assert_upload_lock_held)
         monkeypatch.setattr("tracker.aws.services.invoke_lambda", assert_lambda_lock_held)
         monkeypatch.setattr(BenchmarkServiceClient, "final_score", final_score)
-        # Release the fixture connection so separate probe sessions can contend for the row lock.
         postgres_session.close()
 
         await process_benchmark(
@@ -613,6 +645,15 @@ class TestRunFinalization:
         assert lambda_configs[0].read_timeout == 60
         assert lambda_configs[0].retries == {"total_max_attempts": 1}
 
+    @pytest.mark.description(
+        (
+            "All-error finalization should persist one representative per distinct error group.\n"
+            "\n"
+            "Test cases:\n"
+            "- Eight tasks split across API, model-key, and network failures produce three representatives.\n"
+            "- Eight identical failures produce one representative."
+        )
+    )
     async def test_all_error_finalization_returns_distinct_representatives(
         self,
         postgres_engine: Engine,
@@ -621,12 +662,6 @@ class TestRunFinalization:
         monkeypatch: pytest.MonkeyPatch,
         executor_authority_kwargs: Any,
     ) -> None:
-        """All-error finalization should persist one representative per distinct error group.
-
-        Test cases:
-        - Eight tasks split across API, model-key, and network failures produce three representatives.
-        - Eight identical failures produce one representative.
-        """
         org = Org(id=uuid4(), name=f"error-summary-{uuid4()}")
         contract = AgentContractRequest(name="error-summary-agent", install_cmd="true", run_cmd="true")
         grouped_errors = [
@@ -697,6 +732,9 @@ class TestRunFinalization:
             assert persisted_benchmark.status == BenchmarkStatus.ERROR
             assert persisted_benchmark.error_message == expected_summary
 
+    @pytest.mark.description(
+        "A force stop finishing alongside recovery fails the old dispatch, queues the retry, and returns the task to `PENDING`."
+    )
     async def test_force_stop_terminalization_serializes_with_recovery_dispatch(
         self,
         postgres_engine: Engine,
@@ -826,3 +864,26 @@ class TestRunFinalization:
         assert retry_dispatch.status == ExecutorDispatchStatus.QUEUED
         assert persisted_task is not None
         assert persisted_task.status == TaskStatus.PENDING
+
+    @pytest.mark.description("Final scoring uses the newest evaluation attempt of a retried task.")
+    def test_final_score_inputs_use_newest_evaluation_attempt(self, postgres_session: Session) -> None:
+        org = Org(id=uuid4(), name=f"latest-evaluation-{uuid4()}")
+        contract = AgentContractRequest(name="latest-evaluation-agent", install_cmd="true", run_cmd="true")
+        postgres_session.add(org)
+        postgres_session.flush()
+        benchmark = make_benchmark(name="latest-evaluation", org_id=org.id, contract=contract)
+        postgres_session.add(benchmark)
+        postgres_session.flush()
+        now = datetime.now(UTC)
+        task = make_task(benchmark, "retried-task", status=TaskStatus.FINISHED, finished_at=now)
+        postgres_session.add(task)
+        postgres_session.flush()
+        newer = make_evaluation_result(task, f"newer-{task.id}", {"attempt": "new"}, now)
+        older = make_evaluation_result(task, f"older-{task.id}", {"attempt": "old"}, now - timedelta(minutes=5))
+        postgres_session.add_all([newer, older])
+        postgres_session.commit()
+
+        assert BenchmarkRepository(postgres_session).latest_evaluation_results(org.id, benchmark.id) == [
+            (task.id, newer.id, {"attempt": "new"})
+        ]
+        assert fetch_final_score_inputs(postgres_session, benchmark, org) == {"retried-task": {"attempt": "new"}}

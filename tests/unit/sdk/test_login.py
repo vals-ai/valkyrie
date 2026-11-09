@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from valkyrie.sdk import ValkyrieClient, ValkyrieConfig
 from valkyrie.sdk import login as login_module
 from valkyrie.sdk.config import DEFAULT_TRACKER_URL
-from valkyrie.sdk.errors import ValkyrieConfigError
+from valkyrie.sdk.errors import ValkyrieConfigError, ValkyrieTransportError
 from valkyrie.sdk.login import LoginSession, SessionAuth, device_login
 
 TRACKER = "https://tracker.test"
@@ -50,6 +50,7 @@ def _jwt(claims: dict[str, Any]) -> str:
     return f"header.{payload}.signature"
 
 
+@pytest.mark.description("A saved session file has mode `0o600` in a `0o700` folder, and `forget` removes it.")
 def test_sessions_are_saved_to_a_private_file(tmp_path: Path) -> None:
     _session(tenant="acme").save()
 
@@ -66,6 +67,9 @@ def test_sessions_are_saved_to_a_private_file(tmp_path: Path) -> None:
 
 
 class TestCredentialPrecedence:
+    @pytest.mark.description(
+        "A configured API key is used first, then `VALKYRIE_API_KEY`, and a saved login only when neither is set."
+    )
     def test_a_configured_key_then_the_environment_key_beat_a_saved_login(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -80,6 +84,7 @@ class TestCredentialPrecedence:
 
         assert [request.headers["x-api-key"] for request in seen] == ["config-key", "env-key"]
 
+    @pytest.mark.description("Without a key, the saved login is used, and otherwise nothing.")
     def test_the_saved_login_then_nothing(self) -> None:
         assert ValkyrieConfig(url=TRACKER).http_auth() is None
 
@@ -87,6 +92,7 @@ class TestCredentialPrecedence:
         assert isinstance(ValkyrieConfig(url=TRACKER).http_auth(), SessionAuth)
 
 
+@pytest.mark.description("The Tracker URL comes from the config first, then `VALKYRIE_URL`, then the last login.")
 @pytest.mark.parametrize(
     ("config", "environ", "tracker_url"),
     [
@@ -108,6 +114,7 @@ def test_the_tracker_is_the_given_one_then_valkyrie_url_then_the_last_login(
     assert ValkyrieConfig.model_validate(config).url == tracker_url
 
 
+@pytest.mark.description("When `VALKYRIE_URL` is set, an unreadable saved login does not stop the config from loading.")
 def test_valkyrie_url_skips_an_unreadable_remembered_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
     (login_module.DEFAULT_SESSION_DIR / "tracker").mkdir(parents=True)
     with pytest.raises(ValkyrieConfigError, match="Could not read the Tracker"):
@@ -117,6 +124,7 @@ def test_valkyrie_url_skips_an_unreadable_remembered_tracker(monkeypatch: pytest
     assert ValkyrieConfig().url == "https://env.test"
 
 
+@pytest.mark.description("Saved logins list each Tracker and skip unreadable files.")
 def test_saved_lists_each_trackers_login_and_skips_unreadable_files() -> None:
     _session().save()
     _session().model_copy(update={"tracker_url": "https://self-hosted.test:8000"}).save()
@@ -147,6 +155,9 @@ def _tracker_and_login(seen: list[httpx.Request], token_response: httpx.Response
 
 
 class TestSessionAuth:
+    @pytest.mark.description(
+        "A refresh and an org switch saved at the same time both land, so the session keeps the new org."
+    )
     def test_refresh_and_organization_save_share_a_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         original = _session(expires_in=30, tenant="acme")
         original.save()
@@ -185,6 +196,7 @@ class TestSessionAuth:
         saved = load(TRACKER)
         assert saved is not None and saved.tenant == "beta"
 
+    @pytest.mark.description("Refresh keeps a newly saved organization and the client's request tenant.")
     def test_refresh_preserves_a_new_saved_organization_and_the_clients_request_tenant(self) -> None:
         original = _session(expires_in=30, tenant="acme")
         original.save()
@@ -208,6 +220,9 @@ class TestSessionAuth:
         assert (saved.tenant, saved.access_token, saved.refresh_token) == ("beta", session_jwt, "refresh-2")
         assert seen[-1].headers["x-valkyrie-tenant"] == "acme"
 
+    @pytest.mark.description(
+        "When an async refresh is cancelled, its rotated tokens are still saved and used by the next request."
+    )
     @pytest.mark.parametrize("cancellations", [1, 2])
     async def test_cancelled_async_refresh_saves_rotated_tokens_before_releasing_authentication(
         self, monkeypatch: pytest.MonkeyPatch, cancellations: int
@@ -262,6 +277,7 @@ class TestSessionAuth:
         assert [str(request.url) for request in seen] == [REFRESH_URL, f"{TRACKER}/auth/me"]
         assert seen[-1].headers["authorization"] == f"Bearer {session_jwt}"
 
+    @pytest.mark.description("A refresh that finishes after a new login was saved keeps the newer login.")
     def test_refresh_does_not_replace_a_newer_saved_login(self) -> None:
         original = _session(expires_in=30, tenant="acme")
         original.save()
@@ -281,6 +297,7 @@ class TestSessionAuth:
 
         assert LoginSession.load(TRACKER) == replacement
 
+    @pytest.mark.description("Requests send the session as a bearer token and the org in `x-valkyrie-tenant`.")
     def test_requests_carry_the_session_and_tenant(self) -> None:
         seen: list[httpx.Request] = []
         auth = SessionAuth(_session(tenant="acme"))
@@ -292,6 +309,9 @@ class TestSessionAuth:
         assert [request.headers["authorization"] for request in seen] == ["Bearer access-1"]
         assert seen[0].headers["x-valkyrie-tenant"] == "acme"
 
+    @pytest.mark.description(
+        "A session near expiry is refreshed before the request, and the new refresh token and expiry are saved."
+    )
     def test_expiring_sessions_refresh_and_save_the_rotated_tokens(self) -> None:
         seen: list[httpx.Request] = []
         auth = SessionAuth(_session(expires_in=30, tenant="acme"))
@@ -311,6 +331,9 @@ class TestSessionAuth:
         assert saved is not None and (saved.refresh_token, saved.expires_at) == ("refresh-2", 1e10)
         assert LoginSession.remembered_tracker() is None
 
+    @pytest.mark.description(
+        "When another process already refreshed the session for the same org, its token is used without a second refresh."
+    )
     def test_a_session_another_process_refreshed_is_reused_for_the_same_organization(self) -> None:
         seen: list[httpx.Request] = []
         auth = SessionAuth(_session(expires_in=30, tenant="acme"))
@@ -323,6 +346,7 @@ class TestSessionAuth:
         assert seen[0].headers["authorization"] == "Bearer access-elsewhere"
         assert seen[0].headers["x-valkyrie-tenant"] == "acme"
 
+    @pytest.mark.description("Another account's saved login is not reused.")
     def test_another_accounts_saved_login_is_not_reused(self) -> None:
         mine = _jwt({"sub": "U-alice", "exp": time.time() + 30})
         auth = SessionAuth(_session().model_copy(update={"access_token": mine, "expires_at": time.time() + 30}))
@@ -337,6 +361,9 @@ class TestSessionAuth:
 
         assert [str(request.url) for request in seen] == [REFRESH_URL]
 
+    @pytest.mark.description(
+        "When the refresh token was already rotated, the client uses the session another process saved."
+    )
     def test_a_rotated_refresh_token_falls_back_to_the_stored_session(self) -> None:
         auth = SessionAuth(_session(expires_in=30))
         seen: list[httpx.Request] = []
@@ -353,6 +380,7 @@ class TestSessionAuth:
 
         assert seen[-1].headers["authorization"] == "Bearer access-elsewhere"
 
+    @pytest.mark.description("Async clients refresh an expiring session and send the new token.")
     async def test_async_clients_refresh_too(self) -> None:
         seen: list[httpx.Request] = []
         auth = SessionAuth(_session(expires_in=30))
@@ -363,6 +391,7 @@ class TestSessionAuth:
 
         assert seen[-1].headers["authorization"] == f"Bearer {session_jwt}"
 
+    @pytest.mark.description("Other async requests keep running while one refresh holds the login lock.")
     async def test_async_refresh_keeps_other_requests_running_while_login_is_locked(self) -> None:
         original = _session(expires_in=30, tenant="acme")
         original.save()
@@ -412,6 +441,9 @@ class TestSessionAuth:
         assert seen[-1].headers["authorization"] == f"Bearer {session_jwt}"
         assert seen[-1].headers["x-valkyrie-tenant"] == "acme"
 
+    @pytest.mark.description(
+        "When a refresh fails, the request raises `ValkyrieConfigError` telling the user to run `valkyrie login`."
+    )
     @pytest.mark.parametrize(
         ("session", "response"),
         [
@@ -461,6 +493,9 @@ def _pending(error: str) -> httpx.Response:
 
 
 class TestDeviceLogin:
+    @pytest.mark.description(
+        "Device login polls until approval, slows down on `slow_down`, and saves the expiry from the token response."
+    )
     def test_login_waits_for_approval_and_backs_off_when_asked(self, monkeypatch: pytest.MonkeyPatch) -> None:
         waits: list[float] = []
         announced: list[tuple[str, str]] = []
@@ -471,10 +506,9 @@ class TestDeviceLogin:
         opaque = httpx.Response(200, json={"access_token": "opaque"})
         transport = _login_service([_pending("authorization_pending"), _pending("slow_down"), approved, opaque])
 
-        with httpx.Client(transport=transport) as http:
-            session = device_login(TRACKER + "/", http, lambda link, code: announced.append((link, code)))
-            with pytest.raises(ValkyrieConfigError, match="without an expiry"):
-                device_login(TRACKER, http, lambda _link, _code: None)
+        session = device_login(TRACKER + "/", lambda link, code: announced.append((link, code)), transport=transport)
+        with pytest.raises(ValkyrieConfigError, match="without an expiry"):
+            device_login(TRACKER, lambda _link, _code: None, transport=transport)
 
         assert announced == [("https://login.test/activate?code=ABCD-EFGH", "ABCD-EFGH")]
         assert waits == [1, 1, 6, 1]
@@ -482,6 +516,7 @@ class TestDeviceLogin:
         assert session.access_token == "access-1"
         assert session.expires_at == pytest.approx(time.time() + 600, abs=5)
 
+    @pytest.mark.description("A denied or expired device code raises `ValkyrieConfigError` with the reason.")
     @pytest.mark.parametrize(
         ("response", "message"),
         [(_pending("access_denied"), "denied"), (_pending("expired_token"), "expired")],
@@ -491,10 +526,12 @@ class TestDeviceLogin:
     ) -> None:
         waits: list[float] = []
         monkeypatch.setattr("valkyrie.sdk.login.time.sleep", waits.append)
-        with httpx.Client(transport=_login_service([response])) as http:
-            with pytest.raises(ValkyrieConfigError, match=message):
-                device_login(TRACKER, http, lambda _link, _code: None)
+        with pytest.raises(ValkyrieConfigError, match=message):
+            device_login(TRACKER, lambda _link, _code: None, transport=_login_service([response]))
 
+    @pytest.mark.description(
+        "Device login raises `ValkyrieConfigError` when the login service response is malformed or its URLs are not HTTPS."
+    )
     @pytest.mark.parametrize(
         "settings",
         [
@@ -503,20 +540,32 @@ class TestDeviceLogin:
         ],
     )
     def test_malformed_or_insecure_login_services_are_refused(self, settings: httpx.Response) -> None:
-        with httpx.Client(transport=_login_service(settings=settings)) as http:
-            with pytest.raises(ValkyrieConfigError, match="malformed response"):
-                device_login(TRACKER, http, lambda _link, _code: None)
+        with pytest.raises(ValkyrieConfigError, match="malformed response"):
+            device_login(TRACKER, lambda _link, _code: None, transport=_login_service(settings=settings))
 
+    @pytest.mark.description(
+        "A login service that can't be reached raises `ValkyrieTransportError`, not an `httpx` error."
+    )
+    def test_an_unreachable_login_service_raises_a_transport_error(self) -> None:
+        def offline(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline", request=request)
+
+        with pytest.raises(ValkyrieTransportError, match=f"The login to {TRACKER} could not finish: offline"):
+            device_login(TRACKER, lambda _link, _code: None, transport=httpx.MockTransport(offline))
+
+    @pytest.mark.description("On a Tracker without CLI login, device login raises an error that points to access keys.")
     def test_trackers_without_cli_login_point_to_access_keys(self) -> None:
-        with httpx.Client(transport=_login_service(settings=httpx.Response(404))) as http:
-            with pytest.raises(ValkyrieConfigError, match="VALKYRIE_API_KEY"):
-                device_login(TRACKER, http, lambda _link, _code: None)
+        with pytest.raises(ValkyrieConfigError, match="VALKYRIE_API_KEY"):
+            device_login(TRACKER, lambda _link, _code: None, transport=_login_service(settings=httpx.Response(404)))
 
 
 class _Identity(BaseModel):
     organization: str
 
 
+@pytest.mark.description(
+    "With no API key set, the SDK client sends the saved login as a bearer token and no `x-api-key`."
+)
 async def test_the_sdk_client_sends_the_saved_login(
     make_client: Callable[..., ValkyrieClient], sdk_config: Callable[..., ValkyrieConfig]
 ) -> None:

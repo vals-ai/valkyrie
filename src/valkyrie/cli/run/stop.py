@@ -8,7 +8,7 @@ from valkyrie.cli.run.task_ids import resolve_task_ids
 
 
 @click.command(
-    help="Stop a run by its run id. \n\nExample:\nvalkyrie run stop 123e4567-e89b-12d3-a456-426614174000 --force"
+    help="Stop a run by its ID.\n\nExample:\n    valkyrie run stop 123e4567-e89b-12d3-a456-426614174000 --force"
 )
 @click.argument("run_id", type=UUID)
 @click.option(
@@ -16,26 +16,27 @@ from valkyrie.cli.run.task_ids import resolve_task_ids
     type=str,
     required=False,
     default=None,
-    help="Comma-separated list of task IDs to stop",
+    help="Comma-separated list of task IDs to stop.",
 )
 @click.option(
     "--task-ids-file",
     type=str,
     required=False,
     default=None,
-    help="Path or http(s) URL to a text file with one task ID per line",
+    help="Path or http(s) URL to a text file with one task ID per line.",
 )
 @click.option(
     "--force",
     is_flag=True,
     required=False,
     default=False,
-    help="Force stop the benchmark run",
+    help="Force stop the benchmark run.",
 )
-def stop(run_id: UUID, task_ids: str | None, task_ids_file: str | None, force: bool):
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def stop(run_id: UUID, task_ids: str | None, task_ids_file: str | None, force: bool, yes: bool):
     selected_task_ids = resolve_task_ids(task_ids, task_ids_file)
     scope = f"{len(selected_task_ids)} selected task(s) in run {run_id}" if selected_task_ids else f"run {run_id}"
-    if not click.confirm(f"{'Force stop' if force else 'Stop'} {scope}?"):
+    if not yes and not click.confirm(f"{'Force stop' if force else 'Stop'} {scope}?"):
         click.echo("Cancelled.")
         return
 

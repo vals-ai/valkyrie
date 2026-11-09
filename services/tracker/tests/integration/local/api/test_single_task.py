@@ -1,7 +1,4 @@
-"""Run with `uv run pytest tests/integration/local/api/test_single_task.py`.
-
-Exercise single-task routes through the real app and local database.
-"""
+import pytest
 
 from datetime import datetime
 from typing import Any
@@ -25,7 +22,6 @@ def _persist_benchmark_with_task(
     database_session: Session,
     task_id: str = "astropy__12907",
 ) -> tuple[Benchmark, Task]:
-    """Persist a benchmark and finished task for one route scenario."""
     benchmark = make_benchmark(status=BenchmarkStatus.IN_PROGRESS)
     database_session.add(benchmark)
     database_session.commit()
@@ -37,22 +33,23 @@ def _persist_benchmark_with_task(
 
 
 def _created_at(hour: int) -> datetime:
-    """Return a stable timestamp for ordering result history."""
     return datetime(2026, 6, 24, hour, tzinfo=_UTC)
 
 
+@pytest.mark.description("Single task responses, missing tasks, and authentication.")
 class TestSingleTask:
-    """Single task responses, missing tasks, and authentication."""
-
+    @pytest.mark.description(
+        (
+            "The single task endpoint should expose only the current task outcome.\n"
+            "\n"
+            "Test cases:\n"
+            "- A finished task returns its latest evaluation result and no stale error message.\n"
+            "- An errored task returns its latest error message and no stale evaluation result."
+        )
+    )
     def test_get_single_task_returns_current_result_or_error(
         self, client: TestClient, database_session: Session
     ) -> None:
-        """The single task endpoint should expose only the current task outcome.
-
-        Test cases:
-        - A finished task returns its latest evaluation result and no stale error message.
-        - An errored task returns its latest error message and no stale evaluation result.
-        """
         benchmark, finished_task = _persist_benchmark_with_task(database_session, task_id="finished")
         error_task = make_task(benchmark, "errored", status=TaskStatus.ERROR)
         database_session.add(error_task)
@@ -93,12 +90,15 @@ class TestSingleTask:
         assert error_data["error_message"] == "new error"
         assert error_data["evaluation_result"] is None
 
+    @pytest.mark.description(
+        (
+            "Unknown tasks must return not found inside an existing benchmark.\n"
+            "\n"
+            "Test cases:\n"
+            "- A missing task ID receives 404 without altering the benchmark."
+        )
+    )
     def test_get_single_task_404_unknown(self, client: TestClient, database_session: Session) -> None:
-        """Unknown tasks must return not found inside an existing benchmark.
-
-        Test cases:
-        - A missing task ID receives 404 without altering the benchmark.
-        """
         benchmark, _task = _persist_benchmark_with_task(database_session)
 
         response = client.get(
@@ -108,12 +108,15 @@ class TestSingleTask:
 
         assert response.status_code == 404
 
+    @pytest.mark.description(
+        (
+            "Single-task detail must require authentication.\n"
+            "\n"
+            "Test cases:\n"
+            "- A request without a bearer session receives 401."
+        )
+    )
     def test_unauthenticated_returns_401(self, client: TestClient, database_session: Session) -> None:
-        """Single-task detail must require authentication.
-
-        Test cases:
-        - A request without a bearer session receives 401.
-        """
         benchmark, task = _persist_benchmark_with_task(database_session)
 
         assert client.get(f"/benchmarks/{benchmark.id}/tasks/{task.task_id}").status_code == 401

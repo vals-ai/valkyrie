@@ -1,5 +1,3 @@
-"""Discover native files through the attached sandbox, without artifact storage."""
-
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from shlex import quote
@@ -23,13 +21,9 @@ def valid_native_path(path: str) -> bool:
 
 
 async def discover_native_files(sandbox: Sandbox, output_path: str) -> dict[str, NativeFile] | None:
-    """Discover regular files beneath the declared output path."""
     target = str(PurePosixPath(output_path))
     if not target.startswith("/"):
         target = f"./{target}"
-    # POSIX ls exposes the byte size without reading file contents. Names are emitted
-    # separately with NUL delimiters, so spaces and newlines cannot corrupt metadata.
-    # A vanished candidate is omitted; suppress ls diagnostics to keep the NUL stream parseable.
     metadata = (
         "for path do "
         'metadata=$(LC_ALL=C ls -dn "$path" 2>/dev/null) || { '
@@ -48,7 +42,6 @@ async def discover_native_files(sandbox: Sandbox, output_path: str) -> dict[str,
         "else exit 0; fi; "
         f'find "$target" -type f -exec sh -c {quote(metadata)} sh {{}} +'
     )
-    # Modal applies timeout to the first word, so shell syntax must run inside one sh.
     result = await sandbox.exec(f"sh -c {quote(command)}", timeout=30)
     if result.exit_code != 0:
         raise SandboxError(f"Native output discovery failed: {result.output}")

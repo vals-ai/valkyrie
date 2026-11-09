@@ -1,5 +1,3 @@
-"""Retry telemetry helpers for Tenacity retry sites."""
-
 import logging
 from collections.abc import Callable
 
@@ -11,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 def retry_callback(metric_name: str, *, log_level: int = logging.WARNING) -> Callable[[RetryCallState], None]:
-    """Create a Tenacity before_sleep hook with structured logging and retry metrics."""
 
     def _hook(state: RetryCallState) -> None:
         exc = state.outcome.exception() if state.outcome else None

@@ -1,10 +1,9 @@
 # Valkyrie
 
 [![Paper](https://img.shields.io/badge/Paper-alphaXiv-B31B1B)](https://www.alphaxiv.org/abs/valkyrie)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/vals-ai/Valkyrie)
-[![CLI Coverage](https://img.shields.io/endpoint?url=https://vals-ai.github.io/Valkyrie/cli-coverage.json)](https://github.com/vals-ai/Valkyrie/actions/workflows/cli-unit-tests.yaml)
-[![Tracker Coverage](https://img.shields.io/endpoint?url=https://vals-ai.github.io/Valkyrie/tracker-coverage.json)](https://github.com/vals-ai/Valkyrie/actions/workflows/tracker-unit-tests.yaml)
-[![Doc Coverage](https://vals-ai.github.io/Valkyrie/docstr-coverage.svg)](https://github.com/vals-ai/Valkyrie)
+![CLI coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/cli-coverage.json)
+![Tracker coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/tracker-coverage.json)
+![Docstring coverage](https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/docstr-coverage.svg)
 
 Valkyrie orchestrates scalable, reproducible evaluations for AI agents. Run it on infrastructure that Vals AI hosts, or on your own machine with a local Tracker.
 
@@ -17,8 +16,10 @@ Guides, the CLI reference and the Python SDK reference are published at [docs.va
 Install the CLI:
 
 ```bash
-uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false git+https://github.com/vals-ai/Valkyrie@prod
+uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
 ```
+
+If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
 
 Sign in with your Vals account:
 
@@ -35,7 +36,8 @@ valkyrie agent push ./agents/sweagent --name sweagent
 Create the project the run spends for, once:
 
 ```bash
-valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation
+valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation \
+  --budget 300 --budget-reason "3 runs, about 100 each"
 ```
 
 Start a benchmark run:

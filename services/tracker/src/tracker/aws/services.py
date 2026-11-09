@@ -1,5 +1,3 @@
-"""Compose AWS-backed runtime services."""
-
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -22,18 +20,14 @@ from tracker.runtime.secrets import resolve_secrets
 from tracker.types import FinalViewResponse, StartBenchmarkRequest
 
 
-# Limit non-idempotent completion callbacks to one attempt and a 60-second read.
 _COMPLETION_CALLBACK_CONFIG = Config(read_timeout=60, retries={"total_max_attempts": 1})
 
 
 @dataclass(kw_only=True)
 class CloudRuntimeServices(RuntimeServices):
-    """AWS execution setup behind the shared runtime interface."""
-
     aws_runtime: AWSRuntime
 
     async def prepare_execution(self, request: StartBenchmarkRequest, benchmark_id: UUID) -> None:
-        """Prepare logs before sandbox work."""
         await self.logs.create_benchmark(
             str(benchmark_id), retention_days=self.aws_runtime.resources.log_retention_days
         )
@@ -59,8 +53,6 @@ class CloudRuntimeServices(RuntimeServices):
 
 
 class CloudRuntimeFactory:
-    """Compose AWS services from resolved resources and credentials."""
-
     @staticmethod
     def create_runtime(
         runtime: AWSRuntime,
@@ -68,7 +60,6 @@ class CloudRuntimeFactory:
         sandbox_provider: str = "daytona",
         sandbox_provider_secret_name: str | None = None,
     ) -> RuntimeServices:
-        """Compose existing AWS adapters without resolving credentials again."""
         clients = runtime.clients
         resources = runtime.resources
         secrets = SecretsManagerStore(clients)
@@ -94,7 +85,6 @@ class CloudRuntimeFactory:
         *,
         properties: AWSResources | None = None,
     ) -> RuntimeServices:
-        """Select AWS access and prepare services for one dispatch."""
         assert request.properties is None or isinstance(request.properties, AWSResources)
         if properties is not None and request.properties is not None and request.properties != properties:
             raise TrackerServiceError("Queued AWS resources differ from the saved run")

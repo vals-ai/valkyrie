@@ -1,8 +1,3 @@
-"""Native output HTTP, persistence, and sandbox-boundary tests.
-
-Run: .venv/bin/pytest tests/integration/local/api/test_native_output.py -q
-"""
-
 import asyncio
 import shutil
 import sys
@@ -79,7 +74,6 @@ def native_case(
         return ExecResult(exit_code=process.returncode, output=(output + error).decode())
 
     async def download(remote_path: str) -> bytes:
-        # Modal's filesystem API requires absolute paths, unlike shell execution.
         assert Path(remote_path).is_absolute()
         return Path(remote_path).read_bytes()
 
@@ -97,9 +91,9 @@ def native_case(
     return NativeCase(benchmark, task, root, runtime, provider, sandbox)
 
 
+@pytest.mark.description("Authorized direct native reads and complete generation fencing.")
 class TestNativeOutput:
-    """Authorized direct native reads and complete generation fencing."""
-
+    @pytest.mark.description("Native output returns the file bytes unchanged without going through object storage.")
     @pytest.mark.parametrize("status", [TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
     @pytest.mark.parametrize("single_file", [False, True])
     def test_reads_unchanged_bytes_without_object_storage(
@@ -145,6 +139,7 @@ class TestNativeOutput:
         assert "active_native_output" not in detail.json()
         assert "active_native_output" not in native_case.task.model_dump()
 
+    @pytest.mark.description("Listing nested native files leaves out symlinks.")
     def test_nested_files_exclude_symlinks(self, client: TestClient, native_case: NativeCase, tmp_path: Path) -> None:
         nested = native_case.root / "nested"
         nested.mkdir()
@@ -168,6 +163,7 @@ class TestNativeOutput:
             assert response.status_code == 404
         native_case.sandbox.download_file.assert_not_awaited()
 
+    @pytest.mark.description("Native output rejects malformed paths.")
     @pytest.mark.parametrize("path", ["", "/etc/passwd", "../secret", "a/../b", "a//b", "./a", "a/", "a\\b", "a\x00b"])
     def test_rejects_malformed_paths(self, client: TestClient, native_case: NativeCase, path: str) -> None:
         response = client.get(
@@ -179,6 +175,7 @@ class TestNativeOutput:
         assert response.status_code == 400
         native_case.runtime.get_sandbox_provider_config.assert_not_awaited()
 
+    @pytest.mark.description("Unavailable native output does not fall back to the archive.")
     @pytest.mark.parametrize(
         "state", ["no-descriptor", "old-attempt", "finished", "stopped", "missing-target", "symlink-target"]
     )
@@ -213,6 +210,7 @@ class TestNativeOutput:
         if state not in ("missing-target", "symlink-target"):
             native_case.runtime.get_sandbox_provider_config.assert_not_awaited()
 
+    @pytest.mark.description("A task outside the caller's scope returns not found without calling the provider.")
     @pytest.mark.parametrize("scope", ["org", "task", "benchmark"])
     def test_scoped_not_found_does_not_access_provider(
         self, client: TestClient, database_session: Session, native_case: NativeCase, scope: str
@@ -234,6 +232,7 @@ class TestNativeOutput:
         assert response.status_code == 404
         native_case.runtime.get_sandbox_provider_config.assert_not_awaited()
 
+    @pytest.mark.description("Native output needs auth and its required query parameters.")
     def test_auth_and_required_queries(self, client: TestClient, native_case: NativeCase) -> None:
         assert client.get(f"{native_case.url}/files").status_code == 401
         assert client.get(f"{native_case.url}/file", headers=_HEADERS).status_code == 422
@@ -241,6 +240,7 @@ class TestNativeOutput:
         assert client.get(f"{native_case.url}/file", params={"generation": "a"}, headers=_HEADERS).status_code == 422
         native_case.runtime.get_sandbox_provider_config.assert_not_awaited()
 
+    @pytest.mark.description("A sandbox generation change rejects bytes read from the old generation.")
     @pytest.mark.parametrize(
         ("after_read", "change"),
         [
@@ -291,6 +291,7 @@ class TestNativeOutput:
         if not after_read:
             native_case.runtime.get_sandbox_provider_config.assert_not_awaited()
 
+    @pytest.mark.description("A compose source round trip reads from the original service.")
     def test_compose_source_roundtrip_selects_original_service(
         self, client: TestClient, database_session: Session, native_case: NativeCase
     ) -> None:
@@ -329,6 +330,7 @@ class TestNativeOutput:
         assert any("docker compose -f /custom.yml ps -q worker" in command for command in commands)
         assert native_case.runtime.objects.mock_calls == []
 
+    @pytest.mark.description("A file that vanished is left out, and other metadata errors still surface.")
     @pytest.mark.parametrize("disappears", [False, True])
     def test_vanished_file_is_omitted_without_hiding_other_metadata_errors(
         self,
@@ -393,6 +395,7 @@ class TestNativeOutput:
         assert response.status_code == 200, response.text
         assert response.content == b"still here"
 
+    @pytest.mark.description("Provider errors pass through unwrapped.")
     @pytest.mark.parametrize("stage", ["attach", "download"])
     def test_provider_errors_are_not_wrapped(self, client: TestClient, native_case: NativeCase, stage: str) -> None:
         error = SandboxError("provider error")
@@ -411,6 +414,7 @@ class TestNativeOutput:
 
         assert raised.value is error
 
+    @pytest.mark.description("A sandbox that is gone reports its output as unavailable.")
     @pytest.mark.parametrize("stage", ["attach", "discover", "download"])
     def test_sandbox_gone_is_unavailable(self, client: TestClient, native_case: NativeCase, stage: str) -> None:
         error = SandboxNotFoundError("Modal Sandbox is shutting down.")

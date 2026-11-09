@@ -8,36 +8,34 @@ import click
 from valkyrie.sdk import ValkyrieClient
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, terminal_safe
+from valkyrie.cli.display import format_option, format_table, one_line
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
 
 @click.command(
     name="outputs",
-    help="Fetch run outputs by run id. \n\nExample:\nvalkyrie run outputs 123e4567-e89b-12d3-a456-426614174000 --output-dir ./run_outputs",
+    help=(
+        "Download a run's outputs by its ID.\n"
+        "\n"
+        "Example:\n"
+        "    valkyrie run outputs 123e4567-e89b-12d3-a456-426614174000 --output-dir ./run_outputs"
+    ),
 )
 @click.argument("run_id", type=UUID)
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Directory to save run outputs (defaults to ./<benchmark>_<agent>_<run-id>)",
+    help="Directory to save run outputs (defaults to ./<benchmark>_<agent>_<run-id>).",
 )
 @click.option(
     "--task-ids",
     type=str,
     required=False,
     default=None,
-    help="Comma-separated list of task IDs to download (e.g., astropy__astropy-7606,django__django-10880)",
+    help="Comma-separated list of task IDs to download (e.g., astropy__astropy-7606,django__django-10880).",
 )
 def outputs(run_id: UUID, output_dir: Path | None, task_ids: str | None):
-    """
-    Fetch run outputs for a benchmark by its run id.
-
-    Example:
-        valkyrie run outputs 123e4567-e89b-12d3-a456-426614174000
-        valkyrie run outputs 123e4567-e89b-12d3-a456-426614174000 --task-ids astropy__astropy-7606,django__django-10880
-    """
     selected_task_ids = resolve_task_ids(task_ids)
 
     async def download(client: ValkyrieClient) -> Path:
@@ -57,37 +55,29 @@ def outputs(run_id: UUID, output_dir: Path | None, task_ids: str | None):
     click.echo(click.style(f"\r\033[K✓ Run outputs extracted to: {destination}", fg="green"))
 
 
-@click.command(name="artifacts")
+@click.command(name="artifacts", help="List one page of artifact paths available within a run.")
 @click.argument("run_id", type=UUID)
 @click.option("--prefix", default="", help="Relative file or directory path.")
 @click.option("--cursor", default=None, help="Continue from a previous next_cursor.")
-@click.option("--limit", type=click.IntRange(1, 1000), default=100, show_default=True)
 @click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"], case_sensitive=False),
-    default="text",
-    show_default=True,
+    "--limit", type=click.IntRange(1, 1000), default=100, show_default=True, help="Most artifact paths to list."
 )
+@format_option("Print as text or JSON.")
 def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, output_format: str) -> None:
-    """List one page of artifact paths available within a run."""
     response = call(lambda client: client.artifacts.list(run_id, prefix=prefix, cursor=cursor, limit=limit))
     if output_format == "json":
         click.echo(response.model_dump_json(indent=2))
         return
     format_table(
-        [
-            {"Path": terminal_safe(entry.path, preserve_newlines=False), "Bytes": str(entry.size)}
-            for entry in response.artifacts
-        ],
+        [{"Path": one_line(entry.path), "Bytes": str(entry.size)} for entry in response.artifacts],
         ["Path", "Bytes"],
         item_name="artifact",
     )
     if response.next_cursor is not None:
-        click.echo(f"Next cursor: {terminal_safe(response.next_cursor, preserve_newlines=False)}")
+        click.echo(f"Next cursor: {one_line(response.next_cursor)}")
 
 
-@click.command(name="output", help="Download files from a benchmark run by its ID.")
+@click.command(name="output", help="Download files from a run by its ID.")
 @click.argument("benchmark_id", type=UUID)
 @click.argument("subpath", type=str, default="", required=False)
 @click.option(
@@ -95,28 +85,15 @@ def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, output_
     "--output-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Directory to save downloaded files (defaults to ./<benchmark_id>)",
+    help="Directory to save downloaded files (defaults to ./<benchmark_id>).",
 )
 def output_path(benchmark_id: UUID, subpath: str, output_dir: Path | None):
-    """
-    Download a run artifact path through Tracker into a new local directory.
-
-    Example:
-        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9
-        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9 astropy__astropy-7606
-        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9 swebench.json -o ./downloaded-artifacts
-    """
     destination = output_dir if output_dir is not None else Path(str(benchmark_id))
     result = call(lambda client: client.artifacts.download(benchmark_id, destination, path=subpath))
     click.echo(click.style(f"✓ Run artifacts downloaded to: {result}", fg="green"))
 
 
 def extract_run_outputs(archive: BinaryIO, output_dir: Path) -> None:
-    """Extract a run's output tarball into `output_dir`, which may already exist.
-
-    Each nested `*.tar.gz` (a task's agent output) is unpacked beside itself into a directory of
-    the same name and then removed. tarfile's `data` filter rejects members that would escape.
-    """
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"\r\033[KExtracting archives to {output_dir}...", nl=False)

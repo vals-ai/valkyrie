@@ -1,8 +1,3 @@
-"""Tests for batched run status output.
-
-Run: uv run pytest tests/unit/cli/run/test_status.py
-"""
-
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -30,7 +25,6 @@ def make_entry(index: int, *, status: BenchmarkStatus = BenchmarkStatus.IN_PROGR
 
 
 def invoke_with_entries(tracker: MockTracker, entries: list[BenchmarkStatusEntry], args: list[str]) -> Result:
-    """Answer status requests with the known entries among the requested IDs."""
 
     def statuses(request: httpx.Request) -> httpx.Response:
         requested = set(request.url.params["ids"].split(","))
@@ -44,6 +38,7 @@ def _requested_ids(tracker: MockTracker) -> list[list[str]]:
     return [request.url.params["ids"].split(",") for request in tracker.requests]
 
 
+@pytest.mark.description("JSON status removes duplicate IDs and keeps the requested order.")
 def test_status_json_deduplicates_and_restores_requested_order(tracker: MockTracker) -> None:
     first = make_entry(0)
     second = make_entry(1, status=BenchmarkStatus.FINISHED)
@@ -67,6 +62,9 @@ def test_status_json_deduplicates_and_restores_requested_order(tracker: MockTrac
     assert _requested_ids(tracker) == [[str(first.id), str(second.id)]]
 
 
+@pytest.mark.description(
+    "`run status --json` lists unknown run IDs under `missing_run_ids`, warns on stderr, and exits nonzero."
+)
 def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker) -> None:
     found = make_entry(0)
     missing = UUID(int=2)
@@ -80,6 +78,7 @@ def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker)
     assert "not found or are not accessible" in result.stderr
 
 
+@pytest.mark.description("JSON status splits large ID sets into chunks.")
 def test_status_json_chunks_large_id_sets(tracker: MockTracker) -> None:
     entries = [make_entry(index) for index in range(51)]
 
@@ -92,6 +91,7 @@ def test_status_json_chunks_large_id_sets(tracker: MockTracker) -> None:
     assert json.loads(result.stdout)["returned_count"] == 51
 
 
+@pytest.mark.description("A malformed `--ids` value fails with an error naming the flag before any request.")
 @pytest.mark.parametrize("ids_value", ["", " , ", "not-a-uuid"])
 def test_status_rejects_invalid_ids_before_any_request(tracker: MockTracker, ids_value: str) -> None:
     result = CliRunner().invoke(status_runs, ["--ids", ids_value, "--format", "json"])

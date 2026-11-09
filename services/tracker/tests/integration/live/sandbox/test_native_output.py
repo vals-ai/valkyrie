@@ -1,27 +1,3 @@
-"""Live native-output HTTP checks against real Daytona and Modal sandboxes.
-
-From services/tracker, with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-AWS_DEFAULT_REGION (and AWS_SESSION_TOKEN when needed) configured:
-
-    uv run pytest tests/integration/live/sandbox/test_native_output.py -q -k aws-daytona
-    uv run pytest tests/integration/live/sandbox/test_native_output.py -q -k modal
-    uv run pytest tests/integration/live/sandbox/test_native_output.py -q -k local-daytona
-
-Set TEST_DAYTONA_SECRET_NAME or TEST_MODAL_SECRET_NAME to the corresponding
-AWS Secrets Manager provider-config secret. Omit -k to run all three cases.
-The GitHub live-test workflow needs Actions secrets with those same names and
-its existing bench-account role must be able to read both provider secrets.
-Each case creates one billable sandbox and deletes it in finally. No S3 objects,
-agent artifacts, deployed Tracker, or database migration are needed. Collection
-with --collect-only does not fetch secrets or create cloud resources.
-
-Persistence/auth are local. AWS cases inject provider config; local/Daytona
-reconstructs the saved runtime and reads its provider secret from Secrets Manager.
-Provider creation, reconnection, command execution, file upload, and file
-download use the real provider APIs.
-Executor publication/cancellation is covered separately by local tests.
-"""
-
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,7 +17,7 @@ from tracker.database.models import ActiveNativeOutput, AgentContractRequest, Lo
 from tracker.local.resources import LocalResources
 from tracker.runtime.services import RuntimeServices
 from tracker.sandbox import SANDBOX_AUTO_STOP_INTERVAL, SANDBOX_CREATE_TIMEOUT
-from tracker.utils import fetch_sandbox_provider_config
+from tracker.clients.benchmark_service import fetch_sandbox_provider_config
 
 
 @pytest.fixture(
@@ -66,6 +42,7 @@ async def native_provider_case(
     return environment, secret_name, config
 
 
+@pytest.mark.description("Native output endpoints read the provider's current files.")
 async def test_native_endpoints_read_current_provider_files(
     native_provider_case: tuple[str, str, SandboxProviderConfig],
     live_api_client: TestClient,
@@ -138,7 +115,6 @@ async def test_native_endpoints_read_current_provider_files(
                 tracker_database.add(task)
                 tracker_database.commit()
 
-                # Each HTTP request creates a fresh provider and reconnects using the persisted ID.
                 listing = live_api_client.get(f"{url}/files")
                 assert listing.status_code == 200, listing.text
                 assert listing.json()["files"] == [{"path": relative_path, "size_bytes": len(content)}]

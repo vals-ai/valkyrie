@@ -1,8 +1,3 @@
-"""Provider and benchmark service commands against a fake Tracker.
-
-Run: uv run pytest tests/unit/cli/test_settings_commands.py
-"""
-
 import json
 from typing import Any
 
@@ -14,6 +9,7 @@ from tests.unit.cli.fake_tracker import FakeTracker
 from valkyrie.cli.main import cli
 
 
+@pytest.mark.description("Each settings command sends its change with the API key and prints the saved settings.")
 @pytest.mark.parametrize(
     ("arguments", "method", "path", "body", "output"),
     [
@@ -65,7 +61,11 @@ def test_commands_send_the_change_and_echo_the_saved_state(
     fake_tracker: FakeTracker, arguments: list[str], method: str, path: str, body: Any, output: str
 ) -> None:
     fake_tracker.providers["daytona"] = "oldsecret"
-    fake_tracker.benchmark_services["swebench"] = {"url": "https://old.example"}
+    fake_tracker.benchmark_services["swebench"] = {
+        "url": "https://old.example",
+        "auth_header_name": None,
+        "auth_secret_name": None,
+    }
 
     result = CliRunner().invoke(cli, arguments)
 
@@ -77,6 +77,7 @@ def test_commands_send_the_change_and_echo_the_saved_state(
     assert request.headers["x-api-key"] == "test-key"
 
 
+@pytest.mark.description("Settings names are percent-encoded in the request path.")
 @pytest.mark.parametrize(
     ("arguments", "raw_path"),
     [
@@ -90,6 +91,7 @@ def test_names_are_escaped_in_the_path(fake_tracker: FakeTracker, arguments: lis
     assert fake_tracker.requests[0].url.raw_path == raw_path
 
 
+@pytest.mark.description("`provider list` prints each provider's secret name and marks the default provider.")
 @pytest.mark.parametrize(
     ("providers", "default", "output"),
     [
@@ -118,6 +120,7 @@ def test_provider_list_shows_secret_names_and_marks_the_default(
     assert result.output == output
 
 
+@pytest.mark.description("A 422 from the Tracker exits 1 with the field and its validation message.")
 def test_tracker_validation_errors_reach_the_user(fake_tracker: FakeTracker) -> None:
     fake_tracker.refusal = httpx.Response(
         422, json={"detail": [{"loc": ["body", "url"], "msg": "Value error, Invalid benchmark service URL"}]}
@@ -127,3 +130,29 @@ def test_tracker_validation_errors_reach_the_user(fake_tracker: FakeTracker) -> 
 
     assert result.exit_code == 1
     assert result.output == "Error: url: Value error, Invalid benchmark service URL (422)\n"
+
+
+@pytest.mark.description("A 401 on a settings command exits 1 and tells the user to log in.")
+@pytest.mark.parametrize(
+    ("api_key", "output"),
+    [
+        ("test-key", "Error: The Tracker rejected your credentials. Run `valkyrie login`.\n"),
+        (None, "Error: You are not logged in. Run `valkyrie login`.\n"),
+    ],
+)
+@pytest.mark.parametrize("arguments", [["provider", "list"], ["benchmark", "service", "set", "swebench", "https://x"]])
+def test_an_unauthorized_request_says_to_log_in(
+    fake_tracker: FakeTracker,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    api_key: str | None,
+    output: str,
+) -> None:
+    if api_key is None:
+        monkeypatch.delenv("VALKYRIE_API_KEY")
+    fake_tracker.refusal = httpx.Response(401, json={"detail": "Not authenticated"})
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code == 1
+    assert result.output == output

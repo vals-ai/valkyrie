@@ -4,8 +4,6 @@ import httpx
 
 
 class FakeTracker:
-    """Serve the Tracker's provider and run-settings routes from memory."""
-
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.refusal: httpx.Response | None = None

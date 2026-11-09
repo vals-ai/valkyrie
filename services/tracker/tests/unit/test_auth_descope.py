@@ -1,9 +1,5 @@
 # pyright: reportPrivateUsage=false
 
-"""Tests for Tracker Descope authentication boundaries.
-
-Run: uv run pytest tests/unit/test_auth_descope.py
-"""
 
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +26,6 @@ from tracker.auth import (
     SEVERAL_ORGANIZATIONS,
     LoginIdentity,
     RequestIdentity,
-    find_org_by_tenant,
     get_current_identity,
     get_current_login,
     get_current_runner,
@@ -38,6 +33,7 @@ from tracker.auth import (
 )
 from tracker.aws.tenant_storage import TenantBucketError
 from tracker.database.models import DEFAULT_ORG_NAME, Org
+from tracker.repositories.organization import OrganizationRepository
 
 
 @pytest.fixture
@@ -50,7 +46,6 @@ def test_org(empty_database_session: Session) -> Org:
 
 @pytest.fixture(autouse=True)
 def reset_access_key_state() -> Generator[None, None, None]:
-    """Keep process-local auth state isolated between tests."""
     auth_module._exchange_and_normalize_access_key.cache_clear()
     yield
     auth_module._exchange_and_normalize_access_key.cache_clear()
@@ -92,7 +87,6 @@ def descope_access_key_response(
 
 
 def disable_auth_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep retry behavior while removing production backoff from unit tests."""
     exchange_access_key = getattr(auth_module, "_exchange_access_key")
     monkeypatch.setattr(exchange_access_key.retry, "wait", wait_none())
 
@@ -105,6 +99,7 @@ _RUN_KEY_CLAIM_PLACEMENTS = [
 
 
 class TestDescopeIdentityResolution:
+    @pytest.mark.description("Run keys are not accepted as API credentials.")
     @pytest.mark.parametrize("placement", _RUN_KEY_CLAIM_PLACEMENTS)
     def test_run_keys_are_not_api_credentials(self, mock_descope: MagicMock, placement: dict[str, object]) -> None:
         response = descope_access_key_response()
@@ -118,6 +113,7 @@ class TestDescopeIdentityResolution:
 
         assert exc_info.value.status_code == 401
 
+    @pytest.mark.description("A key created at login needs its creator to still be in the tenant.")
     @pytest.mark.parametrize(
         ("user", "status"),
         [
@@ -148,6 +144,7 @@ class TestDescopeIdentityResolution:
                 auth_module._exchange_and_normalize_access_key("user-key")
         assert exc_info.value.status_code == status
 
+    @pytest.mark.description("Exchanging a valid access key returns its tenant name and access key ID.")
     def test_valid_api_key_resolves_identity(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response()
 
@@ -155,16 +152,18 @@ class TestDescopeIdentityResolution:
         assert identity.tenant_name == "test-tenant"
         assert identity.access_key_id == "K2abc"
 
+    @pytest.mark.description("The tenant name from a valid access key matches an existing org.")
     def test_valid_api_key_finds_org(
         self, mock_descope: MagicMock, empty_database_session: Session, test_org: Org
     ) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response()
 
         identity = _exchange_and_normalize_access_key("valid-key")
-        org = find_org_by_tenant(identity.tenant_name, empty_database_session)
+        org = OrganizationRepository(empty_database_session).get_by_name(identity.tenant_name)
         assert org is not None
         assert org.id == test_org.id
 
+    @pytest.mark.description("An invalid access key returns 401.")
     def test_access_key_invalid_api_key_raises_401(
         self, mock_descope: MagicMock, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -184,6 +183,7 @@ class TestDescopeIdentityResolution:
         assert "API key validation failed" in caplog.text
         assert secret not in caplog.text
 
+    @pytest.mark.description("A request must carry exactly one credential.")
     @pytest.mark.parametrize(
         ("headers", "detail"),
         [
@@ -207,10 +207,12 @@ class TestDescopeIdentityResolution:
         assert exc_info.value.status_code == 401
         assert exc_info.value.detail == detail
 
+    @pytest.mark.description("An org missing from the database resolves to no identity.")
     def test_org_not_in_db_returns_none(self, empty_database_session: Session) -> None:
-        org = find_org_by_tenant("nonexistent-org", empty_database_session)
+        org = OrganizationRepository(empty_database_session).get_by_name("nonexistent-org")
         assert org is None
 
+    @pytest.mark.description("An access key with full claims resolves every identity field.")
     def test_access_key_full_claims(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response(
             email="Alice@Vals.AI",
@@ -223,6 +225,7 @@ class TestDescopeIdentityResolution:
         assert identity.email == "alice@vals.ai"
         assert identity.name == "Alice Smith"
 
+    @pytest.mark.description("An access key without an email resolves to no identity.")
     def test_access_key_missing_email_returns_none(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response()
 
@@ -231,6 +234,7 @@ class TestDescopeIdentityResolution:
         assert identity.email is None
         assert identity.name is None
 
+    @pytest.mark.description("An access key without a name resolves to no identity.")
     def test_access_key_missing_name_returns_none(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response(email="alice@vals.ai")
 
@@ -238,13 +242,14 @@ class TestDescopeIdentityResolution:
         assert identity.email == "alice@vals.ai"
         assert identity.name is None
 
+    @pytest.mark.description("A whitespace-only email claim is treated identically to a missing one.")
     def test_access_key_whitespace_only_email_treated_as_missing(self, mock_descope: MagicMock) -> None:
-        """A whitespace-only email claim is treated identically to a missing one."""
         mock_descope.exchange_access_key.return_value = descope_access_key_response(email="   ")
 
         identity = _exchange_and_normalize_access_key("valid-key")
         assert identity.email is None
 
+    @pytest.mark.description("An access key must belong to exactly one tenant.")
     @pytest.mark.parametrize("tenants", [{}, {"a": {}, "b": {}}])
     def test_access_key_requires_one_tenant(
         self, mock_descope: MagicMock, tenants: dict[str, dict[str, object]]
@@ -260,13 +265,16 @@ class TestDescopeIdentityResolution:
 
         assert exc_info.value.status_code == 400
 
+    @pytest.mark.description(
+        (
+            "Transient Descope timeouts must retry and return the eventual identity.\n"
+            "\n"
+            "Test cases:\n"
+            "- The first exchange times out.\n"
+            "- The second exchange succeeds without a real retry delay."
+        )
+    )
     def test_access_key_retries_read_timeout(self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Transient Descope timeouts must retry and return the eventual identity.
-
-        Test cases:
-        - The first exchange times out.
-        - The second exchange succeeds without a real retry delay.
-        """
         disable_auth_retry_wait(monkeypatch)
         mock_descope.exchange_access_key.side_effect = [
             ReadTimeout("HTTPSConnectionPool(host='api.descope.com', port=443): Read timed out. (read timeout=60)"),
@@ -278,15 +286,18 @@ class TestDescopeIdentityResolution:
         assert identity.tenant_name == "test-tenant"
         assert mock_descope.exchange_access_key.call_count == 2
 
+    @pytest.mark.description(
+        (
+            "Exhausted Descope retries must return a stable service-unavailable error.\n"
+            "\n"
+            "Test cases:\n"
+            "- All three exchanges time out.\n"
+            "- The client receives a safe 503 response after immediate test retries."
+        )
+    )
     def test_access_key_returns_503_when_retries_exhausted(
         self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Exhausted Descope retries must return a stable service-unavailable error.
-
-        Test cases:
-        - All three exchanges time out.
-        - The client receives a safe 503 response after immediate test retries.
-        """
         disable_auth_retry_wait(monkeypatch)
         mock_descope.exchange_access_key.side_effect = ReadTimeout(
             "HTTPSConnectionPool(host='api.descope.com', port=443): Read timed out. (read timeout=60)"
@@ -298,7 +309,9 @@ class TestDescopeIdentityResolution:
 
         assert exc_info.value.status_code == 503
         assert exc_info.value.detail == "Auth service unavailable"
-        log_warning.assert_called_once_with("Descope API key validation failed because the provider is unavailable")
+        log_warning.assert_called_once_with(
+            "Descope API key validation failed because the provider is unavailable", exc_info=True
+        )
         assert mock_descope.exchange_access_key.call_count == 3
 
 
@@ -309,12 +322,16 @@ class TestAccessKeyCache:
     def teardown_method(self) -> None:
         auth_module._exchange_and_normalize_access_key.cache_clear()
 
+    @pytest.mark.description(
+        "A cached key expires at the earlier of the cache TTL or its own expiry minus skew, measured on the monotonic clock."
+    )
     def test_cache_deadline_uses_monotonic_clock_ttl_and_expiry_skew(self) -> None:
-        assert auth_module._cache_deadline(10000.0, wall_now=100.0, monotonic_now=500.0) == 4100.0
-        assert auth_module._cache_deadline(200.0, wall_now=100.0, monotonic_now=500.0) == 599.0
+        assert auth_module._cache_deadline(10000.0, wall_now=100.0, monotonic_now=500.0) == 560.0
+        assert auth_module._cache_deadline(150.0, wall_now=100.0, monotonic_now=500.0) == 549.0
         assert auth_module._cache_deadline(105.0, wall_now=100.0, monotonic_now=500.0) == 504.0
         assert auth_module._cache_deadline(101.0, wall_now=100.0, monotonic_now=500.0) == 500.0
 
+    @pytest.mark.description("A key whose expiry is unsafe is not cached.")
     @pytest.mark.parametrize(
         "expires_at", [None, float("nan"), float("inf"), 0.0, pytest.param(10**400, id="overflowing-int")]
     )
@@ -327,11 +344,13 @@ class TestAccessKeyCache:
         _exchange_and_normalize_access_key("uncached-key")
         assert mock_descope.exchange_access_key.call_count == 2
 
+    @pytest.mark.description("A cached key needs only one exchange.")
     def test_warm_key_uses_one_exchange(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.return_value = descope_access_key_response()
         assert _exchange_and_normalize_access_key("warm-key") == _exchange_and_normalize_access_key("warm-key")
         assert mock_descope.exchange_access_key.call_count == 1
 
+    @pytest.mark.description("Concurrent requests with the same key share one exchange.")
     def test_concurrent_same_key_uses_one_exchange(self, mock_descope: MagicMock) -> None:
         started, release = Event(), Event()
 
@@ -349,6 +368,7 @@ class TestAccessKeyCache:
         assert {identity.access_key_id for identity in identities} == {"K2abc"}
         assert mock_descope.exchange_access_key.call_count == 1
 
+    @pytest.mark.description("Two different access keys are exchanged at the same time without waiting on each other.")
     def test_different_keys_exchange_concurrently(self, mock_descope: MagicMock) -> None:
         entered = Barrier(2, timeout=2)
 
@@ -362,6 +382,7 @@ class TestAccessKeyCache:
             identities = [future.result(timeout=2) for future in futures]
         assert {identity.access_key_id for identity in identities} == {"id-a", "id-b"}
 
+    @pytest.mark.description("Failed exchanges are not cached.")
     def test_failures_are_not_cached(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.side_effect = [
             AuthException(status_code=401, error_message="invalid"),
@@ -373,6 +394,7 @@ class TestAccessKeyCache:
         assert _exchange_and_normalize_access_key("retry-key").access_key_id == "K2abc"
         assert mock_descope.exchange_access_key.call_count == 2
 
+    @pytest.mark.description("The key cache does not keep raw credentials.")
     def test_cache_keys_do_not_retain_raw_credentials(self, mock_descope: MagicMock) -> None:
         raw_key = "raw-access-key-secret"
         mock_descope.exchange_access_key.return_value = descope_access_key_response()
@@ -381,9 +403,9 @@ class TestAccessKeyCache:
         assert auth_module._access_key_digest(raw_key) != raw_key.encode()
 
 
+@pytest.mark.description("Starter and organization dependencies across hosting modes.")
 class TestCurrentStarterResolution:
-    """Starter and organization dependencies across hosting modes."""
-
+    @pytest.mark.description("A self hosted Tracker resolves the run starter locally.")
     def test_get_current_starter_self_hosted(
         self, monkeypatch: pytest.MonkeyPatch, empty_database_session: Session
     ) -> None:
@@ -391,7 +413,6 @@ class TestCurrentStarterResolution:
         empty_database_session.commit()
 
         monkeypatch.setattr("tracker.auth.AUTH_REQUIRED", False)
-        monkeypatch.setattr("tracker.auth._cached_default_org", None)
 
         identity = get_current_starter(get_current_identity(MagicMock(), empty_database_session))
 
@@ -401,6 +422,7 @@ class TestCurrentStarterResolution:
         assert identity.email is None
         assert identity.name is None
 
+    @pytest.mark.description("A hosted Tracker resolves the run starter from the identity.")
     @pytest.mark.parametrize(
         "token_profile", [{"email": "Alice@vals.ai", "name": "Alice"}, {}], ids=["token", "profile"]
     )
@@ -432,6 +454,28 @@ class TestCurrentStarterResolution:
         assert starter.access_key_id == ("K2abc" if "x-api-key" in headers else None)
         assert mock_descope.mgmt.user.load_by_user_id.call_count == (0 if token_profile else 1)
 
+    @pytest.mark.description("A failed Descope profile lookup leaves the starter email empty and logs the traceback.")
+    def test_get_current_starter_logs_profile_lookup_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_descope: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+        test_org: Org,
+    ) -> None:
+        mock_descope.mgmt.user.load_by_user_id.side_effect = ConnectionError("descope down")
+        monkeypatch.setattr(auth_module.logger, "handlers", [caplog.handler])
+        identity = RequestIdentity(org=test_org, user_id="U-alice")
+
+        starter = get_current_starter(identity)
+
+        assert (starter.email, starter.name) == (None, None)
+
+        record = next(
+            record for record in caplog.records if record.getMessage() == "Failed to load Descope user profile"
+        )
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], ConnectionError)
+
 
 class TestCurrentRunnerResolution:
     @pytest.fixture(autouse=True)
@@ -448,6 +492,7 @@ class TestCurrentRunnerResolution:
             "user": {"email": "alice@vals.ai", "userTenants": [{"tenantId": "test-tenant", "roleNames": []}]}
         }
 
+    @pytest.mark.description("Bound credentials resolve to the same live user.")
     @pytest.mark.parametrize(
         ("headers", "access_key_id"),
         [
@@ -482,6 +527,7 @@ class TestCurrentRunnerResolution:
         assert (runner.org.id, runner.user_id, runner.access_key_id) == (test_org.id, "U-alice", access_key_id)
         mock_descope.mgmt.user.load_by_user_id.assert_called_with("U-alice")
 
+    @pytest.mark.description("Only a project role or the selected tenant role can deny a runner.")
     @pytest.mark.parametrize(
         ("project_roles", "tenant_roles", "denied"),
         [
@@ -523,6 +569,9 @@ class TestCurrentRunnerResolution:
             assert get_current_runner(identity).user_id == "U-alice"
         mock_descope.mgmt.user.load_by_user_id.assert_called_once_with("U-alice")
 
+    @pytest.mark.description(
+        "A cached access key is exchanged once, while the user's roles are reloaded on every request."
+    )
     def test_cached_key_exchange_does_not_cache_role_membership(
         self,
         mock_descope: MagicMock,
@@ -549,6 +598,7 @@ class TestCurrentRunnerResolution:
         mock_descope.exchange_access_key.assert_called_once_with("bound-key")
         assert mock_descope.mgmt.user.load_by_user_id.call_count >= 3
 
+    @pytest.mark.description("A console key with no bound user keeps its access.")
     def test_console_key_without_bound_user_is_not_newly_prohibited(
         self,
         mock_descope: MagicMock,
@@ -564,6 +614,7 @@ class TestCurrentRunnerResolution:
         mock_descope.mgmt.access_key.load.assert_called_once_with("K2abc")
         mock_descope.mgmt.user.load_by_user_id.assert_not_called()
 
+    @pytest.mark.description("A key whose user is unclear is loaded by its access key ID before the run is admitted.")
     @pytest.mark.parametrize(
         "headers",
         [{"x-api-key": "console-key"}, {"authorization": "Bearer key-jwt"}],
@@ -610,6 +661,7 @@ class TestCurrentRunnerResolution:
         )
         mock_descope.mgmt.access_key.load.assert_called_once_with("K2abc")
 
+    @pytest.mark.description("A bound key without a marker uses the live user's roles.")
     @pytest.mark.parametrize(
         "headers",
         [{"x-api-key": "bound-key"}, {"authorization": "Bearer key-jwt"}],
@@ -652,6 +704,7 @@ class TestCurrentRunnerResolution:
         )
         assert mock_descope.mgmt.access_key.load.call_count == 2
 
+    @pytest.mark.description("A bound user is not admitted when Descope management is unavailable.")
     def test_management_unavailable_does_not_admit_bound_user(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -670,15 +723,15 @@ class TestCurrentRunnerResolution:
         mock_descope.mgmt.user.load_by_user_id.assert_not_called()
 
 
+@pytest.mark.description("Every org lookup path creates the organization of a tenant it hasn't seen before.")
 class TestMissingOrganization:
-    """Every org lookup path creates the organization of a tenant it hasn't seen before."""
-
     @pytest.fixture(autouse=True)
     def hosted(self, monkeypatch: pytest.MonkeyPatch, mock_descope: MagicMock) -> None:
         monkeypatch.setattr("tracker.auth.AUTH_REQUIRED", True)
         mock_descope.exchange_access_key.return_value = descope_access_key_response(tenant="unknown-tenant")
         mock_descope.validate_session.return_value = {"tenants": {"unknown-tenant": {}}}
 
+    @pytest.mark.description("An unknown tenant gets an organization.")
     @pytest.mark.parametrize(
         "headers", [{"x-api-key": "valid-key"}, {"authorization": "Bearer session-token"}], ids=["api-key", "session"]
     )
@@ -695,15 +748,15 @@ class TestMissingOrganization:
         assert len(empty_database_session.exec(select(Org).where(Org.name == "unknown-tenant")).all()) == 1
 
 
+@pytest.mark.description("Signing in prepares the bucket of an organization that may use managed AWS.")
 class TestOrganizationStorage:
-    """Signing in prepares the bucket of an organization that may use managed AWS."""
-
     @pytest.fixture(autouse=True)
     def hosted(self, monkeypatch: pytest.MonkeyPatch, mock_descope: MagicMock, test_org: Org) -> None:
         monkeypatch.setattr("tracker.auth.AUTH_REQUIRED", True)
         mock_descope.exchange_access_key.return_value = descope_access_key_response(tenant=test_org.name)
         mock_descope.validate_session.return_value = {"tenants": {test_org.name: {}}}
 
+    @pytest.mark.description("Resolving the current identity makes sure the org's bucket exists.")
     @pytest.mark.parametrize(
         "headers", [{"x-api-key": "valid-key"}, {"authorization": "Bearer session-token"}], ids=["api-key", "session"]
     )
@@ -724,6 +777,7 @@ class TestOrganizationStorage:
         assert org.id == test_org.id
         ensure.assert_called_once_with(empty_database_session, org)
 
+    @pytest.mark.description("A bucket setup failure during sign in returns 503 without AWS details in the message.")
     def test_bucket_failure_is_retryable_and_hides_aws_detail(
         self, monkeypatch: pytest.MonkeyPatch, empty_database_session: Session
     ) -> None:
@@ -741,6 +795,65 @@ class TestOrganizationStorage:
         assert "valkyrie-secret" not in exc_info.value.detail
 
 
+@pytest.mark.description(
+    "A read-only access key, or a session token exchanged from one, only makes GET and HEAD requests."
+)
+class TestReadOnlyAccessKeys:
+    @pytest.fixture(autouse=True)
+    def hosted(self, monkeypatch: pytest.MonkeyPatch, mock_descope: MagicMock, test_org: Org) -> None:
+        monkeypatch.setattr("tracker.auth.AUTH_REQUIRED", True)
+        response = descope_access_key_response(tenant=test_org.name)
+        token = response["sessionToken"]
+        assert isinstance(token, dict)
+        token["customClaims"] = {"valkyrie_read_only": True}
+        mock_descope.exchange_access_key.return_value = response
+        mock_descope.validate_session.return_value = {
+            "sub": "K2abc",
+            "tenants": {test_org.name: {}},
+            "user_id": "U-alice",
+            "valkyrie_read_only": True,
+        }
+
+    @pytest.mark.description("GET and HEAD requests are allowed.")
+    @pytest.mark.parametrize(
+        "headers", [{"x-api-key": "read-key"}, {"authorization": "Bearer exchanged-key"}], ids=["api-key", "bearer"]
+    )
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_reads_are_allowed(
+        self, empty_database_session: Session, test_org: Org, headers: dict[str, str], method: str
+    ) -> None:
+        identity = get_current_identity(MagicMock(headers=headers, method=method), empty_database_session)
+
+        assert identity.org.id == test_org.id
+
+    @pytest.mark.description("Write requests are refused with 403.")
+    @pytest.mark.parametrize(
+        "headers", [{"x-api-key": "read-key"}, {"authorization": "Bearer exchanged-key"}], ids=["api-key", "bearer"]
+    )
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    def test_writes_are_refused(self, empty_database_session: Session, headers: dict[str, str], method: str) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            get_current_identity(MagicMock(headers=headers, method=method), empty_database_session)
+
+        assert (exc_info.value.status_code, exc_info.value.detail) == (403, "This access key is read-only")
+
+    @pytest.mark.description("A session token with the read-only claim nested in its custom claims cannot write.")
+    def test_nested_claims_are_read_only(
+        self, mock_descope: MagicMock, empty_database_session: Session, test_org: Org
+    ) -> None:
+        mock_descope.validate_session.return_value = {
+            "sub": "K2abc",
+            "tenants": {test_org.name: {}},
+            "customClaims": {"user_id": "U-alice", "valkyrie_read_only": True},
+        }
+        request = MagicMock(headers={"authorization": "Bearer exchanged-key"}, method="POST")
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_current_identity(request, empty_database_session)
+
+        assert exc_info.value.status_code == 403
+
+
 class TestLoginSessions:
     @pytest.fixture(autouse=True)
     def hosted(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -751,6 +864,7 @@ class TestLoginSessions:
         request.headers = {"authorization": "Bearer session-token", **headers}
         return request
 
+    @pytest.mark.description("Invalid sessions and run keys are refused at login.")
     @pytest.mark.parametrize(
         "validate_session",
         [
@@ -770,6 +884,7 @@ class TestLoginSessions:
 
         assert (exc_info.value.status_code, exc_info.value.detail) == (401, "Invalid session")
 
+    @pytest.mark.description("A login session selects its tenant.")
     @pytest.mark.parametrize(
         ("claims", "headers", "expected"),
         [
@@ -802,6 +917,7 @@ class TestLoginSessions:
 
 
 class TestCliLoginTokens:
+    @pytest.mark.description("A bearer token issued to the CLI client resolves to the signed in user.")
     def test_tokens_issued_to_the_cli_client_are_accepted(
         self, mock_descope: MagicMock, test_org: Org, empty_database_session: Session, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -820,16 +936,34 @@ class TestCliLoginTokens:
 
         assert get_current_identity(request, empty_database_session).user_id == "U-alice"
 
+    @pytest.mark.description("A bearer token issued to any other audience returns 401.")
     def test_tokens_for_neither_the_project_nor_the_cli_client_are_rejected(
         self, mock_descope: MagicMock, empty_database_session: Session, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr("tracker.auth.DESCOPE_CLI_CLIENT_ID", "cli-client")
         mock_descope.validate_session.side_effect = InvalidAudienceError("Audience doesn't match")
+        warning = MagicMock()
+        monkeypatch.setattr(auth_module.logger, "warning", warning)
 
         with pytest.raises(HTTPException) as exc_info:
             auth_module._validate_bearer("other-token")
 
         assert exc_info.value.status_code == 401
+        warning.assert_called_once_with("Descope session validation failed: %s", "InvalidAudienceError")
+
+    @pytest.mark.description("A rejected bearer token logs the provider's reason, not the token.")
+    def test_rejected_session_logs_the_descope_reason(
+        self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("tracker.auth.DESCOPE_CLI_CLIENT_ID", None)
+        mock_descope.validate_session.side_effect = AuthException(401, "invalid token", "Signature has expired")
+        warning = MagicMock()
+        monkeypatch.setattr(auth_module.logger, "warning", warning)
+
+        with pytest.raises(HTTPException):
+            auth_module._validate_bearer("expired-token")
+
+        warning.assert_called_once_with("Descope session validation failed: %s", "Signature has expired")
 
 
 class TestCurrentLogin:
@@ -838,6 +972,7 @@ class TestCurrentLogin:
         monkeypatch.setattr("tracker.auth.DESCOPE_MANAGEMENT_KEY", "management-key")
         mock_descope.validate_session.return_value = {"sub": "U-alice", "dct": "second"}
 
+    @pytest.mark.description("A login needs a Descope user.")
     @pytest.mark.parametrize(
         ("headers", "lookup", "expected"),
         [
@@ -857,6 +992,7 @@ class TestCurrentLogin:
 
         assert (exc_info.value.status_code, exc_info.value.detail) == expected
 
+    @pytest.mark.description("The login's orgs, roles, and current org are read from a fresh Descope user load.")
     def test_organizations_come_from_the_live_user_record(self, mock_descope: MagicMock) -> None:
         tenants = [{"tenantId": "first", "roleNames": ["admin"]}, {"tenantId": "second"}]
         user = {"loginIds": ["a@x.com"], "email": "a@x.com", "userTenants": tenants}
@@ -868,6 +1004,7 @@ class TestCurrentLogin:
         assert login.current_organization == "second"
         mock_descope.mgmt.user.load_by_user_id.assert_called_once_with("U-alice")
 
+    @pytest.mark.description("Without a Descope management key, login lookups return 404 before any session check.")
     def test_a_tracker_without_a_management_key_has_no_logins(
         self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -878,3 +1015,40 @@ class TestCurrentLogin:
 
         assert exc_info.value.status_code == 404
         mock_descope.validate_session.assert_not_called()
+
+
+@pytest.mark.description("Runs in a passkey org need a passkey session.")
+@pytest.mark.parametrize(
+    ("headers", "claims", "allowed"),
+    [
+        ({"authorization": "Bearer session"}, {"sub": "U-alice", "amr": ["webauthn"]}, True),
+        ({"authorization": "Bearer session"}, {"sub": "U-alice", "amr": ["oauth"]}, False),
+        ({"x-api-key": "bound-key"}, {}, False),
+    ],
+    ids=["passkey", "google", "access-key"],
+)
+def test_passkey_org_runs_need_a_passkey_session(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_descope: MagicMock,
+    empty_database_session: Session,
+    headers: dict[str, str],
+    claims: dict[str, Any],
+    allowed: bool,
+) -> None:
+    monkeypatch.setattr(auth_module, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(auth_module, "DESCOPE_MANAGEMENT_KEY", "management-key")
+    monkeypatch.setattr(auth_module, "PASSKEY_ORGS", frozenset({"passkey-org"}))
+    org = Org(id=uuid4(), name="passkey-org")
+    empty_database_session.add(org)
+    empty_database_session.commit()
+    mock_descope.validate_session.return_value = {"tenants": {org.name: {}}, **claims}
+    mock_descope.exchange_access_key.return_value = descope_access_key_response(user_id="U-alice", tenant=org.name)
+    mock_descope.mgmt.user.load_by_user_id.return_value = {"user": {"email": "alice@vals.ai"}}
+    identity = get_current_identity(MagicMock(headers=headers), empty_database_session)
+
+    if allowed:
+        assert get_current_runner(identity).user_id == "U-alice"
+        return
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_runner(identity)
+    assert exc_info.value.status_code == 403
