@@ -29,6 +29,7 @@ from tracker.database.models import (
     Benchmark,
     ExecutorAdmission,
     ExecutorDispatch,
+    ExecutorDispatchPayload,
     FinalEvaluation,
     ExecutorRelease,
     ExecutorReleaseStatus,
@@ -43,6 +44,7 @@ from tracker.database.models import (
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import SecretsError
 from tracker.executor.dependencies import get_execution_runtime
+from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
 from tracker.local.runtime import LocalRuntimeFactory
@@ -434,8 +436,8 @@ def _snapshot(session: Session, benchmark_id: UUID) -> list[dict[str, Any]]:
 
 
 @pytest.mark.description(
-    "Regrade copies every stateful task of a finished run into a new run on the target dataset, reports the "
-    "stateless ones, and leaves the source run, its tasks and its evaluation unchanged."
+    "Regrade copies a finished run's stateful tasks into a new run on the target dataset, reports the stateless "
+    "ones, forwards the service headers, and leaves the source run and its evaluation unchanged."
 )
 def test_regrade_copies_saved_states_into_a_new_run(
     local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -459,8 +461,10 @@ def test_regrade_copies_saved_states_into_a_new_run(
 
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
 
+    service_headers = {"Authorization": "service-credential"}
     response = local_tracker.post(
-        f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset", "concurrency": 8}
+        f"/regrade-benchmark/{source.id}",
+        json={"dataset": "target-dataset", "concurrency": 8, "service_headers": service_headers},
     )
 
     assert response.status_code == 200, response.text
@@ -481,6 +485,10 @@ def test_regrade_copies_saved_states_into_a_new_run(
     assert (source.arguments.concurrency, run.arguments.concurrency) == (5, 8)
     assert run.arguments.sandbox_provider == source.arguments.sandbox_provider
     dispatch = tracker_database.exec(select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)).one()
+    sealed = tracker_database.get(ExecutorDispatchPayload, dispatch.id)
+    assert sealed is not None
+    payload = open_payload(dispatch.id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
+    assert payload["execution_context_json"]["start_benchmark_request"]["service_headers"] == service_headers
     tasks = tracker_database.exec(select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))).all()
     assert [(task.task_id, task.status, task.eval_resume_state, task.started_at) for task in tasks] == [
         ("task-1", TaskStatus.EVALUATING, {"job": "pass"}, dispatch.created_at),

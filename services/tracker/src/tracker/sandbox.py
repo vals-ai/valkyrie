@@ -26,6 +26,7 @@ from benchmark_service import (
     Episode,
     ComposeSandbox,
     ComposeSource,
+    DockerfileSource,
     ExecResult,
     ImageSource,
     Sandbox,
@@ -299,6 +300,8 @@ def _source_name(source: SandboxSource) -> str:
             return image
         case SnapshotSource() | TargetedSnapshotSource():
             return "snapshot"
+        case DockerfileSource():
+            return "dockerfile"
         case _:
             assert_never(source)
 

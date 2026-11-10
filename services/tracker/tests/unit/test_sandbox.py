@@ -23,6 +23,7 @@ import pytest
 from benchmark_service import (
     ComposeSandbox,
     ComposeSource,
+    DockerfileSource,
     Episode,
     ExecResult,
     GenerationContainment,
@@ -4333,6 +4334,7 @@ class TestSandboxLifecycle:
             == "public.ecr.aws/vals/harbor"
         )
         assert metric_source_name(SnapshotSource(snapshot="base-python")) == "snapshot"
+        assert metric_source_name(DockerfileSource(dockerfile="/srv/task/Dockerfile")) == "dockerfile"
         with pytest.raises(AssertionError, match="Expected code to be unreachable"):
             metric_source_name(cast(SandboxSource, object()))
 

@@ -2097,6 +2097,7 @@ def _commit_regrade(
     org: Org,
     source_id: UUID,
     run_json: str,
+    service_headers: dict[str, str],
     tasks: RegradeTasks,
     dispatch_id: UUID,
     telemetry_context: ExecutorTelemetryContext,
@@ -2121,9 +2122,9 @@ def _commit_regrade(
                     RunProject(benchmark_id=run.id, project_id=project.id, created_by_email=run.started_by_email)
                 )
             request = (
-                run.local_start_benchmark_request(service_headers={})
+                run.local_start_benchmark_request(service_headers=service_headers)
                 if run.arguments.environment == "local"
-                else run.managed_start_benchmark_request()
+                else run.managed_start_benchmark_request(service_headers=service_headers)
             )
             _persist_dispatch_payload(
                 session,
@@ -2216,7 +2217,7 @@ async def regrade_benchmark(
     if resolved_properties is not None:
         run.arguments = run.arguments.model_copy(update={"properties": resolved_properties})
     if not reads_secrets_file(run.arguments.properties):
-        prospective_request = run.managed_start_benchmark_request()
+        prospective_request = run.managed_start_benchmark_request(service_headers=service_headers)
         if prospective_request.environment == "aws":
             try:
                 validate_managed_execution_request(prospective_request)
@@ -2230,6 +2231,7 @@ async def regrade_benchmark(
             org,
             source.run.id,
             run.model_dump_json(),
+            service_headers,
             source.tasks,
             uuid4(),
             _executor_telemetry_context(),
