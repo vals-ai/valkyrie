@@ -692,3 +692,69 @@ async def test_managed_presigned_get_requires_only_the_host_header(
 
     assert query["X-Amz-SignedHeaders"] == ["host"]
     assert "x-amz-expected-bucket-owner" not in query
+
+
+@pytest.mark.description(
+    "An object over the single-request copy limit is copied in byte-range parts, and a failed part aborts the upload."
+)
+async def test_copy_over_limit_uses_part_copies(monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime) -> None:
+    size = 5 * 1024**3 + 1
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.copy_object.side_effect = ClientError(
+        {"Error": {"Code": "InvalidRequest", "Message": "The specified copy source is larger than 5368709120"}},
+        "CopyObject",
+    )
+    client.head_object.return_value = {"ContentLength": size}
+    client.create_multipart_upload.return_value = {"UploadId": "upload-1"}
+
+    async def upload_part_copy(**arguments: Any) -> dict[str, Any]:
+        return {"CopyPartResult": {"ETag": f"etag-{arguments['PartNumber']}"}}
+
+    client.upload_part_copy.side_effect = upload_part_copy
+    client.complete_multipart_upload.return_value = {"VersionId": "version-2"}
+    runtime = AWSRuntime(
+        resources=aws_runtime.resources,
+        clients=AWSClientProvider(region=aws_runtime.resources.region),
+        expected_bucket_owner="123456789012",
+    )
+    monkeypatch.setattr(AWSClientProvider, "s3_client", lambda _provider: client)
+    owner = {"ExpectedBucketOwner": "123456789012"}
+
+    assert await copy_s3_object("source", "destination", runtime) == "version-2"
+
+    ranges = [call.kwargs["CopySourceRange"] for call in client.upload_part_copy.await_args_list]
+    assert ranges[0] == f"bytes=0-{512 * 1024**2 - 1}"
+    assert ranges[-1] == f"bytes={5 * 1024**3}-{size - 1}"
+    assert len(ranges) == 11
+    assert all(call.kwargs["ExpectedBucketOwner"] == "123456789012" for call in client.upload_part_copy.await_args_list)
+    client.complete_multipart_upload.assert_awaited_once_with(
+        Bucket="test-bucket",
+        Key="destination",
+        UploadId="upload-1",
+        MultipartUpload={"Parts": [{"ETag": f"etag-{number}", "PartNumber": number} for number in range(1, 12)]},
+        **owner,
+    )
+    client.abort_multipart_upload.assert_not_awaited()
+
+    client.upload_part_copy.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "UploadPartCopy")
+    with pytest.raises(S3Error):
+        await copy_s3_object("source", "destination", runtime)
+    client.abort_multipart_upload.assert_awaited_once_with(
+        Bucket="test-bucket", Key="destination", UploadId="upload-1", **owner
+    )
+
+
+@pytest.mark.description("A copy rejected for a reason other than size fails without starting a part upload.")
+async def test_small_copy_rejection_is_not_retried_in_parts(
+    monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
+) -> None:
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.copy_object.side_effect = ClientError({"Error": {"Code": "InvalidRequest"}}, "CopyObject")
+    client.head_object.return_value = {"ContentLength": 10}
+    monkeypatch.setattr(AWSClientProvider, "s3_client", lambda _provider: client)
+
+    with pytest.raises(S3Error):
+        await copy_s3_object("source", "destination", aws_runtime)
+    client.create_multipart_upload.assert_not_awaited()

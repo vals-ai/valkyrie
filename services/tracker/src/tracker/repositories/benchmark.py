@@ -611,6 +611,11 @@ class BenchmarkRepository:
     def save(self, *rows: SQLModel) -> None:
         self._session.add_all(rows)
 
+    def add_tasks_with_errors(self, tasks: Sequence[Task], errors: Sequence[ErrorResult]) -> None:
+        self._session.add_all(tasks)
+        self._session.flush()
+        self._session.add_all(errors)
+
     def add_tasks(self, org_id: UUID, benchmark_id: UUID, task_ids: Sequence[str]) -> None:
         self._session.add_all(Task(org_id=org_id, benchmark=benchmark_id, task_id=task_id) for task_id in task_ids)
 

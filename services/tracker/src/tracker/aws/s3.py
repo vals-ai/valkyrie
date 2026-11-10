@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ _R = TypeVar("_R")
 S3_BENCHMARKS_PREFIX = "benchmarks"
 
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
+_MAX_COPY_OBJECT_BYTES = 5 * 1024**3
+_COPY_PART_BYTES = 512 * 1024**2
+_PART_COPIES = 8
 
 
 @dataclass(frozen=True)
@@ -163,15 +167,59 @@ async def delete_from_s3(s3_key: str, runtime: AWSRuntime, *, version_id: str | 
         raise S3Error(f"Failed to delete object from S3: {error}") from error
 
 
+async def _copy_in_parts(client: Any, source_key: str, dest_key: str, size: int, runtime: AWSRuntime) -> Any:
+    bucket = runtime.resources.s3_bucket
+    owner_arguments = s3_owner_arguments(runtime)
+    upload_id = (await client.create_multipart_upload(Bucket=bucket, Key=dest_key, **owner_arguments))["UploadId"]
+    slots = asyncio.Semaphore(_PART_COPIES)
+
+    async def copy_part(part_number: int, start: int) -> dict[str, Any]:
+        async with slots:
+            response = await client.upload_part_copy(
+                Bucket=bucket,
+                Key=dest_key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                CopySource={"Bucket": bucket, "Key": source_key},
+                CopySourceRange=f"bytes={start}-{min(start + _COPY_PART_BYTES, size) - 1}",
+                **owner_arguments,
+            )
+        return {"ETag": response["CopyPartResult"]["ETag"], "PartNumber": part_number}
+
+    try:
+        parts = await asyncio.gather(
+            *(copy_part(number, start) for number, start in enumerate(range(0, size, _COPY_PART_BYTES), 1))
+        )
+        return await client.complete_multipart_upload(
+            Bucket=bucket, Key=dest_key, UploadId=upload_id, MultipartUpload={"Parts": parts}, **owner_arguments
+        )
+    except BaseException:
+        with suppress(Exception):
+            await client.abort_multipart_upload(Bucket=bucket, Key=dest_key, UploadId=upload_id, **owner_arguments)
+        raise
+
+
 async def copy_s3_object(source_key: str, dest_key: str, runtime: AWSRuntime) -> str | None:
     try:
         async with runtime.clients.s3_client() as client:
-            response = await client.copy_object(
-                Bucket=runtime.resources.s3_bucket,
-                CopySource={"Bucket": runtime.resources.s3_bucket, "Key": source_key},
-                Key=dest_key,
-                **s3_owner_arguments(runtime),
-            )
+            try:
+                response = await client.copy_object(
+                    Bucket=runtime.resources.s3_bucket,
+                    CopySource={"Bucket": runtime.resources.s3_bucket, "Key": source_key},
+                    Key=dest_key,
+                    **s3_owner_arguments(runtime),
+                )
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "InvalidRequest":
+                    raise
+                size = (
+                    await client.head_object(
+                        Bucket=runtime.resources.s3_bucket, Key=source_key, **s3_owner_arguments(runtime)
+                    )
+                )["ContentLength"]
+                if size <= _MAX_COPY_OBJECT_BYTES:
+                    raise
+                response = await _copy_in_parts(client, source_key, dest_key, size, runtime)
             version_id = response.get("VersionId")
             return str(version_id) if version_id is not None else None
     except (ClientError, BotoCoreError) as e:

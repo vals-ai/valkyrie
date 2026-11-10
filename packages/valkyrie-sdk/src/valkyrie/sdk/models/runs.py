@@ -26,6 +26,8 @@ from valkyrie.sdk.models._generated.runs import (
     LocalBenchmarkArguments,
     Order,
     RetryMode,
+    RegradeBenchmarkRequest,
+    RegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse,
     RunMonitoring,
     RunMonitoringRules,
@@ -66,6 +68,8 @@ __all__ = [
     "ResultsExistResponse",
     "RetrieveResultsResponse",
     "RetryMode",
+    "RegradeBenchmarkRequest",
+    "RegradeBenchmarkResponse",
     "RetryOrResumeBenchmarkResponse",
     "RunMonitoring",
     "RunMonitoringRules",
@@ -144,6 +148,8 @@ class FetchBenchmarkResponse(ResponseModel):
     current_execution_release_id: str | None = None
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
+    regraded_from_run_id: UUID | None = None
+    regrade_skipped_task_ids: list[str] | None = None
 
 
 class RunStreamEvent(ResponseModel):

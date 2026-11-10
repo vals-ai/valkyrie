@@ -375,6 +375,8 @@ class FetchBenchmarkResponse(BaseModel):
     current_execution_release_id: str | None = None
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
+    regraded_from_run_id: UUID | None = None
+    regrade_skipped_task_ids: list[str] | None = None
 
 
 class LogEventResponse(BaseModel):
@@ -530,6 +532,26 @@ class RetryOrResumeBenchmarkResponse(StatusResponse):
     pass
 
 
+class RegradeBenchmarkRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "The dataset to regrade a finished run's saved task states against."}
+    )
+    dataset: str = Field(min_length=1, max_length=1024)
+    dataset_version: str | None = Field(default=None, min_length=1, max_length=1024)
+    concurrency: int | None = Field(default=None, ge=1, strict=True)
+    service_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class RegradeBenchmarkResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "The new run and which source tasks it regrades or skips."}
+    )
+    benchmark_id: UUID
+    regraded_from_run_id: UUID
+    task_ids: list[str]
+    skipped_task_ids: list[str]
+
+
 class UpdateBenchmarkConcurrencyRequest(BaseModel):
     concurrency: int = Field(ge=1, strict=True)
 
@@ -606,6 +628,8 @@ class FetchBenchmarkMetadataResponse(BaseModel):
     executor_artifact_uri: str | None = None
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
+    regraded_from_run_id: UUID | None = None
+    regrade_skipped_task_ids: list[str] | None = None
     project: ProjectResponse | None = None
 
 

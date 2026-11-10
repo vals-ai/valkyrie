@@ -1,0 +1,19 @@
+{
+  "request": {
+    "dataset": "terminal-bench-4.1",
+    "dataset_version": null,
+    "concurrency": null,
+    "service_headers": {}
+  },
+  "response": {
+    "benchmark_id": "8b1f7b4e-3c2a-4d5e-9f60-1a2b3c4d5e6f",
+    "regraded_from_run_id": "123e4567-e89b-12d3-a456-426614174000",
+    "task_ids": [
+      "task-pass",
+      "task-fail"
+    ],
+    "skipped_task_ids": [
+      "task-no-state"
+    ]
+  }
+}

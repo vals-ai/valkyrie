@@ -3965,6 +3965,69 @@ def test_recovery_does_not_overwrite_resources_changed_during_verification(
     enqueue.assert_not_awaited()
 
 
+@pytest.mark.description("A retry that loses to a concurrent change deletes the attempt records it wrote.")
+def test_retry_losing_to_concurrent_change_deletes_its_attempt_records(
+    managed_recovery_run: Benchmark,
+    database_session: Session,
+    monkeypatch: MonkeyPatch,
+    record_prior_attempts: AsyncMock,
+) -> None:
+    benchmark = managed_recovery_run
+
+    async def retry_concurrently(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
+        with Session(database_session.get_bind()) as concurrent_session:
+            row = concurrent_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+            row.status = TaskStatus.PENDING
+            concurrent_session.add(row)
+            concurrent_session.commit()
+        return VerifyTaskIdsResponse(task_ids=["task-1"])
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", retry_concurrently)
+    record_prior_attempts.return_value = ["recorded/attempt.json"]
+    delete = AsyncMock()
+    monkeypatch.setattr(main_module.S3ObjectStore, "delete", delete)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(main_module, "_launch_executor_dispatch", enqueue)
+
+    response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}", params={"retry": True})
+
+    assert response.status_code == 409
+    record_prior_attempts.assert_awaited_once()
+    delete.assert_awaited_once_with("recorded/attempt.json")
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.description(
+    "A retry records replaced attempts before it resets their tasks, and a failed record leaves the run unchanged."
+)
+def test_retry_records_attempts_before_reset_and_blocks_when_record_fails(
+    managed_recovery_run: Benchmark,
+    database_session: Session,
+    monkeypatch: MonkeyPatch,
+    record_prior_attempts: AsyncMock,
+) -> None:
+    benchmark = managed_recovery_run
+    statuses: list[TaskStatus] = []
+
+    async def failed_record(_store: object, _run_id: str, attempts: Any) -> None:
+        with Session(database_session.get_bind()) as checked:
+            statuses.append(checked.exec(select(Task).where(Task.benchmark == benchmark.id)).one().status)
+        assert [attempt.task_id for attempt in attempts] == ["task-1"]
+        raise S3Error("record failed")
+
+    record_prior_attempts.side_effect = failed_record
+    enqueue = AsyncMock()
+    monkeypatch.setattr(main_module, "_launch_executor_dispatch", enqueue)
+
+    response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}", params={"retry": True})
+
+    assert response.status_code == 502, response.text
+    assert statuses == [TaskStatus.STOPPED]
+    database_session.expire_all()
+    assert database_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one().status == TaskStatus.STOPPED
+    enqueue.assert_not_awaited()
+
+
 @pytest.mark.description("Recovery of an in progress v2 run keeps its release and arguments.")
 def test_in_progress_v2_recovery_keeps_release_and_arguments(
     managed_recovery_run: Benchmark,

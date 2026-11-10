@@ -66,6 +66,8 @@ EXPECTED_ALL = [
     "ProjectResponse",
     "ProjectsResponse",
     "RetryMode",
+    "RegradeBenchmarkRequest",
+    "RegradeBenchmarkResponse",
     "RetryOrResumeBenchmarkResponse",
     "RunStreamEvent",
     "ResultsExistResponse",
@@ -146,6 +148,7 @@ EXPECTED_SIGNATURES = {
         "self, run_id, *, concurrency=None, task_ids=None, secrets=None, service_headers=None, from_scratch=False, "
         "update_agent=False, benchmark_url=None, lambda_function=None"
     ),
+    RunsResource.regrade: "self, run_id, *, dataset, dataset_version=None, concurrency=None, service_headers=None",
     RunsResource.events: "self, run_id",
     LogsResource.page_task: (
         "self, run_id, task_id, *, query=None, start_time=None, end_time=None, cursor=None, limit=1000"

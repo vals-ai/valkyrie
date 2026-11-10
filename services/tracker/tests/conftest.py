@@ -2,6 +2,7 @@ from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from sqlite3 import Connection, Cursor
 from typing import cast
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -155,3 +156,17 @@ def fake_access_keys(monkeypatch: pytest.MonkeyPatch) -> FakeAccessKeys:
     access_keys = FakeAccessKeys()
     monkeypatch.setattr("tracker.run_access_keys.descope_access_keys", lambda: access_keys)
     return access_keys
+
+
+@pytest.fixture(autouse=True)
+def record_prior_attempts(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    recorded = AsyncMock(return_value=[])
+    monkeypatch.setattr("main.record_prior_attempts", recorded)
+    return recorded
+
+
+@pytest.fixture(autouse=True)
+def keep_replaced_attempts(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    kept = AsyncMock()
+    monkeypatch.setattr("tracker.services.tasks.execute.keep_replaced_attempts", kept)
+    return kept

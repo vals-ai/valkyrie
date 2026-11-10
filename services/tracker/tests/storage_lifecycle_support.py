@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,7 @@ from botocore.exceptions import ClientError
 class MemoryS3:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
+        self.modified: dict[tuple[str, str], datetime] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def __aenter__(self) -> "MemoryS3":
@@ -38,19 +40,21 @@ class MemoryS3:
     async def put_object(self, **arguments: Any) -> dict[str, str]:
         self.record("put", arguments)
         self.objects[arguments["Bucket"], arguments["Key"]] = arguments["Body"]
+        self.modified[arguments["Bucket"], arguments["Key"]] = datetime.now(UTC)
         return {"VersionId": "saved-version"}
 
     async def copy_object(self, **arguments: Any) -> dict[str, str]:
         self.record("copy", arguments)
         source = arguments["CopySource"]
         self.objects[arguments["Bucket"], arguments["Key"]] = self.objects[source["Bucket"], source["Key"]]
+        self.modified[arguments["Bucket"], arguments["Key"]] = datetime.now(UTC)
         return {"VersionId": "copied-version"}
 
     async def list_objects_v2(self, **arguments: Any) -> dict[str, Any]:
         self.record("list", arguments)
         return {
             "Contents": [
-                {"Key": key, "Size": len(content)}
+                {"Key": key, "Size": len(content), "LastModified": self.modified.get((bucket, key))}
                 for (bucket, key), content in self.objects.items()
                 if bucket == arguments["Bucket"] and key.startswith(arguments["Prefix"])
             ]

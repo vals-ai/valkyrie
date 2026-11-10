@@ -22,7 +22,9 @@
     "executor_release_id": "initial-release",
     "current_execution_release_id": "current-release",
     "executor_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "executor_protocol_version": "1"
+    "executor_protocol_version": "1",
+    "regraded_from_run_id": null,
+    "regrade_skipped_task_ids": null
   },
   "sse": {
     "event": "",
@@ -49,7 +51,9 @@
       "executor_release_id": "initial-release",
       "current_execution_release_id": "current-release",
       "executor_artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "executor_protocol_version": "1"
+      "executor_protocol_version": "1",
+      "regraded_from_run_id": null,
+      "regrade_skipped_task_ids": null
     }
   }
 }

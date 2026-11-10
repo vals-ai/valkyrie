@@ -92,6 +92,18 @@ def format_benchmark_status(benchmark_response: FetchBenchmarkResponse, spend: s
             ("Benchmark:", benchmark_response.benchmark_name),
             ("Run ID:", str(benchmark_response.benchmark_id)),
             ("Label:", benchmark_response.label),
+            (
+                "Regraded:",
+                f"from run {benchmark_response.regraded_from_run_id}"
+                if benchmark_response.regraded_from_run_id
+                else None,
+            ),
+            (
+                "Skipped:",
+                f"{len(benchmark_response.regrade_skipped_task_ids)} task(s) without saved evaluation state"
+                if benchmark_response.regrade_skipped_task_ids
+                else None,
+            ),
             ("Spend:", spend),
             ("Started at:", local_time(details.started_at)),
             (

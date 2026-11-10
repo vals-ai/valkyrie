@@ -38,7 +38,7 @@ from tracker.auth import RequestIdentity, get_current_identity, get_current_org,
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tracker.aws.runtime import AWSResources, AWSRuntime
-from tracker.aws.s3 import s3_owner_arguments, upload_to_s3
+from tracker.aws.s3 import S3ObjectStore, s3_owner_arguments, upload_to_s3
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
@@ -80,6 +80,9 @@ from tracker.types import (
     RunExecutionRequest,
     StartBenchmarkRequest,
 )
+from tracker.services.runs import attempts as attempts_module
+from tracker.services.tasks.attempts import keep_replaced_attempts
+from tracker.services.tasks.execute import task_attempt_id
 from tracker.services.benchmarks import update_benchmark_concurrency
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
@@ -3854,6 +3857,7 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
     database_session.commit()
     output_key = f"benchmarks/{run_id}/task_0/output.txt"
     storage.objects["test-bucket", output_key] = b"output bytes"
+    storage.modified["test-bucket", output_key] = datetime.now(timezone.utc)
     for endpoint in ["fetch-benchmark", f"fetch-benchmark-metadata/{run_id}", f"benchmarks/{run_id}"]:
         response = client.get(f"/{endpoint}", params={"benchmark_id": run_id})
         assert response.status_code == 200, response.text
@@ -3944,8 +3948,38 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
     analysis = client.post(f"/analyze-benchmark/{run_id}", json={"lambda_function": "test-analyzer"})
     assert analysis.status_code == 200 and "event: done" in analysis.text
     assert payloads[0]["s3_bucket"] == "test-bucket"
-    retry = client.post(f"/retry-or-resume-benchmark/{run_id}", params={"task_ids": "task_0"})
+    finished_attempt = task_attempt_id(task.id, task.started_at)
+    monkeypatch.setattr(main_module, "record_prior_attempts", attempts_module.record_prior_attempts)
+    retry = client.post(f"/retry-or-resume-benchmark/{run_id}", params={"retry": True}, json={"task_ids": ["task_0"]})
     assert retry.status_code == 200, retry.text
+    attempt_path = f"task_0/{finished_attempt}"
+    assert ("test-bucket", f"benchmarks/attempts/{run_id}/{attempt_path}/output.txt") not in storage.objects
+    database_session.refresh(task)
+
+    async def read_bytes(store: S3ObjectStore, key: str) -> bytes:
+        async with store.read_session() as reader:
+            return await reader.get_bytes(key)
+
+    monkeypatch.setattr(main_module.S3ObjectStore, "get_bytes", read_bytes)
+    await keep_replaced_attempts(
+        main_module.S3ObjectStore(_managed_test_runtime("test-bucket")),
+        str(run_id),
+        "task_0",
+        datetime.now(timezone.utc),
+    )
+    storage.objects["test-bucket", output_key] = b"retried output"
+    assert storage.objects["test-bucket", f"benchmarks/attempts/{run_id}/{attempt_path}/output.txt"] == b"output bytes"
+    kept = client.get(f"/benchmarks/{run_id}/artifacts", params={"prefix": attempt_path, "attempts": True})
+    assert sorted(entry["path"] for entry in kept.json()["artifacts"]) == [
+        f"{attempt_path}/attempt.json",
+        f"{attempt_path}/output.txt",
+    ]
+    record = json.loads(storage.objects["test-bucket", f"benchmarks/attempts/{run_id}/{attempt_path}/attempt.json"])
+    assert (record["status"], record["error"]) == ("FINISHED", None)
+    kept_url = client.get(
+        f"/benchmarks/{run_id}/artifacts/download-url", params={"path": f"{attempt_path}/output.txt", "attempts": True}
+    )
+    assert kept_url.status_code == 200, kept_url.text
     recovery_context = mock_launcher.queued_calls[-1]["execution_context_json"]
     assert recovery_context["start_benchmark_request"]["properties"]["s3_bucket"] == "test-bucket"
     assert recovery_context["start_benchmark_request"]["properties"]["log_group"] == (

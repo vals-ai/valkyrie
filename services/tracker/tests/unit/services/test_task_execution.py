@@ -165,6 +165,7 @@ class TestTaskExecution:
                 getattr(task_execution, "_DependencySetupRecoveryState")(),
                 recovery,
                 authority,
+                claimed_at=datetime.now(UTC),
             )
 
         if shed_first:

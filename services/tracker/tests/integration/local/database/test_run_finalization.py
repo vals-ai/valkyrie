@@ -13,7 +13,7 @@ import pytest
 from botocore.config import Config
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 import tracker.services.runs.stop as run_control_module
 import tracker.services.runs.finalize as run_finalization_module
@@ -44,9 +44,11 @@ from tracker.executor.release_control import promote_release
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.services.runs.start import process_benchmark
+from tracker.services.runs.regrade import regrade_run, regrade_task_rows, regrade_tasks
+from tracker.auth import RequestIdentity
 from tracker.services.runs.finalize import fetch_final_score_inputs
 from tracker.services.runs.stop import initiate_stop_benchmark
-from tracker.services.runs.retry import reset_to_in_progress_status
+from tracker.services.runs.retry import regrade_rerun_error, reset_to_in_progress_status
 from tracker.services.final_views import create_final_view
 from tracker.services.benchmarks import fetch_benchmark_row
 from tracker.services.tasks.error_summary import summarize_task_errors
@@ -887,3 +889,138 @@ class TestRunFinalization:
             (task.id, newer.id, {"attempt": "new"})
         ]
         assert fetch_final_score_inputs(postgres_session, benchmark, org) == {"retried-task": {"attempt": "new"}}
+
+
+@pytest.mark.description(
+    "A regrade run evaluates each copied state on the target dataset with no agent phase, then finalizes like any run."
+)
+async def test_regrade_run_evaluates_copied_states_and_finalizes(
+    postgres_engine: Engine,
+    postgres_session: Session,
+    aws_runtime: AWSRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    executor_authority_kwargs: Any,
+) -> None:
+    org = Org(id=uuid4(), name=f"regrade-{uuid4()}")
+    contract = AgentContractRequest(name="regrade-agent", install_cmd="true", run_cmd="true")
+    source = make_benchmark(name="regrade", org_id=org.id, contract=contract, status=BenchmarkStatus.FINISHED)
+    source.arguments = source.arguments.model_copy(update={"lambda_function": "vals-format"})
+    source_tasks = [
+        make_task(source, "pass", status=TaskStatus.FINISHED),
+        make_task(source, "fail", status=TaskStatus.FINISHED),
+        make_task(source, "stateless", status=TaskStatus.ERROR),
+    ]
+    source_tasks[0].eval_resume_state, source_tasks[1].eval_resume_state = {"job": "pass"}, {"job": "fail"}
+    tasks = regrade_tasks(source_tasks)
+    run = regrade_run(source, tasks, RequestIdentity(org=org), dataset="target-dataset", dataset_version=None)
+    postgres_session.add(org)
+    postgres_session.flush()
+    postgres_session.add(source)
+    postgres_session.flush()
+    postgres_session.add_all([*source_tasks, run])
+    postgres_session.commit()
+    authority = executor_authority_kwargs(run, session=postgres_session)
+    dispatch = postgres_session.get(ExecutorDispatch, UUID(authority["executor_dispatch_id"]))
+    assert dispatch is not None
+    BenchmarkRepository(postgres_session).add_tasks_with_errors(*regrade_task_rows(run, tasks, dispatch.created_at))
+    postgres_session.commit()
+    resumed: list[tuple[str, dict[str, Any], str | None]] = []
+    uploads: list[Any] = []
+    callbacks: list[Any] = []
+
+    async def resume_evaluation(
+        _client: BenchmarkServiceClient, task_id: str, eval_resume_state: dict[str, Any], **kwargs: Any
+    ) -> dict[str, float]:
+        resumed.append((task_id, eval_resume_state, kwargs["dataset"]))
+        return {"score": float(task_id == "pass")}
+
+    scored: list[dict[str, Any]] = []
+
+    async def final_score(
+        _client: BenchmarkServiceClient, evaluation_results: dict[str, Any], **_kwargs: Any
+    ) -> FinalScoreResponse:
+        scored.append(evaluation_results)
+        return FinalScoreResponse(tasks_evaluated=sorted(evaluation_results), final_score=1 / 3, metadata={})
+
+    async def upload(*args: Any, **_kwargs: Any) -> None:
+        uploads.append(args)
+
+    async def invoke_lambda(*args: Any, **_kwargs: Any) -> None:
+        callbacks.append(args)
+
+    _patch_process_dependencies(monkeypatch, postgres_engine, upload=upload)
+    monkeypatch.setattr("tracker.aws.services.invoke_lambda", invoke_lambda)
+    monkeypatch.setattr("tracker.services.tasks.execute.engine", postgres_engine)
+    monkeypatch.setattr("tracker.services.tasks.monitor.engine", postgres_engine)
+    monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume_evaluation)
+    monkeypatch.setattr(BenchmarkServiceClient, "final_score", final_score)
+    request = StartBenchmarkRequest(
+        contract=contract,
+        benchmark_name=run.name,
+        concurrency=1,
+        dataset="target-dataset",
+        properties=aws_runtime.resources,
+        sandbox_provider="daytona",
+        sandbox_provider_secret_name="test-provider-secret",
+    )
+
+    execution_context = {**_execution_context(request, run), "verified_task_ids": tasks.task_ids}
+
+    await process_benchmark(execution_context_json=execution_context, **authority)
+
+    with Session(postgres_engine) as session:
+        persisted = session.get(Benchmark, run.id)
+        assert persisted is not None
+        assert persisted.status == BenchmarkStatus.FINISHED, persisted.error_message
+        assert persisted.final_evaluation is not None
+        assert [task.status for task in session.exec(select(Task).where(Task.benchmark == source.id)).all()] == [
+            TaskStatus.FINISHED,
+            TaskStatus.FINISHED,
+            TaskStatus.ERROR,
+        ]
+        assert session.exec(select(FinalEvaluation).where(FinalEvaluation.benchmark == source.id)).first() is None
+    assert sorted(resumed) == [("fail", {"job": "fail"}, "target-dataset"), ("pass", {"job": "pass"}, "target-dataset")]
+    assert scored == [{"fail": {"score": 0.0}, "pass": {"score": 1.0}, "stateless": None}]
+    assert (len(uploads), callbacks) == (1, [])
+    final_view = uploads[0][0]
+    assert final_view.task_errors == {"stateless": f"Source run {source.id} saved no eval_resume_state for this task."}
+
+
+@pytest.mark.description(
+    "A plain retry on a finished regrade run re-evaluates its regraded tasks and leaves the skipped task as an error."
+)
+def test_regrade_run_default_retry_leaves_skipped_tasks_out(postgres_session: Session) -> None:
+    org = Org(id=uuid4(), name=f"regrade-retry-{uuid4()}")
+    contract = AgentContractRequest(name="regrade-agent", install_cmd="true", run_cmd="true")
+    source = make_benchmark(name="regrade", org_id=org.id, contract=contract, status=BenchmarkStatus.FINISHED)
+    source_tasks = [
+        make_task(source, "pass", status=TaskStatus.FINISHED),
+        make_task(source, "stateless", status=TaskStatus.ERROR),
+    ]
+    source_tasks[0].eval_resume_state = {"job": "pass"}
+    tasks = regrade_tasks(source_tasks)
+    run = regrade_run(source, tasks, RequestIdentity(org=org), dataset="target-dataset", dataset_version=None)
+    run.status = BenchmarkStatus.FINISHED
+    postgres_session.add(org)
+    postgres_session.flush()
+    postgres_session.add(source)
+    postgres_session.flush()
+    postgres_session.add_all([*source_tasks, run])
+    postgres_session.flush()
+    copied, errors = regrade_task_rows(run, tasks, run.started_at)
+    copied[0].status, copied[0].finished_at = TaskStatus.ERROR, run.started_at
+    BenchmarkRepository(postgres_session).add_tasks_with_errors(copied, errors)
+    postgres_session.commit()
+
+    assert regrade_rerun_error(run, postgres_session, True, [], org, RetryMode.AUTO) is None
+    reset_to_in_progress_status(
+        run, postgres_session, retry=True, retry_mode=RetryMode.AUTO, rerun_task_ids=[], org=org, verified_task_ids=[]
+    )
+    postgres_session.commit()
+
+    postgres_session.expire_all()
+    rows = postgres_session.exec(select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))).all()
+    assert [(row.task_id, row.status, row.eval_resume_state) for row in rows] == [
+        ("pass", TaskStatus.EVALUATING, {"job": "pass"}),
+        ("stateless", TaskStatus.ERROR, None),
+    ]

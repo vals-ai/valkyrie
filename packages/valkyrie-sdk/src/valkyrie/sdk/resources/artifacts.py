@@ -34,25 +34,39 @@ class ArtifactsResource:
         self._sdk = client
 
     async def list(
-        self, run_id: UUID, *, prefix: str = "", cursor: str | None = None, limit: int = 100
+        self,
+        run_id: UUID,
+        *,
+        prefix: str = "",
+        cursor: str | None = None,
+        limit: int = 100,
+        attempts: bool = False,
     ) -> RunArtifactsResponse:
-        """List one page matching an exact artifact path or directory prefix. limit must be between 1 and 1000."""
+        """List one page matching an exact artifact path or directory prefix. limit must be between 1 and 1000.
+
+        attempts=True reads artifacts kept from task attempts replaced by a retry, under `TASK_ID/ATTEMPT_ID/`.
+        """
         if not 1 <= limit <= 1000:
             raise ValkyrieInputError("limit must be between 1 and 1000")
         params: dict[str, str | int] = {"prefix": _path(prefix.rstrip("/"), allow_empty=True), "limit": limit}
         if cursor is not None:
             params["cursor"] = cursor
+        if attempts:
+            params["attempts"] = "true"
         return await self._sdk.request_model(
             "GET", f"/benchmarks/{run_id}/artifacts", RunArtifactsResponse, params=params
         )
 
-    async def download_url(self, run_id: UUID, path: str) -> RunArtifactDownloadResponse:
+    async def download_url(self, run_id: UUID, path: str, *, attempts: bool = False) -> RunArtifactDownloadResponse:
         """Create a temporary URL for one exact artifact path."""
+        params = {"path": _path(path)}
+        if attempts:
+            params["attempts"] = "true"
         return await self._sdk.request_model(
             "GET",
             f"/benchmarks/{run_id}/artifacts/download-url",
             RunArtifactDownloadResponse,
-            params={"path": _path(path)},
+            params=params,
         )
 
     async def download(
@@ -63,6 +77,7 @@ class ArtifactsResource:
         path: str = "",
         max_bytes: int = 5 * 1024**3,
         max_entries: int = 100_000,
+        attempts: bool = False,
     ) -> Path:
         """Download a file or directory prefix into a new local directory.
 
@@ -85,7 +100,7 @@ class ArtifactsResource:
             size = 0
             try:
                 while True:
-                    page = await self.list(run_id, prefix=path, cursor=cursor, limit=1000)
+                    page = await self.list(run_id, prefix=path, cursor=cursor, limit=1000, attempts=attempts)
                     for entry in page.artifacts:
                         relative = _path(entry.path)
                         if sys.platform == "win32" and ":" in relative:
@@ -97,7 +112,7 @@ class ArtifactsResource:
                         paths.add(relative.casefold())
                         if len(paths) > max_entries or entry.size < 0 or entry.size > max_bytes - size:
                             raise ValueError("Artifacts exceed download limits")
-                        url = await self.download_url(run_id, relative)
+                        url = await self.download_url(run_id, relative, attempts=attempts)
                         destination = staging / relative
                         await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
                         size += await _download_file(self._sdk, url.download_url, destination, max_bytes - size)

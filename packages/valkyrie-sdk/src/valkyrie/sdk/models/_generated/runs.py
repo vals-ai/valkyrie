@@ -127,6 +127,24 @@ class StatusResponse(ResponseModel):
     status: str
 
 
+class RegradeBenchmarkRequest(BaseModel):
+    """The dataset to regrade a finished run's saved task states against."""
+
+    dataset: Annotated[str, Field(max_length=1024, min_length=1)]
+    dataset_version: Annotated[str | None, Field(max_length=1024, min_length=1)] = None
+    concurrency: Annotated[int | None, Field(ge=1)] = None
+    service_headers: Annotated[dict[str, str], Field(repr=False)] = {}
+
+
+class RegradeBenchmarkResponse(ResponseModel):
+    """The new run and which source tasks it regrades or skips."""
+
+    benchmark_id: UUID
+    regraded_from_run_id: UUID
+    task_ids: list[str]
+    skipped_task_ids: list[str]
+
+
 class RetryOrResumeBenchmarkResponse(StatusResponse):
     """Response returned after retrying or resuming a run."""
 
@@ -299,6 +317,8 @@ class FetchBenchmarkMetadataResponse(StoredArgumentsBase):
     executor_artifact_uri: str | None = None
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
+    regraded_from_run_id: UUID | None = None
+    regrade_skipped_task_ids: list[str] | None = None
     project: projects.ProjectResponse | None = None
 
 

@@ -27,6 +27,8 @@ from valkyrie.sdk.models import (
     RetrieveResultsResponse,
     ResultsExistResponse,
     RetryMode,
+    RegradeBenchmarkRequest,
+    RegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse,
     ProjectResponse,
     RunStreamEvent,
@@ -439,6 +441,29 @@ class RunsResource:
             update_agent=update_agent,
             benchmark_url=benchmark_url,
             lambda_function=lambda_function,
+        )
+
+    async def regrade(
+        self,
+        run_id: UUID,
+        *,
+        dataset: str,
+        dataset_version: str | None = None,
+        concurrency: int | None = None,
+        service_headers: Mapping[str, str] | None = None,
+    ) -> RegradeBenchmarkResponse:
+        """Regrade a finished run's saved task states into a new run on `dataset`; the source run stays unchanged."""
+        body = RegradeBenchmarkRequest(
+            dataset=dataset,
+            dataset_version=dataset_version,
+            concurrency=concurrency,
+            service_headers=dict(service_headers or {}),
+        )
+        return await self._sdk.request_model(
+            "POST",
+            f"/regrade-benchmark/{run_id}",
+            RegradeBenchmarkResponse,
+            json=body.model_dump(mode="json"),
         )
 
     async def _retry_or_resume(

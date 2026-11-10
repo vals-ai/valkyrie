@@ -70,3 +70,21 @@ valkyrie run output RUN_ID TASK_ID --output-dir ./task-files
 
 The destination must be a new directory, and defaults to `./RUN_ID`. Paths keep their
 place relative to the run inside it.
+
+## Read an attempt a retry replaced
+
+Retrying a task keeps the files and error of the attempt it replaces. The error is kept
+when you retry, and the files are copied when the retried task starts. To list those
+attempts, add `--attempts`:
+
+```bash
+valkyrie run artifacts RUN_ID --prefix TASK_ID --attempts
+```
+
+Each attempt has a folder named `TASK_ID/ATTEMPT_ID`, which holds the attempt's files and an
+`attempt.json` with its status, start and finish times, and error. To download one, add
+`--attempts` to `valkyrie run output`:
+
+```bash
+valkyrie run output RUN_ID TASK_ID/ATTEMPT_ID --attempts --output-dir ./attempt
+```

@@ -67,6 +67,8 @@ def benchmark_response(
         current_execution_release_id=benchmark_row.current_execution_release_id,
         executor_artifact_digest=benchmark_row.executor_artifact_digest,
         executor_protocol_version=benchmark_row.executor_protocol_version,
+        regraded_from_run_id=benchmark_row.arguments.regraded_from_run_id,
+        regrade_skipped_task_ids=benchmark_row.arguments.regrade_skipped_task_ids,
         final_score=benchmark_row.final_evaluation.final_score if benchmark_row.final_evaluation else None,
         error_message=benchmark_row.error_message if benchmark_row.status == BenchmarkStatus.ERROR else None,
     )

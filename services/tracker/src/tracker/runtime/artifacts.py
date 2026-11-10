@@ -44,6 +44,13 @@ def task_artifact_key(benchmark_id: str, task_id: str, output_name: str) -> str:
     return f"{benchmark_prefix(benchmark_id)}{task_id}/{output_name}"
 
 
+ATTEMPT_RECORD = "attempt.json"
+
+
+def run_attempts_prefix(benchmark_id: str) -> str:
+    return f"{BENCHMARKS_PREFIX}/attempts/{benchmark_id}/"
+
+
 async def copy_agent_to_benchmark(
     store: ObjectStore,
     benchmark_id: str,

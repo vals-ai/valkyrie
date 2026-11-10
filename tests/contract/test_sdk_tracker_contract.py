@@ -62,6 +62,8 @@ from tracker.types import (
     FetchBenchmarksResponse,
     FinalViewResponse,
     LogEventResponse,
+    RegradeBenchmarkRequest,
+    RegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse,
     S3UploadResultsResponse,
     SchedulerActiveEntryResponse,
@@ -137,6 +139,8 @@ from valkyrie.sdk.models import (
     FinalViewResponse as SDKFinalViewResponse,
     LogEvent as SDKLogEvent,
     OutputArtifact as SDKOutputArtifact,
+    RegradeBenchmarkRequest as SDKRegradeBenchmarkRequest,
+    RegradeBenchmarkResponse as SDKRegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse as SDKRetryResponse,
     S3UploadResultsResponse as SDKS3ResultsResponse,
     SchedulerActiveEntryResponse as SDKSchedulerActiveEntryResponse,
@@ -189,8 +193,8 @@ ROUTES = (
     ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "put", "benchmark name task_id"),
     ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "get", "benchmark name task_id download"),
     ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "delete", "benchmark name task_id"),
-    ("/benchmarks/{benchmark_id}/artifacts", "get", "benchmark_id prefix cursor limit"),
-    ("/benchmarks/{benchmark_id}/artifacts/download-url", "get", "benchmark_id path download"),
+    ("/benchmarks/{benchmark_id}/artifacts", "get", "benchmark_id prefix cursor limit attempts"),
+    ("/benchmarks/{benchmark_id}/artifacts/download-url", "get", "benchmark_id path download attempts"),
     ("/start-benchmark", "post", ""),
     ("/fetch-benchmark", "get", "benchmark_id connect"),
     (
@@ -202,6 +206,7 @@ ROUTES = (
     ("/preview-results", "get", "benchmark_id task_ids"),
     ("/stop-benchmark/{benchmark_id}", "post", "benchmark_id force"),
     ("/retry-or-resume-benchmark/{benchmark_id}", "post", "benchmark_id retry retry_mode concurrency update_agent"),
+    ("/regrade-benchmark/{benchmark_id}", "post", "benchmark_id"),
     ("/benchmarks/status", "get", "ids"),
     ("/scheduler/overview", "get", "waiting_limit active_limit waiting_offset active_offset include_capacity"),
     ("/benchmarks/{benchmark_id}", "get", "benchmark_id"),
@@ -260,6 +265,7 @@ RESPONSE_MODELS = {
     ("/fetch-benchmarks", "get"): "FetchBenchmarksResponse",
     ("/stop-benchmark/{benchmark_id}", "post"): "StopBenchmarkResponse",
     ("/retry-or-resume-benchmark/{benchmark_id}", "post"): "RetryOrResumeBenchmarkResponse",
+    ("/regrade-benchmark/{benchmark_id}", "post"): "RegradeBenchmarkResponse",
     ("/benchmarks/status", "get"): "BenchmarkStatusResponse",
     ("/scheduler/overview", "get"): "SchedulerOverviewResponse",
     ("/benchmarks/{benchmark_id}", "get"): "SingleBenchmarkResponse",
@@ -359,6 +365,8 @@ MODEL_PAIRS = (
     (DatasetTasksResponse, SDKDatasetTasksResponse),
     (DatasetTaskDownloadResponse, SDKDatasetTaskDownloadResponse),
     (RetryOrResumeBenchmarkResponse, SDKRetryResponse),
+    (RegradeBenchmarkRequest, SDKRegradeBenchmarkRequest),
+    (RegradeBenchmarkResponse, SDKRegradeBenchmarkResponse),
     (BenchmarkStatusEntry, SDKBenchmarkStatusEntry),
     (BenchmarkStatusResponse, SDKBenchmarkStatusResponse),
     (SchedulerActiveEntryResponse, SDKSchedulerActiveEntryResponse),
@@ -442,6 +450,8 @@ def load_fixture(name: str) -> dict[str, Any]:
         ("results.json", "s3", S3UploadResultsResponse, SDKS3ResultsResponse),
         ("stop.json", "response", StopBenchmarkResponse, SDKStopBenchmarkResponse),
         ("retry_resume.json", "response", RetryOrResumeBenchmarkResponse, SDKRetryResponse),
+        ("regrade.json", "request", RegradeBenchmarkRequest, SDKRegradeBenchmarkRequest),
+        ("regrade.json", "response", RegradeBenchmarkResponse, SDKRegradeBenchmarkResponse),
     ],
 )
 def test_sdk_and_tracker_accept_canonical_fixture(
@@ -600,6 +610,7 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
         ("/analyze-benchmark/{benchmark_id}", "AnalyzeBenchmarkRequest"),
         ("/benchmark-services", "BenchmarkServicesRequest"),
         ("/fetch-benchmark-tasks", "FetchBenchmarkTasksRequest"),
+        ("/regrade-benchmark/{benchmark_id}", "RegradeBenchmarkRequest"),
     ):
         operation = schema["paths"][path]["post"]
         assert operation["requestBody"]["content"]["application/json"]["schema"] == {
@@ -676,6 +687,7 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
         ("/preview-results", "get", "benchmark_id"),
         ("/stop-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/retry-or-resume-benchmark/{benchmark_id}", "post", "benchmark_id"),
+        ("/regrade-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/analyze-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/check-results-exist", "get", "benchmark_id"),
         ("/fetch-benchmark-metadata/{benchmark_id}", "get", "benchmark_id"),

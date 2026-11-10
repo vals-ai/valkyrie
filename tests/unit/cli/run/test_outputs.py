@@ -7,7 +7,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from valkyrie.cli.run.outputs import extract_run_outputs, outputs
+from valkyrie.cli.run.outputs import artifacts, extract_run_outputs, outputs
 
 from tests.unit.cli.conftest import MockTracker
 from tests.unit.cli.factories import make_fetch_metadata, ok
@@ -68,3 +68,17 @@ def test_extract_run_outputs_rejects_archive_traversal(nested: bool, tmp_path: P
         extract_run_outputs(io.BytesIO(archive), tmp_path / "output")
 
     assert not escaped_path.exists()
+
+
+@pytest.mark.description("Run artifacts with --attempts lists the artifacts kept from attempts replaced by a retry.")
+def test_artifacts_attempts_lists_kept_attempt_artifacts(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    kept = "task-a/attempt-1/vals_format/result.json"
+    tracker.reply(
+        "GET", f"/benchmarks/{_RUN_ID}/artifacts", httpx.Response(200, json={"artifacts": [{"path": kept, "size": 2}]})
+    )
+
+    result = cli_runner.invoke(artifacts, [str(_RUN_ID), "--prefix", "task-a", "--attempts"])
+
+    assert result.exit_code == 0, result.output
+    assert kept in result.output
+    assert tracker.requested("GET", f"/benchmarks/{_RUN_ID}/artifacts")[0].url.params["attempts"] == "true"

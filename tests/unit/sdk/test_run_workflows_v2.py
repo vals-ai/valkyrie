@@ -698,3 +698,25 @@ async def test_artifact_download_authenticates_only_tracker_origin(make_client, 
             redirect = True
             with pytest.raises(ValkyrieTransportError):
                 await client.artifacts.download(uuid4(), tmp_path / "redirect")
+
+
+@pytest.mark.description("Artifact download with attempts=True reads only the artifacts kept from replaced attempts.")
+async def test_artifact_download_reads_kept_attempts(make_client, tmp_path: Path) -> None:
+    path = "task/attempt-1/vals_format/result.json"
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "download.test":
+            return httpx.Response(200, content=b"{}")
+        requested.append(request)
+        if request.url.path.endswith("download-url"):
+            return httpx.Response(
+                200, json={"path": path, "download_url": "https://download.test/file", "expires_in": 300, "size": 2}
+            )
+        return httpx.Response(200, json={"artifacts": [{"path": path, "size": 2}]})
+
+    async with make_client(handler) as client:
+        result = await client.artifacts.download(uuid4(), tmp_path / "attempts", path="task", attempts=True)
+
+    assert (result / path).read_bytes() == b"{}"
+    assert [request.url.params.get("attempts") for request in requested] == ["true", "true"]

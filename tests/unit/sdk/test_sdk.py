@@ -397,6 +397,25 @@ async def test_resume_request_matches_canonical_wire_fixture(make_client) -> Non
     assert json.loads(request.content) == fixture["body"]
 
 
+@pytest.mark.description("`runs.regrade` posts the canonical regrade body to the source run and returns the new run.")
+async def test_regrade_request_matches_canonical_wire_fixture(make_client) -> None:
+    fixture = load_sdk_fixture("regrade.json")
+    run_id = uuid4()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=fixture["response"])
+
+    async with make_client(handler) as client:
+        response = await client.runs.regrade(run_id, dataset=fixture["request"]["dataset"])
+
+    (request,) = requests
+    assert (request.method, request.url.path) == ("POST", f"/regrade-benchmark/{run_id}")
+    assert json.loads(request.content) == fixture["request"]
+    assert response.skipped_task_ids == fixture["response"]["skipped_task_ids"]
+
+
 @pytest.mark.description("`runs.stream` yields each snapshot, stops at the complete event, and uses no read timeout.")
 async def test_stream_yields_snapshots_and_stops_on_complete(make_client, fetch_response) -> None:
     event = load_sdk_fixture("fetch.json")["sse"]

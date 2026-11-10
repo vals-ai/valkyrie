@@ -740,6 +740,7 @@ class TestTaskExecutionRetry:
         database_session: Session,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
+        keep_replaced_attempts: AsyncMock,
     ) -> None:
         start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
             contract,
@@ -797,6 +798,8 @@ class TestTaskExecutionRetry:
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert sandbox_entry_count == 2
         assert setup_call_count == 2
+        assert len({call.args[3] for call in keep_replaced_attempts.call_args_list}) == 1
+        assert keep_replaced_attempts.call_count == 2
 
         database_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
@@ -1941,6 +1944,49 @@ class TestTaskExecutionRetry:
         assert resume_count == 2
         database_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
+
+    @pytest.mark.description(
+        "A retried attempt keeps the replaced attempt's artifacts before its own work, and a failed copy does not stop it."
+    )
+    async def test_attempt_keeps_replaced_artifacts_first_and_survives_failed_copy(
+        self,
+        contract: AgentContractRequest,
+        database_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+            contract,
+            database_session,
+        )
+        events: list[str] = []
+        copy_failure = OSError("copy failed")
+
+        async def _failed_copy(_store: object, run_id: str, task_id: str, claimed_at: datetime) -> None:
+            assert (run_id, task_id) == (str(benchmark_id), "task_0")
+            assert claimed_at.replace(tzinfo=None) >= task_row.started_at.replace(tzinfo=None)
+            events.append("keep")
+            raise copy_failure
+
+        async def _failed_policy_lookup(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
+            events.append("retrieve")
+            raise BenchmarkServiceError("policy lookup failed")
+
+        capture_exception = Mock()
+        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
+        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
+        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
+        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
+        monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
+        monkeypatch.setattr(task_execution_module, "keep_replaced_attempts", _failed_copy)
+        monkeypatch.setattr(task_execution_module, "capture_exception", capture_exception)
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _failed_policy_lookup)
+
+        with pytest.raises(SandboxSetupError, match="policy lookup failed"):
+            await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+
+        assert events[:2] == ["keep", "retrieve"]
+        assert capture_exception.call_args_list[0].args == (copy_failure,)
 
     @pytest.mark.description("A failed policy lookup on eval resume keeps the sandbox loss.")
     async def test_eval_resume_policy_lookup_failure_preserves_sandbox_loss(

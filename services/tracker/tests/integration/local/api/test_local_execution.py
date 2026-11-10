@@ -1,5 +1,9 @@
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID
 
 import httpx
@@ -8,27 +12,43 @@ from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import VerifyTaskIdsResponse, VersionResponse
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from fastapi.testclient import TestClient
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 import main as main_module
+from tests.factories import make_error_result
 from tests.utils import TEST_ORG_ID
+from tracker.api import dependencies as run_dependencies
 from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.auth import RequestIdentity
+from tracker.aws.runtime import AWSResources
 from tracker.database.models import (
+    AWSBenchmarkArguments,
     BenchmarkStatus,
     DEFAULT_ORG_NAME,
     AgentContractRequest,
     Benchmark,
     ExecutorAdmission,
+    ExecutorDispatch,
+    FinalEvaluation,
     ExecutorRelease,
     ExecutorReleaseStatus,
+    ErrorResult,
     Org,
+    Project,
+    RunProject,
+    SpendType,
+    Task,
+    TaskStatus,
 )
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import SecretsError
 from tracker.executor.dependencies import get_execution_runtime
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
+from tracker.local.runtime import LocalRuntimeFactory
+from tracker.services.runs import attempts as attempts_module
+from tracker.services.tasks.attempts import keep_replaced_attempts
+from tracker.services.tasks.execute import task_attempt_id
 from tracker.runtime.services import RuntimeServices
 from tracker.secret_access import tenant_secret_prefix
 from tracker.types import StartBenchmarkRequest
@@ -73,6 +93,7 @@ def local_tracker(tracker_database: Session, monkeypatch: pytest.MonkeyPatch) ->
     overrides = main_module.app.dependency_overrides
     monkeypatch.setitem(overrides, main_module.get_session, lambda: tracker_database)
     monkeypatch.setitem(overrides, main_module.get_current_org, lambda: ORG)
+    monkeypatch.setitem(overrides, run_dependencies.get_current_org, lambda: ORG)
     monkeypatch.setitem(overrides, main_module.get_current_runner, lambda: RequestIdentity(org=ORG))
     monkeypatch.setattr(BenchmarkServiceClient, "health_check", health_check)
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
@@ -382,3 +403,344 @@ def test_secrets_manager_start_authorizes_uploaded_agent_secrets(
 
     benchmark = _benchmark(tracker_database, response)
     assert benchmark.arguments.contract.secrets == {"MODEL_KEY": f"{tenant_secret_prefix(TEST_ORG_ID)}AgentKey"}
+
+
+def _finished_source(session: Session, response: httpx.Response) -> Benchmark:
+    source = _benchmark(session, response)
+    source.status = BenchmarkStatus.FINISHED
+    source.arguments = source.arguments.model_copy(update={"lambda_function": "vals-format"})
+    (task,) = session.exec(select(Task).where(Task.benchmark == source.id)).all()
+    task.status, task.eval_resume_state = TaskStatus.FINISHED, {"job": "pass"}
+    failed = Task(
+        org_id=source.org_id,
+        benchmark=source.id,
+        task_id="task-2",
+        status=TaskStatus.FINISHED,
+        eval_resume_state={"job": "fail"},
+    )
+    stateless = Task(org_id=source.org_id, benchmark=source.id, task_id="task-3", status=TaskStatus.ERROR)
+    session.add_all([source, task, failed, stateless])
+    session.add(FinalEvaluation(org_id=source.org_id, benchmark=source.id, final_score=0.5))
+    session.commit()
+    return source
+
+
+def _snapshot(session: Session, benchmark_id: UUID) -> list[dict[str, Any]]:
+    session.expire_all()
+    rows: list[Any] = [session.get(Benchmark, benchmark_id)]
+    rows += session.exec(select(Task).where(Task.benchmark == benchmark_id).order_by(col(Task.task_id))).all()
+    rows += session.exec(select(FinalEvaluation).where(FinalEvaluation.benchmark == benchmark_id)).all()
+    return [row.model_dump(mode="json") for row in rows]
+
+
+@pytest.mark.description(
+    "Regrade copies every stateful task of a finished run into a new run on the target dataset, reports the "
+    "stateless ones, and leaves the source run, its tasks and its evaluation unchanged."
+)
+def test_regrade_copies_saved_states_into_a_new_run(
+    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
+    tracker_database.add(project)
+    tracker_database.flush()
+    project_id = project.id
+    tracker_database.add(RunProject(benchmark_id=source.id, project_id=project_id))
+    tracker_database.commit()
+    before = _snapshot(tracker_database, source.id)
+    verified: list[tuple[list[str], str | None]] = []
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        verified.append((task_ids, dataset))
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+
+    response = local_tracker.post(
+        f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset", "concurrency": 8}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["regraded_from_run_id"] == str(source.id)
+    assert (body["task_ids"], body["skipped_task_ids"]) == (["task-1", "task-2"], ["task-3"])
+    assert verified == [(["task-1", "task-2"], "target-dataset")]
+    assert _snapshot(tracker_database, source.id) == before
+    run = tracker_database.get(Benchmark, UUID(body["benchmark_id"]))
+    assert run is not None
+    assert (run.status, run.name, run.arguments.regraded_from_run_id) == (
+        BenchmarkStatus.IN_PROGRESS,
+        source.name,
+        source.id,
+    )
+    assert (run.arguments.dataset, run.arguments.lambda_function) == ("target-dataset", None)
+    assert run.arguments.contract == source.arguments.contract
+    assert (source.arguments.concurrency, run.arguments.concurrency) == (5, 8)
+    assert run.arguments.sandbox_provider == source.arguments.sandbox_provider
+    dispatch = tracker_database.exec(select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)).one()
+    tasks = tracker_database.exec(select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))).all()
+    assert [(task.task_id, task.status, task.eval_resume_state, task.started_at) for task in tasks] == [
+        ("task-1", TaskStatus.EVALUATING, {"job": "pass"}, dispatch.created_at),
+        ("task-2", TaskStatus.EVALUATING, {"job": "fail"}, dispatch.created_at),
+        ("task-3", TaskStatus.ERROR, None, dispatch.created_at),
+    ]
+    (error,) = tracker_database.exec(select(ErrorResult).where(ErrorResult.task == tasks[2].id)).all()
+    assert error.error_message == f"Source run {source.id} saved no eval_resume_state for this task."
+    links = tracker_database.exec(select(RunProject).where(RunProject.benchmark_id == run.id)).all()
+    assert [link.project_id for link in links] == [project_id]
+    fetched = local_tracker.get("/fetch-benchmark", params={"benchmark_id": str(run.id)}).json()
+    metadata = local_tracker.get(f"/fetch-benchmark-metadata/{run.id}").json()
+    for payload in (fetched, metadata):
+        assert (payload["regraded_from_run_id"], payload["regrade_skipped_task_ids"]) == (str(source.id), ["task-3"])
+
+
+@pytest.mark.description(
+    "Regrade onto the source run's own dataset works, so a run can be regraded as a noise control."
+)
+def test_regrade_onto_the_source_dataset(
+    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    source.arguments = source.arguments.model_copy(update={"dataset": "terminal-bench-4.0"})
+    tracker_database.add(source)
+    tracker_database.commit()
+    before = _snapshot(tracker_database, source.id)
+    verified: list[tuple[list[str], str | None]] = []
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        verified.append((task_ids, dataset))
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "terminal-bench-4.0"})
+
+    assert response.status_code == 200, response.text
+    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    assert run is not None
+    assert (run.arguments.dataset, run.arguments.regraded_from_run_id) == ("terminal-bench-4.0", source.id)
+    assert verified == [(["task-1", "task-2"], "terminal-bench-4.0")]
+    assert _snapshot(tracker_database, source.id) == before
+
+
+@pytest.mark.description(
+    "Regrade gives a source run from before managed AWS the organization's current start properties, so the new "
+    "run passes the managed resource check, and leaves the source run's properties unchanged."
+)
+def test_regrade_gives_a_pre_migration_source_fresh_start_properties(
+    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    legacy = AWSResources(
+        region="us-east-1", s3_bucket="legacy-bucket", log_group="/valkyrie/benchmarks", log_retention_days=7
+    )
+    source.arguments = AWSBenchmarkArguments(
+        **source.arguments.model_dump(exclude={"environment", "properties", "sandbox_provider_secret_name"}),
+        sandbox_provider_secret_name=f"{tenant_secret_prefix(TEST_ORG_ID)}provider-secret",
+        properties=legacy,
+    )
+    tracker_database.add(source)
+    tracker_database.commit()
+    before = _snapshot(tracker_database, source.id)
+    fresh = AWSResources(
+        region="us-east-1",
+        s3_bucket="org-bucket",
+        log_group=f"/valkyrie/benchmarks/tenants/{TEST_ORG_ID}",
+        log_retention_days=30,
+    )
+    monkeypatch.setattr(main_module, "resolve_start_aws_runtime", Mock(return_value=SimpleNamespace(resources=fresh)))
+    launched: list[UUID] = []
+
+    async def launch(dispatch: ExecutorDispatch, **_kwargs: Any) -> None:
+        launched.append(dispatch.benchmark_id)
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(main_module, "_launch_executor_dispatch", launch)
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+
+    assert response.status_code == 200, response.text
+    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    assert run is not None
+    assert (run.arguments.environment, run.arguments.properties, launched) == ("aws", fresh, [run.id])
+    assert _snapshot(tracker_database, source.id) == before
+
+
+@pytest.mark.description(
+    (
+        "Retry and resume on a regrade run refuse anything that would run the agent.\n"
+        "\n"
+        "Test cases:\n"
+        "- from_scratch mode.\n"
+        "- A skipped task ID.\n"
+        "- A task ID outside the run.\n"
+        "- Resume with a task ID outside the run."
+    )
+)
+@pytest.mark.parametrize(
+    ("params", "task_ids"),
+    [
+        ({"retry": "true", "retry_mode": "from_scratch"}, ["task-1"]),
+        ({"retry": "true"}, ["task-3"]),
+        ({"retry": "true"}, ["task-9"]),
+        ({}, ["task-9"]),
+    ],
+    ids=["from-scratch", "skipped-task", "unknown-task", "resume-unknown-task"],
+)
+def test_regrade_run_refuses_agent_reruns(
+    params: dict[str, str],
+    task_ids: list[str],
+    local_tracker: TestClient,
+    tracker_database: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+    assert response.status_code == 200, response.text
+    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    assert run is not None
+    run.status, run.finished_at = BenchmarkStatus.FINISHED, run.started_at
+    for task in tracker_database.exec(select(Task).where(Task.benchmark == run.id)).all():
+        if task.status == TaskStatus.EVALUATING:
+            task.status = TaskStatus.ERROR
+            tracker_database.add(task)
+    tracker_database.add(run)
+    tracker_database.commit()
+    before = _snapshot(tracker_database, run.id)
+
+    response = local_tracker.post(f"/retry-or-resume-benchmark/{run.id}", params=params, json={"task_ids": task_ids})
+
+    assert response.status_code == 400, response.text
+    assert "regrade run" in response.json()["detail"]
+    assert _snapshot(tracker_database, run.id) == before
+
+
+@pytest.mark.description(
+    (
+        "Regrade refuses without creating a run.\n"
+        "\n"
+        "Test cases:\n"
+        "- The source run is still in progress.\n"
+        "- The target dataset lacks a copied task.\n"
+        "- The source run's project is archived."
+    )
+)
+@pytest.mark.parametrize(
+    ("case", "status_code"),
+    [("unfinished", 409), ("missing-task", 400), ("archived-project", 409)],
+    ids=["unfinished", "missing-task", "archived-project"],
+)
+def test_regrade_refuses_without_creating_a_run(
+    case: str,
+    status_code: int,
+    local_tracker: TestClient,
+    tracker_database: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    response = _start(local_tracker, "daytona")
+    source = (
+        _benchmark(tracker_database, response) if case == "unfinished" else _finished_source(tracker_database, response)
+    )
+    if case == "archived-project":
+        project = Project(
+            org_id=source.org_id,
+            handle="archived",
+            name="Archived",
+            spend_type=SpendType.INTERNAL,
+            archived_at=datetime.now(UTC),
+        )
+        tracker_database.add(project)
+        tracker_database.flush()
+        tracker_database.add(RunProject(benchmark_id=source.id, project_id=project.id))
+        tracker_database.commit()
+
+        async def verify_task_ids(
+            _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+        ) -> VerifyTaskIdsResponse:
+            return VerifyTaskIdsResponse(task_ids=task_ids)
+
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+    before = _snapshot(tracker_database, source.id)
+
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+
+    assert response.status_code == status_code, response.text
+    assert _snapshot(tracker_database, source.id) == before
+    assert len(tracker_database.exec(select(Benchmark)).all()) == 1
+
+
+@pytest.mark.description(
+    "After a retry, the replaced attempt's `vals_format/result.json` and error download from local storage."
+)
+async def test_retry_keeps_failed_attempt_result_and_error_in_local_storage(
+    local_tracker: TestClient,
+    tracker_database: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    monkeypatch.setattr(main_module, "record_prior_attempts", attempts_module.record_prior_attempts)
+    monkeypatch.setitem(main_module.app.dependency_overrides, run_dependencies.get_current_org, lambda: ORG)
+    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona"))
+    benchmark.status = BenchmarkStatus.STOPPED
+    task = tracker_database.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+    task.status = TaskStatus.ERROR
+    tracker_database.add_all([benchmark, task])
+    tracker_database.flush()
+    tracker_database.add(make_error_result(task, "agent crashed", task.started_at))
+    tracker_database.commit()
+    attempt = task_attempt_id(task.id, task.started_at)
+    assert isinstance(benchmark.arguments.properties, LocalResources)
+    objects = LocalRuntimeFactory.create_runtime(benchmark.arguments.properties, TEST_ORG_ID).objects
+    await objects.put_bytes(f"benchmarks/{benchmark.id}/task-1/vals_format/result.json", b'{"score": 0}')
+
+    retry = local_tracker.post(
+        f"/retry-or-resume-benchmark/{benchmark.id}", params={"retry": True}, json={"task_ids": ["task-1"]}
+    )
+    assert retry.status_code == 200, retry.text
+    await keep_replaced_attempts(objects, str(benchmark.id), "task-1", datetime.now(UTC))
+    await objects.put_bytes(f"benchmarks/{benchmark.id}/task-1/vals_format/result.json", b'{"score": 1}')
+
+    listed = local_tracker.get(f"/benchmarks/{benchmark.id}/artifacts", params={"prefix": "task-1", "attempts": True})
+    assert listed.status_code == 200, listed.text
+    assert [entry["path"] for entry in listed.json()["artifacts"]] == [
+        f"task-1/{attempt}/attempt.json",
+        f"task-1/{attempt}/vals_format/result.json",
+    ]
+
+    def download(path: str) -> bytes:
+        link = local_tracker.get(
+            f"/benchmarks/{benchmark.id}/artifacts/download-url", params={"path": path, "attempts": True}
+        )
+        assert link.status_code == 200, link.text
+        content = local_tracker.get(link.json()["download_url"])
+        assert content.status_code == 200, content.text
+        return content.content
+
+    assert download(f"task-1/{attempt}/vals_format/result.json") == b'{"score": 0}'
+    assert json.loads(download(f"task-1/{attempt}/attempt.json"))["error"] == "agent crashed"
+    current = local_tracker.get(f"/benchmarks/{benchmark.id}/artifacts", params={"prefix": "task-1"})
+    assert [entry["path"] for entry in current.json()["artifacts"]] == ["task-1/vals_format/result.json"]

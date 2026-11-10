@@ -280,6 +280,8 @@ class _BenchmarkArguments(BaseModel):
     sandbox_provider_secret_name: str | None = None
     monitoring: RunMonitoring | None = None
     monitoring_rules: RunMonitoringRules | None = None
+    regraded_from_run_id: UUID | None = PydanticField(default=None, exclude=True)
+    regrade_skipped_task_ids: list[str] | None = PydanticField(default=None, exclude=True)
 
 
 class AWSBenchmarkArguments(_BenchmarkArguments):
@@ -339,6 +341,9 @@ class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
             serialized["queue_pool_id"] = value.queue_pool_id
         if value.selected_project_gateway_secret_ref is not None:
             serialized["selected_project_gateway_secret_ref"] = value.selected_project_gateway_secret_ref
+        if value.regraded_from_run_id is not None:
+            serialized["regraded_from_run_id"] = str(value.regraded_from_run_id)
+            serialized["regrade_skipped_task_ids"] = value.regrade_skipped_task_ids
 
         return serialized
 
@@ -689,6 +694,8 @@ class Benchmark(SQLModel, table=True):
             executor_artifact_uri=self.executor_artifact_uri,
             executor_artifact_digest=self.executor_artifact_digest,
             executor_protocol_version=self.executor_protocol_version,
+            regraded_from_run_id=self.arguments.regraded_from_run_id,
+            regrade_skipped_task_ids=self.arguments.regrade_skipped_task_ids,
         )
 
 

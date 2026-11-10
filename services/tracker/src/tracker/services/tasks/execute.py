@@ -124,6 +124,7 @@ from tracker.secret_access import tenant_secret_prefix
 from tracker.sandbox_cost import SandboxLink, record_sandbox
 from tracker.scheduler.admission import SandboxQueueContext, enter_queued_sandbox
 from tracker.scheduler.store import is_reserved_queue_pool_id, queued_sandbox_name
+from tracker.services.tasks.attempts import keep_replaced_attempts
 from tracker.repositories.advisory_lock import PostgresAdvisoryLock, task_evaluation_lock
 from tracker.types import (
     StartBenchmarkRequest,
@@ -416,6 +417,8 @@ async def process_task(
     ):
         pass
 
+    claimed_at = datetime.now(UTC)
+
     async def run_attempt(
         recovery_attempt: SandboxRecoveryAttempt,
     ) -> dict[str, dict[str, Any] | None]:
@@ -436,6 +439,7 @@ async def process_task(
                 dependency_setup_recovery=dependency_setup_recovery,
                 recovery_attempt=recovery_attempt,
                 authority=authority,
+                claimed_at=claimed_at,
                 sandbox_provider=sandbox_provider,
                 queue_context=queue_context,
             )
@@ -522,6 +526,7 @@ async def _process_task_attempt(
     recovery_attempt: SandboxRecoveryAttempt,
     authority: ExecutionAuthority,
     *,
+    claimed_at: datetime,
     sandbox_provider: SandboxProvider | None = None,
     queue_context: SandboxQueueContext | None = None,
 ) -> dict[str, dict[str, Any] | None]:
@@ -553,6 +558,14 @@ async def _process_task_attempt(
         return {task_id: None}
     benchmark_row, task_row = claimed
     attempt_started_at = task_row.started_at
+    try:
+        await keep_replaced_attempts(runtime.objects, str(benchmark_id), task_id, claimed_at)
+    except Exception as exc:
+        logger.exception(
+            "Replaced task attempt artifacts were not kept",
+            extra={"benchmark_id": str(benchmark_id), "task_id": task_id},
+        )
+        capture_exception(exc)
     expected_failure_status = (
         TaskStatus.EVALUATING
         if task_row.status == TaskStatus.EVALUATING and task_row.eval_resume_state is not None

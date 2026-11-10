@@ -62,9 +62,12 @@ def outputs(run_id: UUID, output_dir: Path | None, task_ids: str | None):
 @click.option(
     "--limit", type=click.IntRange(1, 1000), default=100, show_default=True, help="Most artifact paths to list."
 )
+@click.option("--attempts", is_flag=True, help="Use artifacts kept from task attempts replaced by a retry.")
 @format_option("Print as text or JSON.")
-def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, output_format: str) -> None:
-    response = call(lambda client: client.artifacts.list(run_id, prefix=prefix, cursor=cursor, limit=limit))
+def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, attempts: bool, output_format: str) -> None:
+    response = call(
+        lambda client: client.artifacts.list(run_id, prefix=prefix, cursor=cursor, limit=limit, attempts=attempts)
+    )
     if output_format == "json":
         click.echo(response.model_dump_json(indent=2))
         return
@@ -87,9 +90,10 @@ def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, output_
     default=None,
     help="Directory to save downloaded files (defaults to ./<benchmark_id>).",
 )
-def output_path(benchmark_id: UUID, subpath: str, output_dir: Path | None):
+@click.option("--attempts", is_flag=True, help="Use artifacts kept from task attempts replaced by a retry.")
+def output_path(benchmark_id: UUID, subpath: str, output_dir: Path | None, attempts: bool):
     destination = output_dir if output_dir is not None else Path(str(benchmark_id))
-    result = call(lambda client: client.artifacts.download(benchmark_id, destination, path=subpath))
+    result = call(lambda client: client.artifacts.download(benchmark_id, destination, path=subpath, attempts=attempts))
     click.echo(click.style(f"✓ Run artifacts downloaded to: {result}", fg="green"))
 
 

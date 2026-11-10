@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -15,6 +15,7 @@ from tracker.database.models import (
     TaskStatus,
 )
 from tracker.exceptions import TrackerServiceError
+from tracker.services.runs.attempts import PriorAttempt, prior_attempts
 from tracker.services.benchmarks import fetch_benchmark_row
 
 
@@ -22,6 +23,7 @@ from tracker.services.benchmarks import fetch_benchmark_row
 class RetryState:
     task_ids: tuple[str, ...]
     version: str
+    attempts: tuple[PriorAttempt, ...] = field(default=(), compare=False)
 
 
 def _retry_candidates(
@@ -36,6 +38,8 @@ def _retry_candidates(
     existing_rows = BenchmarkRepository(session).retry_candidates(
         benchmark_row, retry, rerun_task_ids, for_update=for_update
     )
+    if benchmark_row.arguments.regraded_from_run_id is not None and not rerun_task_ids:
+        existing_rows = [task for task in existing_rows if task.eval_resume_state is not None]
     existing_ids = {task.task_id for task in existing_rows}
     new_task_ids = [task_id for task_id in rerun_task_ids if task_id not in existing_ids]
     if benchmark_row.status == BenchmarkStatus.IN_PROGRESS and new_task_ids:
@@ -43,6 +47,28 @@ def _retry_candidates(
             f"{', '.join(new_task_ids)} cannot be retried while run {benchmark_row.id} is in progress because they are not in ERROR or STOPPED status"
         )
     return existing_rows, new_task_ids
+
+
+def regrade_rerun_error(
+    benchmark_row: Benchmark,
+    session: Session,
+    retry: bool,
+    rerun_task_ids: list[str],
+    org: Org,
+    retry_mode: RetryMode,
+) -> str | None:
+    if benchmark_row.arguments.regraded_from_run_id is None:
+        return None
+    if retry_mode == RetryMode.FROM_SCRATCH:
+        return f"Run {benchmark_row.id} is a regrade run; retry_mode from_scratch would rerun the agent."
+    rows, new_task_ids = _retry_candidates(benchmark_row, session, retry, rerun_task_ids, org)
+    stateless = sorted([*new_task_ids, *(row.task_id for row in rows if row.eval_resume_state is None)])
+    if stateless:
+        return (
+            f"Run {benchmark_row.id} is a regrade run with no saved evaluation state for {', '.join(stateless)}; "
+            "only its regraded tasks can be retried."
+        )
+    return None
 
 
 def prepare_retry_state(
@@ -63,10 +89,12 @@ def prepare_retry_state(
             for_update=for_update,
         )
         new_task_ids: list[str] = []
+        attempts: tuple[PriorAttempt, ...] = ()
     else:
         rows, new_task_ids = _retry_candidates(
             benchmark_row, session, retry, rerun_task_ids, org, for_update=for_update
         )
+        attempts = prior_attempts(session, org, rows) if retry else ()
     version = json.dumps(
         {
             "dispatch": ExecutorDispatchRepository(session).latest_id(benchmark_row.id),
@@ -87,7 +115,7 @@ def prepare_retry_state(
         default=str,
         sort_keys=True,
     )
-    return RetryState(tuple([row.task_id for row in rows] + new_task_ids), version)
+    return RetryState(tuple([row.task_id for row in rows] + new_task_ids), version, attempts)
 
 
 def reset_to_in_progress_status(

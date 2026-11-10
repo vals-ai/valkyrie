@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from datetime import datetime
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from tracker.api.dependencies import RunRuntimeDependency, TrackedBenchmarkId
 from tracker.api.download import local_file_response, resolve_download_url
 from tracker.api.storage_errors import storage_errors
-from tracker.runtime.artifacts import benchmark_prefix
+from tracker.runtime.artifacts import benchmark_prefix, run_attempts_prefix
 
 router = APIRouter(prefix="/benchmarks")
 
@@ -36,6 +38,13 @@ class RunArtifactDownloadResponse(BaseModel):
     size: int
 
 
+AttemptsQuery = Annotated[bool, Query(description="Read artifacts kept from task attempts replaced by a retry.")]
+
+
+def _root(benchmark_id: str, attempts: bool) -> str:
+    return run_attempts_prefix(benchmark_id) if attempts else benchmark_prefix(benchmark_id)
+
+
 def _path(value: str, *, allow_empty: bool = False) -> str:
     if not value and allow_empty:
         return value
@@ -55,9 +64,10 @@ async def list_run_artifacts(
     prefix: str = "",
     cursor: str | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
+    attempts: AttemptsQuery = False,
 ) -> RunArtifactsResponse:
     prefix = _path(prefix.rstrip("/"), allow_empty=True)
-    root = benchmark_prefix(str(benchmark_id))
+    root = _root(str(benchmark_id), attempts)
     with storage_errors("Artifact"):
         objects, next_cursor = await run_context.objects.list_objects_page(root + prefix, cursor=cursor, limit=limit)
     entries = [
@@ -81,9 +91,10 @@ async def get_run_artifact_url(
     request: Request,
     path: str = Query(min_length=1),
     download: bool = False,
+    attempts: AttemptsQuery = False,
 ) -> RunArtifactDownloadResponse | FileResponse:
     path = _path(path)
-    key = benchmark_prefix(str(benchmark_id)) + path
+    key = _root(str(benchmark_id), attempts) + path
     with storage_errors("Artifact"):
         metadata = await run_context.objects.stat(key)
         if download:
@@ -96,7 +107,7 @@ async def get_run_artifact_url(
             request=request,
             route_name="get_run_artifact_url",
             route_params={"benchmark_id": benchmark_id},
-            query_params={"path": path},
+            query_params={"path": path, "attempts": "true"} if attempts else {"path": path},
             expires_in=300,
         )
     return RunArtifactDownloadResponse(path=path, download_url=url, expires_in=ttl, size=metadata.size)

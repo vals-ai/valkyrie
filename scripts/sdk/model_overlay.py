@@ -219,6 +219,16 @@ MODELS: dict[str, ModelOverlay] = {
         "schema": "StopBenchmarkResponse",
         "referenced": False,
     },
+    "RegradeBenchmarkRequest": {
+        "module": "runs",
+        "doc": "The dataset to regrade a finished run's saved task states against.",
+        "fields": {"service_headers": {"x-repr": False, "default": {}}},
+        "base": REQUEST,
+    },
+    "RegradeBenchmarkResponse": {
+        "module": "runs",
+        "doc": "The new run and which source tasks it regrades or skips.",
+    },
     "RetryOrResumeBenchmarkResponse": {
         "module": "runs",
         "doc": "Response returned after retrying or resuming a run.",

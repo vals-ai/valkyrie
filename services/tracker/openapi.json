@@ -1980,6 +1980,18 @@
               "default": 100,
               "title": "Limit"
             }
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Read artifacts kept from task attempts replaced by a retry.",
+              "default": false,
+              "title": "Attempts"
+            },
+            "description": "Read artifacts kept from task attempts replaced by a retry."
           }
         ],
         "responses": {
@@ -2041,6 +2053,18 @@
               "default": false,
               "title": "Download"
             }
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Read artifacts kept from task attempts replaced by a retry.",
+              "default": false,
+              "title": "Attempts"
+            },
+            "description": "Read artifacts kept from task attempts replaced by a retry."
           }
         ],
         "responses": {
@@ -4558,6 +4582,57 @@
         }
       }
     },
+    "/regrade-benchmark/{benchmark_id}": {
+      "post": {
+        "summary": "Regrade Benchmark",
+        "description": "Regrade a finished run's saved task states into a new run on another dataset.\n\nThe source run, its tasks and its evaluation stay unchanged. Tasks without saved evaluation state are skipped and listed on the new run.",
+        "operationId": "regrade_benchmark",
+        "parameters": [
+          {
+            "name": "benchmark_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Benchmark Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegradeBenchmarkRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegradeBenchmarkResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/fetch-benchmarks": {
       "get": {
         "summary": "Fetch Benchmarks",
@@ -6626,6 +6701,32 @@
             ],
             "title": "Executor Protocol Version"
           },
+          "regraded_from_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Regraded From Run Id"
+          },
+          "regrade_skipped_task_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Regrade Skipped Task Ids"
+          },
           "project": {
             "anyOf": [
               {
@@ -8218,6 +8319,91 @@
           "providers"
         ],
         "title": "ProvidersResponse"
+      },
+      "RegradeBenchmarkRequest": {
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Dataset"
+          },
+          "dataset_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1024,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Version"
+          },
+          "concurrency": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Concurrency"
+          },
+          "service_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Service Headers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "dataset"
+        ],
+        "title": "RegradeBenchmarkRequest",
+        "description": "The dataset to regrade a finished run's saved task states against."
+      },
+      "RegradeBenchmarkResponse": {
+        "properties": {
+          "benchmark_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Benchmark Id"
+          },
+          "regraded_from_run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Regraded From Run Id"
+          },
+          "task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Task Ids"
+          },
+          "skipped_task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Skipped Task Ids"
+          }
+        },
+        "type": "object",
+        "required": [
+          "benchmark_id",
+          "regraded_from_run_id",
+          "task_ids",
+          "skipped_task_ids"
+        ],
+        "title": "RegradeBenchmarkResponse",
+        "description": "The new run and which source tasks it regrades or skips."
       },
       "ResourceCreateRequest": {
         "properties": {

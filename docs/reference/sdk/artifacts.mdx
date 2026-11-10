@@ -11,6 +11,8 @@ Access these methods through `client.artifacts`.
 
 List one page matching an exact artifact path or directory prefix. limit must be between 1 and 1000.
 
+attempts=True reads artifacts kept from task attempts replaced by a retry, under `TASK_ID/ATTEMPT_ID/`.
+
 ```python Signature
 async def list(
     run_id: UUID,
@@ -18,6 +20,7 @@ async def list(
     prefix: str = '',
     cursor: str | None = None,
     limit: int = 100,
+    attempts: bool = False,
 ) -> RunArtifactsResponse
 ```
 
@@ -39,6 +42,10 @@ async def list(
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"limit"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int · default: <code>{"100"}</code></span></div>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"attempts"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
+</div>
+
 **Returns**
 
 <a href="/reference/sdk/models/artifacts#run-artifacts-response"><code>RunArtifactsResponse</code></a>
@@ -50,7 +57,12 @@ For examples, see the [Python SDK guide](/sdk/resources).
 Create a temporary URL for one exact artifact path.
 
 ```python Signature
-async def download_url(run_id: UUID, path: str) -> RunArtifactDownloadResponse
+async def download_url(
+    run_id: UUID,
+    path: str,
+    *,
+    attempts: bool = False,
+) -> RunArtifactDownloadResponse
 ```
 
 **Parameters**
@@ -61,6 +73,10 @@ async def download_url(run_id: UUID, path: str) -> RunArtifactDownloadResponse
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"path"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"attempts"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
 </div>
 
 **Returns**
@@ -83,6 +99,7 @@ async def download(
     path: str = '',
     max_bytes: int = 5368709120,
     max_entries: int = 100000,
+    attempts: bool = False,
 ) -> Path
 ```
 
@@ -106,6 +123,10 @@ async def download(
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"max_entries"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int · default: <code>{"100000"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"attempts"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
 </div>
 
 **Returns**
