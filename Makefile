@@ -66,6 +66,7 @@ lint: venv_check
 	@uv run ruff check --exclude services/run-monitor/vendor .
 	@uv run python scripts/check_no_comments.py
 	@uv run python scripts/check_descriptions.py
+	@uv run python scripts/check_doc_paragraphs.py
 	@uv run python scripts/check_tracker_no_utils.py
 
 test: venv_check
@@ -73,6 +74,7 @@ test: venv_check
 		$(wildcard tests/unit/egress_proxy) tests/integration/local \
 		--cov=src/valkyrie --cov-report=xml --cov-report=term-missing --cov-fail-under=80
 	@cd services/run-monitor && uv run --frozen pytest -q
+	@cd services/projects && uv run --frozen pytest -q
 
 unit-test: test
 
@@ -96,6 +98,7 @@ style: format lint-fix lint
 typecheck: venv_check
 	@uv run basedpyright
 	@cd services/run-monitor && uv run --frozen basedpyright
+	@cd services/projects && uv run --frozen basedpyright
 
 tracker-service:
 	cd services/tracker && make tracker-service

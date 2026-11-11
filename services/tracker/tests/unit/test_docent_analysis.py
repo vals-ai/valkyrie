@@ -7,9 +7,9 @@ import pytest
 from sqlmodel import Session
 
 from tracker.aws.runtime import AWSRuntime
-from tracker.database.models import Benchmark, BenchmarkStatus, DocentReadingStatus
+from tracker.database.models import Benchmark
+from tracker.domain import BenchmarkStatus, DocentReadingStatus
 from tracker.docent_analysis import invoke_analyzer
-from tracker.services.runs.finalize import catch_errors_during_cleanup
 
 
 @pytest.fixture(autouse=True)
@@ -110,36 +110,21 @@ class TestInvokeAnalyzer:
         assert example_benchmark_object.docent_reading_url is None
 
 
-@pytest.mark.description(
-    (
-        "A benchmark stuck at IN_PROGRESS with docent_reading_status=RUNNING is\n"
-        "swept to ERROR (both the benchmark itself and the analyzer status)."
-    )
-)
-def test_cleanup_sweeps_running_docent_status_to_error(
-    database_session: Session,
+@pytest.mark.description("An exiting executor marks a running analyzer and its run as failed.")
+async def test_cleanup_sweeps_running_docent_status_to_error(
+    control_postgres_session: Session,
     example_benchmark_object: Benchmark,
-    executor_authority: Any,
+    bound_controls: Any,
 ) -> None:
-    from tests.utils import TEST_ORG_ID
-    from tracker.database.models import Org
 
     example_benchmark_object.status = BenchmarkStatus.IN_PROGRESS
     example_benchmark_object.docent_reading_status = DocentReadingStatus.RUNNING
-    database_session.add(example_benchmark_object)
-    database_session.commit()
+    control_postgres_session.add(example_benchmark_object)
+    control_postgres_session.commit()
+    controls = bound_controls(example_benchmark_object, session=control_postgres_session)
 
-    org = database_session.get(Org, TEST_ORG_ID)
-    assert org is not None
-    authority = executor_authority(example_benchmark_object, session=database_session)
+    assert await controls["run_control"].sweep_exit([])
 
-    catch_errors_during_cleanup(
-        example_benchmark_object.id,
-        database_session,
-        org,
-        authority=authority,
-    )
-
-    database_session.refresh(example_benchmark_object)
+    control_postgres_session.refresh(example_benchmark_object)
     assert example_benchmark_object.docent_reading_status == DocentReadingStatus.ERROR
     assert example_benchmark_object.status == BenchmarkStatus.ERROR

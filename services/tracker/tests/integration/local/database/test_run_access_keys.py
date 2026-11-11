@@ -4,7 +4,8 @@ from sqlmodel import Session, select
 
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID, FakeAccessKeys
-from tracker.database.models import BenchmarkStatus, Org, RunAccessKey
+from tracker.database.models import Org, RunAccessKey
+from tracker.domain import BenchmarkStatus
 from tracker.run_access_keys import delete_finished_run_keys
 
 

@@ -1,8 +1,10 @@
 import re
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 
 import click
 from click.core import ParameterSource
+from click.decorators import FC
 from valkyrie.sdk import SPEND_SUBCATEGORIES, NewProjectRequest, ProjectResponse, SpendType
 from valkyrie.sdk.models import FetchBenchmarkMetadataResponse
 
@@ -74,19 +76,15 @@ class _Budget(click.ParamType):
         return budget
 
 
-project_option = click.option(
-    "--project",
-    type=_ProjectName(),
-    required=True,
-    help="Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`.",
-)
-
-optional_project_option = click.option(
-    "--project",
-    type=_ProjectName(),
-    default=None,
-    help="Handle of the project this run is for (e.g., router-bench). Optional unless your organization requires one.",
-)
+def project_option(*, required: bool) -> Callable[[FC], FC]:
+    return click.option(
+        "--project",
+        type=_ProjectName(),
+        required=required,
+        help="Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`."
+        if required
+        else "Handle of the project this run is for. Without it, the run goes in your organization's default project.",
+    )
 
 
 def describe_project(project: ProjectResponse) -> str:

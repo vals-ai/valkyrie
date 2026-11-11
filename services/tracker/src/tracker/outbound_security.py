@@ -71,23 +71,29 @@ def validate_custom_service_destination(
 
     hostname = urlsplit(value).hostname
     assert hostname is not None
-    normalized_host = hostname.translate(_IDNA_SEPARATOR_TRANSLATION).lower().rstrip(".")
+    normalized_host = _normalized_host(hostname)
     if (
-        (restrict_vals_hosts and (normalized_host == _VALS_DOMAIN or normalized_host.endswith(f".{_VALS_DOMAIN}")))
-        or normalized_host in _RESTRICTED_HOSTNAMES
-        or normalized_host.endswith(_RESTRICTED_HOSTNAME_SUFFIXES)
-    ):
+        restrict_vals_hosts and (normalized_host == _VALS_DOMAIN or normalized_host.endswith(f".{_VALS_DOMAIN}"))
+    ) or not is_public_host(normalized_host):
         raise ValueError(_CUSTOM_DESTINATION_DENIED)
 
+
+def _normalized_host(hostname: str) -> str:
+    return hostname.translate(_IDNA_SEPARATOR_TRANSLATION).lower().rstrip(".")
+
+
+def is_public_host(hostname: str) -> bool:
+    host = _normalized_host(hostname)
+    if host in _RESTRICTED_HOSTNAMES or host.endswith(_RESTRICTED_HOSTNAME_SUFFIXES):
+        return False
     try:
-        parsed_ip = ip_address(normalized_host)
+        parsed_ip = ip_address(host)
     except ValueError:
         try:
-            parsed_ip = ip_address(inet_aton(normalized_host))
+            parsed_ip = ip_address(inet_aton(host))
         except OSError:
-            return
-    if not parsed_ip.is_global or parsed_ip.is_multicast:
-        raise ValueError(_CUSTOM_DESTINATION_DENIED)
+            return True
+    return parsed_ip.is_global and not parsed_ip.is_multicast
 
 
 def validate_service_url_syntax(value: str) -> str:

@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from tracker import config
 from tracker.aws.clients import AWSClientProvider, TenantRoleAWSClientProvider
 from tracker.aws.runtime import AWSResources, AWSRuntime
-from tracker.database.models import Org
+from tracker.types import OrgContext
 from tracker.secret_access import may_use_shared_secrets
 
 
@@ -60,7 +60,7 @@ def _deployment_account_id() -> str:
     return account_id
 
 
-def _org_bucket(org: Org) -> str | None:
+def _org_bucket(org: OrgContext) -> str | None:
     if org.storage_key:
         return org.storage_key
     if not config.AUTH_REQUIRED:
@@ -68,7 +68,7 @@ def _org_bucket(org: Org) -> str | None:
     return None
 
 
-def deployment_aws_runtime(org: Org, properties: AWSResources | None = None) -> AWSRuntime:
+def deployment_aws_runtime(org: OrgContext, properties: AWSResources | None = None) -> AWSRuntime:
     bucket = _org_bucket(org)
     if not bucket:
         raise ManagedAWSConfigurationError("This organization has no storage bucket")
@@ -86,7 +86,7 @@ def deployment_aws_runtime(org: Org, properties: AWSResources | None = None) -> 
     )
 
 
-def _client_provider(org: Org, region: str) -> AWSClientProvider:
+def _client_provider(org: OrgContext, region: str) -> AWSClientProvider:
     if not config.AWS_TENANT_ACCESS_ROLE_ARN:
         return AWSClientProvider(region)
     return TenantRoleAWSClientProvider(
@@ -97,7 +97,7 @@ def _client_provider(org: Org, region: str) -> AWSClientProvider:
     )
 
 
-def _http_deployment_runtime(org: Org, properties: AWSResources | None = None) -> AWSRuntime:
+def _http_deployment_runtime(org: OrgContext, properties: AWSResources | None = None) -> AWSRuntime:
     try:
         return deployment_aws_runtime(org, properties)
     except ManagedAWSStorageUnavailableError as exc:
@@ -106,10 +106,7 @@ def _http_deployment_runtime(org: Org, properties: AWSResources | None = None) -
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def resolve_start_aws_runtime(
-    org: Org,
-    properties: AWSResources | None = None,
-) -> AWSRuntime:
+def _deployment_runtime_with_submission_properties(org: OrgContext, properties: AWSResources | None) -> AWSRuntime:
     runtime = _http_deployment_runtime(org)
     runtime = replace(
         runtime,
@@ -125,9 +122,16 @@ def resolve_start_aws_runtime(
     return runtime
 
 
+def resolve_start_aws_runtime(
+    org: OrgContext,
+    properties: AWSResources | None = None,
+) -> AWSRuntime:
+    return _deployment_runtime_with_submission_properties(org, properties)
+
+
 def resolve_run_aws_runtime(
     *,
-    org: Org,
+    org: OrgContext,
     properties: AWSResources | None = None,
 ) -> AWSRuntime:
     return _http_deployment_runtime(org, properties)
@@ -135,7 +139,7 @@ def resolve_run_aws_runtime(
 
 def resolve_run_metadata_aws_runtime(
     *,
-    org: Org,
+    org: OrgContext,
     properties: AWSResources | None = None,
 ) -> AWSRuntime | None:
     try:
@@ -146,5 +150,5 @@ def resolve_run_metadata_aws_runtime(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def resolve_org_aws_runtime(org: Org) -> AWSRuntime:
+def resolve_org_aws_runtime(org: OrgContext) -> AWSRuntime:
     return _http_deployment_runtime(org)

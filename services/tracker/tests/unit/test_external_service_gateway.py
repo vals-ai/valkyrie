@@ -9,6 +9,7 @@ from tracker.external_service_gateway import (
     ExternalServiceDeadlineController,
     ExternalServiceGatewayClient,
     GenerationAccountingSummary,
+    combine_accounting,
 )
 
 
@@ -161,3 +162,33 @@ async def test_counter_for_another_token_is_rejected() -> None:
             await controller.refresh()
     finally:
         await http_client.aclose()
+
+
+@pytest.mark.description("Credit counts only the overhead after the baseline.")
+def test_credit_counts_only_the_overhead_after_the_baseline() -> None:
+    controller = ExternalServiceDeadlineController(
+        base_allowance_seconds=10.0, credit_cap_seconds=5.0, snapshot=_snapshot(4000), baseline_overhead_ms=3000
+    )
+
+    assert controller.applied_credit_seconds() == 1.0
+    assert controller.summary().external_service_overhead_seconds == 1.0
+    assert controller.effective_allowance_seconds() == 11.0
+    behind = ExternalServiceDeadlineController(
+        base_allowance_seconds=10.0, snapshot=_snapshot(2000), baseline_overhead_ms=3000
+    )
+    assert behind.applied_credit_seconds() == 0.0
+
+
+@pytest.mark.description("Combined summaries add up and keep the latest counter.")
+def test_combined_summaries_add_up_and_keep_the_latest_counter() -> None:
+    first = GenerationAccountingSummary("digest", 10.0, 60.0, 2.0, 2.0, 1, 4.0)
+    second = GenerationAccountingSummary("digest", 20.0, 60.0, 3.0, 3.0, 2, 6.0)
+    ungated = GenerationAccountingSummary(None, 5.0, None, None, None, None, 1.0)
+    unlimited = GenerationAccountingSummary(None, None, None, None, None, None, 1.0)
+
+    assert combine_accounting([first, second]) == GenerationAccountingSummary("digest", 30.0, 120.0, 5.0, 5.0, 2, 10.0)
+    assert combine_accounting([ungated, ungated]) == GenerationAccountingSummary(
+        None, 10.0, None, None, None, None, 2.0
+    )
+    assert combine_accounting([unlimited, first]).base_generation_allowance_seconds is None
+    assert combine_accounting([first, unlimited]).base_generation_allowance_seconds is None

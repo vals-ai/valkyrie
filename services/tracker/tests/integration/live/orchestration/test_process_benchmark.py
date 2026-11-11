@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from asyncio import gather
 from collections.abc import AsyncGenerator, Callable
-from sqlite3 import OperationalError
 from typing import Any
 
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import SetupTaskResponse
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from tests.utils import TEST_ORG_ID
@@ -15,14 +15,13 @@ from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import copy_agent_to_benchmark, delete_from_s3, get_benchmark_contract_s3_key
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    BenchmarkStatus,
     Org,
     Task,
     TaskBreakdown,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
@@ -32,7 +31,17 @@ _TASK_ID: str = "astropy__astropy-12907"
 _TASK_IDS: list[str] = ["astropy__astropy-12907", "astropy__astropy-13033"]
 _BENCHMARK: str = "swebench"
 
-pytestmark = pytest.mark.usefixtures("tracker_database", "live_deployment")
+pytestmark = pytest.mark.usefixtures("live_deployment")
+
+
+@pytest.fixture
+def live_control_database(control_postgres_session: Session, live_aws_runtime: AWSRuntime) -> Session:
+    org = control_postgres_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    org.storage_key = live_aws_runtime.resources.s3_bucket
+    control_postgres_session.add(org)
+    control_postgres_session.commit()
+    return control_postgres_session
 
 
 @pytest.fixture
@@ -116,42 +125,42 @@ class TestProcessBenchmark:
     async def test_process_benchmark(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         service_headers: dict[str, str],
         daytona_secret_name: str,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         benchmark, request = await _create_benchmark(
             contract,
             live_aws_runtime,
             frozen_contract_keys,
-            database_session,
+            live_control_database,
             service_headers,
             daytona_secret_name,
             task_ids=_TASK_IDS,
         )
 
-        authority_kwargs = executor_authority_kwargs(benchmark)
+        authority_kwargs = bound_controls(benchmark, session=live_control_database)
         await process_benchmark(
             execution_context_json=_execution_context(request, benchmark, _TASK_IDS), **authority_kwargs
         )
 
-        database_session.refresh(benchmark)
+        live_control_database.refresh(benchmark)
         assert benchmark.status == BenchmarkStatus.FINISHED
         assert benchmark.error_message is None
 
-        tasks = _task_rows(benchmark, database_session)
+        tasks = _task_rows(benchmark, live_control_database)
         assert len(tasks) == len(_TASK_IDS)
         assert all(task.status == TaskStatus.FINISHED for task in tasks)
-        _assert_no_task_errors(benchmark, database_session)
+        _assert_no_task_errors(benchmark, live_control_database)
         for task in tasks:
-            task_breakdown = database_session.get(TaskBreakdown, task.task_breakdown)
+            task_breakdown = live_control_database.get(TaskBreakdown, task.task_breakdown)
             assert task_breakdown is not None
             _assert_task_breakdown_complete(task_breakdown)
 
-        results = benchmark.fetch_evaluation_results(database_session)
+        results = benchmark.fetch_evaluation_results(live_control_database)
         assert set(results.keys()) == set(_TASK_IDS)
 
         assert benchmark.final_evaluation is not None
@@ -168,19 +177,19 @@ class TestProcessBenchmark:
     async def test_process_benchmark_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         monkeypatch: pytest.MonkeyPatch,
         service_headers: dict[str, str],
         daytona_secret_name: str,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         benchmark, request = await _create_benchmark(
             contract,
             live_aws_runtime,
             frozen_contract_keys,
-            database_session,
+            live_control_database,
             service_headers,
             daytona_secret_name,
             task_ids=[_TASK_ID],
@@ -193,18 +202,18 @@ class TestProcessBenchmark:
             nonlocal commit_count
             commit_count += 1
             if commit_count == 1:
-                raise OperationalError("Simulated database error")
+                raise OperationalError("COMMIT", None, RuntimeError("Simulated database error"))
 
             original_commit(self)
 
-        authority_kwargs = executor_authority_kwargs(benchmark)
+        authority_kwargs = bound_controls(benchmark, session=live_control_database)
         monkeypatch.setattr(Session, "commit", failing_commit)
 
         await process_benchmark(
             execution_context_json=_execution_context(request, benchmark, [_TASK_ID]), **authority_kwargs
         )
 
-        database_session.refresh(benchmark)
+        live_control_database.refresh(benchmark)
         assert benchmark.status == BenchmarkStatus.ERROR
         assert "Simulated database error" in (benchmark.error_message or "")
 
@@ -220,13 +229,13 @@ class TestProcessBenchmark:
     async def test_process_task_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         monkeypatch: pytest.MonkeyPatch,
         service_headers: dict[str, str],
         daytona_secret_name: str,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         failing_task = "astropy__astropy-13033"
         task_ids = [_TASK_ID, failing_task]
@@ -235,7 +244,7 @@ class TestProcessBenchmark:
             contract,
             live_aws_runtime,
             frozen_contract_keys,
-            database_session,
+            live_control_database,
             service_headers,
             daytona_secret_name,
             task_ids=task_ids,
@@ -264,32 +273,33 @@ class TestProcessBenchmark:
             )
 
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", setup_task_with_failure)
-        authority_kwargs = executor_authority_kwargs(benchmark)
+        authority_kwargs = bound_controls(benchmark, session=live_control_database)
 
         await process_benchmark(
             execution_context_json=_execution_context(request, benchmark, task_ids), **authority_kwargs
         )
 
-        database_session.refresh(benchmark)
+        live_control_database.refresh(benchmark)
         assert benchmark.status == BenchmarkStatus.FINISHED, benchmark.error_message
         assert benchmark.error_message is None
 
-        error_tasks = database_session.exec(
+        error_tasks = live_control_database.exec(
             select(Task).where(Task.benchmark == benchmark.id).where(Task.status == TaskStatus.ERROR)
         ).all()
         assert len(error_tasks) == 1
         assert error_tasks[0].task_id == failing_task
         assert (
-            "Simulated setup failure" in BenchmarkRepository(database_session).task_failures(benchmark)[failing_task][0]
+            "Simulated setup failure"
+            in BenchmarkRepository(live_control_database).task_failures(benchmark)[failing_task][0]
         )
 
-        finished_tasks = database_session.exec(
+        finished_tasks = live_control_database.exec(
             select(Task).where(Task.benchmark == benchmark.id).where(Task.status == TaskStatus.FINISHED)
         ).all()
         assert len(finished_tasks) == 1
         assert finished_tasks[0].task_id == _TASK_ID
 
-        results = benchmark.fetch_evaluation_results(database_session)
+        results = benchmark.fetch_evaluation_results(live_control_database)
         assert len(results) == 1
         assert _TASK_ID in results
         assert failing_task not in results
@@ -306,44 +316,44 @@ class TestProcessBenchmark:
     async def test_process_benchmark_errors_when_all_tasks_fail_before_evaluation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         service_headers: dict[str, str],
         daytona_secret_name: str,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         failing_contract = contract.model_copy(update={"output_artifacts": ["missing-artifact.json"]})
         benchmark, request = await _create_benchmark(
             failing_contract,
             live_aws_runtime,
             frozen_contract_keys,
-            database_session,
+            live_control_database,
             service_headers,
             daytona_secret_name,
             task_ids=[_TASK_ID],
         )
-        authority_kwargs = executor_authority_kwargs(benchmark)
+        authority_kwargs = bound_controls(benchmark, session=live_control_database)
 
         await process_benchmark(
             execution_context_json=_execution_context(request, benchmark, [_TASK_ID]), **authority_kwargs
         )
 
-        database_session.refresh(benchmark)
+        live_control_database.refresh(benchmark)
         assert benchmark.status == BenchmarkStatus.ERROR
         assert "No tasks were completed successfully" in (benchmark.error_message or "")
         assert "Required output artifact missing" in (benchmark.error_message or "")
         assert "Traceback" not in (benchmark.error_message or "")
         assert benchmark.final_evaluation is None
 
-        tasks = _task_rows(benchmark, database_session)
+        tasks = _task_rows(benchmark, live_control_database)
         assert len(tasks) == 1
         assert tasks[0].status == TaskStatus.ERROR
         assert (
             "Required output artifact missing"
-            in BenchmarkRepository(database_session).task_failures(benchmark)[_TASK_ID][0]
+            in BenchmarkRepository(live_control_database).task_failures(benchmark)[_TASK_ID][0]
         )
-        assert benchmark.fetch_evaluation_results(database_session) == {}
+        assert benchmark.fetch_evaluation_results(live_control_database) == {}
 
     @pytest.mark.description(
         (
@@ -357,19 +367,19 @@ class TestProcessBenchmark:
     async def test_concurrent_benchmarks_same_task(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         service_headers: dict[str, str],
         daytona_secret_name: str,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         benchmark_requests = [
             await _create_benchmark(
                 contract,
                 live_aws_runtime,
                 frozen_contract_keys,
-                database_session,
+                live_control_database,
                 service_headers,
                 daytona_secret_name,
                 task_ids=[_TASK_ID],
@@ -377,7 +387,8 @@ class TestProcessBenchmark:
             for _ in range(2)
         ]
         authority_by_benchmark = {
-            benchmark.id: executor_authority_kwargs(benchmark) for benchmark, _ in benchmark_requests
+            benchmark.id: bound_controls(benchmark, session=live_control_database)
+            for benchmark, _ in benchmark_requests
         }
 
         await gather(
@@ -391,18 +402,18 @@ class TestProcessBenchmark:
         )
 
         for benchmark, _ in benchmark_requests:
-            database_session.refresh(benchmark)
+            live_control_database.refresh(benchmark)
             assert benchmark.status == BenchmarkStatus.FINISHED, (
                 f"Benchmark {benchmark.id} error: {benchmark.error_message}"
             )
             assert benchmark.error_message is None
             assert benchmark.final_evaluation is not None
 
-            tasks = _task_rows(benchmark, database_session)
+            tasks = _task_rows(benchmark, live_control_database)
             assert len(tasks) == 1
             assert tasks[0].task_id == _TASK_ID
             assert tasks[0].status == TaskStatus.FINISHED
-            assert not BenchmarkRepository(database_session).task_failures(benchmark)
+            assert not BenchmarkRepository(live_control_database).task_failures(benchmark)
 
-            results = benchmark.fetch_evaluation_results(database_session)
+            results = benchmark.fetch_evaluation_results(live_control_database)
             assert set(results.keys()) == {_TASK_ID}

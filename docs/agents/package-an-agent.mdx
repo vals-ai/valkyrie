@@ -5,8 +5,9 @@ description: "Wrap your agent in a directory that Valkyrie can install and run, 
 
 Valkyrie runs any agent that has a command-line entry point. To package yours, add a
 `contract.yaml` next to its code that says how to install it, how to run it on one task,
-and which files to keep. Every field is in the
-[contract reference](/agents/agent-contract).
+and which files to keep.
+
+Every field is in the [contract reference](/agents/agent-contract).
 
 ## Give the agent a command-line entry point
 
@@ -60,11 +61,12 @@ defaults:
     description: Model to call, for example anthropic/claude-sonnet-4-6
 ```
 
-Valkyrie fills in `{problem_statement_path}`, `{task_id}`, and `{model}` before it runs
-`run_cmd`. The command runs from the benchmark's working directory, so call your script by
-its full path under `/bundle/AGENT_NAME/`, where *`AGENT_NAME`* is the contract's `name`.
-The following sections cover `secrets` and `defaults`, and the reference lists
-[when each field is used](/agents/agent-contract#order-of-a-task).
+- Valkyrie fills in `{problem_statement_path}`, `{task_id}`, and `{model}` before it runs
+  `run_cmd`.
+- The command runs from the benchmark's working directory, so call your script by its full
+  path under `/bundle/AGENT_NAME/`, where *`AGENT_NAME`* is the contract's `name`.
+- The following sections cover `secrets` and `defaults`, and the reference lists
+  [when each field is used](/agents/agent-contract#order-of-a-task).
 
 ## Install dependencies
 
@@ -104,8 +106,10 @@ valkyrie secret set anthropic-api-key
 ```
 
 Then map the environment variable your agent reads to that reference under `secrets`, as
-in the preceding contract. Valkyrie sets the variable in each task's sandbox. To use another
-key for one run, pass `-s ANTHROPIC_API_KEY other-key` to `valkyrie run start`.
+in the preceding contract. Valkyrie sets the variable in each task's sandbox.
+
+To use another key for one run, pass `-s ANTHROPIC_API_KEY other-key` to
+`valkyrie run start`.
 
 ## Let runs choose the model and settings
 
@@ -160,7 +164,7 @@ Upload the agent and run it on one task:
 ```bash
 valkyrie agent push ./my-agent
 
-valkyrie run start --agent my-agent --benchmark swebench --project my-project \
+valkyrie run start --agent my-agent --benchmark swebench \
   --model anthropic/claude-sonnet-4-6 --slice 0:1 --connect
 ```
 

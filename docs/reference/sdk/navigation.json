@@ -9,7 +9,7 @@
   "reference/sdk/services",
   "reference/sdk/benchmark-definitions",
   "reference/sdk/datasets",
-  "reference/sdk/datasets-tasks",
+  "reference/sdk/datasets-versions",
   "reference/sdk/logs",
   "reference/sdk/scheduler",
   "reference/sdk/secrets",

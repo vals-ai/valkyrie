@@ -1,7 +1,6 @@
-import logging
 from datetime import datetime
 from typing import Any, Sequence, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -17,43 +16,64 @@ from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity
+from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.runtime.secrets import SecretValue
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    BenchmarkStatus,
     ErrorResult,
     EvaluationResult,
-    FailureCategory,
     ExecutorRelease,
     Org,
     Task,
-    TaskStatus,
 )
-from tracker.exceptions import TrackerServiceError
+from tracker.types import AgentContractRequest
+from tracker.database.models import BenchmarkDefinition, Dataset, RunCost
+from tracker.search_cost import SearchCharge
+from decimal import Decimal
+from tracker.repositories.dataset_version import DatasetVersionRepository
+from tracker.services.datasets.ref import HostedDataset
+from tracker.domain import BenchmarkStatus, FailureCategory, TaskStatus
+from tracker.executor.control_tasks import (
+    TaskControl,
+    TaskDecision,
+    TaskFailure,
+    TaskFailureRequest,
+    TaskResumeRequest,
+    TaskSearchCostsRequest,
+)
+from tracker.executor.control_protocol import AttemptRef, PhaseRef
+from tracker.executor.control_runs import RunControl
 from tracker.executor.release_control import promote_release
-from tracker.repositories.benchmark import BenchmarkRepository
-from tracker.services.runs.finalize import RUNNABLE_TASK_STATUSES
+
 from tracker.types import FetchBenchmarksRequest, RunExecutionRequest, StartBenchmarkRequest
-from tracker.services.tasks.execute import save_eval_resume_state
-from tracker.services.tasks.status import commit_task_error
-from tracker.services.runs.start import create_task_rows
-from tracker.services.runs.finalize import fetch_final_score_inputs, set_benchmark_final_status
+from tracker.services.results import fetch_filtered_benchmark_rows
 from tracker.services.benchmarks import fetch_benchmark_row, start_benchmark_request_to_benchmark
 from tracker.clients.benchmark_service import fetch_sandbox_provider_config
-from tracker.services.results import fetch_filtered_benchmark_rows
 
 
 client = TestClient(app)
 _ACTIVE_ATTEMPT = datetime(2026, 7, 1)
 
 
+def _task_failure(message: str) -> TaskFailure:
+    return TaskFailure(
+        message=message,
+        producer="tracker",
+        operation="process_task",
+        error_type="RuntimeError",
+        category=FailureCategory.UNKNOWN,
+        cause_code=None,
+        phase=None,
+        transient=None,
+    )
+
+
 @pytest.fixture
 def example_benchmark_object(contract: AgentContractRequest, database_session: Session) -> Benchmark:
     release = ExecutorRelease(
         id="test-release",
-        artifact_uri="s3://artifacts/test-release.pex",
-        artifact_digest="digest-test-release",
+        artifact_uri="source:///test-release",
+        artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
     )
     database_session.add(release)
@@ -460,169 +480,137 @@ class TestRunState:
         enqueue.assert_not_awaited()
 
     @pytest.mark.description(
-        (
-            "Creating task rows adds only the missing tasks, all pending.\n"
-            "\n"
-            "Test cases:\n"
-            "- No tasks exist in the database already.\n"
-            "- Some tasks exist in the database already.\n"
-            "- No duplicate tasks are created.\n"
-            "- All returned tasks are in the pending state."
-        )
+        "Run state creates missing pending task rows once and returns all tasks on subsequent reads."
     )
-    def test_create_task_rows(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        executor_authority: Any,
+    async def test_read_run_state_creates_missing_task_rows(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
+        benchmark = make_benchmark(contract=contract, concurrency=5)
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
+        task_ids = [f"task_{i}" for i in range(5)]
 
-        benchmark_row = example_benchmark_object
-        database_session.add(benchmark_row)
-        database_session.commit()
-        authority = executor_authority(benchmark_row, session=database_session)
+        snapshot = await run_control.read_run_state(task_ids, create_missing_tasks=True)
+        assert {task.ref.task_id: task.status for task in snapshot.tasks} == dict.fromkeys(task_ids, TaskStatus.PENDING)
+        assert snapshot.authority_current
 
-        verified_task_ids = [f"task_{i}" for i in range(5)]
+        repeated = await run_control.read_run_state(task_ids, create_missing_tasks=True)
+        assert [(task.ref.task_id, task.ref.task_row_id) for task in repeated.tasks] == [
+            (task.ref.task_id, task.ref.task_row_id) for task in snapshot.tasks
+        ]
+        rows = control_postgres_session.exec(select(Task).where(Task.benchmark == benchmark.id)).all()
+        assert len(rows) == len(task_ids)
+        assert all(task.status == TaskStatus.PENDING for task in rows)
+        selected = await run_control.read_run_state(["task_1"], create_missing_tasks=True)
+        assert len(selected.tasks) == len(task_ids)
+        assert {task.ref.task_id for task in selected.tasks} == set(task_ids)
 
-        task_rows = create_task_rows(
-            verified_task_ids, benchmark_row, database_session, self._test_org, authority=authority
-        )
-        assert len(task_rows) == len(verified_task_ids)
-        assert all(task_row[1].status == TaskStatus.PENDING for task_row in task_rows)
-
-        for i, task_row in enumerate(task_rows):
-            assert task_row[0] == verified_task_ids[i]
-
-        task_rows = create_task_rows(
-            verified_task_ids, benchmark_row, database_session, self._test_org, authority=authority
-        )
-        assert len(task_rows) == len(verified_task_ids)
-        assert all(task_row[1].status == TaskStatus.PENDING for task_row in task_rows)
-
-        all_tasks = database_session.exec(select(Task).where(Task.benchmark == benchmark_row.id)).all()
-        assert len(all_tasks) == len(verified_task_ids)
-        assert all(task.status == TaskStatus.PENDING for task in all_tasks)
-
-        task_rows = create_task_rows(["task_1"], benchmark_row, database_session, self._test_org, authority=authority)
-        assert [task_id for task_id, _ in task_rows] == ["task_1"]
-
-    @pytest.mark.description("Final score inputs wait for runnable tasks.")
-    def test_fetch_final_score_inputs_waits_for_runnable_tasks(
-        self, example_benchmark_object: Benchmark, database_session: Session
+    @pytest.mark.description(
+        "A run pinned to a hosted dataset version reads that version's task and metric script digests."
+    )
+    async def test_read_dataset_version_returns_the_pinned_versions_digests(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
-        benchmark_row = example_benchmark_object
-        database_session.add(benchmark_row)
-        database_session.commit()
+        definition = BenchmarkDefinition(org_id=TEST_ORG_ID, name="hosted")
+        control_postgres_session.add(definition)
+        control_postgres_session.flush()
+        dataset = Dataset(benchmark_definition_id=definition.id, name="smoke")
+        control_postgres_session.add(dataset)
+        control_postgres_session.flush()
+        repository = DatasetVersionRepository(control_postgres_session)
+        first, _ = repository.publish(dataset.id, {"a": ("1" * 64, 1)}, [], None, metric_digest="m" * 64)
+        repository.publish(dataset.id, {"a": ("2" * 64, 1), "b": ("3" * 64, 1)}, [], None)
+        benchmark = make_benchmark(contract=contract, concurrency=1)
+        ref = HostedDataset(benchmark="hosted", dataset="smoke", dataset_id=dataset.id, revision=first.revision)
+        benchmark.arguments = benchmark.arguments.model_copy(update={"dataset_ref": ref})
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
 
-        finished_task = Task(
-            org_id=TEST_ORG_ID,
-            task_id="task_finished",
-            benchmark=benchmark_row.id,
-            status=TaskStatus.FINISHED,
-        )
-        error_task = Task(
-            org_id=TEST_ORG_ID,
-            task_id="task_error",
-            benchmark=benchmark_row.id,
-            status=TaskStatus.ERROR,
-        )
-        stopped_task = Task(
-            org_id=TEST_ORG_ID,
-            task_id="task_stopped",
-            benchmark=benchmark_row.id,
-            status=TaskStatus.STOPPED,
-        )
-        pending_task = Task(
-            org_id=TEST_ORG_ID,
-            task_id="task_pending",
-            benchmark=benchmark_row.id,
-            status=TaskStatus.PENDING,
-        )
-        database_session.add_all([finished_task, error_task, stopped_task, pending_task])
-        database_session.commit()
+        snapshot = await run_control.read_dataset_version()
 
-        database_session.add(EvaluationResult(org_id=TEST_ORG_ID, task=finished_task.id, result={"score": 1.0}))
-        database_session.commit()
+        assert snapshot.task_digests == {"a": "1" * 64}
+        assert snapshot.metric_digest == "m" * 64
 
-        assert BenchmarkRepository(database_session).has_tasks(TEST_ORG_ID, benchmark_row.id, RUNNABLE_TASK_STATUSES)
+    @pytest.mark.description(
+        "Finalization waits for runnable tasks, then chooses stopped or score inputs from terminal tasks."
+    )
+    async def test_prepare_finalization_waits_for_runnable_tasks(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
+    ) -> None:
+        benchmark = make_benchmark(contract=contract, concurrency=5)
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
+        tasks = [
+            Task(org_id=TEST_ORG_ID, task_id=task_id, benchmark=benchmark.id, status=status, started_at=_ACTIVE_ATTEMPT)
+            for task_id, status in [
+                ("task_finished", TaskStatus.FINISHED),
+                ("task_error", TaskStatus.ERROR),
+                ("task_stopped", TaskStatus.STOPPED),
+                ("task_pending", TaskStatus.PENDING),
+            ]
+        ]
+        control_postgres_session.add_all(tasks)
+        control_postgres_session.commit()
+        control_postgres_session.add(EvaluationResult(org_id=TEST_ORG_ID, task=tasks[0].id, result={"score": 1.0}))
+        control_postgres_session.commit()
 
-        pending_task.status = TaskStatus.ERROR
-        database_session.add(pending_task)
-        database_session.commit()
+        assert (await run_control.prepare_finalization()).kind == "deferred"
+        tasks[3].status = TaskStatus.ERROR
+        control_postgres_session.add(tasks[3])
+        control_postgres_session.commit()
+        assert (await run_control.prepare_finalization()).kind == "stopped"
+        control_postgres_session.refresh(benchmark)
+        assert benchmark.status == BenchmarkStatus.STOPPED
 
-        assert not BenchmarkRepository(database_session).has_tasks(
-            TEST_ORG_ID, benchmark_row.id, RUNNABLE_TASK_STATUSES
-        )
-        assert fetch_final_score_inputs(database_session, benchmark_row, self._test_org) == {
+        benchmark.status = BenchmarkStatus.IN_PROGRESS
+        tasks[2].status = TaskStatus.ERROR
+        control_postgres_session.add_all([benchmark, tasks[2]])
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
+        decision = await run_control.prepare_finalization()
+        assert decision.kind == "score"
+        assert decision.inputs is not None
+        assert decision.inputs.evaluation_results == {
             "task_finished": {"score": 1.0},
             "task_error": None,
             "task_stopped": None,
             "task_pending": None,
         }
 
-    @pytest.mark.description("Committing a task error records a span for the status change.")
-    def test_commit_task_error_spans_status_transition(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        monkeypatch: pytest.MonkeyPatch,
-        executor_authority: Any,
-        caplog: pytest.LogCaptureFixture,
-        request: pytest.FixtureRequest,
+    @pytest.mark.description("Task failure records terminal status and structured error provenance through Control.")
+    async def test_fail_task_records_status_and_provenance(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
-        span_records: list[dict[str, Any]] = []
-
-        class MockSpan:
-            def __init__(self, record: dict[str, Any]) -> None:
-                self._record = record
-
-            def __enter__(self) -> "MockSpan":
-                self._record["entered"] = True
-                return self
-
-            def __exit__(self, *_args: object) -> None:
-                self._record["exited"] = True
-
-        def fake_span(message: str, **attributes: Any) -> MockSpan:
-            record = {"message": message, **attributes}
-            span_records.append(record)
-            return MockSpan(record)
-
-        monkeypatch.setattr("tracker.observability.tracing.logfire.span", fake_span)
-        tasks_logger = logging.getLogger("tracker.services.tasks")
-        caplog.set_level(logging.INFO, logger=tasks_logger.name)
-        tasks_logger.addHandler(caplog.handler)
-        request.addfinalizer(lambda: tasks_logger.removeHandler(caplog.handler))
-
-        database_session.add(example_benchmark_object)
-        database_session.commit()
-        authority = executor_authority(example_benchmark_object, session=database_session)
-
-        task_row = Task(
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
             org_id=TEST_ORG_ID,
             task_id="task_0",
-            benchmark=example_benchmark_object.id,
+            benchmark=benchmark.id,
             status=TaskStatus.IN_PROGRESS,
+            started_at=_ACTIVE_ATTEMPT,
         )
-        database_session.add(example_benchmark_object)
-        database_session.add(task_row)
-        database_session.commit()
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        attempt = AttemptRef(org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
 
-        commit_task_error(
-            task_row,
-            database_session,
-            "agent failed",
-            producer="tracker",
-            operation="process_task",
-            error_type="RuntimeError",
-            category=FailureCategory.UNKNOWN,
-            authority=authority,
+        assert await control.fail(
+            TaskFailureRequest(
+                ref=control.ref,
+                attempt=attempt,
+                failure=_task_failure("agent failed"),
+                expected_status=TaskStatus.IN_PROGRESS,
+                retry_scheduled=False,
+                failed_attempt_number=None,
+            )
         )
-
-        database_session.refresh(task_row)
-        assert task_row.status == TaskStatus.ERROR
-        error_result = database_session.exec(
-            select(ErrorResult).where(ErrorResult.task == task_row.id).where(ErrorResult.org_id == TEST_ORG_ID)
+        control_postgres_session.refresh(task)
+        assert task.status == TaskStatus.ERROR
+        error_result = control_postgres_session.exec(
+            select(ErrorResult).where(ErrorResult.task == task.id).where(ErrorResult.org_id == TEST_ORG_ID)
         ).one()
         assert error_result.error_message == "agent failed"
         assert error_result.producer == "tracker"
@@ -631,196 +619,187 @@ class TestRunState:
         assert error_result.cause_code is None
         assert error_result.retry_scheduled is False
         assert error_result.failed_attempt_number is None
-        transition_record = next(record for record in span_records if record["message"] == "task.status_transition")
-        assert transition_record["from_status"] == TaskStatus.IN_PROGRESS.value
-        assert transition_record["to_status"] == TaskStatus.ERROR.value
-        assert transition_record["task_id"] == "task_0"
-        assert transition_record["benchmark_id"] == str(example_benchmark_object.id)
-        assert transition_record["entered"] and transition_record["exited"]
-        assert transition_record["has_error_message"]
-        assert not any(record.getMessage().startswith("task.status_transition") for record in caplog.records)
 
-    @pytest.mark.description("Committing a task error leaves finished tasks alone.")
-    @pytest.mark.parametrize("status", [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED])
-    def test_commit_task_error_preserves_terminal_tasks(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        executor_authority: Any,
-        status: TaskStatus,
+    @pytest.mark.description(
+        "Search charges reported for two steps of one attempt are saved as two rows, and a repeated report adds none."
+    )
+    async def test_search_costs_keep_one_row_per_step(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
+        benchmark = make_benchmark(contract=contract)
         task = Task(
             org_id=TEST_ORG_ID,
             task_id="task_0",
-            benchmark=example_benchmark_object.id,
-            status=status,
+            benchmark=benchmark.id,
+            status=TaskStatus.IN_PROGRESS,
+            started_at=_ACTIVE_ATTEMPT,
         )
-        database_session.add_all([example_benchmark_object, task])
-        database_session.commit()
-        authority = executor_authority(example_benchmark_object, session=database_session)
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        attempt = AttemptRef(org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
+        charges = [SearchCharge("exa", Decimal("0.007"))]
 
-        assert not commit_task_error(
-            task,
-            database_session,
-            "stale failure",
-            producer="tracker",
-            operation="process_task",
-            error_type="RuntimeError",
-            category=FailureCategory.UNKNOWN,
-            authority=authority,
+        for step in ("one", "two", "one"):
+            await control.search_costs(
+                TaskSearchCostsRequest(ref=control.ref, attempt=attempt, charges=charges, step_name=step)
+            )
+
+        control_postgres_session.expire_all()
+        sources = control_postgres_session.exec(
+            select(RunCost.source_id).where(RunCost.benchmark_id == benchmark.id)
+        ).all()
+        assert len(sources) == 2
+        assert sorted(source.rsplit(":", 1)[-1] for source in sources) == ["one", "two"]
+
+    @pytest.mark.description("Task failure leaves terminal tasks and their error history unchanged.")
+    @pytest.mark.parametrize("status", [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED])
+    async def test_fail_task_preserves_terminal_tasks(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any, status: TaskStatus
+    ) -> None:
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
+            org_id=TEST_ORG_ID, task_id="task_0", benchmark=benchmark.id, status=status, started_at=_ACTIVE_ATTEMPT
         )
-
-        database_session.refresh(task)
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        attempt = AttemptRef(org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
+        assert not await control.fail(
+            TaskFailureRequest(
+                ref=control.ref,
+                attempt=attempt,
+                failure=_task_failure("stale failure"),
+                expected_status=None,
+                retry_scheduled=False,
+                failed_attempt_number=None,
+            )
+        )
+        control_postgres_session.refresh(task)
         assert task.status == status
-        assert database_session.exec(select(ErrorResult.id).where(ErrorResult.task == task.id)).first() is None
+        assert control_postgres_session.exec(select(ErrorResult.id).where(ErrorResult.task == task.id)).first() is None
 
     @pytest.mark.description("Eval resume state rejects rows that are not active.")
     @pytest.mark.parametrize(
-        "status",
-        [TaskStatus.PENDING, TaskStatus.ERROR, TaskStatus.FINISHED, TaskStatus.STOPPED, TaskStatus.EVALUATING],
+        "status", [TaskStatus.PENDING, TaskStatus.ERROR, TaskStatus.FINISHED, TaskStatus.STOPPED, TaskStatus.EVALUATING]
     )
-    def test_eval_resume_state_rejects_non_active_rows(
+    async def test_eval_resume_state_rejects_non_active_rows(
         self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        executor_authority: Any,
-        monkeypatch: pytest.MonkeyPatch,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
         status: TaskStatus,
     ) -> None:
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        task_row = Task(
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
             org_id=TEST_ORG_ID,
             task_id="task_0",
-            benchmark=example_benchmark_object.id,
+            benchmark=benchmark.id,
             status=status,
             started_at=datetime(2026, 6, 30) if status == TaskStatus.EVALUATING else _ACTIVE_ATTEMPT,
         )
-        database_session.add_all([example_benchmark_object, task_row])
-        database_session.commit()
-        authority = executor_authority(example_benchmark_object, session=database_session)
-
-        updated = save_eval_resume_state(
-            task_row.id,
-            self._test_org,
-            {"cursor": "next"},
-            expected_started_at=_ACTIVE_ATTEMPT,
-            authority=authority,
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        token = uuid4()
+        task.evaluation_phase_dispatch_id = control.ref.dispatch_id
+        task.evaluation_phase_token = token
+        control_postgres_session.add(task)
+        control_postgres_session.commit()
+        request = TaskResumeRequest(
+            ref=control.ref,
+            attempt=AttemptRef(
+                org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=_ACTIVE_ATTEMPT
+            ),
+            phase=PhaseRef(token=token),
+            state={"cursor": "next"},
         )
+        if status == TaskStatus.EVALUATING:
+            with pytest.raises(ExecutionAuthorityRevoked):
+                await control.client.call("save_task_resume", request, TaskDecision)
+        else:
+            assert not (await control.client.call("save_task_resume", request, TaskDecision)).accepted
+        control_postgres_session.refresh(task)
+        assert task.eval_resume_state is None
 
-        database_session.refresh(task_row)
-        assert not updated
-        assert task_row.eval_resume_state is None
-
-    @pytest.mark.description("Committing a task error rolls back when its start time is stale.")
-    def test_commit_task_error_rolls_back_when_started_at_is_stale(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        executor_authority: Any,
+    @pytest.mark.description("A stale task attempt cannot commit failure or change the active task.")
+    async def test_fail_task_rejects_stale_attempt(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
-        database_session.add(example_benchmark_object)
-        database_session.commit()
-        authority = executor_authority(example_benchmark_object, session=database_session)
-        task_row = Task(
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
             org_id=TEST_ORG_ID,
             task_id="stale-task",
-            benchmark=example_benchmark_object.id,
+            benchmark=benchmark.id,
             status=TaskStatus.IN_PROGRESS,
+            started_at=_ACTIVE_ATTEMPT,
         )
-        database_session.add(task_row)
-        database_session.commit()
-
-        committed = commit_task_error(
-            task_row,
-            database_session,
-            "stale failure",
-            producer="tracker",
-            operation="process_task",
-            error_type="RuntimeError",
-            category=FailureCategory.UNKNOWN,
-            expected_started_at=datetime(2000, 1, 1, tzinfo=ZoneInfo("UTC")),
-            authority=authority,
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        stale = AttemptRef(
+            org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=datetime(2000, 1, 1)
         )
+        with pytest.raises(ExecutionAuthorityRevoked):
+            await control.fail(
+                TaskFailureRequest(
+                    ref=control.ref,
+                    attempt=stale,
+                    failure=_task_failure("stale failure"),
+                    expected_status=TaskStatus.IN_PROGRESS,
+                    retry_scheduled=False,
+                    failed_attempt_number=None,
+                )
+            )
+        control_postgres_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert task.finished_at is None
+        assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).all() == []
 
-        assert committed is False
-        database_session.expire_all()
-        persisted_task = database_session.get(Task, task_row.id)
-        assert persisted_task is not None
-        assert persisted_task.status == TaskStatus.IN_PROGRESS
-        assert persisted_task.finished_at is None
-        assert database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
-
-    @pytest.mark.description(
-        (
-            "A run's final status follows its tasks. It is finished when all finished and stopped when any stopped.\n"
-            "\n"
-            "Test cases:\n"
-            "- Error is raised if tasks are still in the pending or in progress state.\n"
-            "- Benchmark status is set to finished if all tasks are finished.\n"
-            "- Benchmark status is set to stopped if any tasks are stopped."
-        )
-    )
-    async def test_set_benchmark_final_status(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        executor_authority: Any,
-        monkeypatch: pytest.MonkeyPatch,
+    @pytest.mark.description("Finalization defers pending work, scores completed work, and stops interrupted runs.")
+    async def test_finalize_benchmark_status(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
     ) -> None:
-
-        finalized_statuses: list[str] = []
-
-        def record_span(name: str, **attributes: Any) -> MagicMock:
-            if name == "run.finalized":
-                finalized_statuses.append(attributes["status"])
-            return MagicMock()
-
-        monkeypatch.setattr("tracker.services.runs.start.observability_span", record_span)
-        monkeypatch.setattr("tracker.services.runs.finalize.observability_span", record_span)
-
-        benchmark_row = example_benchmark_object
-        database_session.add(benchmark_row)
-        database_session.commit()
-        authority = executor_authority(benchmark_row, session=database_session)
-
+        benchmark = make_benchmark(contract=contract, concurrency=5)
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
         task_ids = [f"task_{i}" for i in range(5)]
-        task_rows = create_task_rows(task_ids, benchmark_row, database_session, self._test_org, authority=authority)
-        assert len(task_rows) == len(task_ids)
-        assert all(task_row[1].status == TaskStatus.PENDING for task_row in task_rows)
+        snapshot = await run_control.read_run_state(task_ids, create_missing_tasks=True)
+        assert len(snapshot.tasks) == len(task_ids)
+        assert all(task.status == TaskStatus.PENDING for task in snapshot.tasks)
+        assert (await run_control.prepare_finalization()).kind == "deferred"
 
-        with pytest.raises(TrackerServiceError):
-            set_benchmark_final_status(benchmark_row, database_session, self._test_org, authority=authority)
-
-        database_session.exec(
+        control_postgres_session.exec(
             update(Task)
-            .where(col(Task.benchmark) == benchmark_row.id)
+            .where(col(Task.benchmark) == benchmark.id)
             .values(status=TaskStatus.FINISHED, finished_at=datetime.now(ZoneInfo("UTC")))
         )
-        database_session.commit()
+        control_postgres_session.commit()
+        assert (await run_control.prepare_finalization()).kind == "all_error"
+        task = control_postgres_session.exec(select(Task).where(Task.benchmark == benchmark.id)).first()
+        assert task is not None
+        control_postgres_session.add(EvaluationResult(org_id=TEST_ORG_ID, task=task.id, result={"score": 1.0}))
+        control_postgres_session.commit()
+        decision = await run_control.prepare_finalization()
+        assert decision.kind == "score" and decision.inputs is not None
+        claim = await run_control.commit_final_score(decision.inputs.phase, decision.inputs.fingerprint, 1.0, {})
+        assert claim.committed and claim.status == BenchmarkStatus.FINISHED
+        control_postgres_session.refresh(benchmark)
+        assert benchmark.status == BenchmarkStatus.FINISHED
 
-        set_benchmark_final_status(benchmark_row, database_session, self._test_org, authority=authority)
-        database_session.refresh(benchmark_row, attribute_names=["status"])
-        assert benchmark_row.status == BenchmarkStatus.FINISHED
-
-        benchmark_row.status = BenchmarkStatus.IN_PROGRESS
-        benchmark_row.finished_at = None
-        database_session.add(benchmark_row)
-        database_session.commit()
-
-        stopped_tasks = task_ids[:2]
-        database_session.exec(
+        benchmark.status = BenchmarkStatus.IN_PROGRESS
+        control_postgres_session.add(benchmark)
+        control_postgres_session.exec(
             update(Task)
-            .where(col(Task.task_id).in_(stopped_tasks))
+            .where(col(Task.task_id).in_(task_ids[:2]))
             .values(status=TaskStatus.STOPPED, finished_at=datetime.now(ZoneInfo("UTC")))
         )
-        database_session.commit()
-
-        set_benchmark_final_status(benchmark_row, database_session, self._test_org, authority=authority)
-        database_session.refresh(benchmark_row, attribute_names=["status", "finished_at"])
-        assert benchmark_row.status == BenchmarkStatus.STOPPED
-        assert benchmark_row.finished_at is not None
-        assert finalized_statuses == ["FINISHED", "STOPPED"]
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
+        assert (await run_control.prepare_finalization()).kind == "stopped"
+        control_postgres_session.refresh(benchmark)
+        assert benchmark.status == BenchmarkStatus.STOPPED
 
 
 @pytest.mark.description("Run filtering by starter email.")

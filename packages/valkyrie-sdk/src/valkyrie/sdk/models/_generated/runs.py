@@ -9,7 +9,7 @@ from valkyrie.sdk.models._validation import (
     StartBenchmarkRequestBase,
     StoredArgumentsBase,
 )
-from . import agents, config, projects
+from . import agents, config, datasets as datasets_1, projects
 from datetime import datetime
 
 
@@ -103,7 +103,7 @@ class FinalEvaluation(FinalEvaluationBase):
 
     org_id: str
     benchmark: str
-    final_score: float
+    final_score: float | None = None
     properties: dict[str, Any] = {}
 
 
@@ -112,6 +112,14 @@ class Order(str, Enum):
 
     ASC = "asc"
     DESC = "desc"
+
+
+class RescoreBenchmarkResponse(ResponseModel):
+    """The score a finished dataset run has after its metric script ran again."""
+
+    benchmark_id: UUID
+    final_score: float | None
+    properties: dict[str, Any]
 
 
 class RetryMode(str, Enum):
@@ -275,6 +283,10 @@ class StartBenchmarkRequest(StartBenchmarkRequestBase):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset_version: Annotated[str | None, Field(max_length=1024, min_length=1)] = None
+    dataset_ref: Annotated[
+        datasets_1.HostedDataset | datasets_1.LocalDataset | None,
+        Field(discriminator="kind"),
+    ] = None
     sandbox_provider: str | None = None
     project: Annotated[str | None, Field(min_length=1)] = None
     monitoring: RunMonitoring | None = None

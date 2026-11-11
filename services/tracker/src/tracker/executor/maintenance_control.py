@@ -3,22 +3,12 @@ from datetime import UTC, datetime
 
 from sqlmodel import Session
 
-from tracker.database.models import (
-    BenchmarkStatus,
-    ExecutorDispatchStatus,
-    TaskStatus,
-)
+from executor_protocol import ExecutorDispatchStatus
+from tracker.domain import BenchmarkStatus, TaskStatus
+from tracker.executor.release_control import ReleaseControlError, get_executor_admission
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
-from tracker.executor.release_control import ReleaseControlError, get_executor_admission
-
-_ACTIVE_BENCHMARK_STATUSES = (BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)
-_ACTIVE_TASK_STATUSES = (
-    TaskStatus.PENDING,
-    TaskStatus.BUILDING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.EVALUATING,
-)
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 
 
 class MaintenanceOwnershipError(ReleaseControlError):
@@ -32,43 +22,36 @@ class MaintenanceStopSummary:
     dispatches: int
 
 
-def begin_maintenance(
-    session: Session,
-    *,
-    target_sha: str,
-) -> MaintenanceStopSummary:
+def begin_maintenance(session: Session, *, target_sha: str) -> MaintenanceStopSummary:
     if not target_sha:
         raise ValueError("Maintenance target SHA is required")
-
     admission = get_executor_admission(session, for_update=True)
     if admission.maintenance_target_sha not in (None, target_sha):
-        raise MaintenanceOwnershipError("Executor maintenance is owned by another deployment")
-
+        raise MaintenanceOwnershipError("Another executor maintenance owner holds admission")
     admission.maintenance_target_sha = target_sha
-    admission.updated_at = datetime.now(UTC)
-
+    admission.updated_at = _database_now(session)
+    ExecutorReleaseRepository(session).save(admission)
     benchmark_repository = BenchmarkRepository(session)
-    finished_at = datetime.now(UTC)
-    benchmarks = benchmark_repository.lock_by_status(_ACTIVE_BENCHMARK_STATUSES)
+    finished_at = _database_now(session)
+    benchmarks = benchmark_repository.lock_by_status((BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING))
     for benchmark in benchmarks:
         benchmark.status = BenchmarkStatus.STOPPED
         benchmark.finished_at = finished_at
+        benchmark_repository.save(benchmark)
 
-    tasks = benchmark_repository.lock_all_tasks(_ACTIVE_TASK_STATUSES)
+    tasks = benchmark_repository.lock_all_tasks(
+        (TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+    )
     for task in tasks:
         task.status = TaskStatus.STOPPED
-
+        benchmark_repository.save(task)
     dispatches = ExecutorDispatchRepository(session).lock_active()
     for dispatch in dispatches:
         dispatch.status = ExecutorDispatchStatus.FAILED
         dispatch.finished_at = finished_at
-
+        ExecutorDispatchRepository(session).save(dispatch)
     session.flush()
-    return MaintenanceStopSummary(
-        benchmarks=len(benchmarks),
-        tasks=len(tasks),
-        dispatches=len(dispatches),
-    )
+    return MaintenanceStopSummary(benchmarks=len(benchmarks), tasks=len(tasks), dispatches=len(dispatches))
 
 
 def finish_maintenance(
@@ -85,3 +68,7 @@ def finish_maintenance(
     admission.maintenance_target_sha = None
     admission.updated_at = datetime.now(UTC)
     session.flush()
+
+
+def _database_now(session: Session) -> datetime:
+    return ExecutorDispatchRepository(session).clock_timestamp()

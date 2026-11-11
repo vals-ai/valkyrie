@@ -8,8 +8,8 @@ from sqlmodel import Session
 from tests.factories import make_benchmark
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
 )
+from tracker.domain import BenchmarkStatus
 
 
 def _seed_benchmarks(

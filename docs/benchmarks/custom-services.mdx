@@ -4,8 +4,9 @@ description: "Point your runs at your own copy of a benchmark service, on your m
 ---
 
 By default, runs use the benchmark services that Vals AI hosts. When you save your own URL
-for a benchmark, your runs of that benchmark use your service instead, on any machine. To
-build a service, see [Convert a benchmark into a service](/benchmarks/convert-a-benchmark).
+for a benchmark, your runs of that benchmark use your service instead, on any machine.
+
+To build a service, see [Convert a benchmark into a service](/benchmarks/convert-a-benchmark).
 
 ## Save a service URL
 
@@ -13,10 +14,11 @@ build a service, see [Convert a benchmark into a service](/benchmarks/convert-a-
 valkyrie benchmark service set swebench https://benchmark.example.com
 ```
 
-The URL is saved for you in the current organization, and `valkyrie run start` and
-`valkyrie benchmark tasks` use it until you remove it. Saving needs a login; access keys
-can't change it. The Tracker must be able to reach the URL, so a service on your machine
-needs a [reverse tunnel](#expose-a-local-service).
+- The URL is saved for you in the current organization, and `valkyrie run start` and
+  `valkyrie benchmark tasks` use it until you remove it.
+- Saving needs a login. Access keys can't change it.
+- The Tracker must be able to reach the URL, so a service on your machine needs a
+  [reverse tunnel](#expose-a-local-service).
 
 To send a credential with every request, see
 [Benchmark authentication](/benchmarks/authentication).
@@ -72,9 +74,9 @@ every restart. To point a run that already started at the new address, retry it 
 
 ## Deploy the service
 
-A tunnel works while you iterate. A service other people run against needs a stable HTTPS
-address. The generated `Dockerfile` serves the app on port `8001`, so any container host
-that routes HTTPS and WebSocket traffic to it works.
+A tunnel works while you iterate, but a service other people run against needs a stable
+HTTPS address. The generated `Dockerfile` serves the app on port `8001`, so any container
+host that routes HTTPS and WebSocket traffic to it works.
 
 ```bash
 # Build benchmark-service:latest

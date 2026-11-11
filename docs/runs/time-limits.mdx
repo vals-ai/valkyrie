@@ -15,25 +15,30 @@ The benchmark service sets each task's generation limit, usually through `agent_
 limit can generate for as long as the wall limit allows.
 
 Generation time ends when the sandbox provider confirms the agent's processes have exited,
-not when its output arrives or cleanup ends. The confirmation can come after the actual
-exit, and some providers can't confirm it until their full wait finishes. Creating the
-sandbox, installing the agent, setting the task up, and grading it don't count. In a
-benchmark that [runs the agent several times](/agents/agent-contract#turns), the benchmark
-reports when the agent is working, and slots running side by side share one limit.
+not when its output arrives or cleanup ends.
+
+- The confirmation can come after the actual exit, and some providers can't confirm it
+  until their full wait finishes.
+- Creating the sandbox, installing the agent, setting the task up, and grading it don't
+  count.
+- In a benchmark that [runs the agent several times](/agents/agent-contract#turns), the
+  benchmark reports when the agent is working.
+- Slots running side by side share one limit.
 
 If the agent exits before the limit while its result and output are still being collected,
 Valkyrie waits up to 20 seconds past the limit for them and keeps the agent's own exit
 status. If collection isn't done by then, the task fails without grading.
 
-Otherwise, including an exit confirmed exactly at the limit, Valkyrie stops the agent and
-grades whatever it left. The task finishes with exit reason `TIMEOUT` and can still pass.
-If Valkyrie can't confirm the agent stopped, the task fails without grading.
+- Otherwise, including an exit confirmed exactly at the limit, Valkyrie stops the agent and
+  grades whatever it left. The task finishes with exit reason `TIMEOUT` and can still pass.
+- If Valkyrie can't confirm the agent stopped, the task fails without grading.
 
 ## Wall limit
 
-A task can last at most 166 hours, counted from when its sandbox is first created. Setup,
-generation, grading, and any pauses all count. A task that reaches the wall limit fails with
-`Task wall-time limit reached`.
+A task can last at most 166 hours, counted from when its sandbox is first created.
+
+- Setup, generation, grading, and any pauses all count.
+- A task that reaches the wall limit fails with `Task wall-time limit reached`.
 
 Retrying or resuming a task that restarts the agent gives it a new 166 hours. Continuing a
 task from its saved grading progress keeps the original deadline.

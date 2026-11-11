@@ -1,3 +1,4 @@
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 import time
 
@@ -58,6 +59,7 @@ class ExternalServiceDeadlineController:
     active_elapsed_seconds: float = 0.0
     active_since: float | None = None
     credit_frozen: bool = False
+    baseline_overhead_ms: int = 0
 
     @property
     def accounting_id(self) -> str:
@@ -65,11 +67,13 @@ class ExternalServiceDeadlineController:
             raise ValueError("No gateway accounting counter is configured")
         return self.snapshot.accounting_id
 
+    def overhead_seconds(self) -> float:
+        if self.snapshot is None:
+            return 0.0
+        return max(self.snapshot.cumulative_neutral_overhead_ms - self.baseline_overhead_ms, 0) / 1000
+
     def applied_credit_seconds(self) -> float:
-        return min(
-            self.snapshot.cumulative_neutral_overhead_ms / 1000 if self.snapshot is not None else 0.0,
-            self.credit_cap_seconds,
-        )
+        return min(self.overhead_seconds(), self.credit_cap_seconds)
 
     def freeze_credit(self) -> None:
         self.credit_frozen = True
@@ -127,10 +131,34 @@ class ExternalServiceDeadlineController:
             accounting_id=observed.accounting_id if observed is not None else None,
             base_generation_allowance_seconds=self.base_allowance_seconds,
             cumulative_time_credit_cap_seconds=self.credit_cap_seconds if observed is not None else None,
-            external_service_overhead_seconds=(observed.cumulative_neutral_overhead_ms / 1000)
-            if observed is not None
-            else None,
+            external_service_overhead_seconds=self.overhead_seconds() if observed is not None else None,
             external_service_credit_applied_seconds=applied if observed is not None else None,
             external_service_credit_revision=observed.revision if observed is not None else None,
             generation_elapsed_seconds=self.active_elapsed_seconds,
         )
+
+
+def _total(values: Iterable[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
+
+
+def combine_accounting(summaries: Sequence[GenerationAccountingSummary]) -> GenerationAccountingSummary:
+    revisions = [summary.external_service_credit_revision for summary in summaries]
+    return GenerationAccountingSummary(
+        accounting_id=next((summary.accounting_id for summary in reversed(summaries) if summary.accounting_id), None),
+        base_generation_allowance_seconds=(
+            None
+            if any(summary.base_generation_allowance_seconds is None for summary in summaries)
+            else _total(summary.base_generation_allowance_seconds for summary in summaries)
+        ),
+        cumulative_time_credit_cap_seconds=_total(summary.cumulative_time_credit_cap_seconds for summary in summaries),
+        external_service_overhead_seconds=_total(summary.external_service_overhead_seconds for summary in summaries),
+        external_service_credit_applied_seconds=_total(
+            summary.external_service_credit_applied_seconds for summary in summaries
+        ),
+        external_service_credit_revision=max(
+            (revision for revision in revisions if revision is not None), default=None
+        ),
+        generation_elapsed_seconds=sum(summary.generation_elapsed_seconds for summary in summaries),
+    )

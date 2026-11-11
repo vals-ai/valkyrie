@@ -5,6 +5,18 @@ from uuid import UUID
 from tracker import config
 from tracker.runtime.secrets import TENANT_SECRET_ROOT, secret_display_name
 
+GATEWAY_SECRET_NAME_PREFIX = "model-gateway-"
+
+
+def is_generated_project_gateway_secret_name(name: str) -> bool:
+    if not name.startswith(GATEWAY_SECRET_NAME_PREFIX):
+        return False
+    key_id = name.removeprefix(GATEWAY_SECRET_NAME_PREFIX)
+    try:
+        return str(UUID(key_id)) == key_id
+    except ValueError:
+        return False
+
 
 def tenant_secret_prefix(org_id: UUID) -> str:
     return f"{TENANT_SECRET_ROOT}{org_id}/"
@@ -32,7 +44,6 @@ def resolve_secret_name(name: str, *, org_id: UUID, org_name: str, auth_required
 def validate_secret_names(names: Iterable[str], *, org_id: UUID, org_name: str, auth_required: bool) -> None:
     if not auth_required:
         return
-    from tracker.project_gateway import is_generated_project_gateway_secret_name
 
     prefix = tenant_secret_prefix(org_id)
     shared = may_use_shared_secrets(org_name)

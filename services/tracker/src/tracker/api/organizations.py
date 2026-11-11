@@ -216,7 +216,7 @@ def list_members(
     description=(
         "Invite someone to the organization this admin acts for. They join only after signing in and accepting.\n"
         "\n"
-        "Inviting again restarts the invitation's 14 days."
+        "An invitee without a login gets one, so they can sign in. Inviting again restarts the invitation's 14 days."
     ),
 )
 def invite_member(
@@ -225,8 +225,11 @@ def invite_member(
     login: LoginIdentity = Depends(get_current_login),
 ) -> InviteResponse:
     organization = _require_admin(login)
+    management: Any = descope_management()
     with descope_call("invite the member"):
-        user = _find_user(descope_management(), request.email)
+        user = _find_user(management, request.email)
+        if user is None:
+            management.user.create(login_id=request.email, email=request.email)
     if user is not None and organization in user_tenant_roles(user):
         raise HTTPException(status_code=409, detail=f"{request.email} is already a member")
     invites.save(OrganizationInvite(organization=organization, email=request.email, invited_by=login.user_id))

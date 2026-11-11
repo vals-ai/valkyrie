@@ -1,9 +1,6 @@
 # Valkyrie
 
-[![Paper](https://img.shields.io/badge/Paper-alphaXiv-B31B1B)](https://www.alphaxiv.org/abs/valkyrie)
-![CLI coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/cli-coverage.json)
-![Tracker coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/tracker-coverage.json)
-![Docstring coverage](https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/docstr-coverage.svg)
+[![Paper](https://img.shields.io/badge/Paper-alphaXiv-B31B1B)](https://www.alphaxiv.org/abs/valkyrie) [![valkyrie-cli on PyPI](https://img.shields.io/pypi/v/valkyrie-cli?label=valkyrie-cli)](https://pypi.org/project/valkyrie-cli/) [![valkyrie-sdk on PyPI](https://img.shields.io/pypi/v/valkyrie-sdk?label=valkyrie-sdk)](https://pypi.org/project/valkyrie-sdk/) ![CLI coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/cli-coverage.json) ![Tracker coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/tracker-coverage.json)
 
 Valkyrie orchestrates scalable, reproducible evaluations for AI agents. Run it on infrastructure that Vals AI hosts, or on your own machine with a local Tracker.
 
@@ -19,7 +16,11 @@ Install the CLI:
 uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
 ```
 
-If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
+If you installed the CLI from GitHub before, remove that install first:
+
+```bash
+uv tool uninstall valkyrie
+```
 
 Sign in with your Vals account:
 
@@ -27,27 +28,27 @@ Sign in with your Vals account:
 valkyrie login
 ```
 
-Upload an agent with a valid `contract.yaml`:
+Install an agent from the [public agent registry](https://github.com/vals-ai/public-agent-registry):
 
 ```bash
-valkyrie agent push ./agents/sweagent --name sweagent
+valkyrie agent install https://github.com/vals-ai/public-agent-registry/tree/main/agents/mini_swe_agent
 ```
 
-Create the project the run spends for, once:
+Store your model provider's API key as a secret. The CLI prompts for the value:
 
 ```bash
-valkyrie project create my-project --name "My Project" --spend-type development --subcategory new_benchmark_generation \
-  --budget 300 --budget-reason "3 runs, about 100 each"
+valkyrie secret set anthropic-key
 ```
 
-Start a benchmark run:
+Start a benchmark run, passing the secret to the agent as `ANTHROPIC_API_KEY` with `-s`:
 
 ```bash
 valkyrie run start \
-  --agent sweagent \
+  --agent mini_swe_agent \
   --benchmark swebench \
-  --project my-project \
   --model anthropic/claude-sonnet-4-6 \
+  -s ANTHROPIC_API_KEY anthropic-key \
+  -k config benchmarks/swebench.yaml \
   --slice "0:10" \
   --connect
 ```
@@ -64,7 +65,7 @@ valkyrie run start \
 | Every CLI command | [reference/cli/index](https://docs.valkyrie.vals.ai/reference/cli/index) |
 | Python SDK | [sdk/quickstart](https://docs.valkyrie.vals.ai/sdk/quickstart) |
 | Running Tracker locally without AWS | [self-hosting/local-tracker](https://docs.valkyrie.vals.ai/self-hosting/local-tracker) |
-| Local development | [DEVELOPMENT.md](DEVELOPMENT.md) |
+| Contributing to Valkyrie | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 ## Citation
 

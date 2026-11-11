@@ -12,7 +12,8 @@ from benchmark_service.schemas import RetrieveTaskResponse
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws.s3 import S3ObjectStore
-from tracker.database.models import AgentCausedExitReason, AgentContractRequest
+from tracker.types import AgentContractRequest
+from tracker.domain import AgentCausedExitReason
 from tracker.egress import combine_run_egress_policies
 from tracker.external_service_gateway import ExternalServiceDeadlineController
 from tracker.generation_plan import GenerationPlan
@@ -25,6 +26,7 @@ from tracker.sandbox import (
     run_agent,
     runtime_sandbox,
 )
+from tests.utils import unexpected_sandbox_record
 
 _DIND_IMAGE = "docker:28.3.3-dind"
 _COMPOSE_SERVICE_IMAGE = "alpine:3.20"
@@ -160,6 +162,7 @@ async def compose_sandbox(
         task_data.resources,
         creation_semaphore,
         creation_state=SandboxCreationState(cleanup_pending=False),
+        record_sandbox=unexpected_sandbox_record,
         env_vars=env_vars,
     ) as outer_sandbox:
         try:

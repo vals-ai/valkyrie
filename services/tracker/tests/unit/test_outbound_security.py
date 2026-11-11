@@ -6,7 +6,7 @@ from tracker.config import (
     classify_benchmark_service_destination,
     create_benchmark_service_url,
 )
-from tracker.database.models import AgentContractRequest
+from tracker.types import AgentContractRequest
 from tracker.outbound_security import validate_custom_service_destination
 from tracker.types import (
     BenchmarkServiceEntry,

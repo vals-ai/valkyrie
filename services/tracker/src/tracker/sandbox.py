@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import re
 import shlex
 import time
@@ -20,9 +21,6 @@ from typing import Any, AsyncGenerator, Literal, Never, assert_never
 import logfire
 import sentry_sdk
 from benchmark_service import (
-    LINUX_CGROUP_V2_V1,
-    ControlledWorkload,
-    ControlledWorkloadResult,
     Episode,
     ComposeSandbox,
     ComposeSource,
@@ -30,6 +28,7 @@ from benchmark_service import (
     ExecResult,
     ImageSource,
     Sandbox,
+    SandboxBuildError,
     SandboxCreateRequest,
     SandboxNotFoundError,
     SandboxProvider,
@@ -43,7 +42,6 @@ from benchmark_service import (
 )
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
-from benchmark_service.sandbox.episode import controlled_episode_workload
 from opentelemetry import trace
 from tenacity import (
     retry,
@@ -64,29 +62,27 @@ from tracker.external_service_gateway import (
     GenerationAccountingSummary,
     ExternalServiceDeadlineController,
 )
-from tracker.database.models import (
-    MAX_OUTPUT_ARTIFACT_BYTES,
-    AgentCausedExitReason,
-    AgentContractRequest,
-    OutputArtifactSpec,
-)
+from tracker.types import MAX_OUTPUT_ARTIFACT_BYTES, AgentContractRequest, OutputArtifactSpec
+from tracker.domain import AgentCausedExitReason
+from tracker.services.datasets.user import run_as
 from tracker.exceptions import (
     AgentRunFailedError,
     EpisodeOrchestratorFailedError,
     ControlledGenerationError,
     ControlledGenerationTerminationUnconfirmedError,
     DependencySetupExhaustedError,
-    GenerationContainmentUnavailableError,
     GenerationTerminationUnconfirmedError,
     InvalidSandboxConfigurationError,
     OutputArtifactError,
     SandboxError,
+    SandboxImageBuildError,
     SandboxSetupError,
     SSLConnectionError,
 )
 from tracker.logging import get_logger
+from tracker.executor.control_tasks import SandboxLink
 from tracker.logging.events import LogEvent
-from tracker.sandbox_cost import SandboxLink, record_sandbox
+from tracker.search_cost import SEARCH_COST_MAX_BYTES, SEARCH_COST_PATH_ENV, SearchCharge, parse_search_costs
 from tracker.observability import (
     distribution,
     elapsed_ms,
@@ -101,6 +97,7 @@ logger = get_logger(__name__)
 bundle_path = PurePosixPath("/bundle")
 SANDBOX_AUTO_STOP_INTERVAL = 10 * 60
 SANDBOX_CREATE_TIMEOUT = 360
+BUILD_LOG_CHARS = 2_000
 AGENT_INSTALL_TIMEOUT_SECONDS = 10 * 60
 GENERATION_CREDIT_REFRESH_GRACE_SECONDS = 10.0
 GENERATION_TERMINATION_GRACE_SECONDS = 20.0
@@ -411,6 +408,7 @@ async def create_sandbox(
     creation_state: SandboxCreationState,
     unique_name: bool = True,
     sandbox_link: SandboxLink | None = None,
+    record_sandbox: Callable[[SandboxLink, str], Awaitable[None]],
 ) -> AsyncGenerator[Sandbox, Any]:
     if unique_name:
         sandbox_name = f"{sandbox_name}_{uuid.uuid4().hex[:6]}"
@@ -441,15 +439,23 @@ async def create_sandbox(
             try:
                 sandbox = await asyncio.shield(creation_task)
             except asyncio.CancelledError:
-                sandbox = await creation_task
-                if sandbox_link is not None:
-                    await asyncio.to_thread(record_sandbox, sandbox_link, sandbox.id)
-                if await delete_sandbox(sandbox, provider, initiated_by="create_cancelled"):
-                    creation_state.cleanup_pending = False
+
+                async def settle_creation() -> None:
+                    sandbox = await creation_task
+                    if sandbox_link is not None:
+                        await record_sandbox(sandbox_link, sandbox.id)
+                    if await delete_sandbox(sandbox, provider, initiated_by="create_cancelled"):
+                        creation_state.cleanup_pending = False
+
+                await finish_cleanup(asyncio.create_task(settle_creation()))
                 raise
             except SandboxNotFoundError:
                 raise
             except ProviderSandboxError as e:
+                if isinstance(e, SandboxBuildError) and isinstance(_provider_source(source), DockerfileSource):
+                    raise SandboxImageBuildError(
+                        f"Failed to build the image for sandbox {sandbox_name}\n{e.build_log[-BUILD_LOG_CHARS:] or e}"
+                    ) from e
                 incr("valkyrie.sandbox.create.errors", tags={"error_class": type(e).__name__})
                 logger.warning(
                     "Sandbox %s creation failed: %s: %s",
@@ -481,7 +487,7 @@ async def create_sandbox(
 
     try:
         if sandbox_link is not None:
-            link_write = asyncio.ensure_future(asyncio.to_thread(record_sandbox, sandbox_link, sandbox.id))
+            link_write = asyncio.ensure_future(record_sandbox(sandbox_link, sandbox.id))
             try:
                 await asyncio.shield(link_write)
             except asyncio.CancelledError:
@@ -492,11 +498,15 @@ async def create_sandbox(
         logger.error("Error during sandbox execution %s: %s: %s", sandbox.name, type(e).__name__, e)
         raise
     finally:
-        try:
-            if await delete_sandbox(sandbox, provider, initiated_by="task_teardown"):
-                creation_state.cleanup_pending = False
-        except ProviderSandboxError:
-            pass
+
+        async def cleanup() -> None:
+            try:
+                if await delete_sandbox(sandbox, provider, initiated_by="task_teardown"):
+                    creation_state.cleanup_pending = False
+            except ProviderSandboxError:
+                pass
+
+        await finish_cleanup(asyncio.create_task(cleanup()))
 
 
 @retry(
@@ -672,11 +682,13 @@ _TIMEOUT_EXIT_CODE: int = 124
 _OS_KILL_EXIT_CODE: int = 137
 _SUCCESS_EXIT_CODE: int = 0
 _STATUS_DIR = "/tmp/.valkyrie"
+_AGENT_INPUTS_DIR = "/tmp/.valkyrie-agent"
+_MCP_CONFIG_PLACEHOLDER = "mcp_config_path"
+_SKILLS_PLACEHOLDER = "skills_dir"
 AGENT_ERROR_PATH_ENV = "VALKYRIE_ERROR_PATH"
 _AGENT_ERROR_MAX_BYTES = 2048
 _POST_EXIT_READ_TIMEOUT_SECONDS = 5
 _DNS_CHECK_TIMEOUT_SECONDS = 30
-_CGROUP_PROBE_FAILURE = f"does not support {LINUX_CGROUP_V2_V1.type} v{LINUX_CGROUP_V2_V1.version}"
 _EGRESS_RETRY = retry(
     retry=retry_if_exception_type(ProviderSandboxError) & retry_if_not_exception_type(SandboxNotFoundError),
     reraise=True,
@@ -862,12 +874,117 @@ async def _read_agent_error(
     return message.encode()[:_AGENT_ERROR_MAX_BYTES].decode(errors="ignore")
 
 
+async def _collect_search_costs(
+    sandbox: Sandbox,
+    path: str,
+    on_search_costs: Callable[[list[SearchCharge]], Awaitable[None]],
+    log_line: Callable[[str], None],
+) -> None:
+    content = await _read_post_exit_file(sandbox, f"head -c {SEARCH_COST_MAX_BYTES + 1} {shlex.quote(path)}")
+    if content is not None and len(content.encode()) > SEARCH_COST_MAX_BYTES:
+        log_line(f"[WARNING]: Search cost report exceeds {SEARCH_COST_MAX_BYTES} bytes and was not saved")
+        content = None
+    charges, invalid = parse_search_costs(content or "")
+    if invalid:
+        log_line(f"[WARNING]: Skipped {invalid} invalid search cost report lines")
+    try:
+        if charges:
+            await on_search_costs(charges)
+    except Exception:
+        logger.warning("Failed to save search cost report", exc_info=True)
+        log_line("[WARNING]: Search cost report could not be saved")
+    try:
+        await asyncio.wait_for(_exec(sandbox, f"rm -f {shlex.quote(path)}"), timeout=_POST_EXIT_READ_TIMEOUT_SECONDS)
+    except Exception:
+        logger.warning("Search cost report cleanup failed", exc_info=True)
+
+
+_AGENT_GROUP_ENV = "VALKYRIE_AGENT_GROUP"
+_AGENT_GROUP_KILL_TIMEOUT_SECONDS = 10
+_AGENT_GROUP_NOT_FOUND_EXIT_CODE = 3
+
+
+def _in_own_process_group(command: str, token: str) -> str:
+    leader = (
+        f"env {_AGENT_GROUP_ENV}={token} /bin/sh -c {shlex.quote(f'export {_AGENT_GROUP_ENV}={token}:$$; {command}')}"
+    )
+    return (
+        f"if setsid --help 2>&1 | grep -q -- --wait; then exec setsid --wait {leader}; fi; "
+        f'case " $(cut -d\' \' -f5 /proc/$$/stat 2>/dev/null) " in " $$ ") exec {leader};; esac; {command}'
+    )
+
+
+async def _kill_agent_group(sandbox: Sandbox, token: str) -> None:
+    tag = f"{_AGENT_GROUP_ENV}={token}"
+    command = (
+        "found=0; for d in /proc/[0-9]*; do "
+        f"v=$(tr '\\0' '\\n' 2>/dev/null < \"$d/environ\" | grep -x '{tag}\\(:[0-9]*\\)\\{{0,1\\}}'); "
+        f'case "$v" in "{tag}") g=${{d#/proc/}};; "{tag}:"*) g=${{v#{tag}:}};; *) continue;; esac; '
+        'kill -9 "-$g" 2>/dev/null && found=1; '
+        f'done; [ "$found" = 1 ] || exit {_AGENT_GROUP_NOT_FOUND_EXIT_CODE}'
+    )
+    try:
+        result = await asyncio.wait_for(_exec(sandbox, command), timeout=_AGENT_GROUP_KILL_TIMEOUT_SECONDS)
+    except Exception:
+        logger.warning("Agent process group kill after generation timeout failed", exc_info=True)
+        return
+    if result.exit_code == _AGENT_GROUP_NOT_FOUND_EXIT_CODE:
+        logger.warning("No agent process group found to kill after generation timeout")
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    result: ExecResult
+    absence_confirmed_at: float
+
+
+class _CommandWorkload:
+    def __init__(self, sandbox: Sandbox, command: str, *, cwd: str, env_vars: dict[str, str] | None) -> None:
+        self._chunks: asyncio.Queue[str | None] = asyncio.Queue()
+        self._ended_at: float | None = None
+        self._killed = False
+        self._task = asyncio.create_task(self._run(sandbox, command, cwd, env_vars))
+
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._ended_at
+
+    async def _run(self, sandbox: Sandbox, command: str, cwd: str, env_vars: dict[str, str] | None) -> _CommandResult:
+        exit_code = _SUCCESS_EXIT_CODE
+        try:
+            async for chunk in sandbox.command(command, cwd=cwd, env_vars=env_vars):
+                self._chunks.put_nowait(chunk)
+        except ProviderSandboxCommandError as e:
+            exit_code = e.exit_code
+        except asyncio.CancelledError:
+            if not self._killed:
+                raise
+            exit_code = _OS_KILL_EXIT_CODE
+        finally:
+            self._ended_at = asyncio.get_running_loop().time()
+            self._chunks.put_nowait(None)
+        return _CommandResult(ExecResult(exit_code=exit_code, output=""), self._ended_at)
+
+    async def output(self) -> AsyncGenerator[str, None]:
+        while (chunk := await self._chunks.get()) is not None:
+            yield chunk
+
+    async def wait(self) -> _CommandResult:
+        return await asyncio.shield(self._task)
+
+    async def kill(self) -> None:
+        if not self._task.done():
+            self._killed = True
+            self._task.cancel()
+        await asyncio.wait([self._task])
+
+
 def _controlled_completion_precedes_deadline(ended_at: float, deadline: float) -> bool:
     return ended_at < deadline
 
 
 def _controlled_result_outcome(
-    completed: ControlledWorkloadResult, started_at: float, ended_at: float, *, episode: bool
+    completed: _CommandResult, started_at: float, ended_at: float, *, episode: bool
 ) -> tuple[AgentCausedExitReason | None, float]:
     duration = ended_at - started_at
     exit_code = completed.result.exit_code
@@ -881,7 +998,7 @@ def _controlled_result_outcome(
     raise AgentRunFailedError(f"Agent command failed with exit code {exit_code}")
 
 
-async def _raise_controlled_failure_after_close(workload: ControlledWorkload, error: BaseException) -> Never:
+async def _raise_controlled_failure_after_close(workload: _CommandWorkload, error: BaseException) -> Never:
     if isinstance(error, SandboxNotFoundError):
         raise error
     try:
@@ -899,7 +1016,7 @@ async def _raise_controlled_failure_after_close(workload: ControlledWorkload, er
     raise ControlledGenerationError("Controlled generation failed after workload construction") from error
 
 
-async def _finish_controlled_output(workload: ControlledWorkload, output_task: asyncio.Task[None]) -> None:
+async def _finish_controlled_output(workload: _CommandWorkload, output_task: asyncio.Task[None]) -> None:
     try:
         await output_task
     except Exception as error:
@@ -907,8 +1024,8 @@ async def _finish_controlled_output(workload: ControlledWorkload, output_task: a
 
 
 async def _controlled_wait_result(
-    workload: ControlledWorkload, wait_task: asyncio.Task[ControlledWorkloadResult]
-) -> ControlledWorkloadResult:
+    workload: _CommandWorkload, wait_task: asyncio.Task[_CommandResult]
+) -> _CommandResult:
     try:
         return wait_task.result()
     except BaseException as error:
@@ -937,6 +1054,7 @@ async def _stream_controlled_output(
     extra_env: dict[str, str] | None = None,
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
+    on_timeout_stop: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[AgentCausedExitReason | None, float]:
     loop = asyncio.get_running_loop()
     controller = deadline_controller
@@ -952,12 +1070,8 @@ async def _stream_controlled_output(
             env_vars[AGENT_ERROR_PATH_ENV] = error_path
         if stage is None:
             controller.begin_generation(now=loop.time())
-        if episode is None:
-            started_at = loop.time()
-            workload = sandbox.controlled_workload(command, cwd=cwd, env_vars=env_vars or None)
-        else:
-            workload = await controlled_episode_workload(sandbox, command, cwd=cwd, env_vars=env_vars or None)
-            started_at = loop.time()
+        started_at = loop.time()
+        workload = _CommandWorkload(sandbox, command, cwd=cwd, env_vars=env_vars or None)
     except BaseException as original:
 
         async def finalize_prelaunch() -> None:
@@ -1000,7 +1114,7 @@ async def _stream_controlled_output(
     finalized_running = False
     accounting_error: Exception | None = None
 
-    def completed_end(completed: ControlledWorkloadResult) -> float:
+    def completed_end(completed: _CommandResult) -> float:
         if stage is not None:
             return completed.absence_confirmed_at
         ended_at = workload.agent_absence_confirmed_at
@@ -1014,7 +1128,7 @@ async def _stream_controlled_output(
         assert ended_at is not None
         return ended_at
 
-    async def completed_outcome(completed: ControlledWorkloadResult) -> tuple[AgentCausedExitReason | None, float]:
+    async def completed_outcome(completed: _CommandResult) -> tuple[AgentCausedExitReason | None, float]:
         exit_code = completed.result.exit_code
         if error_path is not None and exit_code not in (_SUCCESS_EXIT_CODE, _OS_KILL_EXIT_CODE):
             sentry_sdk.set_tag("agent_exit_code", str(exit_code))
@@ -1064,7 +1178,11 @@ async def _stream_controlled_output(
             await asyncio.gather(deadline_task, return_exceptions=True)
             deadline_task = None
 
-    async def stop(termination_deadline: float | None = None) -> None:
+    async def kill_timed_out_group() -> None:
+        if on_timeout_stop is not None:
+            await on_timeout_stop()
+
+    async def stop(termination_deadline: float | None = None, *, timed_out: bool = False) -> None:
         nonlocal outer_stopped, inner_stopped, absence_confirmed_at
         try:
             async with asyncio.timeout_at(termination_deadline or loop.time() + GENERATION_TERMINATION_GRACE_SECONDS):
@@ -1085,8 +1203,11 @@ async def _stream_controlled_output(
                     "Generation deadline expired without confirmed workload termination"
                 ) from error
             raise
+        finally:
+            if timed_out and outer_stopped:
+                await kill_timed_out_group()
 
-    async def completed_result() -> ControlledWorkloadResult:
+    async def completed_result() -> _CommandResult:
         nonlocal outer_stopped, absence_confirmed_at
         try:
             completed = await _controlled_wait_result(workload, wait_task)
@@ -1134,7 +1255,7 @@ async def _stream_controlled_output(
         await asyncio.shield(finalize_task)
 
     async def stop_and_finalize_timeout() -> tuple[AgentCausedExitReason, float]:
-        await stop(stop_at)
+        await stop(stop_at, timed_out=True)
         await _cancel_and_join_controlled_tasks(wait_task)
         await finish_output()
         await finalize()
@@ -1256,6 +1377,7 @@ async def _stream_controlled_output(
                     inner_stopped = True
                     absence_confirmed_at = loop.time()
                     controller.end_generation(absence_confirmed_at)
+                    await kill_timed_out_group()
                     await finalize()
                     return AgentCausedExitReason.TIMEOUT, completed.absence_confirmed_at - started_at
                 if finalized_running:
@@ -1317,6 +1439,7 @@ async def _stream_controlled_output(
                         finally:
                             await _cancel_and_join_controlled_tasks(nested_task)
                         if nested_exhausted:
+                            await kill_timed_out_group()
                             await finalize()
                             return timeout_result()
                         inner_stopped = True
@@ -1334,7 +1457,9 @@ async def _stream_controlled_output(
                     if stage is None and controller.client is None and deadline is not None:
                         exhausted = not _controlled_completion_precedes_deadline(ended_at, deadline)
                 if exhausted and stage is None and deadline is not None:
-                    await stop(deadline + GENERATION_TERMINATION_GRACE_SECONDS)
+                    await stop(deadline + GENERATION_TERMINATION_GRACE_SECONDS, timed_out=True)
+                elif exhausted:
+                    await kill_timed_out_group()
                 await finalize()
                 if exhausted:
                     return timeout_result()
@@ -1405,7 +1530,7 @@ async def _stream_controlled_output(
                         await disarm()
                         if await exhausted_at(ended_at, deadline):
                             if episode is None:
-                                await stop(stop_at)
+                                await stop(stop_at, timed_out=True)
                                 await finalize()
                                 return timeout_result()
                             if not await notify_exhausted(deadline):
@@ -1694,6 +1819,7 @@ async def upload_output_artifacts(
     task_id: str,
     object_store: ObjectStore,
     execution_is_current: Callable[[], bool] | None = None,
+    folder: str = "",
 ) -> None:
     total_bytes = 0
     required_artifacts = [artifact for artifact in artifacts if _output_artifact_is_required(artifact)]
@@ -1710,6 +1836,7 @@ async def upload_output_artifacts(
                 object_store,
                 total_bytes,
                 execution_is_current,
+                folder,
             )
             if updated_total_bytes is None:
                 return
@@ -1738,6 +1865,7 @@ async def _upload_output_artifact(
     object_store: ObjectStore,
     total_bytes: int,
     execution_is_current: Callable[[], bool] | None = None,
+    folder: str = "",
 ) -> int | None:
     artifact_path = _output_artifact_path(artifact)
     sandbox_path = await _resolve_output_artifact_sandbox_path(sandbox, artifact, task_id)
@@ -1768,7 +1896,7 @@ async def _upload_output_artifact(
     if execution_is_current is not None and not execution_is_current():
         return None
 
-    s3_key = task_artifact_key(benchmark_id, task_id, artifact_path)
+    s3_key = task_artifact_key(benchmark_id, task_id, posixpath.join(folder, artifact_path))
     chunks = _no_chunks() if artifact_bytes == 0 else sandbox.stream_download(sandbox_path)
     await object_store.put_stream(s3_key, chunks, should_continue=execution_is_current)
 
@@ -1792,6 +1920,34 @@ async def _no_chunks() -> AsyncGenerator[bytes, None]:
     yield
 
 
+def working_directory_command(cwd: str, user: str | None) -> str:
+    directory = shlex.quote(cwd)
+    if user is None:
+        return f"mkdir -p {directory}"
+    return f"[ -d {directory} ] || {{ mkdir -p {directory} && chown {shlex.quote(user)} {directory}; }}"
+
+
+async def _agent_inputs(
+    sandbox: Sandbox, contract: AgentContractRequest, mcp_servers: dict[str, Any], skills_dir: str | None
+) -> dict[str, str]:
+    commands = f"{contract.run_cmd} {contract.turns.continue_cmd if contract.turns else ''}"
+    inputs: dict[str, str] = {}
+    setup = [f"mkdir -p {_AGENT_INPUTS_DIR}"]
+    if f"{{{_MCP_CONFIG_PLACEHOLDER}}}" in commands:
+        inputs[_MCP_CONFIG_PLACEHOLDER] = f"{_AGENT_INPUTS_DIR}/mcp.json"
+        config = json.dumps({"mcpServers": mcp_servers})
+        setup.append(f"printf %s {shlex.quote(config)} > {inputs[_MCP_CONFIG_PLACEHOLDER]}")
+    if f"{{{_SKILLS_PLACEHOLDER}}}" in commands:
+        inputs[_SKILLS_PLACEHOLDER] = skills_dir or f"{_AGENT_INPUTS_DIR}/skills"
+        if skills_dir is None:
+            setup.append(f"mkdir -p {inputs[_SKILLS_PLACEHOLDER]}")
+    if inputs:
+        result = await _exec(sandbox, " && ".join([*setup, f"chmod -R a+rX {_AGENT_INPUTS_DIR}"]))
+        if result.exit_code != _SUCCESS_EXIT_CODE:
+            raise SandboxError(f"Failed to write the agent's MCP config and skills folder: {result.output}")
+    return inputs
+
+
 async def run_agent(
     sandbox: Sandbox,
     contract: AgentContractRequest,
@@ -1812,6 +1968,11 @@ async def run_agent(
     extra_env: dict[str, str] | None = None,
     redact_error: Callable[[str], str] | None = None,
     secret_env_names: tuple[str, ...] = (),
+    user: str | None = None,
+    artifact_folder: str = "",
+    mcp_servers: dict[str, Any] | None = None,
+    skills_dir: str | None = None,
+    on_search_costs: Callable[[list[SearchCharge]], Awaitable[None]] | None = None,
 ) -> tuple[AgentCausedExitReason | None, float]:
     log_line(
         f"Running episode orchestrator for {contract.name}"
@@ -1826,30 +1987,21 @@ async def run_agent(
         if contract.turns is not None and contract.turns.container_name is not None:
             raise InvalidSandboxConfigurationError("Parallel episode does not support container_name")
 
-    runtime_containment = sandbox.generation_containment
-    if (
-        runtime_containment is None
-        or runtime_containment.type not in ("linux_cgroup_v2", "linux_process_group")
-        or runtime_containment.version != 1
-    ):
-        raise InvalidSandboxConfigurationError(
-            "Effective sandbox does not support controlled generation containment v1"
-        )
-    try:
-        await sandbox.probe_generation_containment()
-    except ProviderSandboxError as e:
-        if _CGROUP_PROBE_FAILURE not in str(e):
-            raise
-        raise GenerationContainmentUnavailableError(str(e)) from e
-
-    static_bindings = {**contract.kwargs, "task_id": task_id}
+    static_bindings = {
+        **contract.kwargs,
+        "task_id": task_id,
+        **await _agent_inputs(sandbox, contract, mcp_servers or {}, skills_dir),
+    }
     if plan.episode is None:
         bindings = {**static_bindings, "problem_statement_path": problem_path}
         run_cmd = render_run_cmd(contract.run_cmd, bindings)
     else:
         run_cmd = plan.episode.command
 
-    await _exec(sandbox, f"mkdir -p {shlex.quote(cwd)}")
+    setup = working_directory_command(cwd, user)
+    if user is not None:
+        setup += f"; mkdir -p {shlex.quote(_STATUS_DIR)} && chmod 1777 {shlex.quote(_STATUS_DIR)}"
+    await _exec(sandbox, setup)
     stage_key = await _provision_stage(sandbox) if plan.staged else None
     if plan.episode is not None:
         turns = contract.turns
@@ -1914,6 +2066,7 @@ async def run_agent(
                     task_id,
                     object_store,
                     execution_is_current,
+                    artifact_folder,
                 )
             except Exception as error:
                 errors.append(error)
@@ -1930,10 +2083,28 @@ async def run_agent(
         if errors and not preserve_agent_error:
             raise errors[0]
 
+    search_cost_path = None
+    if on_search_costs is not None:
+        search_cost_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.search-costs.jsonl"
+        await _exec(sandbox, f"mkdir -p {shlex.quote(_STATUS_DIR)}")
+        extra_env = {**(extra_env or {}), SEARCH_COST_PATH_ENV: search_cost_path}
+
+    agent_group = uuid.uuid4().hex
+    agent_group_killed = False
+
+    async def kill_agent_group() -> None:
+        nonlocal agent_group_killed
+        if not agent_group_killed:
+            agent_group_killed = True
+            await _kill_agent_group(sandbox, agent_group)
+
     try:
         command = f"PYTHONSAFEPATH=1 {run_cmd}"
         if stage_key is not None:
             command = f"export VALKYRIE_STAGE_DIR={_STAGE_DIR}; {command}"
+        command = _in_own_process_group(command, agent_group)
+        if user is not None:
+            command = run_as(user, command)
         exit_reason, agent_run_time = await _stream_controlled_output(
             sandbox,
             command,
@@ -1948,12 +2119,17 @@ async def run_agent(
             extra_env=extra_env,
             redact_error=redact_error if plan.episode is None else None,
             secret_env_names=secret_env_names,
+            on_timeout_stop=kill_agent_group,
         )
     except AgentRunFailedError:
         await upload_outputs(preserve_agent_error=True)
         raise
+    finally:
+        if search_cost_path is not None and on_search_costs is not None:
+            await _collect_search_costs(sandbox, search_cost_path, on_search_costs, log_line)
 
     if exit_reason == AgentCausedExitReason.TIMEOUT:
+        await kill_agent_group()
         suffix = (
             "The orchestrator has exited and evaluation will proceed."
             if plan.episode is not None

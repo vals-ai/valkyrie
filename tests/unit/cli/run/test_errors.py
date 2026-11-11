@@ -1,5 +1,4 @@
 import json
-from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,7 +6,7 @@ import pytest
 from click.testing import CliRunner, Result
 from valkyrie.sdk.models import BenchmarkStatus, FailureCategory, FinalViewResponse
 
-from valkyrie.cli.run.errors import build_run_errors_payload, errors
+from valkyrie.cli.run.errors import errors
 
 from tests.unit.cli.conftest import MockTracker
 from tests.unit.cli.factories import make_final_view, ok
@@ -99,69 +98,22 @@ def test_errors_text_sanitizes_terminal_controls(tracker: MockTracker) -> None:
     assert "next    line" in result.stdout
 
 
-@pytest.mark.description("JSON errors are versioned, limited to known fields, and deterministic.")
-def test_errors_json_is_versioned_allowlisted_and_deterministic(tracker: MockTracker) -> None:
-    run_id = uuid4()
-    raw_error = "task failed\n\x1b[31mred"
+@pytest.mark.description("JSON errors print the SDK `FinalViewResponse` with every task's error and category.")
+@pytest.mark.parametrize("task_errors", [{"task-b": "task failed\n\x1b[31mred", "task-a": "another failure"}, None])
+def test_errors_json_prints_the_sdk_final_view(tracker: MockTracker, task_errors: dict[str, str] | None) -> None:
     response = make_final_view(
-        run_id,
+        uuid4(),
         error_message=None,
-        task_errors={"task-b": raw_error, "task-a": "another failure"},
-        task_failure_categories={"task-b": FailureCategory.AGENT},
+        task_errors=task_errors,
+        task_failure_categories={"task-b": FailureCategory.AGENT} if task_errors else None,
     )
+
     result = invoke_with_tracker(tracker, response, "--format", "json")
 
     assert result.exit_code == 0, result.output
     assert len(result.stdout.splitlines()) == 1
     assert "\x1b" not in result.stdout
-    payload = json.loads(result.stdout)
-    assert set(payload) == {
-        "schema_version",
-        "kind",
-        "observed_at",
-        "run_id",
-        "benchmark_name",
-        "status",
-        "error_message",
-        "task_error_count",
-        "task_errors",
-        "task_failure_categories",
-    }
-    assert payload["schema_version"] == 1
-    assert payload["kind"] == "run_errors"
-    assert payload["observed_at"].endswith("Z")
-    assert payload["run_id"] == str(run_id)
-    assert payload["benchmark_name"] == "demo-bench"
-    assert payload["status"] == "ERROR"
-    assert payload["error_message"] is None
-    assert payload["task_error_count"] == 2
-    assert list(payload["task_errors"]) == ["task-a", "task-b"]
-    assert payload["task_errors"]["task-b"] == raw_error
-    assert payload["task_failure_categories"] == {"task-b": "agent"}
-    assert not any(
-        marker in result.stdout
-        for marker in ["excluded-secret-name", "excluded-kwarg-value", "excluded-evaluation-value"]
-    )
-
-    fixed_payload = build_run_errors_payload(
-        response,
-        observed_at=datetime(2026, 7, 10, 20, 15),
-    )
-    assert fixed_payload["observed_at"] == "2026-07-10T20:15:00Z"
-
-
-@pytest.mark.description("JSON errors normalize an empty error state.")
-def test_errors_json_normalizes_empty_error_state(tracker: MockTracker) -> None:
-    response = make_final_view(uuid4(), status=BenchmarkStatus.FINISHED, error_message=None, task_errors=None)
-
-    result = invoke_with_tracker(tracker, response, "--format", "json")
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.stdout)
-    assert payload["status"] == "FINISHED"
-    assert payload["error_message"] is None
-    assert payload["task_error_count"] == 0
-    assert payload["task_errors"] == {}
+    assert json.loads(result.stdout) == response.model_dump(mode="json")
 
 
 @pytest.mark.description("Text errors label each group with its category.")

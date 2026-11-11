@@ -12,7 +12,7 @@ from uuid import UUID
 
 from valkyrie.sdk._sse import error_detail, server_sent_events
 from valkyrie.sdk._transfer import finish_before_cancelling
-from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieRunError, ValkyrieStreamError
+from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieSDKError, ValkyrieRunError, ValkyrieStreamError
 from valkyrie.sdk.models import (
     AgentContractRequest,
     AnalyzeBenchmarkRequest,
@@ -31,11 +31,13 @@ from valkyrie.sdk.models import (
     RegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse,
     ProjectResponse,
+    RunSnapshot,
     RunStreamEvent,
     S3UploadResultsResponse,
     RunMonitoring,
     StartBenchmarkRequest,
     StartBenchmarkResponse,
+    RescoreBenchmarkResponse,
     StopBenchmarkResponse,
     ShedBenchmarkRequest,
     ShedBenchmarkResponse,
@@ -77,16 +79,11 @@ class RunsResource:
         monitoring: RunMonitoring | None = None,
     ) -> StartBenchmarkResponse:
         """Start a run from an uploaded agent name or complete contract, in the project whose handle is ``project``."""
-        if concurrency < 1:
-            raise ValkyrieRunError("concurrency must be greater than 0")
-        if priority is not None and (type(priority) is not int or priority not in range(5)):
-            raise ValkyrieRunError("priority must be an integer from 0 to 4")
+        check_start_options(concurrency, priority, task_ids, slice_str)
         if not benchmark.strip():
             raise ValkyrieRunError("benchmark must not be blank")
-        if task_ids and slice_str:
-            raise ValkyrieRunError("task_ids and slice_str are mutually exclusive")
 
-        contract = self._normalize_contract(agent, model=model, agent_kwargs=agent_kwargs, secrets=secrets)
+        contract = normalize_contract(agent, model=model, agent_kwargs=agent_kwargs, secrets=secrets)
 
         payload = StartBenchmarkRequest(
             contract=contract,
@@ -105,12 +102,7 @@ class RunsResource:
             project=project,
             monitoring=monitoring,
         )
-        return await self._sdk.request_model(
-            "POST",
-            "/start-benchmark",
-            StartBenchmarkResponse,
-            json=payload.model_dump(mode="json", exclude={"environment"}, exclude_none=True),
-        )
+        return await post_start(self._sdk, payload)
 
     async def fetch(self, run_id: UUID) -> FetchBenchmarkResponse:
         """Fetch the latest state of a run."""
@@ -243,6 +235,21 @@ class RunsResource:
             FetchBenchmarkMetadataResponse,
         )
 
+    async def snapshot(self, run_id: UUID) -> RunSnapshot:
+        """Fetch a run's current state and its launch metadata together.
+
+        `metadata` is None when its request fails, so the run still loads.
+        """
+
+        async def metadata() -> FetchBenchmarkMetadataResponse | None:
+            try:
+                return await self.metadata(run_id)
+            except ValkyrieSDKError:
+                return None
+
+        run, found = await asyncio.gather(self.fetch(run_id), metadata())
+        return RunSnapshot(run=run, metadata=found)
+
     async def results_exist(self, run_id: UUID) -> ResultsExistResponse:
         """Check whether the canonical result file already exists in S3."""
         return await self._sdk.request_model(
@@ -372,6 +379,10 @@ class RunsResource:
             ShedBenchmarkResponse,
             json=request.model_dump(mode="json"),
         )
+
+    async def rescore(self, run_id: UUID) -> RescoreBenchmarkResponse:
+        """Run a finished dataset run's metric script again and replace its stored score."""
+        return await self._sdk.request_model("POST", f"/rescore-benchmark/{run_id}", RescoreBenchmarkResponse)
 
     async def stop(
         self,
@@ -507,28 +518,48 @@ class RunsResource:
             json=body,
         )
 
-    @staticmethod
-    def _normalize_contract(
-        agent: str | AgentContractRequest,
-        *,
-        model: str | None,
-        agent_kwargs: Mapping[str, str] | None,
-        secrets: Mapping[str, str] | None,
-    ) -> AgentContractRequest:
-        if isinstance(agent, str):
-            if not agent.strip():
-                raise ValkyrieRunError("agent must not be blank")
-            contract = AgentContractRequest(name=agent)
-        else:
-            contract = agent
 
-        updates: dict[str, Any] = {
-            "kwargs": {**contract.kwargs, **dict(agent_kwargs or {})},
-            "secrets": {**contract.secrets, **dict(secrets or {})},
-        }
-        if model is not None:
-            updates["model"] = model
-        return contract.model_copy(update=updates)
+def check_start_options(
+    concurrency: int, priority: int | None, task_ids: Sequence[str] | None, slice_str: str | None
+) -> None:
+    if concurrency < 1:
+        raise ValkyrieRunError("concurrency must be greater than 0")
+    if priority is not None and (type(priority) is not int or priority not in range(5)):
+        raise ValkyrieRunError("priority must be an integer from 0 to 4")
+    if task_ids and slice_str:
+        raise ValkyrieRunError("task_ids and slice_str are mutually exclusive")
+
+
+def normalize_contract(
+    agent: str | AgentContractRequest,
+    *,
+    model: str | None,
+    agent_kwargs: Mapping[str, str] | None,
+    secrets: Mapping[str, str] | None,
+) -> AgentContractRequest:
+    if isinstance(agent, str):
+        if not agent.strip():
+            raise ValkyrieRunError("agent must not be blank")
+        contract = AgentContractRequest(name=agent)
+    else:
+        contract = agent
+
+    updates: dict[str, Any] = {
+        "kwargs": {**contract.kwargs, **dict(agent_kwargs or {})},
+        "secrets": {**contract.secrets, **dict(secrets or {})},
+    }
+    if model is not None:
+        updates["model"] = model
+    return contract.model_copy(update=updates)
+
+
+async def post_start(sdk: ValkyrieClient, payload: StartBenchmarkRequest) -> StartBenchmarkResponse:
+    return await sdk.request_model(
+        "POST",
+        "/start-benchmark",
+        StartBenchmarkResponse,
+        json=payload.model_dump(mode="json", exclude={"environment"}, exclude_none=True),
+    )
 
 
 def _task_ids_param(task_ids: Sequence[str] | None) -> dict[str, Any]:

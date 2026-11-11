@@ -1,6 +1,6 @@
 import os
 from asyncio import Semaphore
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Generator
 from uuid import uuid4
 from typing import Any, cast
 
@@ -23,26 +23,15 @@ from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.runtime.artifacts import agent_bundle_key
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.config import create_benchmark_service_url
-from tracker.database.models import DEFAULT_ORG_NAME, AgentContractRequest, Org
+from tracker.database.models import DEFAULT_ORG_NAME, Org
+from tracker.types import AgentContractRequest
 from tracker.clients.benchmark_service import create_benchmark_service_client, fetch_sandbox_provider_config
 
 _ = load_dotenv()
 
 
 @pytest.fixture
-def tracker_database(
-    database_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Session:
-
-    async def inline_admission(function: Callable[..., Any], *args: Any) -> Any:
-        return function(*args)
-
-    monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.tasks.execute.to_thread", inline_admission)
-    monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
+def tracker_database(database_session: Session) -> Session:
     existing = database_session.get(Org, TEST_ORG_ID)
     if not existing:
         database_session.add(Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME))

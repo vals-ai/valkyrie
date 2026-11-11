@@ -19,7 +19,7 @@ OUTPUT_DIR = Path("packages/valkyrie-sdk/src/valkyrie/sdk/models/_generated")
 REF_PREFIX = "#/components/schemas/"
 GENERATED_HEADER = re.compile(r"\A(#[^\n]*\n)+\n*")
 SINGLE_LINE_DOCSTRING = re.compile(r'"""\n(\s+)([^\n]+)\n\s+"""')
-TOP_LEVEL_KEYS = {"default", "description", "x-repr", "x-strict", "x-enum-field-as-literal"}
+TOP_LEVEL_KEYS = {"default", "description", "x-discriminator", "x-repr", "x-strict", "x-enum-field-as-literal"}
 CONSTRAINT_KEYS = {"minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "pattern"}
 GENERATOR_ARGS = (
     "--input-file-type",
@@ -45,6 +45,7 @@ GENERATOR_ARGS = (
     "--output-datetime-class",
     "datetime",
     "--field-extra-keys-without-x-prefix",
+    "x-discriminator",
     "x-repr",
     "x-strict",
     "--formatters",

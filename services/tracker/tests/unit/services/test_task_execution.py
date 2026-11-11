@@ -1,8 +1,7 @@
 import asyncio
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
-from unittest.mock import MagicMock, Mock
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -10,14 +9,15 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from tests.utils import TEST_ORG_ID
-from tracker.database.models import Benchmark, ExecutorDispatch, ExecutorDispatchStatus, Org, Task, TaskStatus
+from tracker.database.models import Benchmark, Org, Task
+from tracker.domain import TaskStatus
 from tracker.exceptions import SandboxError, SandboxSetupError
-from tracker.executor.execution_authority import ExecutionAuthority
-from tracker.services.tasks.monitor import ResizableLimiter, TaskMonitor, TrackedTask, TrackedTaskStatus
+from tracker.executor.control_protocol import DispatchRef, TaskRef
+from tracker.executor.control_tasks import TaskControl, TaskState
+from tracker.services.tasks.execute import ResizableLimiter, TaskMonitor, TrackedTask, TrackedTaskStatus
 import tracker.services.tasks.execute as task_execution
-import tracker.services.tasks.monitor as task_monitor
 from tracker.services.runs.stop import apply_shed_benchmark
-from tracker.services.tasks.status import exception_message
+from tracker.services.tasks.execute import _exception_message as exception_message
 
 
 @pytest.mark.description("Persisted task error text keeps the original error behind tracker wrappers.")
@@ -112,16 +112,16 @@ class TestTaskExecution:
     async def test_shed_preserves_waiting_direct_tasks(
         self,
         shed_first: bool,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         example_benchmark_object: Benchmark,
-        monkeypatch: pytest.MonkeyPatch,
-        executor_authority: Any,
     ) -> None:
         benchmark = example_benchmark_object
         benchmark.arguments = benchmark.arguments.model_copy(update={"concurrency": 3})
-        database_session.add(benchmark)
-        database_session.commit()
-        authority = executor_authority(benchmark, session=database_session)
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        controls = bound_controls(benchmark, session=control_postgres_session)
+        control = cast(TaskControl, controls["task_control"])
         tasks = [
             Task(
                 org_id=TEST_ORG_ID,
@@ -131,61 +131,28 @@ class TestTaskExecution:
             )
             for index in range(4)
         ]
-        database_session.add_all(tasks)
-        database_session.commit()
-        monkeypatch.setattr(task_execution, "engine", database_session.get_bind())
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.get_bind())
-        started: list[str] = []
-        ready = asyncio.Event()
-
-        async def inline_admission(function: Callable[..., Any], *args: Any) -> Any:
-            return function(*args)
-
-        monkeypatch.setattr(task_execution, "to_thread", inline_admission)
-
-        async def prepare(task: Task) -> dict[str, dict[str, Any] | None]:
-            async def retrieve() -> None:
-                started.append(task.task_id)
-                if len(started) == (1 if shed_first else 3):
-                    ready.set()
-                await asyncio.Event().wait()
-
-            recovery = MagicMock(retrieve_task=retrieve)
-            return await getattr(task_execution, "_process_task_attempt")(
-                task,
-                MagicMock(),
-                MagicMock(),
-                benchmark.id,
-                task.task_id,
-                MagicMock(),
-                MagicMock(),
-                self._test_org,
-                MagicMock(),
-                asyncio.Semaphore(1),
-                getattr(task_execution, "_DependencySetupRecoveryState")(),
-                recovery,
-                authority,
-                claimed_at=datetime.now(UTC),
-            )
+        control_postgres_session.add_all(tasks)
+        control_postgres_session.commit()
 
         if shed_first:
-            assert apply_shed_benchmark(benchmark, 1, database_session, self._test_org) == []
-            database_session.commit()
+            assert apply_shed_benchmark(benchmark, 1, control_postgres_session, self._test_org) == []
+            control_postgres_session.commit()
+        for task in tasks[: 1 if shed_first else 3]:
+            state = (await control.read(TaskRef(org_id=task.org_id, task_row_id=task.id, task_id=task.task_id))).task
+            assert (await control.admit(state.ref)).admitted
 
-        runners = [asyncio.create_task(prepare(task)) for task in tasks]
-        try:
-            await asyncio.wait_for(ready.wait(), timeout=3)
-            database_session.expire_all()
-            statuses = {task.task_id: task.status for task in database_session.exec(select(Task)).all()}
-            assert list(statuses.values()).count(TaskStatus.BUILDING) == (1 if shed_first else 3)
+        control_postgres_session.expire_all()
+        statuses = {task.task_id: task.status for task in control_postgres_session.exec(select(Task)).all()}
+        assert list(statuses.values()).count(TaskStatus.BUILDING) == (1 if shed_first else 3)
+        assert statuses["task-3"] == TaskStatus.PENDING
+        if not shed_first:
+            assert apply_shed_benchmark(benchmark, 1, control_postgres_session, self._test_org) == ["task-2", "task-1"]
+            control_postgres_session.commit()
+            control_postgres_session.expire_all()
+            statuses = {task.task_id: task.status for task in control_postgres_session.exec(select(Task)).all()}
+            assert statuses["task-0"] == TaskStatus.BUILDING
+            assert statuses["task-1"] == statuses["task-2"] == TaskStatus.STOPPED
             assert statuses["task-3"] == TaskStatus.PENDING
-            if not shed_first:
-                assert apply_shed_benchmark(benchmark, 1, database_session, self._test_org) == ["task-2", "task-1"]
-                database_session.commit()
-        finally:
-            for runner in runners:
-                runner.cancel()
-            await asyncio.gather(*runners, return_exceptions=True)
 
     @pytest.mark.description("Raising the limiter wakes waiting admissions.")
     async def test_resizable_limiter_increase_wakes_waiting_admission(self) -> None:
@@ -275,53 +242,35 @@ class TestTaskExecution:
     @pytest.mark.description("The monitor removes completed work and cancels invalid attempts once.")
     async def test_task_monitor(
         self,
-        database_session: Session,
+        control_postgres_session: Session,
         example_benchmark_object: Benchmark,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority: Any,
+        bound_controls: Any,
     ) -> None:
-        benchmark_row = example_benchmark_object
-        database_session.add(benchmark_row)
-        database_session.commit()
-        authority = executor_authority(benchmark_row, session=database_session)
+        benchmark = example_benchmark_object
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        stopped_row = Task(org_id=TEST_ORG_ID, task_id="stopped", benchmark=benchmark.id, status=TaskStatus.STOPPED)
+        superseded_row = Task(org_id=TEST_ORG_ID, task_id="superseded", benchmark=benchmark.id)
+        control_postgres_session.add_all([stopped_row, superseded_row])
+        control_postgres_session.commit()
 
-        stopped_row = Task(
-            org_id=TEST_ORG_ID,
-            task_id="stopped",
-            benchmark=benchmark_row.id,
-            status=TaskStatus.STOPPED,
-        )
-        superseded_row = Task(org_id=TEST_ORG_ID, task_id="superseded", benchmark=benchmark_row.id)
-        database_session.add_all([stopped_row, superseded_row])
-        database_session.commit()
-
-        done = TrackedTask(asyncio.sleep(0), self._test_org, authority, stopped_row.started_at)
-        stopped = TrackedTask(asyncio.sleep(0), self._test_org, authority, stopped_row.started_at)
-        superseded = TrackedTask(asyncio.sleep(0), self._test_org, authority, superseded_row.started_at)
+        done = TrackedTask(asyncio.sleep(0), control, stopped_row.started_at)
+        stopped = TrackedTask(asyncio.sleep(0), control, stopped_row.started_at)
+        superseded = TrackedTask(asyncio.sleep(0), control, superseded_row.started_at)
         setattr(done, "_status", TrackedTaskStatus.DONE)
         setattr(stopped, "_status", TrackedTaskStatus.RUNNING)
         setattr(superseded, "_status", TrackedTaskStatus.RUNNING)
-
         stopped_cancel = Mock()
         superseded_cancel = Mock()
         setattr(stopped, "_task", Mock(cancel=stopped_cancel, done=lambda: False))
         setattr(superseded, "_task", Mock(cancel=superseded_cancel, done=lambda: False))
-
         superseded_row.started_at += timedelta(seconds=1)
-        database_session.add(superseded_row)
-        database_session.commit()
-
-        task_tracking = {"done": done, "stopped": stopped, "superseded": superseded}
-
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monitor = TaskMonitor(
-            benchmark_row.id,
-            task_tracking,
-            org=self._test_org,
-            limiter=ResizableLimiter(limit=1),
-            authority=authority,
-        )
+        control_postgres_session.add(superseded_row)
+        control_postgres_session.commit()
+        tracking = {"done": done, "stopped": stopped, "superseded": superseded}
+        monitor = TaskMonitor(tracking, limiter=ResizableLimiter(limit=1), control=control)
         sleep_count = 0
 
         async def complete_cancelled_tasks(_delay: float) -> None:
@@ -331,169 +280,88 @@ class TestTaskExecution:
                 setattr(stopped, "_status", TrackedTaskStatus.DONE)
                 setattr(superseded, "_status", TrackedTaskStatus.DONE)
 
-        monkeypatch.setattr("tracker.services.tasks.execute.asyncio.sleep", complete_cancelled_tasks)
-
-        await monitor.track_tasks()
-
+        monkeypatch.setattr(task_execution.asyncio, "sleep", complete_cancelled_tasks)
+        try:
+            await monitor.track_tasks()
+        finally:
+            for tracked in (done, stopped, superseded):
+                getattr(tracked, "_coro").close()
         stopped_cancel.assert_called_once()
         superseded_cancel.assert_called_once()
-        assert task_tracking == {}
-        for tracked_task in (done, stopped, superseded):
-            getattr(tracked_task, "_coro").close()
+        assert tracking == {}
 
     def _monitor_for_task(
         self,
-        database_session: Session,
-        benchmark_row: Benchmark,
-        executor_authority: Any,
-        monkeypatch: pytest.MonkeyPatch,
+        session: Session,
+        benchmark: Benchmark,
+        bound_controls: Any,
         *,
         status: TaskStatus,
-    ) -> tuple[TaskMonitor, TrackedTask, Mock, ExecutionAuthority]:
-        database_session.add(benchmark_row)
-        database_session.commit()
-        authority = executor_authority(benchmark_row, session=database_session)
-        task_row = Task(org_id=TEST_ORG_ID, task_id="monitored", benchmark=benchmark_row.id, status=status)
-        database_session.add(task_row)
-        database_session.commit()
-
-        tracked = TrackedTask(asyncio.sleep(0), self._test_org, authority, task_row.started_at)
+    ) -> tuple[TaskMonitor, TrackedTask, Mock, TaskControl]:
+        session.add(benchmark)
+        session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=session)["task_control"])
+        row = Task(org_id=TEST_ORG_ID, task_id="monitored", benchmark=benchmark.id, status=status)
+        session.add(row)
+        session.commit()
+        tracked = TrackedTask(asyncio.sleep(0), control, row.started_at)
         setattr(tracked, "_status", TrackedTaskStatus.RUNNING)
         cancellation = Mock()
         setattr(tracked, "_task", Mock(cancel=cancellation, done=lambda: False))
-        monkeypatch.setattr(task_execution, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monitor = TaskMonitor(
-            benchmark_row.id,
-            {"monitored": tracked},
-            org=self._test_org,
-            limiter=None,
-            authority=authority,
-        )
 
-        return monitor, tracked, cancellation, authority
+        monitor = TaskMonitor({"monitored": tracked}, limiter=None, control=control)
+        return monitor, tracked, cancellation, control
 
-    @pytest.mark.description(
-        "The task monitor retries a database `OperationalError` three times before it cancels the task."
-    )
-    @pytest.mark.parametrize("failure_stage", ["authority", "state"])
-    async def test_task_monitor_retries_operational_error_without_cancelling(
+    @pytest.mark.description("A Control database failure propagates without cancelling a monitored task.")
+    async def test_task_monitor_operational_error_propagates_without_cancelling(
         self,
-        failure_stage: str,
-        database_session: Session,
+        control_postgres_session: Session,
         example_benchmark_object: Benchmark,
-        executor_authority: Any,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monitor, tracked, cancellation, _authority = self._monitor_for_task(
-            database_session,
+        monitor, tracked, cancellation, control = self._monitor_for_task(
+            control_postgres_session,
             example_benchmark_object,
-            executor_authority,
-            monkeypatch,
-            status=TaskStatus.STOPPED,
-        )
-        owner: Any = task_monitor
-        name = "lock_execution_authority" if failure_stage == "authority" else "fetch_benchmark_row"
-        original = getattr(owner, name)
-        failed = False
-
-        def fail_once(*args: Any, **kwargs: Any) -> Any:
-            nonlocal failed
-            if not failed:
-                failed = True
-                raise OperationalError("SELECT", {}, Exception("connection lost"))
-
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(owner, name, fail_once)
-        sleep_count = 0
-
-        async def finish_after_recovery(_delay: float) -> None:
-            nonlocal sleep_count
-            sleep_count += 1
-            if sleep_count == 1:
-                cancellation.assert_not_called()
-            elif sleep_count == 2:
-                cancellation.assert_called_once()
-                setattr(tracked, "_status", TrackedTaskStatus.DONE)
-
-        monkeypatch.setattr(task_execution.asyncio, "sleep", finish_after_recovery)
-
-        try:
-            await monitor.track_tasks()
-        finally:
-            getattr(tracked, "_coro").close()
-
-        assert failed
-        assert sleep_count == 3
-        cancellation.assert_called_once()
-
-    @pytest.mark.description("The task monitor cancels once when authority is revoked.")
-    async def test_task_monitor_revoked_authority_cancels_once(
-        self,
-        database_session: Session,
-        example_benchmark_object: Benchmark,
-        executor_authority: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monitor, tracked, cancellation, authority = self._monitor_for_task(
-            database_session,
-            example_benchmark_object,
-            executor_authority,
-            monkeypatch,
-            status=TaskStatus.IN_PROGRESS,
-        )
-        dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
-        assert dispatch is not None
-        dispatch.status = ExecutorDispatchStatus.FINISHED
-        database_session.add(dispatch)
-        database_session.commit()
-        sleep_count = 0
-
-        async def finish_after_cancellation(_delay: float) -> None:
-            nonlocal sleep_count
-            sleep_count += 1
-            cancellation.assert_called_once()
-            if sleep_count == 2:
-                setattr(tracked, "_status", TrackedTaskStatus.DONE)
-
-        monkeypatch.setattr(task_execution.asyncio, "sleep", finish_after_cancellation)
-
-        try:
-            await monitor.track_tasks()
-        finally:
-            getattr(tracked, "_coro").close()
-
-        assert sleep_count == 3
-        cancellation.assert_called_once()
-
-    @pytest.mark.description("An unexpected database error in the task monitor propagates.")
-    async def test_task_monitor_unexpected_db_error_propagates(
-        self,
-        database_session: Session,
-        example_benchmark_object: Benchmark,
-        executor_authority: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monitor, tracked, cancellation, _authority = self._monitor_for_task(
-            database_session,
-            example_benchmark_object,
-            executor_authority,
-            monkeypatch,
+            bound_controls,
             status=TaskStatus.STOPPED,
         )
 
-        def fail_read(_benchmark_id: Any, _session: Session, _org: Org) -> None:
+        async def fail_monitor(_task_ids: list[str]) -> Any:
+            raise OperationalError("SELECT", {}, Exception("connection lost"))
+
+        monkeypatch.setattr(control, "monitor", fail_monitor)
+        try:
+            with pytest.raises(OperationalError):
+                await monitor.track_tasks()
+        finally:
+            getattr(tracked, "_coro").close()
+        cancellation.assert_not_called()
+
+    @pytest.mark.description("Unexpected Control monitor errors propagate without cancelling a monitored task.")
+    async def test_task_monitor_unexpected_control_error_propagates(
+        self,
+        control_postgres_session: Session,
+        example_benchmark_object: Benchmark,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monitor, tracked, cancellation, control = self._monitor_for_task(
+            control_postgres_session,
+            example_benchmark_object,
+            bound_controls,
+            status=TaskStatus.STOPPED,
+        )
+
+        async def fail_monitor(_task_ids: list[str]) -> Any:
             raise ValueError("invalid benchmark state")
 
-        monkeypatch.setattr("tracker.services.tasks.monitor.fetch_benchmark_row", fail_read)
-
+        monkeypatch.setattr(control, "monitor", fail_monitor)
         try:
             with pytest.raises(ValueError, match="invalid benchmark state"):
                 await monitor.track_tasks()
         finally:
             getattr(tracked, "_coro").close()
-
         cancellation.assert_not_called()
 
     @pytest.mark.description(
@@ -523,20 +391,29 @@ class TestTaskExecution:
         waiting_attempted = asyncio.Event()
         waiting_started = asyncio.Event()
         release_waiting = asyncio.Event()
-        running_row = MagicMock(spec=Task, task_id="task_id_1")
-        waiting_row = MagicMock(spec=Task, task_id="task_id_2")
-        authority = ExecutionAuthority(benchmark_id=uuid4(), dispatch_id=uuid4())
+
+        def task_state(task_id: str) -> TaskState:
+            return TaskState(
+                id=uuid4(),
+                org_id=TEST_ORG_ID,
+                task_id=task_id,
+                benchmark=uuid4(),
+                started_at=datetime.now(UTC),
+                status=TaskStatus.PENDING,
+                eval_resume_state=None,
+                credited_wall_deadline_at=None,
+                build_phase=None,
+                evaluation_phase=None,
+            )
+
+        running_row = task_state("task_id_1")
+        waiting_row = task_state("task_id_2")
+        control = Mock(spec=TaskControl)
         running = TrackedTask(
-            controlled_result("task_id_1", running_started, release_running),
-            self._test_org,
-            authority,
-            running_row.started_at,
+            controlled_result("task_id_1", running_started, release_running), control, running_row.started_at
         )
         waiting = TrackedTask(
-            controlled_result("task_id_2", waiting_started, release_waiting),
-            self._test_org,
-            authority,
-            waiting_row.started_at,
+            controlled_result("task_id_2", waiting_started, release_waiting), control, waiting_row.started_at
         )
 
         assert running.status == TrackedTaskStatus.WAITING
@@ -571,6 +448,21 @@ class TestTaskExecution:
             waiting.task.result()
 
 
+def _terminal_task_state() -> TaskState:
+    return TaskState(
+        id=uuid4(),
+        org_id=TEST_ORG_ID,
+        task_id="task_0",
+        benchmark=uuid4(),
+        started_at=datetime.now(UTC),
+        status=TaskStatus.PENDING,
+        eval_resume_state=None,
+        credited_wall_deadline_at=None,
+        build_phase=None,
+        evaluation_phase=None,
+    )
+
+
 @pytest.mark.description("A tracked task that is cancelled or raises an unhandled error logs that stable event.")
 @pytest.mark.parametrize(
     "error,level,expected_event",
@@ -585,17 +477,16 @@ async def test_tracked_task_logs_terminal_event(
     async def fail() -> dict[str, dict[str, Any] | None]:
         raise error
 
-    async def skip_database_call(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
+    state = _terminal_task_state()
+    control = Mock(spec=TaskControl)
+    control.ref = DispatchRef(benchmark_id=state.benchmark, dispatch_id=uuid4())
+    control.fail = AsyncMock(return_value=True)
     log = Mock()
-    monkeypatch.setattr(task_monitor.logger, level, log)
-    monkeypatch.setattr(task_monitor, "database_call", skip_database_call)
-    monkeypatch.setattr(task_monitor, "capture_exception", Mock())
-    task_row = Task(org_id=TEST_ORG_ID, task_id="task_0", benchmark=uuid4())
-    tracked = TrackedTask(fail(), Org(id=TEST_ORG_ID, name="default"), Mock(), task_row.started_at)
+    monkeypatch.setattr(task_execution.logger, level, log)
+    monkeypatch.setattr(task_execution, "capture_exception", Mock())
+    tracked = TrackedTask(fail(), control, state.started_at)
 
-    assert await tracked.run(None, task_row) == {"task_0": None}
+    assert await tracked.run(None, state) == {"task_0": None}
     assert [call.kwargs["extra"]["event"] for call in log.call_args_list] == [expected_event]
 
 
@@ -634,20 +525,21 @@ async def test_tracked_task_records_terminal_outcome_metric(
     async def fail() -> dict[str, dict[str, Any] | None]:
         raise error
 
-    async def fake_database_call(*_args: Any, **_kwargs: Any) -> bool | None:
-        if isinstance(write_result, BaseException):
-            raise write_result
-        return write_result
+    control = Mock(spec=TaskControl)
+    state = _terminal_task_state()
+    control.ref = DispatchRef(benchmark_id=state.benchmark, dispatch_id=uuid4())
+    if isinstance(write_result, BaseException):
+        control.fail = AsyncMock(side_effect=write_result)
+    else:
+        control.fail = AsyncMock(return_value=write_result)
 
     monkeypatch.setattr("tracker.observability.metrics.incr", record_outcome_metric)
-    monkeypatch.setattr(task_monitor, "database_call", fake_database_call)
-    monkeypatch.setattr(task_monitor, "capture_exception", Mock())
-    task_row = Task(org_id=TEST_ORG_ID, task_id="task_0", benchmark=uuid4())
-    tracked = TrackedTask(fail(), Org(id=TEST_ORG_ID, name="default"), Mock(), task_row.started_at)
+    monkeypatch.setattr(task_execution, "capture_exception", Mock())
+    tracked = TrackedTask(fail(), control, state.started_at)
 
     if isinstance(write_result, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
-            await tracked.run(None, task_row)
+            await tracked.run(None, state)
     else:
-        assert await tracked.run(None, task_row) == {"task_0": None}
+        assert await tracked.run(None, state) == {"task_0": None}
     assert [tags["outcome"] for tags in outcome_tags] == expected_outcomes

@@ -16,10 +16,9 @@ from sqlmodel import Session
 from tracker.database.models import (
     FINISHED_BENCHMARK_STATUSES,
     Benchmark,
-    BenchmarkStatus,
     Org,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.database.session import database_call
 from tracker.repositories.benchmark import BenchmarkRepository, FinishedEvaluationRow
 from tracker.logging import get_logger
@@ -148,6 +147,10 @@ def fetch_evaluation_results(benchmark_id: UUID, session: Session, org_id: UUID)
         evaluation_results[task_id] = result_data
 
     return evaluation_results
+
+
+def fetch_final_score_inputs(session: Session, benchmark_row: Benchmark, org: Org) -> dict[str, dict[str, Any] | None]:
+    return BenchmarkRepository(session).final_score_inputs(org.id, benchmark_row.id)
 
 
 def fetch_average_task_breakdown(benchmark_id: UUID, session: Session, org_id: UUID) -> AverageTaskBreakdown | None:
@@ -320,7 +323,7 @@ def build_benchmark_table_rows(benchmarks: Sequence[Benchmark], session: Session
                 agent_name=b.arguments.contract.name,
                 label=b.label,
                 model=b.arguments.contract.model,
-                dataset=b.arguments.dataset or "default",
+                dataset=b.arguments.with_hosted_dataset().dataset or "default",
                 executor_release_id=b.executor_release_id,
                 current_execution_release_id=b.current_execution_release_id,
                 executor_artifact_digest=b.executor_artifact_digest,

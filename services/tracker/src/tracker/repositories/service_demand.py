@@ -53,6 +53,10 @@ def record_wake(engine: Engine, name: str) -> None:
         session.commit()
 
 
+def wake_recorded(session: Session, name: str) -> bool:
+    return session.get(BenchmarkServiceWake, name) is not None
+
+
 def was_woken(engine: Engine, name: str) -> bool:
     with Session(engine) as session:
-        return session.get(BenchmarkServiceWake, name) is not None
+        return wake_recorded(session, name)

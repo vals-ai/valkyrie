@@ -1,11 +1,11 @@
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Event, current_thread
-from time import monotonic
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlmodel import Session
 
@@ -27,29 +27,10 @@ def _run(postgres_session: Session) -> tuple[Org, Task, str]:
     return org, task, task_attempt_id(task.id, task.started_at)
 
 
-def _wait_for_database_lock(engine: Engine) -> None:
-    deadline = monotonic() + 5
-    with Session(engine) as observer:
-        while monotonic() < deadline:
-            blocked = (
-                observer.connection()
-                .execute(
-                    text(
-                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                        "WHERE datname = current_database() AND wait_event_type = 'Lock' "
-                        "AND pid <> pg_backend_pid())"
-                    )
-                )
-                .scalar_one()
-            )
-            if blocked:
-                return
-            observer.rollback()
-    raise AssertionError("the second transaction never waited on a PostgreSQL lock")
-
-
 @pytest.mark.description("When the stop commits first, the egress grant refuses the policy.")
-def test_stop_commits_before_grant_refuses_policy(postgres_engine: Engine, postgres_session: Session) -> None:
+def test_stop_commits_before_grant_refuses_policy(
+    postgres_engine: Engine, postgres_session: Session, wait_for_database_lock: Callable[[], None]
+) -> None:
     org, task, key_id = _run(postgres_session)
     proxy = resolve_run_egress_proxy("*", key_id)
     assert proxy is not None
@@ -62,7 +43,7 @@ def test_stop_commits_before_grant_refuses_policy(postgres_engine: Engine, postg
         with ThreadPoolExecutor(max_workers=1) as pool:
             grant = pool.submit(PolicyStore(postgres_engine).grant, proxy, task.benchmark, task.id, expires_at)
             try:
-                _wait_for_database_lock(postgres_engine)
+                wait_for_database_lock()
             finally:
                 stop_session.commit()
             with pytest.raises(AttemptStoppedError):
@@ -73,7 +54,9 @@ def test_stop_commits_before_grant_refuses_policy(postgres_engine: Engine, postg
 
 
 @pytest.mark.description("When the egress grant commits first, the stop revokes the policy.")
-def test_grant_commits_before_stop_revokes_policy(postgres_engine: Engine, postgres_session: Session) -> None:
+def test_grant_commits_before_stop_revokes_policy(
+    postgres_engine: Engine, postgres_session: Session, wait_for_database_lock: Callable[[], None]
+) -> None:
     org, task, key_id = _run(postgres_session)
     proxy = resolve_run_egress_proxy("*", key_id)
     assert proxy is not None
@@ -111,7 +94,7 @@ def test_grant_commits_before_stop_revokes_policy(postgres_engine: Engine, postg
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-stop") as stops:
                 stopped = stops.submit(stop)
                 try:
-                    _wait_for_database_lock(postgres_engine)
+                    wait_for_database_lock()
                 finally:
                     release_grant.set()
                 grant.result(timeout=5)

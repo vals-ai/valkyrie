@@ -5,12 +5,12 @@ from uuid import uuid4
 
 from benchmark_service import ImageSource, Resources, SandboxProvider
 
-from tests.utils import random_task_id
+from tests.utils import random_task_id, unexpected_sandbox_record
 from tests.integration.seed_agent_artifacts import create_s3_client
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import S3ObjectStore, get_benchmark_contract_s3_key
 from tracker.runtime.artifacts import agent_bundle_key
-from tracker.database.models import AgentContractRequest
+from tracker.types import AgentContractRequest
 from tracker.sandbox import SandboxCreationState, create_sandbox, upload_agent_artifacts
 
 _IMAGES = [
@@ -78,6 +78,7 @@ class TestUploadArtifactsAcrossImages:
                     test_resources,
                     creation_semaphore,
                     creation_state=SandboxCreationState(cleanup_pending=False),
+                    record_sandbox=unexpected_sandbox_record,
                 ) as sandbox,
             ):
                 await upload_agent_artifacts(sandbox, contract, benchmark_id, object_store)

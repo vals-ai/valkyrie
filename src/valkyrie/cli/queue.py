@@ -35,12 +35,7 @@ def status(waiting_limit: int, active_limit: int, waiting_offset: int, active_of
     )
 
     if output_format == "json":
-        click.echo(
-            response.model_dump_json(
-                indent=2,
-                exclude={"pools": {"__all__": {"provider", "capacity_domains"}}},
-            )
-        )
+        click.echo(response.model_dump_json(indent=2))
         return
 
     _format_overview(response)
@@ -70,11 +65,12 @@ def _format_overview(response: SchedulerOverviewResponse) -> None:
                 "Priority": f"P{entry.priority}",
                 "Run": str(entry.benchmark_uuid),
                 "Task": one_line(entry.external_task_id),
+                "Started by": one_line(entry.started_by_email or "-"),
                 "Wait (s)": f"{max(0, (response.observed_at - entry.enqueued_at).total_seconds()):.0f}",
             }
             for entry in response.waiting_entries
         ],
-        ["Pool", "Position", "Priority", "Run", "Task", "Wait (s)"],
+        ["Pool", "Position", "Priority", "Run", "Task", "Started by", "Wait (s)"],
         total_count=summary.waiting,
         item_name="waiting task",
     )
@@ -90,10 +86,11 @@ def _format_overview(response: SchedulerOverviewResponse) -> None:
                 "Run": str(entry.benchmark_uuid),
                 "Task": one_line(entry.external_task_id),
                 "Status": entry.status.value,
+                "Started by": one_line(entry.started_by_email or "-"),
             }
             for entry in response.active_entries
         ],
-        ["Run", "Task", "Status"],
+        ["Run", "Task", "Status", "Started by"],
         total_count=summary.building + summary.in_progress + summary.evaluating,
         item_name="active task",
     )

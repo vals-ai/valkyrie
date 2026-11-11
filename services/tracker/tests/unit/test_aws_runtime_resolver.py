@@ -20,7 +20,8 @@ from tracker.aws.resolver import (
     resolve_start_aws_runtime,
 )
 from tracker.aws.runtime import AWSResources, AWSRuntime
-from tracker.database.models import AgentContractRequest, Benchmark, Org
+from tracker.database.models import Benchmark, Org
+from tracker.types import AgentContractRequest
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
 
 _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")

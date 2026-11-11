@@ -288,7 +288,7 @@ class TestDatasetsScreen:
             assert _row_keys(pilot.app.screen)[0] == "polyglot-001"
 
             await pilot.press("j", "y")
-            assert pilot.app.clipboard == "valk dataset task download aider polyglot polyglot-002"
+            assert pilot.app.clipboard == "valk dataset task download aider/polyglot polyglot-002"
 
             await pilot.press("slash", *"005", "enter")
             assert _row_keys(pilot.app.screen) == ["polyglot-005"]

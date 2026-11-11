@@ -1,16 +1,23 @@
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 
 from benchmark_service import SandboxProviderConfig
-from benchmark_service.sandbox import DaytonaProviderConfig, ModalProviderConfig
+from benchmark_service.sandbox import DaytonaProviderConfig, DaytonaV2ProviderConfig, ModalProviderConfig
 from dotenv import dotenv_values
 
-from tracker.exceptions import InvalidSandboxConfigurationError, SecretsError
+from tracker.exceptions import InvalidSandboxConfigurationError, SecretNotFoundError, SecretsError
 from tracker.runtime.secrets import SecretValue, sandbox_provider_config_from_secret
 
 PROVIDER_SETTING_NAMES = frozenset(
-    name for config in (DaytonaProviderConfig, ModalProviderConfig) for name in config.model_fields if name.isupper()
+    name
+    for config in (DaytonaProviderConfig, DaytonaV2ProviderConfig, ModalProviderConfig)
+    for name in config.model_fields
+    if name.isupper()
 )
+
+
+GATEWAY_SETTING_NAMES = frozenset({"MODEL_GATEWAY_API_KEY", "MODEL_GATEWAY_URL"})
 
 
 class InMemorySecretStore:
@@ -26,7 +33,20 @@ class InMemorySecretStore:
         try:
             return self._values[name]
         except KeyError:
-            raise SecretsError(f"Local execution has no values for secret reference '{name}'") from None
+            raise SecretNotFoundError(f"Local execution has no values for secret reference '{name}'") from None
+
+
+class SecretsFile:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    async def get(self, name: str) -> SecretValue:
+        if name in PROVIDER_SETTING_NAMES | GATEWAY_SETTING_NAMES:
+            raise SecretsError(f"Tasks cannot read sandbox provider or model gateway settings: {name}")
+        values = await asyncio.to_thread(dotenv_values, self._path, interpolate=False)
+        if (value := values.get(name)) is None:
+            raise SecretNotFoundError(f"The local secrets file has no value for '{name}'")
+        return value
 
 
 def load_execution_secrets(path: Path | None, references: Mapping[str, str]) -> dict[str, str]:

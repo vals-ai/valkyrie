@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import asdict
 import json
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -25,10 +26,10 @@ from benchmark_service.schemas import BenchmarkEgressPlan, ChildPolicy, Retrieve
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, select
 
+import tracker.executor.control_task_api as control_task_api
 import tracker.services.tasks.execute as utils_module
 from tests.unit.services.task_execution_support import (
     TEST_ORG,
-    bind_task_to_dispatch,
     create_task_environment,
     finalize_agent_generation,
     make_retrieve_task_response,
@@ -41,19 +42,23 @@ from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.generation_plan import GenerationPlan
 from tracker.external_service_gateway import ExternalServiceGatewayClient, GenerationAccountingSummary
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
     ErrorResult,
     ExecutorDispatch,
-    ExecutorDispatchStatus,
     Task,
     TaskBreakdown,
-    TaskStatus,
 )
+from executor_protocol import ExecutorDispatchStatus
+from tracker.types import AgentContractRequest
+from tracker.domain import TaskStatus
+from tracker.exceptions import ExecutionAuthorityRevoked
+from tracker.executor.control_protocol import AttemptRef, TaskRef
+from tracker.executor.control_tasks import TaskAccountingRequest, TaskMutationRequest, TaskResultRequest
+from tracker.executor.control_queue import QueueControl, reserved_queue_pool_id
 from tracker.sandbox import SandboxCreationState, create_sandbox
 from tracker.scheduler.admission import SandboxQueueContext
-from tracker.scheduler.store import reserved_queue_pool_id
 import tracker.egress_proxy.run_stage as proxy_run_stage
+
 import tracker.runtime.model_gateway as model_gateway_module
 from tracker.egress_proxy.settings import EgressProxyEndpoint
 
@@ -112,24 +117,25 @@ class TestQueuedTaskSource:
     async def test_reserved_backlog_preparation_is_bounded_and_releases_slots(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         cancel_preparing: bool,
     ) -> None:
-        request, first, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, first, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         tasks = [first]
         for index in range(1, 15):
             task = Task(org_id=first.org_id, benchmark=benchmark_id, task_id=f"task_{index}")
-            database_session.add(task)
+            control_postgres_session.add(task)
             tasks.append(task)
-        database_session.commit()
-        task_engine = database_session.get_bind()
-        assert isinstance(task_engine, Engine)
+        control_postgres_session.commit()
         context = SandboxQueueContext(
             provider=Mock(),
             pool_id=reserved_queue_pool_id("pool_test"),
-            engine=task_engine,
+            control=QueueControl(control.client, control.ref),
         )
         started = 0
         active = 0
@@ -162,7 +168,7 @@ class TestQueuedTaskSource:
                     task,
                     benchmark_id,
                     runtime_services,
-                    authority,
+                    control,
                     queue_context=context,
                 )
             )
@@ -185,7 +191,7 @@ class TestQueuedTaskSource:
                                 task,
                                 benchmark_id,
                                 runtime_services,
-                                authority,
+                                control,
                                 queue_context=context,
                             )
                             for task in tasks
@@ -208,13 +214,15 @@ class TestQueuedTaskSource:
     async def test_targeted_source_is_shared_by_admission_and_creation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         source = TargetedSnapshotSource(snapshot="snapshot", target="us-west-3")
         task_response = make_retrieve_task_response().model_copy(update={"source": source})
@@ -248,7 +256,7 @@ class TestQueuedTaskSource:
         async def enter_queue(
             *,
             stack: Any,
-            task_row_id: Any,
+            attempt: AttemptRef,
             source: SandboxSource,
             create: Callable[[], Any],
             creation_state: SandboxCreationState,
@@ -257,18 +265,26 @@ class TestQueuedTaskSource:
             admission_sources.append(source)
             admission_states.append(creation_state)
             lifecycle.append(("admission", creation_state.cleanup_pending))
+            admission = await control.admit(attempt)
+            assert admission.phase is not None
+            _kwargs["on_phase_claimed"](admission.phase)
             sandbox = await stack.enter_async_context(create())
-            with Session(task_engine) as task_session:
-                queued_task = task_session.get(Task, task_row_id)
-                assert queued_task is not None
-                queued_task.status = TaskStatus.IN_PROGRESS
-                task_session.add(queued_task)
-                task_session.commit()
+            assert await control.transition(
+                TaskMutationRequest(
+                    ref=control.ref,
+                    attempt=attempt,
+                    to_status=TaskStatus.IN_PROGRESS,
+                    expected_status=TaskStatus.BUILDING,
+                )
+            )
+            _kwargs["on_phase_released"](True)
             return sandbox
 
-        task_engine = database_session.get_bind()
-        assert isinstance(task_engine, Engine)
-        queue_context = SandboxQueueContext(provider=provider, pool_id="pool_test", engine=task_engine)
+        queue_context = SandboxQueueContext(
+            provider=provider,
+            pool_id="pool_test",
+            control=QueueControl(control.client, control.ref),
+        )
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
         monkeypatch.setattr(DaytonaProviderConfig, "create_provider", provider_context)
         monkeypatch.setattr(utils_module, "create_sandbox", create_sandbox)
@@ -279,7 +295,7 @@ class TestQueuedTaskSource:
             task_row,
             benchmark_id,
             runtime_services,
-            authority,
+            control,
             queue_context=queue_context,
         )
 
@@ -299,7 +315,8 @@ class TestProcessTaskEnvironment:
     async def test_process_task_injects_tracker_owned_attribution_env(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -317,9 +334,10 @@ class TestProcessTaskEnvironment:
             email="starter@example.com",
             name="Starter User",
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
             run_starter,
         )
         start_benchmark_request = start_benchmark_request.model_copy(
@@ -351,7 +369,7 @@ class TestProcessTaskEnvironment:
             partial(_capture_sandbox_environment, captured_env_vars),
         )
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(captured_env_vars) == 1
@@ -390,7 +408,8 @@ class TestProcessTaskEnvironment:
     async def test_eligible_task_mints_native_bearer_and_persists_terminal_counter(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         allowance: float | None,
@@ -408,14 +427,15 @@ class TestProcessTaskEnvironment:
                 "inference_settings_attested": True,
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         original_deadline = datetime.now(UTC) + timedelta(seconds=5)
         task_row.credited_wall_deadline_at = original_deadline
-        database_session.add(task_row)
-        database_session.commit()
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
         task_response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": allowance,
@@ -505,7 +525,7 @@ class TestProcessTaskEnvironment:
                 task_row,
                 benchmark_id,
                 runtime_services,
-                authority,
+                control,
             )
         finally:
             await ssp_http.aclose()
@@ -529,13 +549,13 @@ class TestProcessTaskEnvironment:
         assert minted[0]["ttl_seconds"] == 7 * 24 * 60 * 60
         assert captured_env_vars[0]["UNRELATED_SECRET"] == "unrelated-value"
         assert captured_env_vars[0]["VALKYRIE_AGENT_VARIANT"] == "xhigh"
-        database_session.expire_all()
-        persisted_task = database_session.get(Task, task_row.id)
+        control_postgres_session.expire_all()
+        persisted_task = control_postgres_session.get(Task, task_row.id)
         assert persisted_task is not None
         assert persisted_task.credited_wall_deadline_at is not None
         assert persisted_task.credited_wall_deadline_at.replace(tzinfo=UTC) == original_deadline
         assert persisted_task.task_breakdown is not None
-        breakdown = database_session.get(TaskBreakdown, persisted_task.task_breakdown)
+        breakdown = control_postgres_session.get(TaskBreakdown, persisted_task.task_breakdown)
         assert breakdown is not None
         assert getattr(breakdown, "accounting_id") == accounting_id
         assert getattr(breakdown, "external_service_overhead_seconds") == 7.0
@@ -547,16 +567,18 @@ class TestProcessTaskEnvironment:
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize("handoff", ["stop", "retry"])
     async def test_stopped_or_retried_attempt_rejects_prior_finalized_accounting(
-        self, contract: AgentContractRequest, database_session: Session, handoff: str
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any, handoff: str
     ) -> None:
-        _, task_row, _, authority = create_task_environment(contract, database_session)
-        bind_task_to_dispatch(database_session, task_row, authority)
+        _, task_row, _, control = create_task_environment(contract, control_postgres_session, bound_controls)
         task_row.status = TaskStatus.IN_PROGRESS
-        database_session.add(task_row)
-        database_session.commit()
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
+        attempt = (
+            await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+        ).task.ref
         expected_started_at = task_row.started_at
         assert expected_started_at is not None
-        bind = database_session.get_bind()
+        bind = control_postgres_session.get_bind()
         assert isinstance(bind, Engine)
         summary = GenerationAccountingSummary(
             accounting_id=sha256(b"prior-attempt-bearer").hexdigest(),
@@ -578,26 +600,22 @@ class TestProcessTaskEnvironment:
             handoff_session.add(current_task)
             handoff_session.commit()
 
-        with pytest.raises(utils_module.ExecutionAuthorityRevoked):
-            utils_module._persist_generation_accounting_summary(
-                summary,
-                task_breakdown=TaskBreakdown(),
-                task_row_id=task_row.id,
-                org=TEST_ORG,
-                authority=authority,
-                expected_started_at=expected_started_at,
-                open_task_session=lambda: Session(bind=bind),
-            )
+        request = TaskAccountingRequest(ref=control.ref, attempt=attempt, summary=asdict(summary))
+        if handoff == "retry":
+            with pytest.raises(ExecutionAuthorityRevoked):
+                await control.accounting(request)
+        else:
+            await control.accounting(request)
 
         with Session(bind=bind) as verify_session:
             current_task = verify_session.get(Task, task_row.id)
             assert current_task is not None
             if handoff == "stop":
                 assert current_task.status == TaskStatus.STOPPED
-                assert current_task.started_at == expected_started_at
+                assert current_task.started_at == expected_started_at.replace(tzinfo=None)
             else:
                 assert current_task.status == TaskStatus.IN_PROGRESS
-                assert current_task.started_at == expected_started_at + timedelta(seconds=1)
+                assert current_task.started_at == (expected_started_at + timedelta(seconds=1)).replace(tzinfo=None)
             assert current_task.task_breakdown is None
             assert verify_session.exec(select(TaskBreakdown)).all() == []
 
@@ -605,7 +623,8 @@ class TestProcessTaskEnvironment:
     async def test_accounting_persistence_failure_blocks_evaluation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -616,7 +635,9 @@ class TestProcessTaskEnvironment:
                 "secrets": {"MODEL_GATEWAY_URL": "gateway-url", "MODEL_GATEWAY_API_KEY": "gateway-key"},
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": 10.0,
@@ -672,7 +693,7 @@ class TestProcessTaskEnvironment:
             task_row,
             benchmark_id,
             runtime_services,
-            authority,
+            control,
         )
 
         assert result == {"task_0": None}
@@ -739,19 +760,22 @@ class TestProcessTaskEnvironment:
     async def test_base_only_task_keeps_its_whole_task_wall_without_model_or_ssp_session(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         persisted_retry: bool,
         allowance: float | None,
     ) -> None:
         contract = contract.model_copy(update={"model": None, "inference_settings_attested": False})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         original_deadline = datetime.now(UTC) + timedelta(seconds=5) if persisted_retry else None
         if original_deadline is not None:
             task_row.credited_wall_deadline_at = original_deadline
-            database_session.add(task_row)
-            database_session.commit()
+            control_postgres_session.add(task_row)
+            control_postgres_session.commit()
         task_response = make_retrieve_task_response().model_copy(update={"agent_timeout": allowance})
         observed: list[tuple[float | None, Any, str | None]] = []
 
@@ -769,7 +793,7 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", None)
 
-        result = await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(observed) == 1
@@ -778,7 +802,7 @@ class TestProcessTaskEnvironment:
         assert deadline.base_allowance_seconds == allowance
         assert deadline.client is None
         assert generation_gateway_url is None
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.credited_wall_deadline_at is not None
         if original_deadline is not None:
             assert task_row.credited_wall_deadline_at.replace(tzinfo=UTC) == original_deadline
@@ -791,7 +815,8 @@ class TestProcessTaskEnvironment:
     async def test_task_wall_expires_during_agent_execution_with_or_without_gateway_key(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         native_key: bool,
@@ -805,7 +830,9 @@ class TestProcessTaskEnvironment:
                 else {},
             }
         )
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         captured_env_vars: list[dict[str, str]] = []
         minted: list[dict[str, Any]] = []
         revoked = asyncio.Event()
@@ -826,11 +853,11 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", resolve_secrets)
         monkeypatch.setattr(utils_module, "create_sandbox", partial(_capture_sandbox_environment, captured_env_vars))
         monkeypatch.setattr(utils_module, "run_agent", wait_for_wall)
-        monkeypatch.setattr(utils_module, "TASK_WALL_SECONDS", 0.5)
+        monkeypatch.setattr(control_task_api, "_TASK_WALL_SECONDS", 0.5)
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
 
         result = await asyncio.wait_for(
-            run_process_task(request, task_row, benchmark_id, runtime_services, authority), timeout=5
+            run_process_task(request, task_row, benchmark_id, runtime_services, control), timeout=5
         )
 
         assert result == {"task_0": None}
@@ -841,7 +868,7 @@ class TestProcessTaskEnvironment:
             assert "MODEL_GATEWAY_API_KEY" not in captured_env_vars[0]
         assert len(minted) == int(native_key)
         assert revoked.is_set() is native_key
-        with Session(database_session.get_bind()) as session:
+        with Session(control_postgres_session.get_bind()) as session:
             errors = session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
             assert len(errors) == 1
             assert errors[0].error_type == "CreditedTaskWallTimeExceeded"
@@ -851,7 +878,8 @@ class TestProcessTaskEnvironment:
     async def test_sandbox_creation_error_survives_revoke_past_wall_deadline(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -862,7 +890,9 @@ class TestProcessTaskEnvironment:
                 "secrets": {"MODEL_GATEWAY_URL": "gateway-url", "MODEL_GATEWAY_API_KEY": "gateway-key"},
             }
         )
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         minted: list[dict[str, Any]] = []
         revoke_complete = asyncio.Event()
         creation_failed = asyncio.Event()
@@ -898,14 +928,14 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
 
         result = await asyncio.wait_for(
-            run_process_task(request, task_row, benchmark_id, runtime_services, authority), timeout=5
+            run_process_task(request, task_row, benchmark_id, runtime_services, control), timeout=5
         )
 
         assert result == {"task_0": None}
         assert creation_failed.is_set()
         assert revoke_complete.is_set()
         assert len(minted) == 1
-        with Session(database_session.get_bind()) as session:
+        with Session(control_postgres_session.get_bind()) as session:
             errors = session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
             assert len(errors) == 1
             assert errors[0].error_type == "RuntimeError"
@@ -915,12 +945,15 @@ class TestProcessTaskEnvironment:
     async def test_credited_wall_timer_does_not_interrupt_sandbox_teardown(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract = contract.model_copy(update={"model": None, "inference_settings_attested": False})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": 10.0,
@@ -928,17 +961,44 @@ class TestProcessTaskEnvironment:
             }
         )
         teardown_complete = asyncio.Event()
+        wall_timeouts: list[asyncio.Timeout] = []
+        sandbox_timeouts: list[asyncio.Timeout] = []
+        armed_deadlines: list[float] = []
+        original_timeout_at = asyncio.timeout_at
+        original_finish = control.finish
+
+        def record_timeout_at(_when: float | None) -> asyncio.Timeout:
+            timeout = original_timeout_at(None)
+            wall_timeouts.append(timeout)
+
+            return timeout
+
+        async def finish_and_arm(request: TaskResultRequest) -> bool:
+            accepted = await original_finish(request)
+            deadline = asyncio.get_running_loop().time() + 0.1
+            sandbox_timeouts[0].reschedule(deadline)
+            armed_deadlines.append(deadline)
+
+            return accepted
 
         @asynccontextmanager
         async def delayed_teardown(*_args: Any, **_kwargs: Any) -> AsyncGenerator[SimpleNamespace, None]:
+            sandbox_timeouts.append(wall_timeouts[-1])
             try:
                 yield SimpleNamespace(id="mock-sandbox-id", name="mock-sandbox-name")
             finally:
-                await asyncio.sleep(0.6)
+                assert len(armed_deadlines) == 1
+                assert sandbox_timeouts[0].when() is None
+                deadline = armed_deadlines[0]
+                loop = asyncio.get_running_loop()
+                await asyncio.sleep(max(0, deadline - loop.time() + 0.01))
+                assert loop.time() > deadline
                 teardown_complete.set()
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=response))
         monkeypatch.setattr(utils_module, "create_sandbox", delayed_teardown)
+        monkeypatch.setattr(asyncio, "timeout_at", record_timeout_at)
+        monkeypatch.setattr(control, "finish", finish_and_arm)
 
         async def complete_agent(*_args: Any, **kwargs: Any) -> tuple[None, float]:
             await _complete_base_only_agent(**kwargs)
@@ -946,17 +1006,15 @@ class TestProcessTaskEnvironment:
 
         monkeypatch.setattr(utils_module, "run_agent", complete_agent)
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
-        monkeypatch.setattr(utils_module, "TASK_WALL_SECONDS", 0.5)
 
         result = await asyncio.wait_for(
-            run_process_task(request, task_row, benchmark_id, runtime_services, authority), timeout=3
+            run_process_task(request, task_row, benchmark_id, runtime_services, control), timeout=3
         )
 
         assert teardown_complete.is_set()
         assert result == {"task_0": {"status": "success", "score": 1.0}}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.credited_wall_deadline_at is not None
-        assert datetime.now(UTC) > task_row.credited_wall_deadline_at.replace(tzinfo=UTC)
 
     @pytest.mark.description("Each scoped token gets the SHA-256 of the token as its accounting ID.")
     async def test_distinct_scoped_tokens_have_distinct_accounting_ids(
@@ -993,7 +1051,8 @@ class TestProcessTaskEnvironment:
     async def test_ineligible_model_runs_base_only_without_ssp_accounting(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         attested: bool,
@@ -1005,7 +1064,9 @@ class TestProcessTaskEnvironment:
                 "inference_settings_attested": attested,
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": 10.0,
@@ -1024,19 +1085,20 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN", "tracker-control")
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", 5.0)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(captured_env) == 1
-        database_session.expire_all()
-        assert database_session.get(Task, task_row.id).status == TaskStatus.FINISHED
+        control_postgres_session.expire_all()
+        assert control_postgres_session.get(Task, task_row.id).status == TaskStatus.FINISHED
 
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize("run_through_proxy", [True, False])
     async def test_only_a_task_that_asks_goes_through_the_proxy(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         run_through_proxy: bool,
@@ -1055,7 +1117,9 @@ class TestProcessTaskEnvironment:
                 "inference_settings_attested": True,
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(
             update={"egress": BenchmarkEgressPlan(run_through_proxy=run_through_proxy)}
         )
@@ -1077,7 +1141,7 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "run_agent", _complete_base_only_agent)
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", AsyncMock(return_value=secrets))
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         env = captured_env[0]
@@ -1099,12 +1163,15 @@ class TestProcessTaskEnvironment:
     async def test_task_that_asks_for_the_proxy_fails_without_one(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         egress: BenchmarkEgressPlan,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(update={"egress": egress})
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
@@ -1115,11 +1182,11 @@ class TestProcessTaskEnvironment:
         create_sandbox = AsyncMock()
         monkeypatch.setattr(utils_module, "create_sandbox", create_sandbox)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
         create_sandbox.assert_not_awaited()
-        with Session(database_session.get_bind()) as session:
+        with Session(control_postgres_session.get_bind()) as session:
             errors = session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
             assert [error.error_type for error in errors] == ["InvalidSandboxConfigurationError"]
 
@@ -1137,12 +1204,15 @@ class TestProcessTaskEnvironment:
     async def test_wildcard_proxy_entries_fail_before_sandbox_creation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         egress: BenchmarkEgressPlan,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(update={"egress": egress})
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
@@ -1155,11 +1225,11 @@ class TestProcessTaskEnvironment:
         create_sandbox = AsyncMock()
         monkeypatch.setattr(utils_module, "create_sandbox", create_sandbox)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
         create_sandbox.assert_not_awaited()
-        with Session(database_session.get_bind()) as session:
+        with Session(control_postgres_session.get_bind()) as session:
             errors = session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
             assert [error.error_type for error in errors] == ["InvalidSandboxConfigurationError"]
             assert "list the domain itself" in errors[0].error_message
@@ -1168,7 +1238,8 @@ class TestProcessTaskEnvironment:
     async def test_missing_native_gateway_credentials_runs_base_only(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -1178,7 +1249,9 @@ class TestProcessTaskEnvironment:
                 "inference_settings_attested": True,
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": 10.0,
@@ -1198,20 +1271,21 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", 5.0)
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", AsyncMock(return_value={}))
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(captured_env) == 1
         assert "MODEL_GATEWAY_API_KEY" not in captured_env[0]
-        database_session.expire_all()
-        assert database_session.get(Task, task_row.id).status == TaskStatus.FINISHED
+        control_postgres_session.expire_all()
+        assert control_postgres_session.get(Task, task_row.id).status == TaskStatus.FINISHED
 
     @pytest.mark.description("One execution carries one ATTEMPT_ID. A whole-task rerun carries another.")
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_process_task_injects_attempt_id_that_changes_on_rerun(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -1221,9 +1295,10 @@ class TestProcessTaskEnvironment:
             email="starter@example.com",
             name="Starter User",
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
             run_starter,
         )
         captured_env_vars: list[dict[str, str]] = []
@@ -1238,18 +1313,18 @@ class TestProcessTaskEnvironment:
             partial(_capture_sandbox_environment, captured_env_vars),
         )
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
         first_attempt_id = captured_env_vars[0]["ATTEMPT_ID"]
         assert first_attempt_id == utils_module.task_attempt_id(task_row.id, task_row.started_at)
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         task_row.status = TaskStatus.PENDING
         task_row.started_at = task_row.started_at + timedelta(microseconds=1)
-        database_session.add(task_row)
-        database_session.commit()
-        database_session.refresh(task_row)
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
+        control_postgres_session.refresh(task_row)
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert len(captured_env_vars) == 2
         second_attempt_id = captured_env_vars[1]["ATTEMPT_ID"]
@@ -1261,7 +1336,8 @@ class TestProcessTaskEnvironment:
     async def test_process_task_withholds_unattested_inference_settings(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -1274,9 +1350,10 @@ class TestProcessTaskEnvironment:
             }
         )
         assert contract.inference_settings_attested is False
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         captured_env_vars: list[dict[str, str]] = []
 
@@ -1287,7 +1364,7 @@ class TestProcessTaskEnvironment:
             partial(_capture_sandbox_environment, captured_env_vars),
         )
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert len(captured_env_vars) == 1
         env_vars = captured_env_vars[0]
@@ -1304,7 +1381,8 @@ class TestProcessTaskEnvironment:
     async def test_process_task_does_not_scope_credentials_to_an_injected_model(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
@@ -1317,9 +1395,10 @@ class TestProcessTaskEnvironment:
             }
         )
         assert contract.inference_settings_attested is False
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         captured_env_vars: list[dict[str, str]] = []
         minted: list[dict[str, Any]] = []
@@ -1339,7 +1418,7 @@ class TestProcessTaskEnvironment:
             partial(_capture_sandbox_environment, captured_env_vars),
         )
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert minted == []
         assert captured_env_vars[0]["MODEL_GATEWAY_API_KEY"] == "gateway-key"
@@ -1348,14 +1427,16 @@ class TestProcessTaskEnvironment:
     async def test_process_task_omits_identity_email_when_unavailable(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract = contract.model_copy(update={"inference_settings_attested": True})
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         captured_env_vars: list[dict[str, str]] = []
 
@@ -1369,7 +1450,7 @@ class TestProcessTaskEnvironment:
             partial(_capture_sandbox_environment, captured_env_vars),
         )
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(captured_env_vars) == 1
@@ -1387,14 +1468,16 @@ class TestProcessTaskEnvironment:
     async def test_process_task_forwards_native_secret_references_without_resolving_values(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract = contract.model_copy(update={"secrets": {"LEGACY_API_KEY": "aws-secret"}})
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         captured: dict[str, dict[str, str]] = {}
         resolved_inputs: list[dict[str, str]] = []
@@ -1418,7 +1501,7 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(utils_module, "create_sandbox", _capture_sandbox)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert resolved_inputs == [{"LEGACY_API_KEY": "aws-secret"}]
@@ -1430,15 +1513,17 @@ class TestProcessTaskEnvironment:
     async def test_stopped_task_output_is_fenced_while_sibling_keeps_dispatch_active(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
-        benchmark = database_session.get(Benchmark, benchmark_id)
+        benchmark = control_postgres_session.get(Benchmark, benchmark_id)
         assert benchmark is not None
         benchmark.arguments = benchmark.arguments.model_copy(update={"concurrency": 2})
         sibling = Task(
@@ -1447,8 +1532,8 @@ class TestProcessTaskEnvironment:
             task_id="task_sibling",
             status=TaskStatus.IN_PROGRESS,
         )
-        database_session.add(sibling)
-        database_session.commit()
+        control_postgres_session.add(sibling)
+        control_postgres_session.commit()
         output_authority_checks: list[bool] = []
 
         async def stop_before_output(
@@ -1456,16 +1541,19 @@ class TestProcessTaskEnvironment:
             execution_is_current: Callable[[], bool],
             **_kwargs: Any,
         ) -> tuple[None, float]:
-            selected = database_session.get(Task, task_row.id)
+            selected = control_postgres_session.get(Task, task_row.id)
             assert selected is not None
             selected.status = TaskStatus.STOPPED
-            database_session.add(selected)
-            database_session.commit()
+            control_postgres_session.add(selected)
+            control_postgres_session.commit()
+            tick = await control.monitor([task_row.task_id])
+            assert tick.tasks[task_row.task_id].status == TaskStatus.STOPPED
+            control.invalidate(task_row.id)
 
-            dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
+            dispatch = control_postgres_session.get(ExecutorDispatch, control.ref.dispatch_id)
             assert dispatch is not None
             assert dispatch.status == ExecutorDispatchStatus.RUNNING
-            persisted_sibling = database_session.get(Task, sibling.id)
+            persisted_sibling = control_postgres_session.get(Task, sibling.id)
             assert persisted_sibling is not None
             assert persisted_sibling.status == TaskStatus.IN_PROGRESS
 
@@ -1479,7 +1567,7 @@ class TestProcessTaskEnvironment:
             task_row,
             benchmark_id,
             runtime_services,
-            authority,
+            control,
         )
 
         assert output_authority_checks == [False]
@@ -1490,11 +1578,12 @@ class TestProcessTaskEnvironment:
 @pytest.mark.usefixtures("process_benchmark_env")
 async def test_task_waits_for_final_log_write(
     contract: AgentContractRequest,
-    database_session: Session,
+    control_postgres_session: Session,
     runtime_services: RuntimeServices,
+    bound_controls: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request, task, benchmark_id, authority = create_task_environment(contract, database_session)
+    request, task, benchmark_id, control = create_task_environment(contract, control_postgres_session, bound_controls)
     loop = asyncio.get_running_loop()
     writing = asyncio.Event()
     release_write = threading.Event()
@@ -1513,7 +1602,7 @@ async def test_task_waits_for_final_log_write(
 
     monkeypatch.setattr(utils_module, "run_agent", run_agent)
     monkeypatch.setattr("tracker.aws.cloudwatch_logs.CloudWatchBenchmarkLogSink.write", write)
-    execution = asyncio.create_task(run_process_task(request, task, benchmark_id, runtime_services, authority))
+    execution = asyncio.create_task(run_process_task(request, task, benchmark_id, runtime_services, control))
     try:
         await asyncio.wait_for(writing.wait(), timeout=2)
         assert not execution.done()

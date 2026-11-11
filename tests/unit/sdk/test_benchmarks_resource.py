@@ -196,3 +196,74 @@ async def test_task_methods_reject_normalized_dot_segments(make_client, method_n
         method = getattr(client.benchmarks, method_name)
         with pytest.raises(ValueError, match=r"task_id must not be '\.' or '\.\.'"):
             await method(uuid4(), task_id)
+
+
+@pytest.mark.description("`statuses` sends at most 50 run IDs per request and joins the entries in order.")
+async def test_statuses_batches_fifty_ids_per_request(make_client) -> None:
+    run_ids = [uuid4() for _ in range(51)]
+    batch_sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ids = request.url.params["ids"].split(",")
+        batch_sizes.append(len(ids))
+        entries = [
+            {
+                "id": run_id,
+                "status": "IN_PROGRESS",
+                "finished_at": None,
+                "total_tasks": 1,
+                "finished_tasks": 0,
+                "task_state_counts": {},
+            }
+            for run_id in ids
+        ]
+        return httpx.Response(200, json={"entries": entries})
+
+    async with make_client(handler) as client:
+        response = await client.benchmarks.statuses(run_ids)
+
+    assert batch_sizes == [50, 1]
+    assert [entry.id for entry in response.entries] == run_ids
+
+
+@pytest.mark.description(
+    "`runs.snapshot` returns the run with its metadata, and `None` metadata when that request errors or drops."
+)
+@pytest.mark.parametrize("metadata_status", [200, 404, 0], ids=["ok", "api-error", "connection-dropped"])
+async def test_run_snapshot_pairs_the_run_with_its_metadata(make_client, metadata_status: int) -> None:
+    run_id = uuid4()
+    run = {
+        "benchmark_name": "swebench",
+        "benchmark_id": str(run_id),
+        "details": {
+            "status": "IN_PROGRESS",
+            "started_at": "2026-07-09T12:00:00Z",
+            "total_tasks": 4,
+            "finished_tasks": 1,
+            "task_breakdown": {"FINISHED": 1},
+            "docent_reading_status": "IDLE",
+        },
+        "s3_bucket_url": "s3://bucket/run",
+    }
+    metadata = {
+        "benchmark_id": str(run_id),
+        "benchmark_name": "swebench",
+        "benchmark_arguments": {"contract": {"name": "mini_sweagent"}, "concurrency": 2},
+        "started_by_email": "runner@vals.ai",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/fetch-benchmark":
+            return httpx.Response(200, json=run)
+        assert request.url.path == f"/fetch-benchmark-metadata/{run_id}"
+        if metadata_status == 0:
+            raise httpx.ConnectError("metadata connection dropped")
+        if metadata_status != 200:
+            return httpx.Response(metadata_status, json={"detail": "missing"})
+        return httpx.Response(200, json=metadata)
+
+    async with make_client(handler) as client:
+        snapshot = await client.runs.snapshot(run_id)
+
+    assert snapshot.run.benchmark_id == run_id
+    assert (snapshot.metadata is not None) is (metadata_status == 200)

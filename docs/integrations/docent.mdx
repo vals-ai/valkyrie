@@ -6,8 +6,10 @@ description: "Send a finished run's agent outputs to an analyzer Lambda and open
 
 `valkyrie run analyze` hands a finished run to an AWS Lambda function, the analyzer, that
 turns the agent's outputs into [Transluce Docent](https://docent.transluce.org) records and
-returns a link to read them. Valkyrie saves the link on the run. The analyzer decides what
-to upload, how to summarize it, and which models to use.
+returns a link to read them.
+
+- Valkyrie saves the link on the run.
+- The analyzer decides what to upload, how to summarize it, and which models to use.
 
 Valkyrie invokes the analyzer the same way as a [post-run
 Lambda](/integrations/post-run-lambda), so the same AWS account requirement applies, and a
@@ -42,9 +44,10 @@ The analyzer needs to do the following:
    {"reading_plan_url": "https://docent.transluce.org/..."}
    ```
 
-Other returned fields are ignored. A response without `reading_plan_url` marks the analysis
-`DONE` with no link, and raising an exception marks it `ERROR`. The analyzer needs read
-access to the run's folder in the bucket.
+- Other returned fields are ignored.
+- A response without `reading_plan_url` marks the analysis `DONE` with no link, and raising
+  an exception marks it `ERROR`.
+- The analyzer needs read access to the run's folder in the bucket.
 
 ## Name the analyzer in the contract
 
@@ -68,9 +71,10 @@ runs of that agent analyzable too.
 valkyrie run analyze RUN_ID
 ```
 
-Replace *`RUN_ID`* with the run's ID. The run must be `FINISHED`. The command streams
-progress and prints the reading link when the analyzer returns.
-`valkyrie run fetch RUN_ID` also shows the link when it exists.
+Replace *`RUN_ID`* with the run's ID, which must be `FINISHED`.
+
+- The command streams progress and prints the reading link when the analyzer returns.
+- `valkyrie run fetch RUN_ID` also shows the link when it exists.
 
 A run that already has a link returns it without calling the analyzer again. After you fix
 the analyzer, run it again with `--no-cache`:

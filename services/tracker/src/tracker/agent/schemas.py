@@ -5,9 +5,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError, create_model, field_validator, model_validator
 
-from tracker.database.models import AgentTurns, OutputArtifact, OutputArtifactSpec
 from tracker.egress import EgressPolicy
 from tracker.exceptions import ContractValidationError
+from tracker.types import AgentTurns, OutputArtifact, OutputArtifactSpec
 
 
 __all__ = [

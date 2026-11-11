@@ -5,7 +5,11 @@ description: Use when adding or changing Tracker code that reads or writes the d
 
 # Tracker repositories
 
-New and changed Tracker code keeps ORM code out of the main paths, with no exceptions. Routers, `main.py`, the executor, the scheduler and the helpers they call don't build `select`/`update`/`delete` statements or call `session.add`/`delete`/`exec`; they call a repository method instead. Existing inline queries in those paths move into a repository when you change them. Each repository lives in `services/tracker/src/tracker/repositories/`, owns one API domain (projects, benchmarks, costs, ...), and wraps a `Session`.
+New and changed Tracker code keeps ORM code out of the main paths, with no exceptions.
+
+- Routers, `main.py`, the executor, the scheduler and the helpers they call don't build `select`/`update`/`delete` statements or call `session.add`/`delete`/`exec`. They call a repository method instead.
+- Existing inline queries in those paths move into a repository when you change them.
+- Each repository lives in `services/tracker/src/tracker/repositories/`, owns one API domain (projects, benchmarks, costs), and wraps a `Session`.
 
 ## Rules
 

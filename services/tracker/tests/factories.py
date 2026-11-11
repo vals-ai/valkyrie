@@ -6,17 +6,13 @@ from sqlmodel import Session
 
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import (
-    AgentCausedExitReason,
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     ErrorResult,
     EvaluationResult,
-    FailureCategory,
     Task,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
+from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, TaskStatus
 
 
 def make_benchmark(

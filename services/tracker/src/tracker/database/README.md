@@ -1,6 +1,9 @@
 # Database and migrations
 
-The Tracker uses PostgreSQL through SQLModel, with Alembic for migrations.
+The Tracker API and separate executor control service use the same PostgreSQL database through SQLModel.
+
+- Alembic owns schema migrations; neither API nor control startup applies DDL.
+- The explicit migration task runs before the services in Docker Compose, and the local Tracker target runs Alembic before starting control and the API.
 
 ## Add a table
 
@@ -22,9 +25,10 @@ SQLModel sees it.
 From `services/tracker`:
 
 ```bash
-# Runs alembic revision --autogenerate and asks for a message
+# Generate a migration; review it before applying
 make migrate-gen
 
+# Explicitly apply it (never by starting the API or control service)
 uv run alembic upgrade head
 
 # pytest-alembic checks, also run in CI

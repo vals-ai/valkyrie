@@ -25,6 +25,7 @@ from valkyrie.sdk.models._generated.runs import (
     FinalViewResponse,
     LocalBenchmarkArguments,
     Order,
+    RescoreBenchmarkResponse,
     RetryMode,
     RegradeBenchmarkRequest,
     RegradeBenchmarkResponse,
@@ -65,6 +66,7 @@ __all__ = [
     "FinalViewResponse",
     "LocalBenchmarkArguments",
     "Order",
+    "RescoreBenchmarkResponse",
     "ResultsExistResponse",
     "RetrieveResultsResponse",
     "RetryMode",
@@ -150,6 +152,15 @@ class FetchBenchmarkResponse(ResponseModel):
     executor_protocol_version: str | None = None
     regraded_from_run_id: UUID | None = None
     regrade_skipped_task_ids: list[str] | None = None
+
+
+class RunSnapshot(ResponseModel):
+    """A run's current state with its launch metadata, as returned by `runs.snapshot()`."""
+
+    run: FetchBenchmarkResponse
+    metadata: FetchBenchmarkMetadataResponse | None = Field(
+        default=None, description="Launch metadata, or None when its request failed."
+    )
 
 
 class RunStreamEvent(ResponseModel):

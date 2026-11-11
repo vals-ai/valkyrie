@@ -10,10 +10,9 @@ from sqlmodel import Session
 from tests.factories import make_benchmark, make_error_result, make_evaluation_result, make_task
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, TaskStatus
 
 _UTC = ZoneInfo("UTC")
 

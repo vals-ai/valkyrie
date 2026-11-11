@@ -205,6 +205,65 @@ wheels = [
 ]
 
 [[package]]
+name = "aws-cdk-asset-awscli-v1"
+version = "2.2.263"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsii" },
+    { name = "publication" },
+    { name = "typeguard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/03/1bf33967bf1e2a196907266152743ec2dff96b842176084646f910dae732/aws_cdk_asset_awscli_v1-2.2.263.tar.gz", hash = "sha256:657605260ace055fac4ae30a6fb84a80504a6e24ce0b1d278913d4db4bafa266", size = 20229495, upload-time = "2026-01-19T17:25:28.242Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/29/af/02481a85fdd0b8a2a1fd9b84925591e1113a7a61b014dabe9d3f92dd6a67/aws_cdk_asset_awscli_v1-2.2.263-py3-none-any.whl", hash = "sha256:185150757d4216ea982d7b35596de5b3d767776be00cd78cacce02eaa08f8851", size = 20227990, upload-time = "2026-01-19T17:25:25.692Z" },
+]
+
+[[package]]
+name = "aws-cdk-asset-node-proxy-agent-v6"
+version = "2.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsii" },
+    { name = "publication" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/b2/a8e84037da16463ff33c1174d3e8b2fdb9a1c4457654b547e9f2249b86ce/aws_cdk_asset_node_proxy_agent_v6-2.1.3.tar.gz", hash = "sha256:1724285cb3ab50494f4c641c236d0e57d1f2da82bda71d15585a203dc0e75516", size = 1559117, upload-time = "2026-09-08T11:01:50.746Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/58/2d8e000954ea1f8bf22e826e42ef0d283df9b86e25e78a06c20750dcb71d/aws_cdk_asset_node_proxy_agent_v6-2.1.3-py3-none-any.whl", hash = "sha256:b8adb536ad19f8a44e94054c712f5ea5ff487cc3c10ecdc158846b29ca2cbbe5", size = 1557696, upload-time = "2026-09-08T11:01:48.74Z" },
+]
+
+[[package]]
+name = "aws-cdk-cloud-assembly-schema"
+version = "48.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsii" },
+    { name = "publication" },
+    { name = "typeguard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a7/b5/1ce2f6bff913ca8c94a001b84290ec4ce3729f54a3af0e3ff0edb303ac20/aws_cdk_cloud_assembly_schema-48.20.0.tar.gz", hash = "sha256:229aa136c26b71b0a82b5a32658eabcd30e344f7e136315fdb6e3de8ef523bfa", size = 208109, upload-time = "2025-11-19T12:19:48.206Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/08/17a35f0b668451484f2254f5e50a0105958bffe90da11c41b7629972e6a9/aws_cdk_cloud_assembly_schema-48.20.0-py3-none-any.whl", hash = "sha256:f5b6cf661cac8690add9461de13aeae3f3742eec71c066032bd045b08d0b7c3e", size = 207669, upload-time = "2025-11-19T12:19:46.614Z" },
+]
+
+[[package]]
+name = "aws-cdk-lib"
+version = "2.237.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aws-cdk-asset-awscli-v1" },
+    { name = "aws-cdk-asset-node-proxy-agent-v6" },
+    { name = "aws-cdk-cloud-assembly-schema" },
+    { name = "constructs" },
+    { name = "jsii" },
+    { name = "publication" },
+    { name = "typeguard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fd/dc/d8f8a177b586b7724a6bf72d7273fefee6642e956816a6c6d972548a2d47/aws_cdk_lib-2.237.0.tar.gz", hash = "sha256:82b0d9880c2352ea71d9e62e4d55331150c95795e1c9429b7ce2bd47cda8ff9d", size = 47318762, upload-time = "2026-02-02T13:44:05.471Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/63/ff0f4df41a8c29266e3960269b7b1dee4c11ae68a897d6c7f90b6a1cd32d/aws_cdk_lib-2.237.0-py3-none-any.whl", hash = "sha256:10e60c9060c9b461234afcc2932273a08033e2b796ca7f732b64a7be40d295d3", size = 47970102, upload-time = "2026-02-02T13:43:27.586Z" },
+]
+
+[[package]]
 name = "basedpyright"
 version = "1.39.1"
 source = { registry = "https://pypi.org/simple" }
@@ -290,6 +349,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ff/e2/85f227594656000ff4d8adadae91a21f536d4a84c6c716a86bd6685874be/cachetools-7.1.1.tar.gz", hash = "sha256:27bdf856d68fd3c71c26c01b5edc312124ed427524d1ddb31aa2b7746fe20d4b", size = 40202, upload-time = "2026-05-03T20:00:29.391Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bf/0f/f897abe4ea0a8c408ae65c8c83bffab4936ad65d6032d4fb4cd35bbdc3ee/cachetools-7.1.1-py3-none-any.whl", hash = "sha256:0335cd7a0952d2b22327441fb0628139e234c565559eeb91a8a4ac7551c5353d", size = 16775, upload-time = "2026-05-03T20:00:27.857Z" },
+]
+
+[[package]]
+name = "cattrs"
+version = "26.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/23/75/e72b839c3dc869c990b4842f3dba730bdcdf5215f68fc7955edf849a1792/cattrs-26.2.1.tar.gz", hash = "sha256:679132bfdc225c5ee40c024fc42519954767c387f950dc6751946c586bccdc6d", size = 525617, upload-time = "2026-09-26T20:53:21.114Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/cf/22794a399d99480486120e26e879ef008e21f5e85274c2ed591d568bb326/cattrs-26.2.1-py3-none-any.whl", hash = "sha256:a12aaa3453dc8f633a815293179f08b7421ed18d2575c459c3c736f840beac24", size = 74843, upload-time = "2026-09-26T20:53:19.767Z" },
 ]
 
 [[package]]
@@ -387,6 +459,19 @@ wheels = [
 ]
 
 [[package]]
+name = "constructs"
+version = "10.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsii" },
+    { name = "publication" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d1/7e/5caadda94765496d4096528bcc432ae256ade10cf4b847e88a5d09918c1d/constructs-10.8.1.tar.gz", hash = "sha256:9f6e4eb1f6b8b1ac8dcbc85457dcbb1e3f9bd93bbeef03154f6cc7fbbba74b06", size = 788838, upload-time = "2026-08-03T15:28:03.745Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2d/df/3afc4e2c4c6bdf58bfe27d7e082f82f3364562592613c159209ed50ddd16/constructs-10.8.1-py3-none-any.whl", hash = "sha256:f71297db64723889147c82de46dcacaa76b120f856d5b5ac5f65abb22ea88355", size = 787025, upload-time = "2026-08-03T15:28:02.082Z" },
+]
+
+[[package]]
 name = "coverage"
 version = "7.13.5"
 source = { registry = "https://pypi.org/simple" }
@@ -412,8 +497,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.67.0"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.67.0#8cfeef0d53c8f14b8642e25447b5c1454e98d9d7" }
+version = "0.72.0"
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.0#8c5a8e3a82a15ea7bbfeb43d36f706aeba7569ba" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -1013,6 +1098,23 @@ wheels = [
 ]
 
 [[package]]
+name = "jsii"
+version = "1.142.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "cattrs" },
+    { name = "publication" },
+    { name = "python-dateutil" },
+    { name = "typeguard" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/33/c3/0a0165c7258dce26244e32469f13bdbada8bbda2eb2924c9318140ef9731/jsii-1.142.0.tar.gz", hash = "sha256:2fe1c5f2a5a405a5fbaaafb8b362cdf6a30171589e508c01682f33c5d529172f", size = 523956, upload-time = "2026-10-20T08:47:29.207Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/98/36c81719866db47c7b049d2ea4a180bcbdabf84919bc1d94d1f927f9f00d/jsii-1.142.0-py3-none-any.whl", hash = "sha256:16d6b3e25bbaa081dd39eabe910b07f646fe4988302d8aae401690f247baf7df", size = 506963, upload-time = "2026-10-20T08:47:27.512Z" },
+]
+
+[[package]]
 name = "liccheck"
 version = "0.9.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1452,6 +1554,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/ea/d3390e6696276078bd01b2ece417deac954dfdd552d2edc3d03204416c0c/psycopg2_binary-2.9.11-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:edcb3aeb11cb4bf13a2af3c53a15b3d612edeb6409047ea0b5d6a21a9d744b34", size = 3044641, upload-time = "2025-10-30T02:55:19.929Z" },
     { url = "https://files.pythonhosted.org/packages/12/9a/0402ded6cbd321da0c0ba7d34dc12b29b14f5764c2fc10750daa38e825fc/psycopg2_binary-2.9.11-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:62b6d93d7c0b61a1dd6197d208ab613eb7dcfdcca0a49c42ceb082257991de9d", size = 3347940, upload-time = "2025-10-10T11:12:26.529Z" },
     { url = "https://files.pythonhosted.org/packages/b1/d2/99b55e85832ccde77b211738ff3925a5d73ad183c0b37bcbbe5a8ff04978/psycopg2_binary-2.9.11-cp312-cp312-win_amd64.whl", hash = "sha256:b33fabeb1fde21180479b2d4667e994de7bbf0eec22832ba5d9b5e4cf65b6c6d", size = 2714147, upload-time = "2025-10-10T11:12:29.535Z" },
+]
+
+[[package]]
+name = "publication"
+version = "0.0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/8e/8c9fe7e32fdf9c386f83d59610cc819a25dadb874b5920f2d0ef7d35f46d/publication-0.0.3.tar.gz", hash = "sha256:68416a0de76dddcdd2930d1c8ef853a743cc96c82416c4e4d3b5d901c6276dc4", size = 5484, upload-time = "2019-01-15T07:52:23.914Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f8/d3/6308debad7afcdb3ea5f50b4b3d852f41eb566a311fbcb4da23755a28155/publication-0.0.3-py2.py3-none-any.whl", hash = "sha256:0248885351febc11d8a1098d5c8e3ab2dabcf3e8c0c96db1e17ecd12b53afbe6", size = 7687, upload-time = "2019-01-15T07:52:22.151Z" },
 ]
 
 [[package]]
@@ -1990,10 +2101,10 @@ wheels = [
 name = "tracker"
 version = "0.1.0"
 source = { editable = "." }
+default-groups = ["database", "dev"]
 dependencies = [
     { name = "aioboto3" },
     { name = "aiobotocore" },
-    { name = "alembic" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "cachetools" },
@@ -2006,17 +2117,21 @@ dependencies = [
     { name = "modal" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
-    { name = "psycopg2-binary" },
     { name = "python-dotenv" },
     { name = "python-json-logger" },
     { name = "sentry-sdk", extra = ["fastapi"] },
-    { name = "sqlmodel" },
     { name = "starlette" },
     { name = "tenacity" },
 ]
 
 [package.dev-dependencies]
+database = [
+    { name = "alembic" },
+    { name = "psycopg2-binary" },
+    { name = "sqlmodel" },
+]
 dev = [
+    { name = "aws-cdk-lib" },
     { name = "basedpyright" },
     { name = "pytest" },
     { name = "pytest-alembic" },
@@ -2031,11 +2146,10 @@ dev = [
 requires-dist = [
     { name = "aioboto3", specifier = ">=7.0.0" },
     { name = "aiobotocore", specifier = ">=3.4.0" },
-    { name = "alembic", specifier = ">=1.18.4" },
     { name = "boto3", specifier = ">=1.42.20" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.67.0" },
+    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
@@ -2044,17 +2158,21 @@ requires-dist = [
     { name = "modal", specifier = ">=1.6.4.dev2" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "opentelemetry-sdk", specifier = ">=1.20.0" },
-    { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "python-json-logger", specifier = ">=3.2.1" },
     { name = "sentry-sdk", extras = ["fastapi"], specifier = "==2.58.0" },
-    { name = "sqlmodel", specifier = ">=0.0.38" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tenacity", specifier = ">=9.0.0" },
 ]
 
 [package.metadata.requires-dev]
+database = [
+    { name = "alembic", specifier = ">=1.18.4" },
+    { name = "psycopg2-binary", specifier = ">=2.9.11" },
+    { name = "sqlmodel", specifier = ">=0.0.38" },
+]
 dev = [
+    { name = "aws-cdk-lib", specifier = "==2.237.0" },
     { name = "basedpyright" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "pytest-alembic", specifier = ">=0.12.1" },
@@ -2063,6 +2181,15 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff" },
     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.10.0" },
+]
+
+[[package]]
+name = "typeguard"
+version = "2.13.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/38/c61bfcf62a7b572b5e9363a802ff92559cb427ee963048e1442e3aef7490/typeguard-2.13.3.tar.gz", hash = "sha256:00edaa8da3a133674796cf5ea87d9f4b4c367d77476e185e80251cc13dfbb8c4", size = 40604, upload-time = "2021-12-10T21:09:39.158Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9a/bb/d43e5c75054e53efce310e79d63df0ac3f25e34c926be5dffb7d283fb2a8/typeguard-2.13.3-py3-none-any.whl", hash = "sha256:5e3e3be01e887e7eafae5af63d1f36c849aaa94e3a0112097312aabfa16284f1", size = 17605, upload-time = "2021-12-10T21:09:37.844Z" },
 ]
 
 [[package]]

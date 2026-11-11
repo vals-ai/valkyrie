@@ -168,10 +168,10 @@ class DatasetTasksScreen(BrowseScreen[None]):
         table = self.query_one(Table)
         table.border_title = f"{self.title} · tasks"
         table.add_column("task", key="task")
+        table.add_column("digest", key="digest")
         table.add_column("bytes", key="size")
-        table.add_column("updated", key="updated")
         self.query_one(KeyBar).show(("/", "filter"), ("y", "copy cmd"), ("esc", "back"), ("?", "keys"), ("q", "quit"))
-        self.query_one(CommandLine).show(f"valk dataset task list {self.dataset.benchmark} {self.dataset.name}")
+        self.query_one(CommandLine).show(f"valk dataset task list {self.dataset.benchmark}/{self.dataset.name}")
         self.load_tasks()
 
     @work(exclusive=True, group="dataset-tasks")
@@ -194,12 +194,10 @@ class DatasetTasksScreen(BrowseScreen[None]):
         self._show_highlighted()
 
     def _cells(self, task: DatasetTaskResponse) -> list[Text]:
-        now = cast("ValkyrieApp", self.app).now()
-        updated = ago(task.last_modified, now, compact=True) if task.last_modified else ""
         return [
             Text(shown(task.task_id), style=palette().text),
+            Text(task.digest.removeprefix("sha256:")[:12], style=palette().faint),
             Text(f"{task.size:,}", style=palette().muted, justify="right"),
-            Text(updated, style=palette().faint, justify="right"),
         ]
 
     def on_data_table_row_highlighted(self, _event: Table.RowHighlighted) -> None:
@@ -212,8 +210,8 @@ class DatasetTasksScreen(BrowseScreen[None]):
         key = self.query_one(Table).highlighted_key()
         dataset = self.dataset
         command = (
-            f"valk dataset task download {dataset.benchmark} {dataset.name} {shlex.quote(key)}"
+            f"valk dataset task download {dataset.benchmark}/{dataset.name} {shlex.quote(key)}"
             if key
-            else f"valk dataset task list {dataset.benchmark} {dataset.name}"
+            else f"valk dataset task list {dataset.benchmark}/{dataset.name}"
         )
         self.query_one(CommandLine).show(command)

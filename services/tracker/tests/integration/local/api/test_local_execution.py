@@ -22,17 +22,13 @@ from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSResources
 from tracker.database.models import (
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     DEFAULT_ORG_NAME,
-    AgentContractRequest,
     Benchmark,
     ExecutorAdmission,
     ExecutorDispatch,
     ExecutorDispatchPayload,
     FinalEvaluation,
     ExecutorRelease,
-    ExecutorReleaseStatus,
     ErrorResult,
     Org,
     Project,
@@ -41,6 +37,8 @@ from tracker.database.models import (
     Task,
     TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus
+from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import SecretsError
 from tracker.executor.dependencies import get_execution_runtime
@@ -53,7 +51,6 @@ from tracker.services.tasks.attempts import keep_replaced_attempts
 from tracker.services.tasks.execute import task_attempt_id
 from tracker.runtime.services import RuntimeServices
 from tracker.secret_access import tenant_secret_prefix
-from tracker.types import StartBenchmarkRequest
 
 ORG = Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME)
 PROVIDER_SETTINGS = {
@@ -67,21 +64,21 @@ async def _version(*_args: Any, **_kwargs: Any) -> VersionResponse:
 
 
 @pytest.fixture
-def local_tracker(tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def local_tracker(control_postgres_session: Session, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     release = ExecutorRelease(
         id="local-release",
-        artifact_uri="s3://artifacts/local-release.pex",
-        artifact_digest="digest-local-release",
+        artifact_uri="source:///local-release",
+        artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
         status=ExecutorReleaseStatus.ACTIVE,
     )
-    admission = tracker_database.get(ExecutorAdmission, 1)
+    admission = control_postgres_session.get(ExecutorAdmission, 1)
     assert admission is not None
-    tracker_database.add(release)
-    tracker_database.flush()
+    control_postgres_session.add(release)
+    control_postgres_session.flush()
     admission.release_id = release.id
-    tracker_database.add(admission)
-    tracker_database.commit()
+    control_postgres_session.add(admission)
+    control_postgres_session.commit()
 
     async def verify_task_ids(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
         return VerifyTaskIdsResponse(task_ids=["task-1"])
@@ -93,7 +90,7 @@ def local_tracker(tracker_database: Session, monkeypatch: pytest.MonkeyPatch) ->
         return None
 
     overrides = main_module.app.dependency_overrides
-    monkeypatch.setitem(overrides, main_module.get_session, lambda: tracker_database)
+    monkeypatch.setitem(overrides, main_module.get_session, lambda: control_postgres_session)
     monkeypatch.setitem(overrides, main_module.get_current_org, lambda: ORG)
     monkeypatch.setitem(overrides, run_dependencies.get_current_org, lambda: ORG)
     monkeypatch.setitem(overrides, main_module.get_current_runner, lambda: RequestIdentity(org=ORG))
@@ -137,14 +134,25 @@ def _benchmark(session: Session, response: httpx.Response) -> Benchmark:
 async def test_executor_builds_saved_provider_from_secrets_file(
     provider: str,
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS[provider] + "MODEL_KEY=model-value\n")
 
-    benchmark = _benchmark(tracker_database, _start(local_tracker, provider, {"MODEL_KEY": "model-key"}))
-    runtime = await get_execution_runtime(benchmark.local_start_benchmark_request(service_headers={}), benchmark, ORG)
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, provider, {"MODEL_KEY": "model-key"}))
+    runtime = await get_execution_runtime(
+        benchmark.local_start_benchmark_request(service_headers={}),
+        benchmark_id=benchmark.id,
+        org_id=ORG.id,
+        org_name=ORG.name,
+        org_storage_key=ORG.storage_key,
+        saved_environment=benchmark.arguments.environment,
+        saved_properties=benchmark.arguments.properties,
+        saved_sandbox_provider=benchmark.arguments.sandbox_provider,
+        saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
+        context_version=None,
+    )
 
     assert benchmark.arguments.environment == "local"
     assert benchmark.arguments.sandbox_provider == provider
@@ -201,26 +209,37 @@ def test_start_requires_secrets_file_for_hosted_provider(
 async def test_contract_cannot_read_provider_settings(
     name: str,
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"] + PROVIDER_SETTINGS["modal"])
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona", {name: "provider"}))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona", {name: "provider"}))
 
     with pytest.raises(SecretsError, match=f"cannot read sandbox provider settings: {name}"):
-        await get_execution_runtime(benchmark.local_start_benchmark_request(service_headers={}), benchmark, ORG)
+        await get_execution_runtime(
+            benchmark.local_start_benchmark_request(service_headers={}),
+            benchmark_id=benchmark.id,
+            org_id=ORG.id,
+            org_name=ORG.name,
+            org_storage_key=ORG.storage_key,
+            saved_environment=benchmark.arguments.environment,
+            saved_properties=benchmark.arguments.properties,
+            saved_sandbox_provider=benchmark.arguments.sandbox_provider,
+            saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
+            context_version=None,
+        )
 
 
 @pytest.mark.description("Force-stop signals the run's own provider, configured from the original secrets file.")
 async def test_force_stop_rebuilds_saved_provider(
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["modal"])
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "modal"))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "modal"))
     runtimes: list[RuntimeServices] = []
 
     async def force_stop_sandboxes(
@@ -258,14 +277,14 @@ def _use_secrets_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 )
 async def test_secrets_manager_run_rebuilds_saved_provider_for_force_stop(
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_secrets_manager(monkeypatch, tmp_path)
     monkeypatch.setattr(main_module, "AUTH_REQUIRED", True)
     monkeypatch.setattr("tracker.config.AWS_SHARED_SECRET_TENANTS", "")
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona"))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
     runtimes: list[RuntimeServices] = []
 
     async def force_stop_sandboxes(
@@ -300,7 +319,7 @@ def test_start_rejects_incompatible_composition(
     fields: dict[str, str],
     detail: str,
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -327,21 +346,21 @@ def test_start_rejects_incompatible_composition(
 
     assert response.status_code == 400, response.text
     assert detail in response.json()["detail"]
-    assert not tracker_database.exec(select(Benchmark)).all()
+    assert not control_postgres_session.exec(select(Benchmark)).all()
 
 
 @pytest.mark.description("Resuming with a Lambda callback and exporting to S3 both need S3 storage.")
 def test_filesystem_runs_reject_resume_callbacks_and_s3_export(
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona"))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
     benchmark.status = BenchmarkStatus.STOPPED
-    tracker_database.add(benchmark)
-    tracker_database.commit()
+    control_postgres_session.add(benchmark)
+    control_postgres_session.commit()
 
     resume = local_tracker.post(
         f"/retry-or-resume-benchmark/{benchmark.id}",
@@ -363,15 +382,15 @@ def test_secrets_manager_resume_limits_secret_names_to_the_organization(
     secret_name: str,
     expected_status: int,
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_secrets_manager(monkeypatch, tmp_path)
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona"))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
     benchmark.status = BenchmarkStatus.STOPPED
-    tracker_database.add(benchmark)
-    tracker_database.commit()
+    control_postgres_session.add(benchmark)
+    control_postgres_session.commit()
     monkeypatch.setattr(main_module, "AUTH_REQUIRED", True)
     monkeypatch.setattr("tracker.config.AWS_SHARED_SECRET_TENANTS", "")
 
@@ -386,7 +405,7 @@ def test_secrets_manager_resume_limits_secret_names_to_the_organization(
 @pytest.mark.description("Secret names from an uploaded agent are resolved for the organization.")
 def test_secrets_manager_start_authorizes_uploaded_agent_secrets(
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,7 +422,7 @@ def test_secrets_manager_start_authorizes_uploaded_agent_secrets(
         json={"benchmark_name": "hello", "sandbox_provider": "daytona", "contract": {"name": "agent"}},
     )
 
-    benchmark = _benchmark(tracker_database, response)
+    benchmark = _benchmark(control_postgres_session, response)
     assert benchmark.arguments.contract.secrets == {"MODEL_KEY": f"{tenant_secret_prefix(TEST_ORG_ID)}AgentKey"}
 
 
@@ -440,17 +459,17 @@ def _snapshot(session: Session, benchmark_id: UUID) -> list[dict[str, Any]]:
     "ones, forwards the service headers, and leaves the source run and its evaluation unchanged."
 )
 def test_regrade_copies_saved_states_into_a_new_run(
-    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
-    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
-    tracker_database.add(project)
-    tracker_database.flush()
+    control_postgres_session.add(project)
+    control_postgres_session.flush()
     project_id = project.id
-    tracker_database.add(RunProject(benchmark_id=source.id, project_id=project_id))
-    tracker_database.commit()
-    before = _snapshot(tracker_database, source.id)
+    control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project_id))
+    control_postgres_session.commit()
+    before = _snapshot(control_postgres_session, source.id)
     verified: list[tuple[list[str], str | None]] = []
 
     async def verify_task_ids(
@@ -472,8 +491,8 @@ def test_regrade_copies_saved_states_into_a_new_run(
     assert body["regraded_from_run_id"] == str(source.id)
     assert (body["task_ids"], body["skipped_task_ids"]) == (["task-1", "task-2"], ["task-3"])
     assert verified == [(["task-1", "task-2"], "target-dataset")]
-    assert _snapshot(tracker_database, source.id) == before
-    run = tracker_database.get(Benchmark, UUID(body["benchmark_id"]))
+    assert _snapshot(control_postgres_session, source.id) == before
+    run = control_postgres_session.get(Benchmark, UUID(body["benchmark_id"]))
     assert run is not None
     assert (run.status, run.name, run.arguments.regraded_from_run_id) == (
         BenchmarkStatus.IN_PROGRESS,
@@ -484,20 +503,24 @@ def test_regrade_copies_saved_states_into_a_new_run(
     assert run.arguments.contract == source.arguments.contract
     assert (source.arguments.concurrency, run.arguments.concurrency) == (5, 8)
     assert run.arguments.sandbox_provider == source.arguments.sandbox_provider
-    dispatch = tracker_database.exec(select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)).one()
-    sealed = tracker_database.get(ExecutorDispatchPayload, dispatch.id)
+    dispatch = control_postgres_session.exec(
+        select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)
+    ).one()
+    sealed = control_postgres_session.get(ExecutorDispatchPayload, dispatch.id)
     assert sealed is not None
     payload = open_payload(dispatch.id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
     assert payload["execution_context_json"]["start_benchmark_request"]["service_headers"] == service_headers
-    tasks = tracker_database.exec(select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))).all()
+    tasks = control_postgres_session.exec(
+        select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))
+    ).all()
     assert [(task.task_id, task.status, task.eval_resume_state, task.started_at) for task in tasks] == [
         ("task-1", TaskStatus.EVALUATING, {"job": "pass"}, dispatch.created_at),
         ("task-2", TaskStatus.EVALUATING, {"job": "fail"}, dispatch.created_at),
         ("task-3", TaskStatus.ERROR, None, dispatch.created_at),
     ]
-    (error,) = tracker_database.exec(select(ErrorResult).where(ErrorResult.task == tasks[2].id)).all()
+    (error,) = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == tasks[2].id)).all()
     assert error.error_message == f"Source run {source.id} saved no eval_resume_state for this task."
-    links = tracker_database.exec(select(RunProject).where(RunProject.benchmark_id == run.id)).all()
+    links = control_postgres_session.exec(select(RunProject).where(RunProject.benchmark_id == run.id)).all()
     assert [link.project_id for link in links] == [project_id]
     fetched = local_tracker.get("/fetch-benchmark", params={"benchmark_id": str(run.id)}).json()
     metadata = local_tracker.get(f"/fetch-benchmark-metadata/{run.id}").json()
@@ -509,14 +532,14 @@ def test_regrade_copies_saved_states_into_a_new_run(
     "Regrade onto the source run's own dataset works, so a run can be regraded as a noise control."
 )
 def test_regrade_onto_the_source_dataset(
-    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
-    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     source.arguments = source.arguments.model_copy(update={"dataset": "terminal-bench-4.0"})
-    tracker_database.add(source)
-    tracker_database.commit()
-    before = _snapshot(tracker_database, source.id)
+    control_postgres_session.add(source)
+    control_postgres_session.commit()
+    before = _snapshot(control_postgres_session, source.id)
     verified: list[tuple[list[str], str | None]] = []
 
     async def verify_task_ids(
@@ -530,11 +553,11 @@ def test_regrade_onto_the_source_dataset(
     response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "terminal-bench-4.0"})
 
     assert response.status_code == 200, response.text
-    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    run = control_postgres_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert run is not None
     assert (run.arguments.dataset, run.arguments.regraded_from_run_id) == ("terminal-bench-4.0", source.id)
     assert verified == [(["task-1", "task-2"], "terminal-bench-4.0")]
-    assert _snapshot(tracker_database, source.id) == before
+    assert _snapshot(control_postgres_session, source.id) == before
 
 
 @pytest.mark.description(
@@ -542,10 +565,10 @@ def test_regrade_onto_the_source_dataset(
     "run passes the managed resource check, and leaves the source run's properties unchanged."
 )
 def test_regrade_gives_a_pre_migration_source_fresh_start_properties(
-    local_tracker: TestClient, tracker_database: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
-    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     legacy = AWSResources(
         region="us-east-1", s3_bucket="legacy-bucket", log_group="/valkyrie/benchmarks", log_retention_days=7
     )
@@ -554,9 +577,9 @@ def test_regrade_gives_a_pre_migration_source_fresh_start_properties(
         sandbox_provider_secret_name=f"{tenant_secret_prefix(TEST_ORG_ID)}provider-secret",
         properties=legacy,
     )
-    tracker_database.add(source)
-    tracker_database.commit()
-    before = _snapshot(tracker_database, source.id)
+    control_postgres_session.add(source)
+    control_postgres_session.commit()
+    before = _snapshot(control_postgres_session, source.id)
     fresh = AWSResources(
         region="us-east-1",
         s3_bucket="org-bucket",
@@ -580,10 +603,10 @@ def test_regrade_gives_a_pre_migration_source_fresh_start_properties(
     response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
 
     assert response.status_code == 200, response.text
-    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    run = control_postgres_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert run is not None
     assert (run.arguments.environment, run.arguments.properties, launched) == ("aws", fresh, [run.id])
-    assert _snapshot(tracker_database, source.id) == before
+    assert _snapshot(control_postgres_session, source.id) == before
 
 
 @pytest.mark.description(
@@ -611,12 +634,12 @@ def test_regrade_run_refuses_agent_reruns(
     params: dict[str, str],
     task_ids: list[str],
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
-    source = _finished_source(tracker_database, _start(local_tracker, "daytona"))
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
 
     async def verify_task_ids(
         _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
@@ -626,22 +649,22 @@ def test_regrade_run_refuses_agent_reruns(
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
     response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
     assert response.status_code == 200, response.text
-    run = tracker_database.get(Benchmark, UUID(response.json()["benchmark_id"]))
+    run = control_postgres_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert run is not None
     run.status, run.finished_at = BenchmarkStatus.FINISHED, run.started_at
-    for task in tracker_database.exec(select(Task).where(Task.benchmark == run.id)).all():
+    for task in control_postgres_session.exec(select(Task).where(Task.benchmark == run.id)).all():
         if task.status == TaskStatus.EVALUATING:
             task.status = TaskStatus.ERROR
-            tracker_database.add(task)
-    tracker_database.add(run)
-    tracker_database.commit()
-    before = _snapshot(tracker_database, run.id)
+            control_postgres_session.add(task)
+    control_postgres_session.add(run)
+    control_postgres_session.commit()
+    before = _snapshot(control_postgres_session, run.id)
 
     response = local_tracker.post(f"/retry-or-resume-benchmark/{run.id}", params=params, json={"task_ids": task_ids})
 
     assert response.status_code == 400, response.text
     assert "regrade run" in response.json()["detail"]
-    assert _snapshot(tracker_database, run.id) == before
+    assert _snapshot(control_postgres_session, run.id) == before
 
 
 @pytest.mark.description(
@@ -663,14 +686,16 @@ def test_regrade_refuses_without_creating_a_run(
     case: str,
     status_code: int,
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     response = _start(local_tracker, "daytona")
     source = (
-        _benchmark(tracker_database, response) if case == "unfinished" else _finished_source(tracker_database, response)
+        _benchmark(control_postgres_session, response)
+        if case == "unfinished"
+        else _finished_source(control_postgres_session, response)
     )
     if case == "archived-project":
         project = Project(
@@ -680,10 +705,10 @@ def test_regrade_refuses_without_creating_a_run(
             spend_type=SpendType.INTERNAL,
             archived_at=datetime.now(UTC),
         )
-        tracker_database.add(project)
-        tracker_database.flush()
-        tracker_database.add(RunProject(benchmark_id=source.id, project_id=project.id))
-        tracker_database.commit()
+        control_postgres_session.add(project)
+        control_postgres_session.flush()
+        control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
+        control_postgres_session.commit()
 
         async def verify_task_ids(
             _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
@@ -691,13 +716,13 @@ def test_regrade_refuses_without_creating_a_run(
             return VerifyTaskIdsResponse(task_ids=task_ids)
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
-    before = _snapshot(tracker_database, source.id)
+    before = _snapshot(control_postgres_session, source.id)
 
     response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
 
     assert response.status_code == status_code, response.text
-    assert _snapshot(tracker_database, source.id) == before
-    assert len(tracker_database.exec(select(Benchmark)).all()) == 1
+    assert _snapshot(control_postgres_session, source.id) == before
+    assert len(control_postgres_session.exec(select(Benchmark)).all()) == 1
 
 
 @pytest.mark.description(
@@ -705,21 +730,21 @@ def test_regrade_refuses_without_creating_a_run(
 )
 async def test_retry_keeps_failed_attempt_result_and_error_in_local_storage(
     local_tracker: TestClient,
-    tracker_database: Session,
+    control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     monkeypatch.setattr(main_module, "record_prior_attempts", attempts_module.record_prior_attempts)
     monkeypatch.setitem(main_module.app.dependency_overrides, run_dependencies.get_current_org, lambda: ORG)
-    benchmark = _benchmark(tracker_database, _start(local_tracker, "daytona"))
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
     benchmark.status = BenchmarkStatus.STOPPED
-    task = tracker_database.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+    task = control_postgres_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
     task.status = TaskStatus.ERROR
-    tracker_database.add_all([benchmark, task])
-    tracker_database.flush()
-    tracker_database.add(make_error_result(task, "agent crashed", task.started_at))
-    tracker_database.commit()
+    control_postgres_session.add_all([benchmark, task])
+    control_postgres_session.flush()
+    control_postgres_session.add(make_error_result(task, "agent crashed", task.started_at))
+    control_postgres_session.commit()
     attempt = task_attempt_id(task.id, task.started_at)
     assert isinstance(benchmark.arguments.properties, LocalResources)
     objects = LocalRuntimeFactory.create_runtime(benchmark.arguments.properties, TEST_ORG_ID).objects

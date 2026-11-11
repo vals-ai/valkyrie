@@ -4,15 +4,14 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 from sqlmodel import SQLModel
 
-from tracker.config import DATABASE_URL
+from tracker.config import build_database_url
 from tracker.database.models import *  # noqa: F403
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url with DATABASE_URL from environment
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+config.set_main_option("sqlalchemy.url", build_database_url())
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -25,7 +24,6 @@ if config.config_file_name is not None:
 # target_metadata = mymodel.Base.metadata
 target_metadata = SQLModel.metadata
 
-# Serialize schema upgrades from concurrent rolling Tracker task starts.
 _MIGRATION_ADVISORY_LOCK_ID = 0x56414C4B59524945
 
 # other values from the config, defined by the needs of env.py,

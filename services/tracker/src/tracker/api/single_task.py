@@ -18,21 +18,22 @@ from tracker.runtime.logs import task_log_stream_name
 from tracker.aws.s3 import S3_BENCHMARKS_PREFIX
 from tracker.aws.services import CloudRuntimeServices
 from tracker.database.models import (
-    ActiveNativeOutput,
     Benchmark,
     Org,
     Task,
-    TaskStatus,
 )
+from tracker.domain import TaskStatus
 from tracker.database.session import database_call, get_session
 from tracker.repositories.benchmark import BenchmarkRepository, BenchmarkRepositoryDependency
 from tracker.types import (
+    ActiveNativeOutput,
     NativeOutputFile,
     NativeOutputFilesResponse,
     SingleTaskResponse,
     TaskArtifactsResponse,
     TaskBreakdown as TaskBreakdownResponse,
 )
+from tracker.runtime.artifacts import latest_step_output
 from tracker.runtime.native_output import discover_native_files, valid_native_path
 from tracker.sandbox import runtime_sandbox
 
@@ -122,15 +123,18 @@ async def get_task_artifacts(
 
     agent_output_url: str | None = None
     ttl_seconds: int | None = None
-    key = f"{_task_prefix(benchmark_id, task_id)}agent_output.tar.gz"
-    if await runtime.objects.exists(key):
+    prefix = _task_prefix(benchmark_id, task_id)
+    output_path: str | None = "agent_output.tar.gz"
+    if not await runtime.objects.exists(f"{prefix}{output_path}"):
+        output_path = await latest_step_output(runtime.objects, str(benchmark_id), task_id)
+    if output_path is not None:
         agent_output_url, ttl_seconds = await resolve_download_url(
             runtime.objects,
-            key,
+            f"{prefix}{output_path}",
             request=request,
             route_name="get_run_artifact_url",
             route_params={"benchmark_id": benchmark_id},
-            query_params={"path": f"{task_id}/agent_output.tar.gz"},
+            query_params={"path": f"{task_id}/{output_path}"},
             expires_in=300,
         )
 

@@ -20,20 +20,20 @@ def inline_database_calls_in(monkeypatch: pytest.MonkeyPatch) -> None:
         "tracker.api.single_task",
         "tracker.modal_cost",
         "tracker.sandbox_cost",
-        "tracker.scheduler.admission",
         "tracker.scheduler.coordinator",
         "tracker.services.results",
-        "tracker.services.runs.start",
         "tracker.services.runs.stop",
         "tracker.services.sandboxes",
-        "tracker.services.tasks.execute",
-        "tracker.services.tasks.monitor",
     ):
         monkeypatch.setattr(f"{module}.database_call", run_inline)
 
 
 def random_task_id() -> str:
     return f"test-task-{uuid4().hex[:5]}"
+
+
+async def unexpected_sandbox_record(_link: object, _sandbox_id: str) -> None:
+    raise AssertionError("Sandbox without a link must not request persistence")
 
 
 async def async_iterator(items: Iterable[_Item]) -> AsyncIterator[_Item]:

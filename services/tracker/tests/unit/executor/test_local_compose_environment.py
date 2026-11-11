@@ -28,7 +28,7 @@ def _environment_keys(source: Path) -> set[str]:
 def test_compose_tracker_supplies_local_executor_environment() -> None:
     executor_keys = _environment_keys(EXECUTOR_SOURCE / "entrypoint.py")
     launcher_keys = _environment_keys(EXECUTOR_SOURCE / "launcher.py")
-    required = (executor_keys - {"ECS_CONTAINER_METADATA_URI_V4"}) | {
+    required = (executor_keys - {"ECS_CONTAINER_METADATA_URI_V4", "TRACKER_WATCHDOG_FD"}) | {
         key for key in launcher_keys if not key.startswith("EXECUTOR_RUNNER_")
     }
     required.add("EXECUTOR_PAYLOAD_LOCAL_KEY")

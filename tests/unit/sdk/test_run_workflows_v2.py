@@ -700,6 +700,26 @@ async def test_artifact_download_authenticates_only_tracker_origin(make_client, 
                 await client.artifacts.download(uuid4(), tmp_path / "redirect")
 
 
+@pytest.mark.description("Rescore asks the tracker to run the datasets metric script again.")
+async def test_rescore_asks_the_tracker_to_run_the_datasets_metric_script_again(make_client) -> None:
+    run_id = UUID("123e4567-e89b-12d3-a456-426614174000")
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(
+            200,
+            json={"benchmark_id": str(run_id), "final_score": 75.0, "properties": {"scorer": {"cached": False}}},
+        )
+
+    async with make_client(handler) as client:
+        rescored = await client.runs.rescore(run_id)
+
+    assert seen == [("POST", f"/rescore-benchmark/{run_id}")]
+    assert (rescored.benchmark_id, rescored.final_score) == (run_id, 75.0)
+    assert rescored.properties == {"scorer": {"cached": False}}
+
+
 @pytest.mark.description("Artifact download with attempts=True reads only the artifacts kept from replaced attempts.")
 async def test_artifact_download_reads_kept_attempts(make_client, tmp_path: Path) -> None:
     path = "task/attempt-1/vals_format/result.json"

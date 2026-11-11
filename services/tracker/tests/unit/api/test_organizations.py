@@ -77,6 +77,9 @@ class _Users:
             "userTenants": [],
         }
 
+    def create(self, login_id: str, email: str | None = None) -> None:
+        self.add(f"U-{login_id}", login_id, email or login_id)
+
     def _tenants(self, login_id: str) -> list[dict[str, Any]]:
         return self.users[login_id]["userTenants"]
 
@@ -270,8 +273,9 @@ def test_invites_need_the_invitees_acceptance(
     assert new.json() == {"organization": "acme", "email": "bob@gmail.com"}
     assert existing.json() == {"organization": "acme", "email": "carol@other.com"}
     assert invalid.status_code == 422
-    assert "bob@gmail.com" not in descope.user.users
+    assert descope.user.users["bob@gmail.com"]["userTenants"] == []
     assert descope.user.users["carol-sso"]["userTenants"] == []
+    assert len(descope.user.users) == 3
 
     _as(monkeypatch, {}, None, email="carol@other.com", user_id="U-carol", login_id="carol-sso")
     assert _client.get("/orgs").json()["invitations"] == ["acme"]

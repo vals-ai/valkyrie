@@ -350,7 +350,7 @@ def collect_sdk_reference() -> SDKReference:
     from valkyrie.sdk.resources.datasets import (  # pyright: ignore[reportMissingImports]
         BenchmarkDefinitionsResource,
         DatasetsResource,
-        DatasetTasksResource,
+        DatasetVersionsResource,
     )
     from valkyrie.sdk.resources.logs import LogsResource  # pyright: ignore[reportMissingImports]
     from valkyrie.sdk.resources.projects import ProjectsResource  # pyright: ignore[reportMissingImports]
@@ -370,7 +370,7 @@ def collect_sdk_reference() -> SDKReference:
         ("BenchmarkServicesResource", "client.services", BenchmarkServicesResource),
         ("BenchmarkDefinitionsResource", "client.benchmark_definitions", BenchmarkDefinitionsResource),
         ("DatasetsResource", "client.datasets", DatasetsResource),
-        ("DatasetTasksResource", "client.datasets.tasks", DatasetTasksResource),
+        ("DatasetVersionsResource", "client.datasets.versions", DatasetVersionsResource),
         ("LogsResource", "client.logs", LogsResource),
         ("SchedulerResource", "client.scheduler", SchedulerResource),
         ("SecretsResource", "client.secrets", SecretsResource),

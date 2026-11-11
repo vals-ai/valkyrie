@@ -55,23 +55,6 @@ _SWEEP_INTERVAL_SECONDS = 900.0
 _SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
-@dataclass(frozen=True)
-class SandboxLink:
-    benchmark_id: UUID
-    provider: str
-
-
-def record_sandbox(link: SandboxLink, sandbox_id: str) -> None:
-    try:
-        with Session(engine) as session:
-            CostRepository(session).record_sandbox(link.provider, sandbox_id, link.benchmark_id)
-            session.commit()
-    except Exception:
-        logger.exception(
-            "Failed to save run sandbox", extra={"sandbox_id": sandbox_id, "benchmark_id": str(link.benchmark_id)}
-        )
-
-
 def _as_utc(moment: datetime) -> datetime:
     return moment if moment.utcoffset() is not None else moment.replace(tzinfo=ZoneInfo("UTC"))
 
@@ -195,6 +178,18 @@ async def open_daytona_usage(org: Org, secret_name: str) -> AsyncGenerator[HourR
                 offset += USAGE_PAGE_SIZE
 
         yield read_hour
+
+
+async def daytona_last_ends(
+    org: Org, secret_name: str, start: datetime, end: datetime, open_usage: UsageOpener = open_daytona_usage
+) -> dict[str, datetime]:
+    async with open_usage(org, secret_name) as read:
+        usage = await read(start, end)
+    return {
+        sandbox_id: found.last_end
+        for sandbox_id, found in usage.items()
+        if found is not None and found.last_end is not None and found.last_end < end
+    }
 
 
 def _usage_of(record: ModelsSandboxUsage) -> SandboxUsage | None:
@@ -360,6 +355,8 @@ class _CursorSweep:
         with Session(self.bind) as session:
             costs = CostRepository(session)
             written = self._write(costs, hour, plan.priced)
+            if plan.unmatched:
+                costs.record_unmatched_usage(account.org_id, account.secret_name, hour, plan.unmatched)
             if not costs.advance_usage_cursor(account.org_id, account.secret_name, hour, hour + USAGE_SLICE_WIDTH):
                 session.rollback()
                 logger.warning(

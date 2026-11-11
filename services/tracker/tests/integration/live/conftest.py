@@ -1,6 +1,8 @@
 from collections.abc import Generator
+from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
@@ -10,8 +12,11 @@ from tracker.auth import get_current_org
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.database.session import get_session
 from tracker import config
+from tracker.aws import cloudwatch_logs
+from tracker.aws.cloudwatch_logs import benchmark_log_group_name
 from tracker.aws.runtime import AWSRuntime
-from tracker.database.models import AWSBenchmarkArguments, AgentContractRequest, Benchmark
+from tracker.database.models import Benchmark
+from tracker.types import AWSBenchmarkArguments, AgentContractRequest
 from tests.factories import make_benchmark
 
 
@@ -40,7 +45,7 @@ def database_session(database_session: Session, live_aws_runtime: AWSRuntime) ->
 
 
 @pytest.fixture
-def live_deployment(live_aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatch) -> None:
+def live_deployment(live_aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     resources = live_aws_runtime.resources
     for name, value in {
         "AWS_DEPLOYMENT_ACCOUNT_ID": live_aws_runtime.expected_bucket_owner,
@@ -50,6 +55,23 @@ def live_deployment(live_aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatc
         "AWS_DEPLOYMENT_LOG_RETENTION_DAYS": str(resources.log_retention_days),
     }.items():
         monkeypatch.setattr(config, name, value)
+
+    log_group_names: set[str] = set()
+
+    def record_log_group_name(log_group: str, benchmark_id: str) -> str:
+        name = benchmark_log_group_name(log_group, benchmark_id)
+        log_group_names.add(name)
+        return name
+
+    monkeypatch.setattr(cloudwatch_logs, "benchmark_log_group_name", record_log_group_name)
+    yield
+    logs_client: Any = live_aws_runtime.clients.cloudwatch_logs_client()
+    for log_group_name in log_group_names:
+        try:
+            logs_client.delete_log_group(logGroupName=log_group_name)
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+                raise
 
 
 @pytest.fixture

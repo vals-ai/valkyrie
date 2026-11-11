@@ -1,4 +1,3 @@
-import pytest
 import hashlib
 from collections.abc import Callable
 from pathlib import Path
@@ -7,27 +6,22 @@ from time import monotonic, sleep
 from typing import cast
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, select
 
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION, source_executor_artifact_uri
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     ExecutorAdmission,
     ExecutorDispatch,
-    ExecutorDispatchKind,
     ExecutorRelease,
-    ExecutorReleaseStatus,
     Org,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, ExecutorReleaseStatus, TaskStatus
 from tracker.executor.dispatch_control import admit_recovery_dispatch, admit_start_dispatch
-from tracker.executor.maintenance_control import begin_maintenance
 from tracker.executor.release_control import (
     ReleaseControlError,
     activate_release,
@@ -36,9 +30,10 @@ from tracker.executor.release_control import (
     register_release,
     retire_drained_releases,
 )
+from tracker.local.releases import register_source_release
 from tracker.services.benchmarks import fetch_benchmark_row
 from tracker.services.runs.stop import apply_stop_benchmark
-from tracker.local.releases import register_source_release
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
 
 
 _EXECUTOR_ARTIFACT = b"immutable executor artifact"
@@ -48,7 +43,7 @@ _EXECUTOR_ARTIFACT_DIGEST = hashlib.sha256(_EXECUTOR_ARTIFACT).hexdigest()
 def _release(release_id: str) -> ExecutorRelease:
     return ExecutorRelease(
         id=release_id,
-        artifact_uri=f"source:///artifacts/{release_id}.pex",
+        artifact_uri=f"source:///artifacts/{release_id}/src",
         artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
     )
@@ -57,7 +52,7 @@ def _release(release_id: str) -> ExecutorRelease:
 def _activation_candidate() -> ExecutorRelease:
     return ExecutorRelease(
         id="concurrent-activation",
-        artifact_uri="source:///artifacts/releases/concurrent-activation/executor.pex",
+        artifact_uri="source:///artifacts/releases/concurrent-activation/src",
         artifact_digest=_EXECUTOR_ARTIFACT_DIGEST,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
     )
@@ -610,10 +605,8 @@ def test_whole_stop_and_retry_serialize_on_the_benchmark_row(
     assert stored_retry_first.status == BenchmarkStatus.STOPPED
 
 
-@pytest.mark.description(
-    "A run start waiting on the admission lock is rejected once maintenance begins and commits first."
-)
-def test_maintenance_commit_rejects_start_waiting_on_admission_lock(
+@pytest.mark.description("A start that waits on the admission lock is rejected after the adoption fence commits.")
+def test_adoption_fence_commit_rejects_start_waiting_on_admission_lock(
     postgres_session: Session,
     postgres_engine: Engine,
 ) -> None:
@@ -641,8 +634,15 @@ def test_maintenance_commit_rejects_start_waiting_on_admission_lock(
         )
         admit_start_dispatch(session, benchmark=benchmark, dispatch_id=uuid4())
 
+    def close_admission(session: Session) -> None:
+        admission = session.get(ExecutorAdmission, 1, with_for_update=True)
+        assert admission is not None
+        admission.maintenance_target_sha = "a" * 40
+        session.add(admission)
+        session.flush()
+
     outcomes = _run_while_first_transaction_holds_locks(
-        lambda session: begin_maintenance(session, target_sha="a" * 40),
+        close_admission,
         admit_start,
         postgres_engine,
     )

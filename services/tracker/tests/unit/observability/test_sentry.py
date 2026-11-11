@@ -6,8 +6,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import Mock
-from uuid import UUID
+from unittest.mock import AsyncMock, Mock
+from uuid import UUID, uuid4
 
 import pytest
 import sentry_sdk
@@ -27,9 +27,10 @@ import tracker.observability.sentry as sentry_module
 import tracker.observability.tracing as tracing_module
 import tracker.services.runs.start as run_orchestration
 import tracker.services.tasks.execute as task_execution
-import tracker.services.tasks.monitor as task_monitor_module
-from tracker.database.models import FailureCategory, Org, Task
-from tracker.executor.execution_authority import ExecutionAuthority
+import tracker.services.tasks.execute as task_monitor_module
+from tracker.domain import FailureCategory, TaskStatus
+from tracker.executor.control_tasks import TaskState
+from tracker.executor.control_protocol import DispatchRef
 from tracker.exceptions import SandboxError, SandboxSetupError, SSLConnectionError
 from tracker.logging.context import (
     attempt_started_at_var,
@@ -410,35 +411,12 @@ async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[Event] = []
-    rows: dict[str, SimpleNamespace] = {}
+    rows: dict[str, TaskState] = {}
 
     attempt_starts = {
         "task-a": datetime(2026, 4, 1, 12, tzinfo=UTC),
         "task-b": datetime(2026, 4, 1, 13, tzinfo=UTC),
     }
-
-    class FakeSession:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def __enter__(self) -> "FakeSession":
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            pass
-
-    def fetch_task(task_id: object, _session: object, _org: object) -> SimpleNamespace:
-        return rows[str(task_id)]
-
-    monkeypatch.setattr(task_execution, "Session", FakeSession)
-    monkeypatch.setattr("tracker.services.tasks.monitor.Session", FakeSession)
-    monkeypatch.setattr("tracker.services.tasks.status.Session", FakeSession)
-    monkeypatch.setattr(task_execution, "fetch_task_row", fetch_task)
-    monkeypatch.setattr("tracker.services.tasks.monitor.fetch_task_row", fetch_task)
-    monkeypatch.setattr("tracker.services.tasks.status.fetch_task_row", fetch_task)
-    monkeypatch.setattr(task_execution, "commit_task_error", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("tracker.services.tasks.monitor.commit_task_error", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("tracker.services.tasks.status.commit_task_error", lambda *_args, **_kwargs: None)
 
     async def run_tasks() -> None:
         ready = 0
@@ -456,28 +434,30 @@ async def test_task_scope_isolates_concurrent_sandbox_events_and_outer_capture(
                 raise RuntimeError("outer failure")
             return {task_id: {"ok": True}}
 
+        benchmark_id = uuid4()
         for task_id in ("task-a", "task-b"):
-            rows[task_id] = SimpleNamespace(
-                id=task_id,
+            rows[task_id] = TaskState(
+                id=uuid4(),
+                org_id=uuid4(),
                 task_id=task_id,
+                benchmark=benchmark_id,
                 started_at=attempt_starts[task_id],
+                status=TaskStatus.IN_PROGRESS,
+                eval_resume_state=None,
+                credited_wall_deadline_at=None,
+                task_breakdown=None,
+                build_phase=None,
+                evaluation_phase=None,
             )
 
-        task_a = task_monitor_module.TrackedTask(
-            body("task-a", "sandbox-a", fail=False),
-            cast(Org, object()),
-            cast(ExecutionAuthority, object()),
-            attempt_starts["task-a"],
-        )
-        task_b = task_monitor_module.TrackedTask(
-            body("task-b", "sandbox-b", fail=True),
-            cast(Org, object()),
-            cast(ExecutionAuthority, object()),
-            attempt_starts["task-b"],
-        )
+        control = Mock()
+        control.ref = DispatchRef(benchmark_id=benchmark_id, dispatch_id=uuid4())
+        control.fail = AsyncMock()
+        task_a = task_execution.TrackedTask(body("task-a", "sandbox-a", fail=False), control, attempt_starts["task-a"])
+        task_b = task_execution.TrackedTask(body("task-b", "sandbox-b", fail=True), control, attempt_starts["task-b"])
         await asyncio.gather(
-            task_a.run(None, cast(Task, rows["task-a"])),
-            task_b.run(None, cast(Task, rows["task-b"])),
+            task_a.run(None, rows["task-a"]),
+            task_b.run(None, rows["task-b"]),
         )
 
     with sentry_sdk.init(
@@ -539,6 +519,22 @@ async def test_retry_attempt_clears_previous_sandbox_identity(
         return {"task-0": {"ok": True}}
 
     monkeypatch.setattr(task_execution, "_process_task_attempt", process_attempt)
+    row = TaskState(
+        id=uuid4(),
+        org_id=uuid4(),
+        task_id="task-0",
+        benchmark=uuid4(),
+        started_at=datetime(2026, 4, 1, 12, tzinfo=UTC),
+        status=TaskStatus.IN_PROGRESS,
+        eval_resume_state=None,
+        credited_wall_deadline_at=None,
+        task_breakdown=None,
+        build_phase=None,
+        evaluation_phase=None,
+    )
+    control = Mock()
+    control.ref = DispatchRef(benchmark_id=row.benchmark, dispatch_id=uuid4())
+    control.fail = AsyncMock()
 
     with sentry_sdk.init(
         dsn="https://public@example.com/1",
@@ -548,13 +544,7 @@ async def test_retry_attempt_clears_previous_sandbox_identity(
     ):
         with sentry_module.task_scope("task-0", attempt_started_at="2026-04-01T12:00:00+00:00"):
             result = await task_execution.process_task(
-                task_row=cast(
-                    Any,
-                    SimpleNamespace(
-                        id=UUID("00000000-0000-0000-0000-000000000504"),
-                        started_at=datetime(2026, 4, 1, 12, tzinfo=UTC),
-                    ),
-                ),
+                task_row=row,
                 start_benchmark_request=cast(
                     Any,
                     SimpleNamespace(
@@ -564,13 +554,14 @@ async def test_retry_attempt_clears_previous_sandbox_identity(
                     ),
                 ),
                 benchmark_service=cast(Any, FakeBenchmarkService()),
-                benchmark_id=cast(Any, "benchmark-0"),
+                benchmark_id=row.benchmark,
                 task_id="task-0",
                 runtime=cast(Any, SimpleNamespace(logs=None)),
                 org=cast(Any, object()),
                 sandbox_provider_config=cast(Any, object()),
                 creation_semaphore=cast(Any, object()),
-                authority=cast(Any, object()),
+                control=control,
+                started_by_email=None,
             )
 
     assert result == {"task-0": {"ok": True}}
@@ -588,35 +579,23 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     events: list[Event] = []
-    committed: dict[str, Any] = {}
-
-    class FakeSession:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def __enter__(self) -> "FakeSession":
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            pass
-
-    def commit_task_error(*_args: Any, **kwargs: Any) -> None:
-        committed.update(kwargs)
-
-    row = SimpleNamespace(id="task-0", task_id="task-0", started_at=datetime(2026, 4, 1, 12, tzinfo=UTC))
-
-    def fetch_task(*_args: object) -> SimpleNamespace:
-        return row
-
-    monkeypatch.setattr(task_execution, "Session", FakeSession)
-    monkeypatch.setattr("tracker.services.tasks.monitor.Session", FakeSession)
-    monkeypatch.setattr("tracker.services.tasks.status.Session", FakeSession)
-    monkeypatch.setattr(task_execution, "fetch_task_row", fetch_task)
-    monkeypatch.setattr("tracker.services.tasks.monitor.fetch_task_row", fetch_task)
-    monkeypatch.setattr("tracker.services.tasks.status.fetch_task_row", fetch_task)
-    monkeypatch.setattr(task_execution, "commit_task_error", commit_task_error)
-    monkeypatch.setattr("tracker.services.tasks.monitor.commit_task_error", commit_task_error)
-    monkeypatch.setattr("tracker.services.tasks.status.commit_task_error", commit_task_error)
+    committed = AsyncMock()
+    row = TaskState(
+        id=uuid4(),
+        org_id=uuid4(),
+        task_id="task-0",
+        benchmark=uuid4(),
+        started_at=datetime(2026, 4, 1, 12, tzinfo=UTC),
+        status=TaskStatus.IN_PROGRESS,
+        eval_resume_state=None,
+        credited_wall_deadline_at=None,
+        task_breakdown=None,
+        build_phase=None,
+        evaluation_phase=None,
+    )
+    control = Mock()
+    control.ref = DispatchRef(benchmark_id=row.benchmark, dispatch_id=uuid4())
+    control.fail = committed
 
     async def body() -> dict[str, dict[str, object] | None]:
         raise SandboxSetupError("provider rejected the sandbox request")
@@ -629,14 +608,12 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
     ):
         task_monitor_module.logger.addHandler(caplog.handler)
         try:
-            tracked = task_monitor_module.TrackedTask(
-                body(), cast(Org, object()), cast(ExecutionAuthority, object()), row.started_at
-            )
-            await tracked.run(None, cast(Task, row))
+            tracked = task_execution.TrackedTask(body(), control, row.started_at)
+            await tracked.run(None, row)
         finally:
             task_monitor_module.logger.removeHandler(caplog.handler)
 
-    stored_category = committed["category"]
+    stored_category = committed.await_args.args[0].failure.category
     assert stored_category == FailureCategory.INFRASTRUCTURE
     (exception_event,) = [event for event in events if "exception" in event]
     assert cast(dict[str, str], exception_event.get("tags", {}))["failure_category"] == stored_category.value

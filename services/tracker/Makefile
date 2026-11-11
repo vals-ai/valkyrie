@@ -13,12 +13,12 @@ help:
 	@echo "Available commands:"
 	@echo "  make install         - Install local development environment and dependencies"
 	@echo "  make build           - Build Docker images"
-	@echo "  make run             - Start Tracker and PostgreSQL with docker-compose"
+	@echo "  make run             - Start PostgreSQL, migrate, control, and Tracker with docker-compose"
 	@echo "  make stop            - Stop all services"
 	@echo "  make clean           - Stop services and remove images"
 	@echo "  make logs            - View container logs"
 	@echo "  make tracker-service - Build, run, and view logs for the tracker service"
-	@echo "  make local-tracker [CONFIG=<path>] - Start PostgreSQL, migrate, and run Tracker on this machine"
+	@echo "  make local-tracker [CONFIG=<path>] - Migrate and run host control/Tracker (requires EXECUTOR_BOOTSTRAP_KEY)"
 	@echo "  make migrate-gen     - Generate a new migration from model changes"
 
 # --- Setup ---
@@ -39,7 +39,7 @@ build:
 	@$(COMPOSE) build
 .PHONY: executor-image
 executor-image:
-	docker build --platform linux/arm64 -t "$(EXECUTOR_IMAGE)" .
+	docker build --target executor --platform linux/arm64 -t "$(EXECUTOR_IMAGE)" .
 run:
 	@echo "Starting services with docker-compose..."
 	@$(COMPOSE) up -d
@@ -55,9 +55,19 @@ logs:
 	@$(COMPOSE) logs -f tracker
 tracker-service: build run logs
 local-tracker: venv-check
+	@: "$${EXECUTOR_BOOTSTRAP_KEY:?Set EXECUTOR_BOOTSTRAP_KEY for local control}"
 	@$(COMPOSE) up -d --wait postgres
-	DATABASE_URL=$(LOCAL_DATABASE_URL) uv run alembic upgrade head
-	DATABASE_URL=$(LOCAL_DATABASE_URL) uv run python -m tracker.serve --config $(CONFIG)
+	@DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run alembic upgrade head
+	@set -e; \
+	  if [ -z "$${EXECUTOR_PAYLOAD_LOCAL_KEY+x}" ]; then \
+	    EXECUTOR_PAYLOAD_LOCAL_KEY="$$(uv run python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"; \
+	  fi; \
+	  export EXECUTOR_PAYLOAD_LOCAL_KEY EXECUTOR_LAUNCHER=local; \
+	  unset EXECUTOR_PAYLOAD_KMS_KEY_ID; \
+	  DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run uvicorn tracker.executor.control_app:app --host 127.0.0.1 --port 8002 & \
+	  control_pid=$$!; \
+	  trap 'kill "$$control_pid"; wait "$$control_pid"' EXIT; \
+	  DATABASE_URL="$(LOCAL_DATABASE_URL)" EXECUTOR_CONTROL_URL=http://127.0.0.1:8002 uv run python -m tracker.serve --config "$(CONFIG)"
 
 # --- Tests ---
 test: venv-check

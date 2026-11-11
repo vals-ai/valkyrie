@@ -6,7 +6,8 @@ from sqlmodel import Session
 
 from main import app
 from tests.utils import TEST_ORG_ID
-from tracker.database.models import Benchmark, ErrorResult, EvaluationResult, FailureCategory, Task, TaskStatus
+from tracker.database.models import Benchmark, ErrorResult, EvaluationResult, Task
+from tracker.domain import FailureCategory, TaskStatus
 
 
 @pytest.mark.usefixtures("process_benchmark_env")

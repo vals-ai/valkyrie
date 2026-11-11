@@ -12,17 +12,22 @@ from benchmark_service.sandbox import SandboxError as ProviderSandboxError
 from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
-from tracker.database.models import FailureCategory, FailurePhase
+from tracker.clients.dataset_tasks import InvalidTaskError
+from tracker.services.datasets.grading import VerifierResultError
+from tracker.services.datasets.healthcheck import HealthcheckError
+from tracker.services.datasets.separate_verifier import SeparateVerifierError
+from tracker.services.datasets.steps import StepSetupError
+from tracker.domain import FailureCategory, FailurePhase
 from tracker.exceptions import (
     AgentRunFailedError,
     CloudWatchError,
     EpisodeOrchestratorFailedError,
-    GenerationContainmentUnavailableError,
     LambdaError,
     OutputArtifactError,
     S3Error,
     SandboxDNSResolutionError,
     SandboxError,
+    SandboxImageBuildError,
     SandboxSetupError,
     SecretsError,
 )
@@ -100,8 +105,21 @@ class _Labels(NamedTuple):
 _LABELS: dict[type[BaseException], _Labels] = {
     SandboxSetupError: _Labels("sandbox_provider", "setup", transient=True),
     SandboxDNSResolutionError: _Labels("sandbox_provider", "dns", transient=True, cause_code="sandbox_dns_resolution"),
-    GenerationContainmentUnavailableError: _Labels(
-        "sandbox_provider", "containment_probe", transient=True, cause_code="generation_containment_unavailable"
+    SandboxImageBuildError: _Labels("sandbox_provider", "build", cause_code="sandbox_image_build"),
+    VerifierResultError: _Labels(
+        "dataset_task", "verify", False, "verifier_result", category=FailureCategory.BENCHMARK_SERVICE
+    ),
+    StepSetupError: _Labels(
+        "dataset_task", "step_setup", False, "step_setup", category=FailureCategory.BENCHMARK_SERVICE
+    ),
+    HealthcheckError: _Labels(
+        "dataset_task", "healthcheck", False, "healthcheck", category=FailureCategory.BENCHMARK_SERVICE
+    ),
+    SeparateVerifierError: _Labels(
+        "dataset_task", "separate_verifier", False, "separate_verifier", category=FailureCategory.BENCHMARK_SERVICE
+    ),
+    InvalidTaskError: _Labels(
+        "dataset_task", "load_task", False, "invalid_task", category=FailureCategory.BENCHMARK_SERVICE
     ),
     OutputArtifactError: _Labels("output_artifact", "upload_output_artifacts", transient=False),
     AgentRunFailedError: _Labels("tracker", "process_task", transient=False),
@@ -205,7 +223,7 @@ def _benchmark_service_request(
 
 
 def decide(failure: Failure) -> Disposition:
-    if isinstance(failure.exc, (SandboxSetupError, SandboxDNSResolutionError, GenerationContainmentUnavailableError)):
+    if isinstance(failure.exc, (SandboxSetupError, SandboxDNSResolutionError)):
         return Disposition.RECREATE_SANDBOX
     if failure.phase in PRE_AGENT_PHASES and (
         failure.transient or (failure.transient is None and failure.category is FailureCategory.BENCHMARK_SERVICE)

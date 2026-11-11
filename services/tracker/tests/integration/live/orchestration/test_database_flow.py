@@ -2,6 +2,7 @@ import uuid
 from asyncio import Semaphore, gather
 from typing import Any
 from uuid import UUID
+from unittest.mock import AsyncMock
 
 import pytest
 from benchmark_service import SandboxProvider, SandboxProviderConfig
@@ -10,7 +11,8 @@ from benchmark_service.schemas import FinalScoreResponse, RetrieveTaskResponse
 from sqlmodel import Session, col, select
 
 from tests.utils import TEST_ORG_ID
-from tracker.database.models import Benchmark, EvaluationResult, FinalEvaluation, Task, TaskStatus
+from tracker.database.models import Benchmark, EvaluationResult, FinalEvaluation, Task
+from tracker.domain import TaskStatus
 from tracker.sandbox import SandboxCreationState, create_sandbox
 
 pytestmark = pytest.mark.usefixtures("tracker_database")
@@ -78,6 +80,7 @@ async def evaluate_instance(
         task_data.resources,
         creation_semaphore,
         creation_state=SandboxCreationState(cleanup_pending=False),
+        record_sandbox=AsyncMock(),
         labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id), "Task": task_row.task_id},
     ) as sandbox:
         setup_response = await benchmark_service.setup_task(

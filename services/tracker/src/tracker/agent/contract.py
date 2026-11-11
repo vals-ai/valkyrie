@@ -8,8 +8,8 @@ import yaml
 from pydantic import ValidationError as PydanticValidationError
 
 from tracker.agent.schemas import AgentConfig, AgentContract
-from tracker.database.models import AgentContractRequest
 from tracker.exceptions import BundlerError, ContractValidationError
+from tracker.types import AgentContractRequest
 
 
 def read_agent_name(agent_dir: Path) -> str:

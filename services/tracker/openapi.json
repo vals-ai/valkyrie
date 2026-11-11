@@ -112,7 +112,7 @@
             }
           },
           "400": {
-            "description": "Invalid agent archive"
+            "description": "Invalid agent archive, or a name reserved for a built-in agent"
           },
           "403": {
             "description": "Storage permission denied"
@@ -427,7 +427,7 @@
           "organizations"
         ],
         "summary": "Invite Member",
-        "description": "Invite someone to the organization this admin acts for. They join only after signing in and accepting.\n\nInviting again restarts the invitation's 14 days.",
+        "description": "Invite someone to the organization this admin acts for. They join only after signing in and accepting.\n\nAn invitee without a login gets one, so they can sign in. Inviting again restarts the invitation's 14 days.",
         "operationId": "invite_member",
         "requestBody": {
           "content": {
@@ -955,6 +955,77 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProjectSandboxResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/costs/daytona-unmatched": {
+      "get": {
+        "summary": "Get Daytona Unmatched Costs",
+        "description": "Sum Daytona usage in this organization's accounts from sandboxes no run recorded, over the usage hours in [start, end), and count the listed sandboxes that had no price.",
+        "operationId": "get_daytona_unmatched_costs",
+        "parameters": [
+          {
+            "name": "start",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ],
+              "description": "First UTC date, or timezone-aware ISO-8601 datetime, whose usage hours are counted.",
+              "title": "Start"
+            },
+            "description": "First UTC date, or timezone-aware ISO-8601 datetime, whose usage hours are counted."
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ],
+              "description": "UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded).",
+              "title": "End"
+            },
+            "description": "UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DaytonaUnmatchedResponse"
                 }
               }
             }
@@ -3466,12 +3537,454 @@
         }
       }
     },
-    "/v1/benchmarks/{benchmark}/datasets/{name}/tasks": {
-      "get": {
-        "summary": "List Dataset Tasks",
-        "description": "List a dataset's tasks a page at a time, in the order the bucket returns them.",
-        "operationId": "list_dataset_tasks",
+    "/v1/benchmarks/{benchmark}/datasets/{name}/blobs/missing": {
+      "post": {
+        "summary": "Missing Blobs",
+        "description": "Return the digests among the given ones whose task archive the dataset does not store yet.",
+        "operationId": "missing_blobs",
         "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlobDigestsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MissingBlobsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "403": {
+            "description": "Storage permission denied"
+          },
+          "502": {
+            "description": "Storage operation failed"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/blobs/{digest}": {
+      "put": {
+        "summary": "Put Blob",
+        "description": "Store a task's .zip archive under its digest. The Tracker hashes the archive's files and refuses a mismatch.\n\nIt then checks the task and refuses one that can't run. The response lists the task's warnings.",
+        "operationId": "put_blob",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Digest"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The archive is new"
+          },
+          "400": {
+            "description": "The body is not a safe zip archive"
+          },
+          "413": {
+            "description": "The archive exceeds DATASET_TASK_UPLOAD_MAX_BYTES"
+          },
+          "415": {
+            "description": "The content type is not application/zip"
+          },
+          "422": {
+            "description": "The archive's files do not hash to the digest in the path, or the task is not valid"
+          },
+          "409": {
+            "description": "The dataset is archived; restore it first"
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "403": {
+            "description": "Storage permission denied"
+          },
+          "502": {
+            "description": "Storage operation failed"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/files/{digest}": {
+      "put": {
+        "summary": "Put File",
+        "description": "Store a dataset's metric script under the sha256 digest of its bytes, after checking that it is valid Python.",
+        "operationId": "put_file",
+        "parameters": [
+          {
+            "name": "digest",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Digest"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The file is new"
+          },
+          "400": {
+            "description": "The script is not valid Python or has an invalid inline header"
+          },
+          "403": {
+            "description": "Storage permission denied"
+          },
+          "413": {
+            "description": "The script is larger than 256 KB"
+          },
+          "422": {
+            "description": "The bytes do not hash to the digest in the path"
+          },
+          "409": {
+            "description": "The dataset is archived; restore it first"
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "502": {
+            "description": "Storage operation failed"
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions": {
+      "post": {
+        "summary": "Create Version",
+        "description": "Publish the version holding exactly these tasks. A version with the same tasks is returned as it is (200) instead of a new revision. `latest` and the given tags point at the version.\n\nA `manifest` records the dataset.toml the tasks came from, and the tasks must be exactly the ones it lists with the digests it gives.",
+        "operationId": "create_version",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetVersionDetailResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "The dataset already has a version with exactly these tasks"
+          },
+          "409": {
+            "description": "The dataset is archived, a task's archive is not stored yet, or a tag points elsewhere"
+          },
+          "422": {
+            "description": "The tasks are not exactly the ones the manifest lists"
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "403": {
+            "description": "Storage permission denied"
+          },
+          "502": {
+            "description": "Storage operation failed"
+          }
+        }
+      },
+      "get": {
+        "summary": "List Versions",
+        "description": "List the dataset's versions, newest first, with the tags that point at each.",
+        "operationId": "list_versions",
+        "parameters": [
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetVersionsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}": {
+      "get": {
+        "summary": "Get Version",
+        "description": "Return one version, whose tasks `/versions/{ref}/tasks` lists. `ref` is a revision number, a tag, or a digest of at least 8 hex characters after `sha256:`.",
+        "operationId": "get_version",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetVersionDetailResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "409": {
+            "description": "The digest prefix matches more than one version"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks": {
+      "get": {
+        "summary": "List Version Tasks",
+        "description": "List one page of a version's tasks in task ID order. Pass `next_cursor` as `cursor` to read the next page.",
+        "operationId": "list_version_tasks",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Ref"
+            }
+          },
           {
             "name": "name",
             "in": "path",
@@ -3518,7 +4031,7 @@
               "type": "integer",
               "maximum": 1000,
               "minimum": 1,
-              "default": 100,
+              "default": 1000,
               "title": "Limit"
             }
           }
@@ -3529,19 +4042,16 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DatasetTasksResponse"
+                  "$ref": "#/components/schemas/DatasetTasksPage"
                 }
               }
             }
           },
           "404": {
-            "description": "The benchmark, the dataset or the task does not exist"
+            "description": "The benchmark, the dataset, the version or the task does not exist"
           },
-          "403": {
-            "description": "Storage permission denied"
-          },
-          "502": {
-            "description": "Storage operation failed"
+          "409": {
+            "description": "The digest prefix matches more than one version"
           },
           "422": {
             "description": "Validation Error",
@@ -3556,108 +4066,21 @@
         }
       }
     },
-    "/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}": {
-      "put": {
-        "summary": "Put Dataset Task",
-        "description": "Store a task's .zip archive, replacing the task if it exists. The archive streams to storage.",
-        "operationId": "put_dataset_task",
-        "parameters": [
-          {
-            "name": "task_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-              "title": "Task Id"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "maxLength": 64,
-              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
-              "title": "Name"
-            }
-          },
-          {
-            "name": "benchmark",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "maxLength": 64,
-              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
-              "title": "Benchmark"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DatasetTaskResponse"
-                }
-              }
-            }
-          },
-          "201": {
-            "description": "The task is new"
-          },
-          "400": {
-            "description": "The body is not a zip archive"
-          },
-          "413": {
-            "description": "The archive exceeds DATASET_TASK_UPLOAD_MAX_BYTES"
-          },
-          "415": {
-            "description": "The content type is not application/zip"
-          },
-          "409": {
-            "description": "The dataset is archived; restore it first"
-          },
-          "404": {
-            "description": "The benchmark, the dataset or the task does not exist"
-          },
-          "403": {
-            "description": "Storage permission denied"
-          },
-          "502": {
-            "description": "Storage operation failed"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/zip": {
-              "schema": {
-                "type": "string",
-                "format": "binary"
-              }
-            }
-          }
-        }
-      },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}": {
       "get": {
-        "summary": "Get Dataset Task",
-        "description": "Return a task's size and a temporary URL to download its archive.",
-        "operationId": "get_dataset_task",
+        "summary": "Get Version Task",
+        "description": "Return a task's digest and size in a version, and a temporary URL to download its archive.",
+        "operationId": "get_version_task",
         "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Ref"
+            }
+          },
           {
             "name": "task_id",
             "in": "path",
@@ -3713,7 +4136,7 @@
             }
           },
           "404": {
-            "description": "The benchmark, the dataset or the task does not exist"
+            "description": "The benchmark, the dataset, the version or the task does not exist"
           },
           "403": {
             "description": "Storage permission denied"
@@ -3732,31 +4155,21 @@
             }
           }
         }
-      },
-      "delete": {
-        "summary": "Delete Dataset Task",
-        "description": "Delete a task's archive from the dataset's storage and return what was deleted.",
-        "operationId": "delete_dataset_task",
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/tags/{tag}": {
+      "put": {
+        "summary": "Put Tag",
+        "description": "Point a tag at the version `ref` names. Returns 409 when the tag points at another version, unless `force` is set or the tag is `latest`.",
+        "operationId": "put_tag",
         "parameters": [
           {
-            "name": "task_id",
+            "name": "tag",
             "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-              "title": "Task Id"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "maxLength": 64,
-              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
-              "title": "Name"
+              "title": "Tag"
             }
           },
           {
@@ -3769,6 +4182,96 @@
               "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
               "title": "Benchmark"
             }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetVersionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The tag or the reference is not valid"
+          },
+          "409": {
+            "description": "The dataset is archived, or the tag points at another version and `force` is not set"
+          },
+          "404": {
+            "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Tag",
+        "description": "Remove a tag and return the version it pointed at. `latest` can't be removed.",
+        "operationId": "delete_tag",
+        "parameters": [
+          {
+            "name": "tag",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Tag"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
           }
         ],
         "responses": {
@@ -3777,22 +4280,16 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DatasetTaskResponse"
+                  "$ref": "#/components/schemas/DatasetVersionResponse"
                 }
               }
             }
           },
           "409": {
-            "description": "The dataset is archived; restore it first"
+            "description": "The dataset is archived, or the tag is `latest`"
           },
           "404": {
-            "description": "The benchmark, the dataset or the task does not exist"
-          },
-          "403": {
-            "description": "Storage permission denied"
-          },
-          "502": {
-            "description": "Storage operation failed"
+            "description": "The benchmark, the dataset, the version or the task does not exist"
           },
           "422": {
             "description": "Validation Error",
@@ -4087,6 +4584,47 @@
                     }
                   ],
                   "title": "Response Retrieve Results"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rescore-benchmark/{benchmark_id}": {
+      "post": {
+        "summary": "Rescore Benchmark",
+        "description": "Score a finished dataset run again, running its metric script again and replacing the stored score. Returns 502 and keeps the stored score when the metric script fails.",
+        "operationId": "rescore_benchmark",
+        "parameters": [
+          {
+            "name": "benchmark_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Benchmark Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RescoreBenchmarkResponse"
                 }
               }
             }
@@ -4490,7 +5028,7 @@
     "/retry-or-resume-benchmark/{benchmark_id}": {
       "post": {
         "summary": "Retry Or Resume Benchmark",
-        "description": "Retry a run's errored tasks or resume its stopped ones.\n\nThe request can change concurrency, refresh the agent, pick task IDs, or replace the benchmark URL. A valid task ID with no row yet gets a new pending task.",
+        "description": "Retry a run's errored tasks or resume its stopped ones.\n\nThe request can change concurrency, refresh the agent, pick task IDs, replace the benchmark URL, or replace the Lambda callback. A valid task ID with no row yet gets a new pending task.",
         "operationId": "retry_or_resume_benchmark",
         "parameters": [
           {
@@ -6134,6 +6672,49 @@
         ],
         "title": "BenchmarkTableRow"
       },
+      "BlobDigestsRequest": {
+        "properties": {
+          "digests": {
+            "items": {
+              "$ref": "#/components/schemas/Digest"
+            },
+            "type": "array",
+            "maxItems": 100000,
+            "title": "Digests"
+          }
+        },
+        "type": "object",
+        "required": [
+          "digests"
+        ],
+        "title": "BlobDigestsRequest"
+      },
+      "BlobResponse": {
+        "properties": {
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "digest",
+          "size"
+        ],
+        "title": "BlobResponse"
+      },
       "Body_retry_or_resume_benchmark": {
         "properties": {
           "task_ids": {
@@ -6401,11 +6982,16 @@
             "type": "string",
             "title": "Task Id"
           },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          },
           "size": {
             "type": "integer",
             "title": "Size"
           },
-          "last_modified": {
+          "source_name": {
             "anyOf": [
               {
                 "type": "string"
@@ -6414,7 +7000,7 @@
                 "type": "null"
               }
             ],
-            "title": "Last Modified"
+            "title": "Source Name"
           },
           "download_url": {
             "type": "string",
@@ -6428,6 +7014,7 @@
         "type": "object",
         "required": [
           "task_id",
+          "digest",
           "size",
           "download_url",
           "expires_in"
@@ -6440,11 +7027,16 @@
             "type": "string",
             "title": "Task Id"
           },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          },
           "size": {
             "type": "integer",
             "title": "Size"
           },
-          "last_modified": {
+          "source_name": {
             "anyOf": [
               {
                 "type": "string"
@@ -6453,17 +7045,18 @@
                 "type": "null"
               }
             ],
-            "title": "Last Modified"
+            "title": "Source Name"
           }
         },
         "type": "object",
         "required": [
           "task_id",
+          "digest",
           "size"
         ],
         "title": "DatasetTaskResponse"
       },
-      "DatasetTasksResponse": {
+      "DatasetTasksPage": {
         "properties": {
           "tasks": {
             "items": {
@@ -6488,7 +7081,7 @@
         "required": [
           "tasks"
         ],
-        "title": "DatasetTasksResponse"
+        "title": "DatasetTasksPage"
       },
       "DatasetVersion": {
         "properties": {
@@ -6520,6 +7113,160 @@
         "title": "DatasetVersion",
         "description": "An immutable dataset identity and its optional display label."
       },
+      "DatasetVersionDetailResponse": {
+        "properties": {
+          "benchmark": {
+            "type": "string",
+            "title": "Benchmark"
+          },
+          "dataset": {
+            "type": "string",
+            "title": "Dataset"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          },
+          "task_count": {
+            "type": "integer",
+            "title": "Task Count"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags"
+          },
+          "created_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By Email"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "metric_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Digest"
+          },
+          "manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ManifestInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "benchmark",
+          "dataset",
+          "revision",
+          "digest",
+          "task_count",
+          "tags",
+          "created_at"
+        ],
+        "title": "DatasetVersionDetailResponse"
+      },
+      "DatasetVersionResponse": {
+        "properties": {
+          "benchmark": {
+            "type": "string",
+            "title": "Benchmark"
+          },
+          "dataset": {
+            "type": "string",
+            "title": "Dataset"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          },
+          "task_count": {
+            "type": "integer",
+            "title": "Task Count"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags"
+          },
+          "created_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By Email"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "benchmark",
+          "dataset",
+          "revision",
+          "digest",
+          "task_count",
+          "tags",
+          "created_at"
+        ],
+        "title": "DatasetVersionResponse"
+      },
+      "DatasetVersionsResponse": {
+        "properties": {
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetVersionResponse"
+            },
+            "type": "array",
+            "title": "Versions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "versions"
+        ],
+        "title": "DatasetVersionsResponse"
+      },
       "DatasetsResponse": {
         "properties": {
           "datasets": {
@@ -6536,6 +7283,34 @@
         ],
         "title": "DatasetsResponse"
       },
+      "DaytonaUnmatchedResponse": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "title": "Start"
+          },
+          "end": {
+            "type": "string",
+            "title": "End"
+          },
+          "total_usd": {
+            "type": "number",
+            "title": "Total Usd"
+          },
+          "unpriced_sandboxes": {
+            "type": "integer",
+            "title": "Unpriced Sandboxes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "total_usd",
+          "unpriced_sandboxes"
+        ],
+        "title": "DaytonaUnmatchedResponse"
+      },
       "DefaultProviderRequest": {
         "properties": {
           "provider": {
@@ -6549,6 +7324,10 @@
           "provider"
         ],
         "title": "DefaultProviderRequest"
+      },
+      "Digest": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
       },
       "EmailCost": {
         "properties": {
@@ -6895,7 +7674,14 @@
             "title": "Benchmark"
           },
           "final_score": {
-            "type": "number",
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Final Score"
           },
           "properties": {
@@ -6907,8 +7693,7 @@
         "type": "object",
         "required": [
           "org_id",
-          "benchmark",
-          "final_score"
+          "benchmark"
         ],
         "title": "FinalEvaluation"
       },
@@ -7101,6 +7886,58 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HostedDataset": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "hosted",
+            "title": "Kind",
+            "default": "hosted"
+          },
+          "benchmark": {
+            "type": "string",
+            "title": "Benchmark"
+          },
+          "dataset": {
+            "type": "string",
+            "title": "Dataset"
+          },
+          "ref": {
+            "type": "string",
+            "title": "Ref",
+            "default": "latest"
+          },
+          "dataset_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Id"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "benchmark",
+          "dataset"
+        ],
+        "title": "HostedDataset"
       },
       "IdentityResponse": {
         "properties": {
@@ -7304,6 +8141,25 @@
         "title": "LocalBenchmarkArguments",
         "description": "Stored arguments with the filesystem resources selected at admission."
       },
+      "LocalDataset": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "folder",
+            "title": "Kind",
+            "default": "folder"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "LocalDataset"
+      },
       "LocalResources": {
         "properties": {
           "data_root": {
@@ -7461,6 +8317,115 @@
         ],
         "title": "LoginSettingsResponse"
       },
+      "ManifestAuthor": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "ManifestAuthor"
+      },
+      "ManifestFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "digest": {
+            "type": "string",
+            "title": "Digest",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "ManifestFile"
+      },
+      "ManifestInfo": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "authors": {
+            "items": {
+              "$ref": "#/components/schemas/ManifestAuthor"
+            },
+            "type": "array",
+            "title": "Authors"
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keywords"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "ManifestInfo"
+      },
+      "ManifestTask": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "digest"
+        ],
+        "title": "ManifestTask"
+      },
       "MemberEntry": {
         "properties": {
           "email": {
@@ -7527,6 +8492,22 @@
           "members"
         ],
         "title": "MembersResponse"
+      },
+      "MissingBlobsResponse": {
+        "properties": {
+          "missing": {
+            "items": {
+              "$ref": "#/components/schemas/Digest"
+            },
+            "type": "array",
+            "title": "Missing"
+          }
+        },
+        "type": "object",
+        "required": [
+          "missing"
+        ],
+        "title": "MissingBlobsResponse"
       },
       "MonitorTaskResponse": {
         "properties": {
@@ -8404,6 +9385,38 @@
         ],
         "title": "RegradeBenchmarkResponse",
         "description": "The new run and which source tasks it regrades or skips."
+      },
+      "RescoreBenchmarkResponse": {
+        "properties": {
+          "benchmark_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Benchmark Id"
+          },
+          "final_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Score"
+          },
+          "properties": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Properties"
+          }
+        },
+        "type": "object",
+        "required": [
+          "benchmark_id",
+          "final_score",
+          "properties"
+        ],
+        "title": "RescoreBenchmarkResponse"
       },
       "ResourceCreateRequest": {
         "properties": {
@@ -9752,6 +10765,31 @@
             ],
             "title": "Dataset Version"
           },
+          "dataset_ref": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/HostedDataset"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LocalDataset"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "kind",
+                  "mapping": {
+                    "folder": "#/components/schemas/LocalDataset",
+                    "hosted": "#/components/schemas/HostedDataset"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Ref"
+          },
           "sandbox_provider": {
             "type": "string",
             "title": "Sandbox Provider",
@@ -9968,6 +11006,25 @@
           "status"
         ],
         "title": "StopBenchmarkResponse"
+      },
+      "TagRequest": {
+        "properties": {
+          "ref": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Ref"
+          },
+          "force": {
+            "type": "boolean",
+            "title": "Force",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "ref"
+        ],
+        "title": "TagRequest"
       },
       "TaskArtifactsResponse": {
         "properties": {
@@ -10342,6 +11399,123 @@
         ],
         "title": "VerifyTaskIdsResponse",
         "description": "Response containing verified task IDs that exist in your benchmark."
+      },
+      "VersionCreateRequest": {
+        "properties": {
+          "tasks": {
+            "patternProperties": {
+              "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            },
+            "type": "object",
+            "maxProperties": 100000,
+            "minProperties": 1,
+            "title": "Tasks"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 10,
+            "title": "Tags"
+          },
+          "manifest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VersionManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metric_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Digest"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tasks"
+        ],
+        "title": "VersionCreateRequest"
+      },
+      "VersionManifest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "authors": {
+            "items": {
+              "$ref": "#/components/schemas/ManifestAuthor"
+            },
+            "type": "array",
+            "title": "Authors"
+          },
+          "keywords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keywords"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "tasks": {
+            "patternProperties": {
+              "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$": {
+                "$ref": "#/components/schemas/ManifestTask"
+              }
+            },
+            "type": "object",
+            "maxProperties": 100000,
+            "title": "Tasks"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ManifestFile"
+            },
+            "type": "array",
+            "title": "Files"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "tasks"
+        ],
+        "title": "VersionManifest"
       }
     },
     "securitySchemes": {

@@ -19,14 +19,12 @@ from tests.utils import TEST_ORG_ID
 from tracker.auth import get_current_org
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     ExecutorDispatch,
-    ExecutorDispatchKind,
     ExecutorRelease,
     Org,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, TaskStatus
 from tracker.executor.release_control import promote_release
 from tracker.logging import benchmark_id_var
 from tracker.repositories.executor_release import ExecutorReleaseRepository
@@ -41,8 +39,8 @@ pytestmark = pytest.mark.usefixtures("mapped_providers")
 def recovery_run(database_session: Session, example_benchmark_object: Benchmark) -> tuple[Benchmark, Task]:
     release = ExecutorRelease(
         id="barrier-release",
-        artifact_uri="s3://artifacts/barrier-release.pex",
-        artifact_digest="barrier-digest",
+        artifact_uri="source:///barrier-release",
+        artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
     )
     database_session.add(release)
@@ -417,8 +415,8 @@ async def test_recovery_rechecks_verified_state_before_mutating_or_dispatching(
                             benchmark_id=benchmark_id,
                             kind=ExecutorDispatchKind.RESUME,
                             executor_release_id="barrier-release",
-                            executor_artifact_uri="s3://artifacts/barrier-release.pex",
-                            executor_artifact_digest="barrier-digest",
+                            executor_artifact_uri="source:///barrier-release",
+                            executor_artifact_digest="a" * 64,
                             executor_protocol_version=SUPPORTED_PROTOCOL_VERSION,
                         )
                     )

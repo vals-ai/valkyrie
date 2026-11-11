@@ -5,14 +5,18 @@ description: "Evaluate AI agents on agentic benchmarks at scale, with each task 
 ---
 
 Valkyrie is a platform for evaluating AI agents on agentic benchmarks, such as SWE-bench
-Verified and Terminal-Bench 2.0. One command runs a benchmark's tasks in parallel, each in
-its own cloud sandbox. Valkyrie keeps every run's score, logs, and agent output, together
-with the settings that produced them.
+Verified and Terminal-Bench 2.0.
 
-The benchmark, the agent, and the platform are separate pieces. Benchmark authors host
-their benchmark as a service, and agent authors describe their agent in one
-`contract.yaml`. You start and follow runs from the `valkyrie` CLI or the Python SDK, with
-no benchmark to install yourself.
+- One command runs a benchmark's tasks in parallel, each in its own cloud sandbox.
+- Valkyrie keeps every run's score, logs, and agent output, together with the settings that
+  produced them.
+
+The benchmark, the agent, and the platform are separate pieces:
+
+- Benchmark authors host their benchmark as a service.
+- Agent authors describe their agent in one `contract.yaml`.
+- You start and follow runs from the `valkyrie` CLI or the Python SDK, with no benchmark to
+  install yourself.
 
 <CardGroup cols={2}>
 
@@ -38,19 +42,20 @@ Start and inspect runs from Python.
 
 Older benchmarks such as HumanEval check a function's output against fixed tests, which
 takes little more than one machine. Agentic benchmarks evaluate what an agent does inside an
-environment. Each task needs its own sandbox with the right repository and tools, the agent
-works in it for minutes or hours, and a test harness grades what it left behind. Run the
-usual way, from one repository on one large machine, that causes four problems:
+environment:
 
-- **Benchmarks change slowly and silently.** When every benchmark lives in one repository, a
-  new benchmark waits for maintainers to review it, and every user has to pull and
-  reconfigure. Two people can run different versions without noticing.
-- **One machine caps the run.** A machine sized for the largest run sits idle between runs,
-  and still can't run hundreds of tasks at once. Logs and agent outputs stay on its disk,
-  where they're hard to share and easy to lose.
-- **Results rest on trust.** A submitter runs the agent on their own machine and sends in
-  its outputs. A maintainer can grade the outputs again, but can't tell whether time limits
-  or network rules were followed while the agent worked.
+- Each task needs its own sandbox with the right repository and tools.
+- The agent works in it for minutes or hours.
+- A test harness grades what it left behind.
+
+Run the usual way, from one repository on one large machine, that causes four problems:
+
+- **Benchmarks change slowly and silently.** When every benchmark lives in one repository, a new benchmark waits for maintainers to review it, and every user has to pull and reconfigure.
+  - Two people can run different versions without noticing.
+- **One machine caps the run.** A machine sized for the largest run sits idle between runs, and still can't run hundreds of tasks at once.
+  - Logs and agent outputs stay on its disk, where they're hard to share and easy to lose.
+- **Results rest on trust.** A submitter runs the agent on their own machine and sends in its outputs.
+  - A maintainer can grade the outputs again, but can't tell whether time limits or network rules were followed while the agent worked.
 - **Agents are written against each harness.** Harnesses ask an agent to implement their
   classes or function signatures, although all that differs between agents is how to
   install and run them, where their output goes, and which secrets they need.
@@ -68,11 +73,11 @@ Valkyrie splits an evaluation into three parts, each owned by someone different:
 Because the parts are separate, each person works on their own:
 
 - **Benchmark authors** ship a new benchmark or a fix by deploying their service. Everyone's
-  next run uses it, with no change to Valkyrie and nothing for users to update. Authors
-  start from a generated project, and a service can require credentials, so one service
-  can serve public and private datasets. See
-  [Convert a benchmark into a service](/benchmarks/convert-a-benchmark).
-- **Agent authors** write a contract instead of code against Valkyrie. Any agent that
+  next run uses it, with no change to Valkyrie and nothing for users to update.
+  - Authors start from a generated project, and a service can require credentials, so one
+    service can serve public and private datasets.
+  - See [Convert a benchmark into a service](/benchmarks/convert-a-benchmark).
+- **Agent authors** write a contract instead of code against Valkyrie, and any agent that
   starts from a shell command works. See [Package an agent](/agents/package-an-agent).
 - **People running evaluations** install only the CLI. They keep no local copy of a
   benchmark and nothing in sync.
@@ -133,25 +138,23 @@ messages. [Monitor runs](/runs/monitor) shows how to follow it.
 
 - **Everyone runs the same benchmark.** Runs on a hosted benchmark all use its one service,
   and each run records the dataset version it used, when the service publishes versions.
-- **A run keeps its agent.** Agents live in your organization's library, so teammates run
-  the same version. A run keeps the agent it started with: uploading a new version doesn't
-  change it, unless you rerun with [`--update-agent`](/runs/manage#resume-or-retry) to pick
-  up the new files.
-- **Limits are applied, not trusted.** Valkyrie stops the agent when its time limit runs
-  out, and sets each stage's network rules on the sandbox itself. The settings a run started
-  with are stored with it.
+- **A run keeps its agent.** Agents live in your organization's library, so teammates run the same version.
+  - A run keeps the agent it started with: uploading a new version doesn't change it, unless you rerun with [`--update-agent`](/runs/manage#resume-or-retry) to pick up the new files.
+- **Limits are applied, not trusted.** Valkyrie stops the agent when its time limit runs out, and sets each stage's network rules on the sandbox itself.
+  - The settings a run started with are stored with it.
 - **Nothing lives on one machine.** Logs, agent outputs, and results are kept in your
   organization's storage, where any member can read, compare, and score them again.
-- **Routine upgrades don't interrupt runs.** When a new version of Valkyrie is deployed,
-  tasks that are already running finish on the version they started with. An upgrade that
-  needs maintenance stops running tasks instead, and you can resume the run afterwards.
+- **Routine upgrades don't interrupt runs.** When a new version of Valkyrie is deployed, tasks that are already running finish on the version they started with.
+  - An upgrade that needs maintenance stops running tasks instead, and you can resume the run afterwards.
 
 ## How far it scales
 
-Sandboxes exist only while their task runs, so nothing sits idle between runs. How many
-tasks run at once is set by the run's `--concurrency`, your sandbox provider's quota, and
-your model provider's rate limits. With enough of each, all 500 SWE-bench Verified tasks can
-run at once, and the run takes about as long as its slowest task.
+Sandboxes exist only while their task runs, so nothing sits idle between runs.
+
+- How many tasks run at once is set by the run's `--concurrency`, your sandbox provider's
+  quota, and your model provider's rate limits.
+- With enough of each, all 500 SWE-bench Verified tasks can run at once, and the run takes
+  about as long as its slowest task.
 
 ## Core concepts
 
@@ -165,10 +168,10 @@ run at once, and the run takes about as long as its slowest task.
 ## Where Valkyrie runs
 
 - **Hosted by Vals AI.** This is the default: `valkyrie login` signs you in, and Vals AI
-  runs the Tracker and stores your organization's results. Sandboxes run on your own
-  provider account. To get access, send an email to
-  [contact@vals.ai](mailto:contact@vals.ai).
-- **On your machine.** Run the Tracker yourself with no AWS account. See
+  runs the Tracker and stores your organization's results.
+  - Sandboxes run on your own provider account.
+  - To get access, send an email to [contact@vals.ai](mailto:contact@vals.ai).
+- **On your machine.** Run the Tracker yourself with no AWS account, as in
   [Run Tracker locally](/self-hosting/local-tracker).
 
 ## Paper

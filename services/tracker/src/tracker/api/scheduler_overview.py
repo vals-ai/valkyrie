@@ -11,11 +11,13 @@ from starlette.concurrency import run_in_threadpool
 from tracker.auth import get_current_org
 from tracker.aws.resolver import deployment_aws_runtime
 from tracker.aws.secrets import SecretsManagerStore
-from tracker.database.models import Org, TaskStatus
+from tracker.database.models import Org
+from tracker.domain import TaskStatus
 from tracker.repositories.scheduler import PoolProviderReference, SchedulerRepository, SchedulerRepositoryDependency
 from tracker.logging import get_logger
-from tracker.scheduler.store import queue_pool_id, queue_pool_lock_id
+from tracker.executor.control_queue import queue_pool_id, queue_pool_lock_id
 from tracker.types import (
+    OrgContext,
     SchedulerActiveEntryResponse,
     SchedulerActiveStatus,
     SchedulerCapacityDomainResponse,
@@ -138,7 +140,7 @@ async def _read_provider_capacity(
             return None
         try:
             async with asyncio.timeout_at(read_deadline):
-                runtime = deployment_aws_runtime(org)
+                runtime = deployment_aws_runtime(OrgContext(id=org.id, name=org.name, storage_key=org.storage_key))
                 provider_config = await fetch_sandbox_provider_config(
                     secret_name,
                     SecretsManagerStore(runtime.clients),

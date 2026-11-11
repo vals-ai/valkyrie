@@ -21,14 +21,12 @@ from tracker.api.organizations import (
     OrganizationResponse,
     OrganizationsResponse,
 )
-from tracker.database.models import (
-    AgentContractRequest,
+from tracker.database.models import FinalEvaluation
+from tracker.types import (
     AWSBenchmarkArguments,
     LocalBenchmarkArguments,
-    FinalEvaluation,
     OutputArtifact,
-)
-from tracker.types import (
+    AgentContractRequest,
     SecretEntry,
     SecretsResponse,
     ProvidersResponse,
@@ -47,11 +45,15 @@ from tracker.types import (
     BenchmarkServicesResponse,
     BenchmarkDefinitionResponse,
     BenchmarkDefinitionsResponse,
+    BlobResponse,
     DatasetResponse,
     DatasetsResponse,
     DatasetTaskDownloadResponse,
     DatasetTaskResponse,
-    DatasetTasksResponse,
+    DatasetTasksPage,
+    DatasetVersionDetailResponse,
+    DatasetVersionResponse,
+    DatasetVersionsResponse,
     BenchmarkStatusEntry,
     BenchmarkStatusResponse,
     BenchmarkTableRow,
@@ -62,6 +64,12 @@ from tracker.types import (
     FetchBenchmarksResponse,
     FinalViewResponse,
     LogEventResponse,
+    ManifestAuthor,
+    ManifestFile,
+    ManifestInfo,
+    ManifestTask,
+    MissingBlobsResponse,
+    RescoreBenchmarkResponse,
     RegradeBenchmarkRequest,
     RegradeBenchmarkResponse,
     RetryOrResumeBenchmarkResponse,
@@ -106,11 +114,21 @@ from valkyrie.sdk.models import (
     AgentsResponse as SDKAgentsResponse,
     BenchmarkDefinitionResponse as SDKBenchmarkDefinitionResponse,
     BenchmarkDefinitionsResponse as SDKBenchmarkDefinitionsResponse,
+    BlobResponse as SDKBlobResponse,
     DatasetResponse as SDKDatasetResponse,
     DatasetsResponse as SDKDatasetsResponse,
     DatasetTaskDownloadResponse as SDKDatasetTaskDownloadResponse,
     DatasetTaskResponse as SDKDatasetTaskResponse,
-    DatasetTasksResponse as SDKDatasetTasksResponse,
+    DatasetTasksPage as SDKDatasetTasksPage,
+    DatasetVersionDetailResponse as SDKDatasetVersionDetailResponse,
+    DatasetVersionResponse as SDKDatasetVersionResponse,
+    DatasetVersionsResponse as SDKDatasetVersionsResponse,
+    ManifestAuthor as SDKManifestAuthor,
+    ManifestFile as SDKManifestFile,
+    ManifestInfo as SDKManifestInfo,
+    ManifestTask as SDKManifestTask,
+    MissingBlobsResponse as SDKMissingBlobsResponse,
+    RescoreBenchmarkResponse as SDKRescoreBenchmarkResponse,
     SecretEntry as SDKSecretEntry,
     SecretsResponse as SDKSecretsResponse,
     ProvidersResponse as SDKProvidersResponse,
@@ -189,10 +207,20 @@ ROUTES = (
     ("/v1/benchmarks/{benchmark}/datasets/{name}", "patch", "benchmark name"),
     ("/v1/benchmarks/{benchmark}/datasets/{name}", "delete", "benchmark name"),
     ("/v1/benchmarks/{benchmark}/datasets/{name}/restore", "post", "benchmark name"),
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks", "get", "benchmark name cursor limit"),
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "put", "benchmark name task_id"),
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "get", "benchmark name task_id download"),
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "delete", "benchmark name task_id"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/blobs/missing", "post", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/blobs/{digest}", "put", "benchmark name digest"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/files/{digest}", "put", "benchmark name digest"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions", "post", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions", "get", "benchmark name"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}", "get", "benchmark name ref"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks", "get", "benchmark name ref cursor limit"),
+    (
+        "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}",
+        "get",
+        "benchmark name ref task_id download",
+    ),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tags/{tag}", "put", "benchmark name tag"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tags/{tag}", "delete", "benchmark name tag"),
     ("/benchmarks/{benchmark_id}/artifacts", "get", "benchmark_id prefix cursor limit attempts"),
     ("/benchmarks/{benchmark_id}/artifacts/download-url", "get", "benchmark_id path download attempts"),
     ("/start-benchmark", "post", ""),
@@ -206,6 +234,7 @@ ROUTES = (
     ("/preview-results", "get", "benchmark_id task_ids"),
     ("/stop-benchmark/{benchmark_id}", "post", "benchmark_id force"),
     ("/retry-or-resume-benchmark/{benchmark_id}", "post", "benchmark_id retry retry_mode concurrency update_agent"),
+    ("/rescore-benchmark/{benchmark_id}", "post", "benchmark_id"),
     ("/regrade-benchmark/{benchmark_id}", "post", "benchmark_id"),
     ("/benchmarks/status", "get", "ids"),
     ("/scheduler/overview", "get", "waiting_limit active_limit waiting_offset active_offset include_capacity"),
@@ -265,6 +294,7 @@ RESPONSE_MODELS = {
     ("/fetch-benchmarks", "get"): "FetchBenchmarksResponse",
     ("/stop-benchmark/{benchmark_id}", "post"): "StopBenchmarkResponse",
     ("/retry-or-resume-benchmark/{benchmark_id}", "post"): "RetryOrResumeBenchmarkResponse",
+    ("/rescore-benchmark/{benchmark_id}", "post"): "RescoreBenchmarkResponse",
     ("/regrade-benchmark/{benchmark_id}", "post"): "RegradeBenchmarkResponse",
     ("/benchmarks/status", "get"): "BenchmarkStatusResponse",
     ("/scheduler/overview", "get"): "SchedulerOverviewResponse",
@@ -311,10 +341,18 @@ RESPONSE_MODELS = {
     ("/v1/benchmarks/{benchmark}/datasets/{name}", "patch"): "DatasetResponse",
     ("/v1/benchmarks/{benchmark}/datasets/{name}", "delete"): "DatasetResponse",
     ("/v1/benchmarks/{benchmark}/datasets/{name}/restore", "post"): "DatasetResponse",
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks", "get"): "DatasetTasksResponse",
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "put"): "DatasetTaskResponse",
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "get"): "DatasetTaskDownloadResponse",
-    ("/v1/benchmarks/{benchmark}/datasets/{name}/tasks/{task_id}", "delete"): "DatasetTaskResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/blobs/missing", "post"): "MissingBlobsResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/blobs/{digest}", "put"): "BlobResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/files/{digest}", "put"): "BlobResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions", "get"): "DatasetVersionsResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}", "get"): "DatasetVersionDetailResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks", "get"): "DatasetTasksPage",
+    (
+        "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}",
+        "get",
+    ): "DatasetTaskDownloadResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tags/{tag}", "put"): "DatasetVersionResponse",
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/tags/{tag}", "delete"): "DatasetVersionResponse",
     ("/preview-results", "get"): "S3UploadResultsResponse",
 }
 MODEL_PAIRS = (
@@ -361,9 +399,19 @@ MODEL_PAIRS = (
     (BenchmarkDefinitionsResponse, SDKBenchmarkDefinitionsResponse),
     (DatasetResponse, SDKDatasetResponse),
     (DatasetsResponse, SDKDatasetsResponse),
+    (BlobResponse, SDKBlobResponse),
+    (ManifestAuthor, SDKManifestAuthor),
+    (ManifestInfo, SDKManifestInfo),
+    (ManifestTask, SDKManifestTask),
+    (ManifestFile, SDKManifestFile),
+    (MissingBlobsResponse, SDKMissingBlobsResponse),
     (DatasetTaskResponse, SDKDatasetTaskResponse),
-    (DatasetTasksResponse, SDKDatasetTasksResponse),
+    (DatasetTasksPage, SDKDatasetTasksPage),
+    (RescoreBenchmarkResponse, SDKRescoreBenchmarkResponse),
     (DatasetTaskDownloadResponse, SDKDatasetTaskDownloadResponse),
+    (DatasetVersionResponse, SDKDatasetVersionResponse),
+    (DatasetVersionDetailResponse, SDKDatasetVersionDetailResponse),
+    (DatasetVersionsResponse, SDKDatasetVersionsResponse),
     (RetryOrResumeBenchmarkResponse, SDKRetryResponse),
     (RegradeBenchmarkRequest, SDKRegradeBenchmarkRequest),
     (RegradeBenchmarkResponse, SDKRegradeBenchmarkResponse),
@@ -402,6 +450,7 @@ INTERNAL_ROUTES = {
     ("/costs/by-email", "get"),
     ("/costs/by-project", "get"),
     ("/costs/project-daytona", "get"),
+    ("/costs/daytona-unmatched", "get"),
     ("/costs/sandbox-rows", "get"),
     ("/costs/project-sandbox", "get"),
     ("/projects/{handle}/archive", "post"),
@@ -499,7 +548,16 @@ def test_sdk_and_tracker_wire_models_have_the_same_fields(
             assert sdk_property == {"anyOf": [tracker_property, {"type": "null"}]}
             assert sdk_model.model_fields[name].default is None
             continue
-        assert tracker_property == sdk_property
+        if tracker_model is FinalViewResponse and name == "final_evaluation":
+            tracker_ref = tracker_property["anyOf"][0]["$ref"].rsplit("/", 1)[-1]
+            sdk_ref = sdk_property["anyOf"][0]["$ref"].rsplit("/", 1)[-1]
+            assert tracker_property == {"anyOf": [{"$ref": f"#/$defs/{tracker_ref}"}, {"type": "null"}]}
+            assert sdk_property == {"anyOf": [{"$ref": f"#/$defs/{sdk_ref}"}, {"type": "null"}]}
+            assert _normalized_wire_schema(tracker_schema["$defs"][tracker_ref]["properties"]) == (
+                _normalized_wire_schema(sdk_schema["$defs"][sdk_ref]["properties"])
+            )
+        else:
+            assert tracker_property == sdk_property
 
         tracker_field = tracker_model.model_fields[name]
         sdk_field = sdk_model.model_fields[name]
@@ -687,6 +745,7 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
         ("/preview-results", "get", "benchmark_id"),
         ("/stop-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/retry-or-resume-benchmark/{benchmark_id}", "post", "benchmark_id"),
+        ("/rescore-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/regrade-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/analyze-benchmark/{benchmark_id}", "post", "benchmark_id"),
         ("/check-results-exist", "get", "benchmark_id"),
@@ -720,20 +779,20 @@ def test_every_tracker_route_is_classified_as_sdk_supported_or_internal() -> Non
     assert tracker_routes == sdk_routes | INTERNAL_ROUTES
 
 
-@pytest.mark.description("Final evaluation keeps the Tracker's runtime string IDs.")
-def test_final_evaluation_preserves_tracker_runtime_string_ids() -> None:
+@pytest.mark.description("Final evaluation preserves Tracker's serialized string identifiers.")
+def test_final_evaluation_preserves_serialized_string_ids() -> None:
     payload = load_fixture("results.json")["inline"]
     tracker_evaluation = FinalViewResponse.model_validate(payload).final_evaluation
     sdk_evaluation = SDKFinalViewResponse.model_validate(payload).final_evaluation
 
     assert tracker_evaluation is not None
     assert sdk_evaluation is not None
+    tracker_wire = tracker_evaluation.model_dump(mode="json", warnings=False)
+    sdk_wire = sdk_evaluation.model_dump(mode="json")
     for field in ("id", "org_id", "benchmark"):
-        tracker_value = getattr(tracker_evaluation, field)
-        sdk_value = getattr(sdk_evaluation, field)
-        assert isinstance(tracker_value, str)
-        assert type(sdk_value) is type(tracker_value)
-    assert sdk_evaluation.model_dump() == tracker_evaluation.model_dump(warnings=False)
+        assert isinstance(tracker_wire[field], str)
+        assert tracker_wire[field] == sdk_wire[field] == payload["final_evaluation"][field]
+    assert tracker_wire == sdk_wire
 
 
 @pytest.mark.description("The SDK and the Tracker list the same subcategories for each spend type.")

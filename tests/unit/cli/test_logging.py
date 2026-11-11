@@ -185,4 +185,4 @@ def test_machine_json_subprocess_suppresses_import_time_dotenv_warnings(tmp_path
     assert result.stderr == ""
     lines = result.stdout.splitlines()
     assert len(lines) == 1
-    assert json.loads(lines[0])["run_id"] == str(run_id)
+    assert json.loads(lines[0])["run"]["benchmark_id"] == str(run_id)

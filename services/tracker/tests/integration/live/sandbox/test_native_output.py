@@ -13,10 +13,12 @@ from tests.factories import make_benchmark, make_task
 from tracker.api.dependencies import get_run_runtime
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.secrets import SecretsManagerStore
-from tracker.database.models import ActiveNativeOutput, AgentContractRequest, LocalBenchmarkArguments, TaskStatus
+from tracker.types import AgentContractRequest, LocalBenchmarkArguments
+from tracker.domain import TaskStatus
 from tracker.local.resources import LocalResources
 from tracker.runtime.services import RuntimeServices
 from tracker.sandbox import SANDBOX_AUTO_STOP_INTERVAL, SANDBOX_CREATE_TIMEOUT
+from tracker.types import ActiveNativeOutput
 from tracker.clients.benchmark_service import fetch_sandbox_provider_config
 
 

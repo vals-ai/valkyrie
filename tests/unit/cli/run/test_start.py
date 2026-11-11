@@ -7,6 +7,7 @@ from uuid import UUID
 import httpx
 import pytest
 from click.testing import CliRunner, Result
+from valkyrie.sdk import ValkyrieRunError
 from valkyrie.sdk.models import BenchmarkStatus, TaskStatus
 
 from valkyrie.cli.run.start import start
@@ -397,4 +398,197 @@ def test_start_with_a_blank_project_names_it_before_any_request(tracker: MockTra
 
     assert result.exit_code == 2
     assert "must name the project this run is for" in result.output
+
+
+def _dataset_invoke(*arguments: str) -> Result:
+    return CliRunner().invoke(start, ["--agent", "remote-agent", *_ROUTER_BENCH, *arguments])
+
+
+@pytest.mark.description("A hosted dataset run is named for the datasets benchmark.")
+def test_a_hosted_dataset_run_is_named_for_the_datasets_benchmark(tracker: MockTracker) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+
+    result = _dataset_invoke("--dataset", "swe-bench/verified", "--task-ids", "task-a")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["benchmark_name"] == "swe-bench"
+    assert body["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": "latest"}
+    assert body["task_ids"] == ["task-a"]
+    assert "dataset" not in body and "dataset_version" not in body
+    assert body["service_headers"] == {}
+    assert "Dataset:" in result.output and "verified" in result.output
+
+
+@pytest.mark.description("A hosted dataset run names the version after the at sign.")
+@pytest.mark.parametrize("version", ["2", "stable", "sha256:3f2a9c1e"])
+def test_a_hosted_dataset_run_names_the_version_after_the_at_sign(tracker: MockTracker, version: str) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+
+    result = _dataset_invoke("--dataset", f"swe-bench/verified@{version}")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": version}
+
+
+@pytest.mark.description("A folder run sends the resolved path and is named after the folder.")
+def test_a_folder_run_sends_the_resolved_path_and_is_named_after_the_folder(
+    tracker: MockTracker, tmp_path: Path
+) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+    folder = tmp_path / "My Tasks"
+    folder.mkdir()
+
+    default_name = _dataset_invoke("--dataset", str(folder))
+    chosen_name = _dataset_invoke("--dataset", str(folder), "--benchmark", "mine")
+
+    assert default_name.exit_code == chosen_name.exit_code == 0, default_name.output + chosen_name.output
+    first, second = _start_bodies(tracker)
+    assert first["benchmark_name"] == "my-tasks"
+    assert second["benchmark_name"] == "mine"
+    assert first["dataset_ref"] == second["dataset_ref"] == {"kind": "folder", "path": str(folder.resolve())}
+
+
+@pytest.mark.description("Dataset run options that do not fit are refused before any request.")
+@pytest.mark.parametrize(
+    ("arguments", "complaint"),
+    [
+        (["--dataset", "swe-bench"], "Missing option '--benchmark'"),
+        (["--dataset", ""], "Missing option '--benchmark'"),
+        (["--dataset", "a" * 300], "Missing option '--benchmark'"),
+        (["--dataset", "Swe/verified"], "must be BENCHMARK/DATASET"),
+        (["--dataset", "swe-bench/verified@"], "must be BENCHMARK/DATASET"),
+        (["--dataset", "./missing"], "is not a folder"),
+        (["--dataset", "a/b", "--dataset-version", "1"], "belong to benchmark services"),
+        (["--dataset", "a/b", "-H", "X-Key", "value"], "belong to benchmark services"),
+        (["--dataset", "a/b", "--ignore-custom-services"], "belong to benchmark services"),
+    ],
+)
+def test_dataset_run_options_that_do_not_fit_are_refused_before_any_request(
+    tracker: MockTracker, arguments: list[str], complaint: str
+) -> None:
+    result = _dataset_invoke(*arguments)
+
+    assert result.exit_code == 2
+    assert complaint in result.output
+    assert tracker.requests == []
+
+
+@pytest.mark.description("The benchmark is still required without a dataset.")
+def test_the_benchmark_is_still_required_without_a_dataset(tracker: MockTracker) -> None:
+    result = _dataset_invoke()
+
+    assert result.exit_code == 2
+    assert "Missing option '--benchmark'" in result.output
+    assert tracker.requests == []
+
+
+@pytest.mark.description("A dataset name with a benchmark stays a service dataset even when a folder has its name.")
+def test_a_dataset_name_with_a_benchmark_stays_a_service_dataset_even_when_a_folder_has_its_name(
+    tracker: MockTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+    (tmp_path / "verified").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    result = _dataset_invoke("--benchmark", "swebench", "--dataset", "verified")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["dataset"] == "verified"
+    assert body.get("dataset_ref") is None
+
+
+@pytest.mark.description("A benchmark that owns the dataset name still runs the pushed dataset.")
+def test_a_benchmark_that_owns_the_dataset_name_still_runs_the_pushed_dataset(tracker: MockTracker) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+
+    result = _dataset_invoke("--benchmark", "swe-bench", "--dataset", "swe-bench/verified")
+    other = _dataset_invoke("--benchmark", "other", "--dataset", "swe-bench/verified")
+
+    assert result.exit_code == other.exit_code == 0, result.output + other.output
+    first, second = _start_bodies(tracker)
+    assert first["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": "latest"}
+    assert second["dataset"] == "swe-bench/verified" and second.get("dataset_ref") is None
+
+
+@pytest.mark.description("A name with a slash runs the hosted dataset even when a folder of that name exists.")
+def test_a_name_with_a_slash_runs_the_hosted_dataset_even_when_a_folder_of_that_name_exists(
+    tracker: MockTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+    (tmp_path / "swe-bench" / "verified").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    result = _dataset_invoke("--dataset", "swe-bench/verified")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": "latest"}
+
+
+@pytest.mark.description("A folder named from the home directory is resolved.")
+def test_a_folder_named_from_the_home_directory_is_resolved(
+    tracker: MockTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+    (tmp_path / "tasks").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    result = _dataset_invoke("--dataset", "~/tasks")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["dataset_ref"] == {"kind": "folder", "path": str((tmp_path / "tasks").resolve())}
+
+
+@pytest.mark.description("A path the filesystem cannot probe is not a folder and not a traceback.")
+def test_a_path_the_filesystem_cannot_probe_is_not_a_folder_and_not_a_traceback(
+    tracker: MockTracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_home(_path: Path) -> Path:
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(Path, "expanduser", no_home)
+
+    result = _dataset_invoke("--benchmark", "mine", "--dataset", "~weird")
+
+    assert result.exit_code == 2
+    assert "--dataset ~weird is not a folder" in result.output
+    assert tracker.requests == []
+
+
+@pytest.mark.description("A `./` folder in the working directory runs without a benchmark.")
+def test_a_folder_in_the_working_directory_runs_without_a_benchmark(
+    tracker: MockTracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+    (tmp_path / "tasks").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    result = _dataset_invoke("--dataset", "./tasks")
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["dataset_ref"] == {"kind": "folder", "path": str((tmp_path / "tasks").resolve())}
+
+
+@pytest.mark.description("The `--dataset` help names the hosted dataset and folder forms.")
+def test_the_dataset_help_names_the_hosted_dataset_and_folder_forms() -> None:
+    result = CliRunner().invoke(start, ["--help"])
+
+    assert "BENCHMARK/DATASET[@VERSION]" in result.output and "starting with ./" in result.output
+
+
+@pytest.mark.description("A folder that cannot name a run is an error not a traceback.")
+def test_a_folder_that_cannot_name_a_run_is_an_error_not_a_traceback(tracker: MockTracker, tmp_path: Path) -> None:
+    folder = tmp_path / "___"
+    folder.mkdir()
+
+    result = _dataset_invoke("--dataset", str(folder))
+
+    assert result.exit_code == 1
+    assert "pass a benchmark name" in result.output
+    assert not isinstance(result.exception, ValkyrieRunError)
     assert tracker.requests == []

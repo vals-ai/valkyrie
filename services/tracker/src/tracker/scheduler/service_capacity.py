@@ -5,20 +5,19 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import boto3
-import httpx
 import sentry_sdk
-from benchmark_service import BenchmarkServiceClient, BenchmarkServiceError
+from benchmark_service import BenchmarkServiceClient
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.engine import Engine
 
 from tracker.config import BenchmarkServiceDestination, classify_benchmark_service_destination
+from tracker.clients.benchmark_service import _WAKE_TIMEOUT_SECONDS, wait_for_benchmark_service
 from tracker.database.models import BenchmarkStatus, TaskStatus
 from tracker.database.session import engine as tracker_engine
-from tracker.exceptions import TrackerServiceError
 from tracker.logging import get_logger
+from tracker.repositories.advisory_lock import PostgresAdvisoryLock
 from tracker.repositories.service_demand import active_runs, recent_tasks, record_wake, wakes_since
-from tracker.scheduler.store import PostgresAdvisoryLock
 
 logger = get_logger(__name__)
 
@@ -32,8 +31,6 @@ _IDLE_MINUTES = 30
 _DOWN_MINUTES = 10
 _RECONCILE_SECONDS = 30.0
 _AWS_CONFIG = Config(connect_timeout=3, read_timeout=8, retries={"max_attempts": 3})
-_WAKE_TIMEOUT_SECONDS = 15 * 60.0
-_WAKE_POLL_SECONDS = 15.0
 API_WAKE_SECONDS = 40.0
 
 
@@ -246,29 +243,3 @@ async def wake_benchmark_service(
         return
     await asyncio.to_thread(record_wake, engine, name)
     await wait_for_benchmark_service(client, timeout_seconds=timeout_seconds)
-
-
-async def wait_for_benchmark_service(
-    client: BenchmarkServiceClient,
-    *,
-    timeout_seconds: float = _WAKE_TIMEOUT_SECONDS,
-    poll_seconds: float = _WAKE_POLL_SECONDS,
-) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    while True:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise TrackerServiceError("Benchmark service did not become ready before the wake deadline")
-        try:
-            await asyncio.wait_for(client.health_check(), remaining)
-            return
-        except TimeoutError as error:
-            raise TrackerServiceError("Benchmark service did not become ready before the wake deadline") from error
-        except (httpx.TransportError, BenchmarkServiceError) as error:
-            if isinstance(error, BenchmarkServiceError) and (error.status_code or 500) < 500:
-                raise
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TrackerServiceError(f"Benchmark service is not ready: {error}") from error
-            logger.info("Waiting for benchmark service to start", extra={"error": str(error)})
-            await asyncio.sleep(min(poll_seconds, remaining))

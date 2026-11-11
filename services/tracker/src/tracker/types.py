@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Literal, Self, cast
-from uuid import UUID
+from hashlib import sha256
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeAliasType, cast
+from uuid import UUID, uuid4
 
+from benchmark_service import SandboxSource
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import DatasetVersion
 from pydantic import (
@@ -16,33 +19,247 @@ from pydantic import (
     Field,
     FiniteFloat,
     PlainSerializer,
+    SerializerFunctionWrapHandler,
     StringConstraints,
+    TypeAdapter,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 from tracker.aws.runtime import AWSResources
 from tracker.local.resources import LocalResources, reads_secrets_file
-from tracker.config import create_benchmark_service_url
+from tracker.domain import BenchmarkStatus, DocentReadingStatus, FailureCategory, SpendType, TaskStatus
+from tracker.egress import EgressPolicy
 from tracker.runtime.artifacts import TASK_ID_PATTERN
-from tracker.repositories.benchmark import BenchmarkFilters
-from tracker.database.models import (
-    AgentContractRequest,
-    BenchmarkArguments,
-    BenchmarkDefinition,
-    BenchmarkStatus,
-    Dataset,
-    DocentReadingStatus,
-    FailureCategory,
-    FinalEvaluation,
-    Project,
-    RunMonitoring,
-    RunMonitoringRules,
-    SpendType,
-    TaskStatus,
-)
+
+from tracker.services.datasets.digest import DIGEST_PATTERN
+from tracker.services.datasets.ref import DatasetRef, HostedDataset
+from tracker.services.datasets.version_ref import MAX_VERSION_TAGS, MAX_VERSION_TASKS, validate_tag
+
+if TYPE_CHECKING:
+    from tracker.database.models import BenchmarkDefinition, Dataset, Project
 from tracker.outbound_security import validate_benchmark_name, validate_service_header_name, validate_service_url_syntax
+
+MAX_OUTPUT_ARTIFACT_BYTES = 250 * 1024 * 1024
+MAX_OUTPUT_ARTIFACT_COUNT = 10
+
+
+def _source_has_glob(source: str) -> bool:
+    return any(char in source for char in "*?[")
+
+
+def _source_glob_root(source: str) -> str:
+    glob_indices = [source.find(char) for char in "*?[" if source.find(char) != -1]
+    first_glob_index = min(glob_indices)
+    root = source[:first_glob_index].rsplit("/", 1)[0]
+    return root or "/"
+
+
+class OutputArtifact(BaseModel):
+    path: str
+    source: str | None = None
+    required: bool = True
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.required:
+            data.pop("required", None)
+        return data
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        if not value.startswith("/"):
+            raise ValueError("output_artifacts source paths must be absolute sandbox paths")
+
+        path = PurePosixPath(value)
+        if not path.parts or ".." in path.parts or "." in path.parts:
+            raise ValueError("output_artifacts source paths cannot contain empty, '.', or '..' path parts")
+        if _source_has_glob(value) and _source_glob_root(value) == "/":
+            raise ValueError("output_artifacts glob sources must include a non-root directory prefix")
+
+        return value
+
+
+OutputArtifactSpec = str | OutputArtifact
+
+
+class AgentTurns(BaseModel):
+    continue_cmd: str | None = None
+    interrupt_grace_seconds: float | None = None
+    container_name: str | None = None
+
+
+class AgentContractRequest(BaseModel):
+    name: str
+    model: str | None = None
+    install_cmd: str = ""
+    run_cmd: str = ""
+    turns: AgentTurns | None = None
+    final_output: str | None = None
+    output_artifacts: list[OutputArtifactSpec] = []
+    egress_allowlist: list[str] = []
+    install_egress: EgressPolicy | None = None
+    allow_provider_tools: bool = False
+    secrets: dict[str, str] = {}
+    kwargs: dict[str, str] = {}
+    inference_settings_attested: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_obsolete_egress(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "egress" in value:
+            raise ValueError("'egress' is no longer supported; use 'install_egress'")
+        return value
+
+    @property
+    def install_egress_policy(self) -> EgressPolicy:
+        return self.install_egress if self.install_egress is not None else "*"
+
+    @field_validator("output_artifacts")
+    @classmethod
+    def validate_output_artifacts(cls, value: list[OutputArtifactSpec]) -> list[OutputArtifactSpec]:
+        if len(value) > MAX_OUTPUT_ARTIFACT_COUNT:
+            raise ValueError(f"output_artifacts cannot contain more than {MAX_OUTPUT_ARTIFACT_COUNT} entries")
+
+        normalized_artifacts: list[OutputArtifactSpec] = []
+        normalized_paths: set[str] = set()
+        for artifact in value:
+            artifact_path = artifact if isinstance(artifact, str) else artifact.path
+            path = PurePosixPath(artifact_path)
+            if path.is_absolute():
+                raise ValueError("output_artifacts paths must be relative paths")
+            if not path.parts or ".." in path.parts or "." in path.parts:
+                raise ValueError("output_artifacts paths cannot contain empty, '.', or '..' path parts")
+            normalized_path = str(path)
+            if normalized_path in normalized_paths:
+                raise ValueError(f"output_artifacts cannot contain duplicate paths: {normalized_path}")
+            normalized_paths.add(normalized_path)
+            if isinstance(artifact, str):
+                normalized_artifacts.append(normalized_path)
+            else:
+                normalized_artifacts.append(artifact.model_copy(update={"path": normalized_path}))
+
+        return normalized_artifacts
+
+
+class RunMonitoring(BaseModel):
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={"description": "Opt-in external monitoring requested by whoever starts the run."},
+    )
+
+
+class RunMonitoringRules(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"description": "Monitor rules the benchmark service declares for its runs."},
+    )
+
+    policy: str | None = None
+    watcher_policy_pack: str | None = None
+    allowed_cidrs: list[str] = []
+    allowed_hosts: list[str] = []
+
+
+class _BenchmarkArguments(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    contract: AgentContractRequest
+    concurrency: int
+    priority: int | None = Field(default=None, exclude=True, strict=True, ge=0, le=4)
+    queue_pool_id: str | None = Field(default=None, exclude=True)
+    selected_project_gateway_secret_ref: str | None = Field(default=None, exclude=True)
+    task_ids: list[str] | None = None
+    slice_str: str | None = None
+    lambda_function: str | None = None
+    dataset: str | None = None
+    dataset_version: DatasetVersion | None = None
+    dataset_ref: DatasetRef | None = Field(default=None, exclude=True)
+    sandbox_provider: str = "daytona"
+    sandbox_provider_secret_name: str | None = None
+    monitoring: RunMonitoring | None = None
+    monitoring_rules: RunMonitoringRules | None = None
+    regraded_from_run_id: UUID | None = Field(default=None, exclude=True)
+    regrade_skipped_task_ids: list[str] | None = Field(default=None, exclude=True)
+
+    def with_hosted_dataset(self) -> Self:
+        ref = self.dataset_ref
+        if not isinstance(ref, HostedDataset) or ref.revision is None:
+            return self
+        version = DatasetVersion(id=f"{ref.benchmark}/{ref.dataset}@{ref.revision}", label=None)
+        return self.model_copy(update={"dataset": ref.dataset, "dataset_version": version})
+
+
+class AWSBenchmarkArguments(_BenchmarkArguments):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Stored arguments for an AWS run, including legacy rows without resources."}
+    )
+
+    environment: Literal["aws"] = "aws"
+    properties: AWSResources | None = None
+
+
+class LocalBenchmarkArguments(_BenchmarkArguments):
+    model_config = ConfigDict(
+        json_schema_extra={"description": "Stored arguments with the filesystem resources selected at admission."}
+    )
+
+    environment: Literal["local"] = "local"
+    properties: LocalResources
+
+
+BenchmarkArguments = Annotated[
+    AWSBenchmarkArguments | LocalBenchmarkArguments,
+    Field(discriminator="environment"),
+]
+benchmark_arguments_adapter: TypeAdapter[BenchmarkArguments] = TypeAdapter(BenchmarkArguments)
+
+
+class ActiveNativeOutput(BaseModel):
+    attempt_started_at: datetime
+    sandbox_id: str
+    runtime_source: SandboxSource
+    output_path: str
+
+    @property
+    def generation(self) -> str:
+        started_at = self.attempt_started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        identity = f"{started_at.astimezone(UTC).isoformat()}\0{self.sandbox_id}"
+        return sha256(identity.encode()).hexdigest()
+
+    def matches_attempt(self, started_at: datetime) -> bool:
+        def utc(value: datetime) -> datetime:
+            return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+        return utc(self.attempt_started_at) == utc(started_at)
+
+
+class FinalEvaluation(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID = Field(default_factory=uuid4)
+    org_id: UUID
+    benchmark: UUID
+    final_score: float | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+    @field_serializer("id", "benchmark")
+    def serialize_uuid(self, value: UUID | str) -> str:
+        return str(value)
+
+
+class OrgContext(BaseModel):
+    id: UUID
+    name: str
+    storage_key: str | None
+
 
 BenchmarkName = Annotated[str, AfterValidator(validate_benchmark_name)]
 ServiceUrl = Annotated[str, AfterValidator(validate_service_url_syntax)]
@@ -196,7 +413,21 @@ class GatewayKeyEligibilityResponse(BaseModel):
     subject: str
 
 
-ResourceName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$", max_length=64)]
+RESOURCE_NAME_PATTERN = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+RESOURCE_NAME_MAX_LENGTH = 64
+
+
+def is_resource_name(value: str) -> bool:
+    return len(value) <= RESOURCE_NAME_MAX_LENGTH and re.fullmatch(RESOURCE_NAME_PATTERN, value) is not None
+
+
+def validate_run_name(value: str) -> str:
+    return value if is_resource_name(value) else validate_benchmark_name(value)
+
+
+ResourceName = Annotated[
+    str, StringConstraints(pattern=f"^{RESOURCE_NAME_PATTERN}$", max_length=RESOURCE_NAME_MAX_LENGTH)
+]
 ResourceDescription = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
 
 
@@ -251,15 +482,107 @@ class DatasetsResponse(BaseModel):
 TaskId = Annotated[str, StringConstraints(pattern=f"^{TASK_ID_PATTERN}$")]
 
 
+Digest = Annotated[str, StringConstraints(pattern=f"^{DIGEST_PATTERN}$")]
+ListedDigest = TypeAliasType("Digest", Digest)
+
+
+class BlobDigestsRequest(BaseModel):
+    digests: list[ListedDigest] = Field(max_length=MAX_VERSION_TASKS)
+
+
+class MissingBlobsResponse(BaseModel):
+    missing: list[ListedDigest]
+
+
+class BlobResponse(BaseModel):
+    digest: Digest
+    size: int
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ManifestAuthor(BaseModel):
+    name: str
+    email: str | None = None
+
+
+class ManifestInfo(BaseModel):
+    name: str
+    version: str | None = None
+    description: str = ""
+    authors: list[ManifestAuthor] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManifestTask(BaseModel):
+    name: str
+    digest: Digest
+
+
+class ManifestFile(BaseModel):
+    path: str
+    digest: str = ""
+
+
+class VersionManifest(ManifestInfo):
+    tasks: dict[TaskId, ManifestTask] = Field(max_length=MAX_VERSION_TASKS)
+    files: list[ManifestFile] = Field(default_factory=list)
+
+    @field_validator("files")
+    @classmethod
+    def no_files(cls, files: list[ManifestFile]) -> list[ManifestFile]:
+        if files:
+            raise ValueError("dataset.toml pins dataset files, which Valkyrie can't score with yet")
+        return files
+
+
+class VersionCreateRequest(BaseModel):
+    tasks: dict[TaskId, Digest] = Field(min_length=1, max_length=MAX_VERSION_TASKS)
+    tags: list[str] = Field(default_factory=list, max_length=MAX_VERSION_TAGS)
+    manifest: VersionManifest | None = None
+    metric_digest: Digest | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def valid_tags(cls, tags: list[str]) -> list[str]:
+        return [validate_tag(tag) for tag in tags]
+
+
+class TagRequest(BaseModel):
+    ref: NonBlankText
+    force: bool = False
+
+
 class DatasetTaskResponse(BaseModel):
     task_id: str
+    digest: Digest
     size: int
-    last_modified: UTCDateTime | None = None
+    source_name: str | None = None
 
 
-class DatasetTasksResponse(BaseModel):
+class DatasetVersionResponse(BaseModel):
+    benchmark: str
+    dataset: str
+    revision: int
+    digest: Digest
+    task_count: int
+    tags: list[str]
+    created_by_email: str | None = None
+    created_at: UTCDateTime
+
+
+class DatasetTasksPage(BaseModel):
     tasks: list[DatasetTaskResponse]
     next_cursor: str | None = None
+
+
+class DatasetVersionDetailResponse(DatasetVersionResponse):
+    metric_digest: Digest | None = None
+    manifest: ManifestInfo | None = None
+
+
+class DatasetVersionsResponse(BaseModel):
+    versions: list[DatasetVersionResponse]
 
 
 class DatasetTaskDownloadResponse(DatasetTaskResponse):
@@ -275,6 +598,7 @@ class RunProjectRequest(BaseModel):
 class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
     model_config = ConfigDict(hide_input_in_errors=True)
 
+    benchmark_name: Annotated[str, AfterValidator(validate_run_name)]
     environment: Literal["aws", "local"] = "aws"
     properties: AWSResources | LocalResources | None = None
     contract: AgentContractRequest
@@ -285,12 +609,25 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset_version: str | None = Field(default=None, min_length=1, max_length=1024)
+    dataset_ref: DatasetRef | None = None
     sandbox_provider: str = "daytona"
     sandbox_provider_secret_name: str | None = None
     service_auth_header_name: str | None = None
     service_auth_secret_name: str | None = None
     project: NonBlankText | None = None
     monitoring: RunMonitoring | None = None
+
+    @model_validator(mode="after")
+    def validate_run_source(self) -> "StartBenchmarkRequest":
+        if self.dataset_ref is None:
+            validate_benchmark_name(self.benchmark_name)
+            return self
+        if not is_resource_name(self.benchmark_name):
+            raise ValueError("Invalid benchmark name")
+        if self.dataset or self.dataset_version or self.service_headers:
+            raise ValueError("A dataset run can't set a benchmark service dataset, version or headers")
+        self.ignore_custom_services = True
+        return self
 
     @model_validator(mode="after")
     def validate_execution_environment(self) -> "StartBenchmarkRequest":
@@ -316,6 +653,7 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
+        from tracker.config import create_benchmark_service_url
         from tracker.clients.benchmark_service import create_benchmark_service_client
 
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
@@ -332,6 +670,7 @@ class RunExecutionRequest(StartBenchmarkRequest):
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
+        from tracker.config import create_benchmark_service_url
         from tracker.clients.benchmark_service import create_benchmark_service_client
 
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
@@ -532,6 +871,12 @@ class RetryOrResumeBenchmarkResponse(StatusResponse):
     pass
 
 
+class RescoreBenchmarkResponse(BaseModel):
+    benchmark_id: UUID
+    final_score: float | None
+    properties: dict[str, Any]
+
+
 class RegradeBenchmarkRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={"description": "The dataset to regrade a finished run's saved task states against."}
@@ -571,6 +916,24 @@ class ShedBenchmarkResponse(BaseModel):
     benchmark_id: UUID
     concurrency: int
     task_ids: list[str]
+
+
+class Order(str, Enum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class BenchmarkFilters(BaseModel):
+    agent_name: list[str] | None = None
+    benchmark_name: list[str] | None = None
+    model: str | None = None
+    dataset: str | None = None
+    label: str | None = None
+    status: list[BenchmarkStatus] | None = None
+    started_by: list[str] | None = None
+    started_after: datetime | None = None
+    started_before: datetime | None = None
+    order_by: Order = Order.DESC
 
 
 class FetchBenchmarksRequest(BenchmarkFilters):

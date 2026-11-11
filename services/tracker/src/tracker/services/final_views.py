@@ -23,7 +23,7 @@ def create_final_view(benchmark_row: Benchmark, session: Session, org: Org) -> F
         status=benchmark_row.status,
         error_message=benchmark_row.error_message,
         benchmark_id=benchmark_row.id,
-        benchmark_arguments=benchmark_row.arguments,
+        benchmark_arguments=benchmark_row.arguments.with_hosted_dataset(),
         started_at=benchmark_row.started_at,
         finished_at=benchmark_row.finished_at,
         tasks_stopped=tasks_stopped or None,

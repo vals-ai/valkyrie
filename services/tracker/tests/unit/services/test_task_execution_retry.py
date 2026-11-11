@@ -27,44 +27,40 @@ from benchmark_service.schemas import (
     SetupTaskResponse,
     VolumeMount,
 )
-from sqlalchemy.engine import Engine
 from sqlmodel import Session, col, desc, select
 
 from tests.unit.services.task_execution_support import (
-    TEST_ORG,
-    bind_task_to_dispatch,
     create_task_environment,
     finalize_agent_generation,
-    install_sqlite_evaluation_lock,
     make_retrieve_task_response,
     run_process_task,
 )
 from tracker.scheduler.admission import SandboxQueueContext
+from tracker.executor.control_queue import QueueControl
 from tracker.runtime.services import RuntimeServices
-from tracker.database.session import database_call
 from tracker.database.models import (
-    AgentContractRequest,
     ErrorResult,
     EvaluationResult,
     ExecutorDispatch,
-    ExecutorDispatchStatus,
     Task,
-    FailureCategory,
-    FailurePhase,
-    TaskStatus,
 )
+from executor_protocol import ExecutorDispatchStatus
+from tracker.types import AgentContractRequest
+from tracker.domain import FailureCategory, FailurePhase, TaskStatus
 from tracker.egress import EgressPolicy
 from tracker.exceptions import (
     AgentRunFailedError,
     ControlledGenerationTerminationUnconfirmedError,
     DependencySetupExhaustedError,
-    GenerationContainmentUnavailableError,
+    ExecutionAuthorityRevoked,
     GenerationTerminationUnconfirmedError,
     SandboxError,
     SandboxSetupError,
 )
 from tracker.sandbox import DependencySetupMode, apply_egress_policy, create_sandbox
-from tracker.services.tasks.monitor import TrackedTask
+from tracker.executor import control_task_api as control_task_api_module
+from tracker.executor.control_protocol import TaskRef
+from tracker.services.tasks.execute import TrackedTask
 import tracker.services.tasks.execute as task_execution_module
 
 
@@ -85,7 +81,8 @@ class TestTaskExecutionRetry:
     async def test_native_output_does_not_change_cancellation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         stop: bool,
@@ -93,12 +90,14 @@ class TestTaskExecutionRetry:
         expected_path: str,
         preview_failure: str | None,
     ) -> None:
+        contract = contract.model_copy(update={"final_output": output_path})
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         if preview_failure is not None:
             monkeypatch.setattr(
-                task_execution_module, preview_failure, Mock(side_effect=RuntimeError("preview database failure"))
+                control, preview_failure, AsyncMock(side_effect=RuntimeError("preview control failure"))
             )
-        contract = contract.model_copy(update={"final_output": output_path})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
         source = ComposeSource(
             outer=ImageSource(image="original-image"), service="agent", compose_command="docker compose -f /run.yml"
         )
@@ -113,7 +112,7 @@ class TestTaskExecutionRetry:
             try:
                 yield sandbox
             finally:
-                database_session.refresh(task_row)
+                control_postgres_session.refresh(task_row)
                 assert (task_row.active_native_output is None) == (preview_failure != "clear_native_output")
                 teardown_seen = True
 
@@ -121,7 +120,7 @@ class TestTaskExecutionRetry:
             return make_retrieve_task_response().model_copy(update={"source": source, "cwd": "/workspace/task"})
 
         async def install(*_args: Any, **_kwargs: Any) -> None:
-            database_session.refresh(task_row)
+            control_postgres_session.refresh(task_row)
             descriptor = task_row.active_native_output
             if preview_failure == "publish_native_output":
                 assert descriptor is None
@@ -132,28 +131,26 @@ class TestTaskExecutionRetry:
                 assert descriptor.output_path == expected_path
             if stop:
                 task_row.status = TaskStatus.STOPPED
-                dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
+                dispatch = control_postgres_session.get(ExecutorDispatch, control.ref.dispatch_id)
                 assert dispatch is not None
                 dispatch.status = ExecutorDispatchStatus.FINISHED
-                database_session.add(dispatch)
-                database_session.add(task_row)
-                database_session.commit()
+                control_postgres_session.add(dispatch)
+                control_postgres_session.add(task_row)
+                control_postgres_session.commit()
             raise asyncio.CancelledError
 
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module, "create_sandbox", create)
         monkeypatch.setattr(task_execution_module, "install_agent_dependencies", install)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve)
 
         with pytest.raises(asyncio.CancelledError):
-            await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
+            await run_process_task(request, task_row, benchmark_id, runtime_services, control)
 
         assert teardown_seen
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == (TaskStatus.STOPPED if stop else TaskStatus.IN_PROGRESS)
-        assert database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
+        assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
 
     @pytest.mark.description("Setup failures retry even when preview bookkeeping fails.")
     @pytest.mark.parametrize("preview_failure", [None, "publish_native_output", "clear_native_output"])
@@ -183,7 +180,8 @@ class TestTaskExecutionRetry:
     async def test_process_task_retries_on_dependency_setup_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         error: SandboxSetupError,
@@ -192,15 +190,16 @@ class TestTaskExecutionRetry:
         expected_status: TaskStatus,
         preview_failure: str | None,
     ) -> None:
+        contract = contract.model_copy(update={"final_output": "/agent/native-output"})
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract,
+            control_postgres_session,
+            bound_controls,
+        )
         if preview_failure is not None:
             monkeypatch.setattr(
-                task_execution_module, preview_failure, Mock(side_effect=RuntimeError("preview database failure"))
+                control, preview_failure, AsyncMock(side_effect=RuntimeError("preview control failure"))
             )
-        contract = contract.model_copy(update={"final_output": "/agent/native-output"})
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
-            contract,
-            database_session,
-        )
 
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
 
@@ -216,7 +215,7 @@ class TestTaskExecutionRetry:
             try:
                 yield mock_sandbox
             finally:
-                database_session.refresh(task_row)
+                control_postgres_session.refresh(task_row)
                 assert (task_row.active_native_output is None) == (preview_failure != "clear_native_output")
 
         generations: list[str] = []
@@ -226,7 +225,7 @@ class TestTaskExecutionRetry:
         async def _install_dependencies(*args: Any, **_kwargs: Any) -> None:
             nonlocal call_count
             dependency_modes.append(args[3])
-            database_session.refresh(task_row)
+            control_postgres_session.refresh(task_row)
             descriptor = task_row.active_native_output
             if preview_failure == "publish_native_output":
                 assert descriptor is None
@@ -254,15 +253,11 @@ class TestTaskExecutionRetry:
             return make_retrieve_task_response(problem_path="/tmp/problem.txt")
 
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-            database_session.refresh(task_row)
+            control_postgres_session.refresh(task_row)
             assert task_row.status is TaskStatus.EVALUATING
             assert (task_row.active_native_output is None) == (preview_failure == "publish_native_output")
             return {"status": "success", "score": 1.0}
 
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
         monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
         monkeypatch.setattr("tracker.services.tasks.execute.install_agent_dependencies", _install_dependencies)
@@ -280,19 +275,25 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr("tracker.observability.metrics.incr", _record_outcome_metric)
 
         tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control),
+            control,
             task_row.started_at,
         )
-        result = await tracked.run(None, task_row)
+        result = await tracked.run(
+            None,
+            (
+                await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+            ).task,
+        )
         failed_events = [
             call.kwargs["extra"]["event"]
             for call in error_log.call_args_list
             if "event" in call.kwargs.get("extra", {})
         ]
-        terminal_task_failure = expected_status is TaskStatus.ERROR and not isinstance(second_error, SandboxSetupError)
-        assert failed_events == (["task.failed"] if terminal_task_failure else [])
+        if isinstance(second_error, SandboxSetupError):
+            assert failed_events == ["task.unhandled_error"]
+        else:
+            assert failed_events == (["task.failed"] if expected_status is TaskStatus.ERROR else [])
 
         expected_result = None if expected_status is TaskStatus.ERROR else {"status": "success", "score": 1.0}
         assert result == {"task_0": expected_result}
@@ -310,10 +311,10 @@ class TestTaskExecutionRetry:
         assert dependency_modes == expected_dependency_modes
         assert len(set(generations)) == (0 if preview_failure == "publish_native_output" else 2)
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == expected_status
 
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
+        error_results = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
         retry_results = [result for result in error_results if result.retry_scheduled]
         terminal_results = [result for result in error_results if not result.retry_scheduled]
 
@@ -351,27 +352,29 @@ class TestTaskExecutionRetry:
     async def test_native_output_publication_preserves_authority_revocation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract = contract.model_copy(update={"final_output": "/agent/native-output"})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         @asynccontextmanager
         async def create(*_args: Any, **_kwargs: Any) -> AsyncGenerator[AsyncMock, None]:
             sandbox = AsyncMock()
             sandbox.id = sandbox.name = "revoked-sandbox"
-            dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
+            dispatch = control_postgres_session.get(ExecutorDispatch, control.ref.dispatch_id)
             assert dispatch is not None
             dispatch.status = ExecutorDispatchStatus.FINISHED
-            database_session.add(dispatch)
-            database_session.commit()
+            control_postgres_session.add(dispatch)
+            control_postgres_session.commit()
             yield sandbox
 
         install = AsyncMock(side_effect=AssertionError("Revoked attempts must not execute"))
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
+
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module, "create_sandbox", create)
         monkeypatch.setattr(task_execution_module, "install_agent_dependencies", install)
@@ -379,11 +382,13 @@ class TestTaskExecutionRetry:
             BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=make_retrieve_task_response())
         )
 
-        result = await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
-
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
         assert result == {task_row.task_id: None}
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.BUILDING
+        assert task_row.finished_at is None
         install.assert_not_awaited()
-        assert database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
+        assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
 
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize(
@@ -399,7 +404,8 @@ class TestTaskExecutionRetry:
     async def test_docker_generation_requires_an_unrestricted_plan_before_creation(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         stage: str | None,
@@ -412,7 +418,9 @@ class TestTaskExecutionRetry:
             contract = contract.model_copy(update={"egress_allowlist": policy})
         elif stage is not None:
             task_data = task_data.model_copy(update={"egress": task_data.egress.model_copy(update={stage: policy})})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         sandbox = DockerSandbox(
             cast(Any, Mock()),
             cast(
@@ -436,7 +444,7 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(task_execution_module, "apply_egress_policy", apply_egress_policy)
         monkeypatch.setattr("tracker.runtime.run_egress.apply_egress_policy", apply_egress_policy)
 
-        result = await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
 
         if stage is None:
             assert result == {"task_0": {"status": "success", "score": 1.0}}
@@ -444,7 +452,7 @@ class TestTaskExecutionRetry:
         else:
             assert result == {"task_0": None}
             assert not provider.create_sandbox.called
-            error = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
+            error = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
             assert "requires unrestricted egress for every stage" in error.error_message
 
     @pytest.mark.description(
@@ -462,7 +470,8 @@ class TestTaskExecutionRetry:
     async def test_transient_sandbox_error_recreates_sandbox_only_before_the_agent_runs(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         failing_policy: list[str],
@@ -470,9 +479,10 @@ class TestTaskExecutionRetry:
         expected_sandboxes: int,
         expected_phase: FailurePhase,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         task_data = make_retrieve_task_response().model_copy(
             update={
@@ -524,10 +534,6 @@ class TestTaskExecutionRetry:
         async def evaluate(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             return {"status": "success", "score": 1.0}
 
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
         monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", create_sandbox)
         monkeypatch.setattr("tracker.services.tasks.execute.upload_agent_artifacts", noop)
@@ -540,12 +546,12 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", setup)
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", evaluate)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == expected_status
         assert sandbox_count == expected_sandboxes
-        error = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
         assert error.phase == expected_phase
         assert error.transient is True
         assert error.category == FailureCategory.INFRASTRUCTURE
@@ -571,7 +577,8 @@ class TestTaskExecutionRetry:
     async def test_process_task_applies_stage_policies_in_lifecycle_order(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         compose_runtime: bool,
@@ -584,9 +591,10 @@ class TestTaskExecutionRetry:
                 "egress_allowlist": ["https://agent-runtime.example.com"],
             }
         )
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         source = (
             ComposeSource(
@@ -657,10 +665,6 @@ class TestTaskExecutionRetry:
             events.append("evaluate")
             return {"status": "success", "score": 1.0}
 
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
         monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", create_sandbox)
         monkeypatch.setattr("tracker.services.tasks.execute.upload_agent_artifacts", upload)
@@ -673,7 +677,7 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", setup)
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", evaluate)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         expected_agent_target = "agent" if compose_runtime else "raw"
@@ -737,20 +741,18 @@ class TestTaskExecutionRetry:
         service_error: str,
         cause_code: str | None,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         keep_replaced_attempts: AsyncMock,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         sandbox_entry_count = 0
@@ -793,7 +795,7 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert sandbox_entry_count == 2
@@ -801,10 +803,10 @@ class TestTaskExecutionRetry:
         assert len({call.args[3] for call in keep_replaced_attempts.call_args_list}) == 1
         assert keep_replaced_attempts.call_count == 2
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
 
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
+        error_results = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
         retry_results = [result for result in error_results if result.retry_scheduled]
         assert len(retry_results) == 1
         assert retry_results[0].error_message == (
@@ -841,19 +843,17 @@ class TestTaskExecutionRetry:
         service_error: str,
         cause_code: str | None,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         sandbox_entry_count = 0
@@ -878,18 +878,22 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
         tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control),
+            control,
             task_row.started_at,
         )
-        result = await tracked.run(None, task_row)
+        result = await tracked.run(
+            None,
+            (
+                await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+            ).task,
+        )
 
         assert result == {"task_0": None}
         assert sandbox_entry_count == 2
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
+        error_results = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
         assert sorted((row.retry_scheduled, row.cause_code) for row in error_results) == [
             (False, cause_code),
             (True, cause_code),
@@ -926,19 +930,17 @@ class TestTaskExecutionRetry:
         expected_sandboxes: int,
         expected_rows: list[tuple[bool, str | None]],
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         sandbox_entry_count = 0
@@ -992,115 +994,22 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
         tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control),
+            control,
             task_row.started_at,
         )
-        await tracked.run(None, task_row)
+        await tracked.run(
+            None,
+            (
+                await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+            ).task,
+        )
 
-        database_session.refresh(task_row)
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
+        control_postgres_session.refresh(task_row)
+        error_results = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
         assert task_row.status == expected_status
         assert probed_hosts == ["gateway.example.com"] * len(gateway_resolves)
         assert sandbox_entry_count == expected_sandboxes
-        assert sorted((row.retry_scheduled, row.cause_code) for row in error_results) == expected_rows
-
-    @pytest.mark.description(
-        (
-            "A sandbox that fails the containment probe before the agent command gets one fresh sandbox.\n"
-            "\n"
-            "Test cases:\n"
-            "- The probe fails once: one rerun, the task finishes, and the retry row reads generation_containment_unavailable.\n"
-            "- The probe fails on both sandboxes: one rerun only, and both rows read generation_containment_unavailable."
-        )
-    )
-    @pytest.mark.parametrize(
-        ("probe_failures", "expected_status", "expected_rows"),
-        [
-            pytest.param(1, TaskStatus.FINISHED, [(True, "generation_containment_unavailable")], id="probe-fails-once"),
-            pytest.param(
-                2,
-                TaskStatus.ERROR,
-                [(False, "generation_containment_unavailable"), (True, "generation_containment_unavailable")],
-                id="probe-fails-on-both-sandboxes",
-            ),
-        ],
-    )
-    async def test_failed_containment_probe_reruns_on_a_fresh_sandbox(
-        self,
-        probe_failures: int,
-        expected_status: TaskStatus,
-        expected_rows: list[tuple[bool, str]],
-        contract: AgentContractRequest,
-        database_session: Session,
-        monkeypatch: pytest.MonkeyPatch,
-        runtime_services: RuntimeServices,
-    ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
-            contract,
-            database_session,
-        )
-        monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
-
-        sandbox_entry_count = 0
-
-        @asynccontextmanager
-        async def _mock_create_sandbox(*_args: Any, **_kwargs: Any) -> AsyncGenerator[AsyncMock, None]:
-            nonlocal sandbox_entry_count
-            sandbox_entry_count += 1
-            mock_sandbox = AsyncMock()
-            mock_sandbox.id = f"mock-sandbox-{sandbox_entry_count}"
-            mock_sandbox.name = mock_sandbox.id
-            yield mock_sandbox
-
-        agent_calls = 0
-
-        async def _run_agent(*_args: Any, **kwargs: Any) -> tuple[None, float]:
-            nonlocal agent_calls
-            agent_calls += 1
-            if agent_calls <= probe_failures:
-                raise GenerationContainmentUnavailableError(
-                    "Daytona sandbox does not support linux_cgroup_v2 v1: name=T-119_38847c"
-                )
-            await finalize_agent_generation(
-                deadline_controller=kwargs["deadline_controller"],
-                on_external_service_finalized=kwargs["on_external_service_finalized"],
-            )
-            return None, 0.0
-
-        async def _mock_setup_task(*_args: Any, **_kwargs: Any) -> SetupTaskResponse:
-            return SetupTaskResponse(status="ok")
-
-        async def _mock_retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
-            return make_retrieve_task_response(problem_path="/tmp/problem.txt")
-
-        async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-            return {"status": "success", "score": 1.0}
-
-        monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
-        monkeypatch.setattr("tracker.services.tasks.execute.run_agent", _run_agent)
-        monkeypatch.setattr(BenchmarkServiceClient, "setup_task", _mock_setup_task)
-        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
-        monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
-
-        tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
-            task_row.started_at,
-        )
-        await tracked.run(None, task_row)
-
-        database_session.refresh(task_row)
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
-        assert task_row.status == expected_status
-        assert sandbox_entry_count == 2
         assert sorted((row.retry_scheduled, row.cause_code) for row in error_results) == expected_rows
 
     @pytest.mark.description(
@@ -1109,19 +1018,17 @@ class TestTaskExecutionRetry:
     async def test_dns_check_probes_the_external_gateway_when_the_agent_was_given_it(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
         monkeypatch.setattr(
             task_execution_module, "EXTERNAL_SERVICE_GATEWAY_URL", "https://external-gateway.example.com"
@@ -1174,12 +1081,16 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
         tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control),
+            control,
             task_row.started_at,
         )
-        await tracked.run(None, task_row)
+        await tracked.run(
+            None,
+            (
+                await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+            ).task,
+        )
 
         assert probed_hosts == ["external-gateway.example.com"]
 
@@ -1215,7 +1126,8 @@ class TestTaskExecutionRetry:
     async def test_process_task_terminates_on_service_errors_it_does_not_retry(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         failing_call: str,
@@ -1223,15 +1135,12 @@ class TestTaskExecutionRetry:
         status_code: int | None,
         expected_phase: FailurePhase,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         sandbox_entry_count = 0
@@ -1268,14 +1177,14 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, failing_call, _fail)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
         assert sandbox_entry_count == 1
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
         assert not error.retry_scheduled
         assert error.phase == expected_phase
 
@@ -1292,20 +1201,18 @@ class TestTaskExecutionRetry:
     async def test_terminal_error_counts_failed_only_after_the_error_write(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         write: str,
         expected_outcomes: list[str],
+        bound_controls: Any,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         @asynccontextmanager
@@ -1324,11 +1231,11 @@ class TestTaskExecutionRetry:
         write_started = threading.Event()
         release_write = threading.Event()
 
-        def _commit_task_error(*_args: Any, **_kwargs: Any) -> bool:
+        async def _commit_task_error(*_args: Any, **_kwargs: Any) -> bool:
             if write == "refused":
                 return False
             write_started.set()
-            release_write.wait(5)
+            await asyncio.to_thread(release_write.wait, 5)
             return True
 
         outcome_tags: list[dict[str, Any]] = []
@@ -1340,17 +1247,18 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", _reject_setup)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
-        monkeypatch.setattr(task_execution_module, "commit_task_error", _commit_task_error)
-        monkeypatch.setattr(task_execution_module, "database_call", database_call)
+        monkeypatch.setattr(control, "fail", _commit_task_error)
         monkeypatch.setattr("tracker.observability.metrics.incr", _record_outcome_metric)
 
         tracked = TrackedTask(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority),
-            TEST_ORG,
-            authority,
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control),
+            control,
             task_row.started_at,
         )
-        running = asyncio.create_task(tracked.run(None, task_row))
+        state = (
+            await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+        ).task
+        running = asyncio.create_task(tracked.run(None, state))
         if write == "cancelled":
             assert await asyncio.to_thread(write_started.wait, 5)
             assert tracked.task is not None
@@ -1377,20 +1285,18 @@ class TestTaskExecutionRetry:
     async def test_process_task_releases_queued_task_when_pending_transition_refused(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         failure_site: str,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         mock_sandbox = AsyncMock()
@@ -1413,20 +1319,17 @@ class TestTaskExecutionRetry:
 
         transition_statuses: list[TaskStatus] = []
 
-        def _refuse_pending_transition(*args: Any, **_kwargs: Any) -> bool:
-            transition_statuses.append(args[3])
+        async def _refuse_pending_transition(*args: Any, **_kwargs: Any) -> bool:
+            transition_statuses.append(args[2])
             return False
 
-        task_engine = database_session.get_bind()
-        assert isinstance(task_engine, Engine)
         queue_context = SandboxQueueContext(
             provider=Mock(),
             pool_id="pool_test",
-            engine=task_engine,
+            control=QueueControl(control.client, control.ref),
         )
         monkeypatch.setattr(task_execution_module, "enter_queued_sandbox", _mock_enter_queued_sandbox)
         monkeypatch.setattr(task_execution_module, "commit_task_status_transition", _refuse_pending_transition)
-        monkeypatch.setattr("tracker.services.tasks.status.commit_task_status_transition", _refuse_pending_transition)
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", _mock_setup_task)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
@@ -1435,14 +1338,103 @@ class TestTaskExecutionRetry:
             task_row,
             benchmark_id,
             runtime_services,
-            authority,
+            control,
             queue_context=queue_context,
         )
 
         assert result == {"task_0": None}
         assert transition_statuses == [TaskStatus.PENDING]
-        error_results = database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
+        error_results = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all()
         assert [result for result in error_results if result.retry_scheduled] == []
+
+    @pytest.mark.description(
+        "A retry waits for its Control failure row before the delay, and cancelling during that delay keeps the row."
+    )
+    async def test_retry_failure_persists_before_delay_and_survives_delay_cancellation(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 60)
+        monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
+
+        sandbox_entry_count = 0
+        write_started = asyncio.Event()
+        write_allowed = asyncio.Event()
+        retry_callback_completed = asyncio.Event()
+        original_fail = control.fail
+        original_recovery = BenchmarkServiceClient.run_with_sandbox_recovery
+
+        @asynccontextmanager
+        async def _fail_sandbox_setup(*_args: Any, **_kwargs: Any) -> AsyncGenerator[AsyncMock, None]:
+            nonlocal sandbox_entry_count
+            sandbox_entry_count += 1
+            raise SandboxSetupError("sandbox setup failed")
+            yield AsyncMock()
+
+        async def _mock_retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
+            return make_retrieve_task_response(problem_path="/tmp/problem.txt")
+
+        async def _gated_fail(failure_request: Any) -> bool:
+            write_started.set()
+            await write_allowed.wait()
+            return await original_fail(failure_request)
+
+        async def _observed_recovery(self: BenchmarkServiceClient, **kwargs: Any) -> Any:
+            callback = kwargs["on_retry"]
+
+            async def _observed_retry(attempt: Any, exc: Exception) -> None:
+                await callback(attempt, exc)
+                retry_callback_completed.set()
+
+            kwargs["on_retry"] = _observed_retry
+            return await original_recovery(self, **kwargs)
+
+        monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _fail_sandbox_setup)
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
+        monkeypatch.setattr(BenchmarkServiceClient, "run_with_sandbox_recovery", _observed_recovery)
+        monkeypatch.setattr(control, "fail", _gated_fail)
+
+        running = asyncio.create_task(run_process_task(request, task_row, benchmark_id, runtime_services, control))
+        try:
+            await asyncio.wait_for(write_started.wait(), timeout=5)
+            assert not retry_callback_completed.is_set()
+            assert sandbox_entry_count == 1
+            control_postgres_session.expire_all()
+            assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).all() == []
+
+            write_allowed.set()
+            await asyncio.wait_for(retry_callback_completed.wait(), timeout=5)
+            await asyncio.sleep(0)
+            assert sandbox_entry_count == 1
+            assert not running.done()
+
+            control_postgres_session.expire_all()
+            retry_row = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
+            assert retry_row.retry_scheduled
+            assert retry_row.failed_attempt_number == 1
+
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+            assert sandbox_entry_count == 1
+            control_postgres_session.expire_all()
+            persisted_row = control_postgres_session.exec(
+                select(ErrorResult).where(ErrorResult.task == task_row.id)
+            ).one()
+            assert persisted_row.id == retry_row.id
+            assert persisted_row.retry_scheduled
+        finally:
+            write_allowed.set()
+            if not running.done():
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
 
     @pytest.mark.description(
         "After the dispatch is revoked, the automatic retry never opens a second sandbox or fetches the task again."
@@ -1450,17 +1442,17 @@ class TestTaskExecutionRetry:
     async def test_revoked_dispatch_does_not_begin_the_second_automatic_attempt(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
 
         sandbox_entry_count = 0
@@ -1474,8 +1466,8 @@ class TestTaskExecutionRetry:
             yield AsyncMock()
 
         def _revoke_authority(*_args: object) -> None:
-            with Session(bind=database_session.bind) as session:
-                dispatch = session.get(ExecutorDispatch, authority.dispatch_id)
+            with Session(bind=control_postgres_session.bind) as session:
+                dispatch = session.get(ExecutorDispatch, control.ref.dispatch_id)
                 assert dispatch is not None
                 dispatch.status = ExecutorDispatchStatus.FAILED
                 session.add(dispatch)
@@ -1490,12 +1482,13 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(task_execution_module, "_observe_task_retry", _revoke_authority)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
-
-        assert result == {"task_0": None}
+        with pytest.raises(ExecutionAuthorityRevoked):
+            await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
         assert sandbox_entry_count == 1
         assert retrieve_task_call_count == 1
-        assert database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).all() == []
+        assert (
+            control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).all() == []
+        )
 
     @pytest.mark.description("Sandbox recovery is limited before the agent starts and final after.")
     @pytest.mark.parametrize(
@@ -1514,7 +1507,8 @@ class TestTaskExecutionRetry:
     async def test_sandbox_recovery_is_bounded_before_agent_start_and_terminal_after(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         max_attempts: int | None,
@@ -1524,13 +1518,14 @@ class TestTaskExecutionRetry:
         failure_stage: str,
         agent_timeout: float | None,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
-        monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
+        monkeypatch.setattr("benchmark_service.sandbox_recovery.time.time", lambda: 1_234.5)
+        monkeypatch.setattr("benchmark_service.sandbox_recovery.uuid4", lambda: UUID(int=1))
 
         sandbox_envs: list[dict[str, str]] = []
 
@@ -1576,10 +1571,6 @@ class TestTaskExecutionRetry:
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             return {"status": "success", "score": 1.0}
 
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module, "create_sandbox", _mock_create_sandbox)
         monkeypatch.setattr(task_execution_module, "install_agent_dependencies", _mock_install_dependencies)
@@ -1587,7 +1578,7 @@ class TestTaskExecutionRetry:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         expected_result = None if expected_status is TaskStatus.ERROR else {"status": "success", "score": 1.0}
         assert result == {"task_0": expected_result}
@@ -1601,10 +1592,10 @@ class TestTaskExecutionRetry:
             assert env["VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"] == "1234.5"
             assert env["VALKYRIE_SANDBOX_OUTAGE_ID"] == (f"{benchmark_id}:task_0:1:00000000000000000000000000000001")
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == expected_status
         if failure_stage in ("agent", "agent_setup"):
-            error = database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
+            error = control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
             assert error.retry_scheduled is False
             assert error.operation == "sandbox_recovery"
             if failure_stage == "agent_setup":
@@ -1618,40 +1609,39 @@ class TestTaskExecutionRetry:
     async def test_expired_credited_wall_deadline_stops_before_task_retrieval(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         status: TaskStatus,
     ) -> None:
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         if status == TaskStatus.EVALUATING:
-            bind_task_to_dispatch(database_session, task_row, authority)
             task_row.status = status
             task_row.eval_resume_state = {"artifact_prefix": "s3://bucket/run"}
         task_row.credited_wall_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
-        database_session.add(task_row)
-        database_session.commit()
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
         retrieve_task = AsyncMock()
         resume_evaluation = AsyncMock()
         create_sandbox = Mock()
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
+
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume_evaluation, raising=False)
         monkeypatch.setattr(task_execution_module, "create_sandbox", create_sandbox)
 
-        result = await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
         retrieve_task.assert_not_awaited()
         create_sandbox.assert_not_called()
         resume_evaluation.assert_not_awaited()
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error = database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
         assert error.cause_code == "credited_task_wall_time_exceeded"
         assert error.retry_scheduled is False
 
@@ -1661,18 +1651,19 @@ class TestTaskExecutionRetry:
     async def test_evaluating_resume_cannot_outlive_durable_credited_wall_deadline(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
-        bind_task_to_dispatch(database_session, task_row, authority)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_row.status = TaskStatus.EVALUATING
         task_row.eval_resume_state = {"artifact_prefix": "s3://bucket/run"}
         task_row.credited_wall_deadline_at = datetime.now(UTC) + timedelta(seconds=0.5)
-        database_session.add(task_row)
-        database_session.commit()
-        install_sqlite_evaluation_lock(database_session, monkeypatch)
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
         started = asyncio.Event()
 
         async def stalled_resume(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -1680,22 +1671,18 @@ class TestTaskExecutionRetry:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", stalled_resume, raising=False)
 
         result = await asyncio.wait_for(
-            run_process_task(request, task_row, benchmark_id, runtime_services, authority), timeout=3
+            run_process_task(request, task_row, benchmark_id, runtime_services, control), timeout=3
         )
 
         assert started.is_set()
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error = database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
         assert error.cause_code == "credited_task_wall_time_exceeded"
         assert error.retry_scheduled is False
 
@@ -1703,12 +1690,15 @@ class TestTaskExecutionRetry:
     async def test_interrupted_evaluation_stream_recovery_shares_the_task_wall_deadline(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract = contract.model_copy(update={"model": None, "inference_settings_attested": False})
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         response = make_retrieve_task_response().model_copy(
             update={
                 "agent_timeout": 10.0,
@@ -1716,15 +1706,34 @@ class TestTaskExecutionRetry:
             }
         )
         saved_state = {"artifact_prefix": "s3://bucket/run"}
-        resume_started = asyncio.Event()
+        wall_timeouts: list[tuple[asyncio.Timeout, float]] = []
+        evaluation_wall: list[tuple[asyncio.Timeout, float]] = []
+        resume_wall: list[asyncio.Timeout] = []
+        real_timeout_at = asyncio.timeout_at
+
+        def record_timeout_at(when: float | None) -> asyncio.Timeout:
+            assert when is not None
+            timeout = real_timeout_at(when)
+            wall_timeouts.append((timeout, when))
+            return timeout
+
+        monkeypatch.setattr(asyncio, "timeout_at", record_timeout_at)
 
         async def disconnected_stream(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            evaluation_wall.append(wall_timeouts[-1])
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def stalled_resume(*_args: Any, eval_resume_state: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
             assert eval_resume_state == saved_state
-            resume_started.set()
+            assert len(evaluation_wall) == 1
+            original_wall, original_when = evaluation_wall[0]
+            assert not original_wall.expired()
+            resumed_wall, resumed_when = wall_timeouts[-1]
+            assert resumed_wall is not original_wall
+            assert abs(resumed_when - original_when) <= 0.05
+            resume_wall.append(resumed_wall)
+            resumed_wall.reschedule(asyncio.get_running_loop().time())
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
@@ -1742,18 +1751,20 @@ class TestTaskExecutionRetry:
 
         monkeypatch.setattr(task_execution_module, "run_agent", _mock_run_agent)
         monkeypatch.setattr(task_execution_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
-        monkeypatch.setattr(task_execution_module, "TASK_WALL_SECONDS", 0.5)
+        monkeypatch.setattr(control_task_api_module, "_TASK_WALL_SECONDS", 15)
 
         result = await asyncio.wait_for(
-            run_process_task(request, task_row, benchmark_id, runtime_services, authority), timeout=3
+            run_process_task(request, task_row, benchmark_id, runtime_services, control), timeout=3
         )
 
-        assert resume_started.is_set()
+        assert len(resume_wall) == 1
+        assert not evaluation_wall[0][0].expired()
+        assert resume_wall[0].expired()
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
         assert task_row.credited_wall_deadline_at is not None
-        error = database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
         assert error.cause_code == "credited_task_wall_time_exceeded"
         assert error.retry_scheduled is False
 
@@ -1777,14 +1788,17 @@ class TestTaskExecutionRetry:
     async def test_unconfirmed_controlled_termination_is_terminal_without_retry(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         failure: ControlledGenerationTerminationUnconfirmedError,
         expected_operation: str,
         expected_cause_code: str | None,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         sandbox_entries = 0
         observed_task_opt_in: list[float | None] = []
 
@@ -1812,25 +1826,22 @@ class TestTaskExecutionRetry:
             return response
 
         evaluate_instance = AsyncMock(return_value={"status": "success", "score": 1.0})
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
+
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module, "create_sandbox", _mock_create_sandbox)
         monkeypatch.setattr(task_execution_module, "run_agent", _mock_run_agent)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
         assert sandbox_entries == 1
         assert observed_task_opt_in == [10.0]
         evaluate_instance.assert_not_awaited()
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error = database_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
+        error = control_postgres_session.exec(select(ErrorResult).where(col(ErrorResult.task) == task_row.id)).one()
         assert error.producer == (
             "tracker" if isinstance(failure, GenerationTerminationUnconfirmedError) else "sandbox_provider"
         )
@@ -1844,30 +1855,31 @@ class TestTaskExecutionRetry:
         self,
         resume_origin: str,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run"}
         if resume_origin == "direct":
             task_row.status = TaskStatus.EVALUATING
             task_row.eval_resume_state = saved_state
-            database_session.add(task_row)
-            database_session.commit()
-            bind_task_to_dispatch(database_session, task_row, authority)
-            install_sqlite_evaluation_lock(database_session, monkeypatch)
+            control_postgres_session.add(task_row)
+            control_postgres_session.commit()
         else:
 
             async def _stream_closed(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-                on_eval_resume_state(saved_state)
+                await on_eval_resume_state(saved_state)
                 raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
             monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _stream_closed)
 
         async def _resume(*_args: Any, eval_resume_state: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
             assert eval_resume_state == saved_state
-            with Session(bind=database_session.bind) as session:
+            with Session(bind=control_postgres_session.bind) as session:
                 stopped_task = session.get(Task, task_row.id)
                 assert stopped_task is not None
                 stopped_task.status = TaskStatus.STOPPED
@@ -1875,41 +1887,40 @@ class TestTaskExecutionRetry:
                 session.commit()
             return {"score": 1.0}
 
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _resume, raising=False)
 
-        result = await run_process_task(request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.STOPPED
-        assert database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).all() == []
+        assert (
+            control_postgres_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).all()
+            == []
+        )
 
     @pytest.mark.description("An eval resume that loses its sandbox resumes again and the task ends `FINISHED`.")
     async def test_eval_resume_loads_recovery_policy_before_handling_sandbox_loss(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         task_row.status = TaskStatus.EVALUATING
         task_row.eval_resume_state = {"artifact_prefix": "s3://bucket/run"}
-        database_session.add(task_row)
-        database_session.commit()
-        bind_task_to_dispatch(database_session, task_row, authority)
-        install_sqlite_evaluation_lock(database_session, monkeypatch)
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
 
         monkeypatch.setattr(task_execution_module, "_SANDBOX_RETRY_DELAY_SECONDS", 0)
-        monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
+        monkeypatch.setattr("benchmark_service.sandbox_recovery.time.time", lambda: 1_234.5)
 
         retrieve_count = 0
 
@@ -1929,20 +1940,16 @@ class TestTaskExecutionRetry:
                 raise SandboxNotFoundError("grading sandbox was preempted")
             return {"status": "success", "score": 1.0}
 
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert retrieve_count == 1
         assert resume_count == 2
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
 
     @pytest.mark.description(
@@ -1951,13 +1958,15 @@ class TestTaskExecutionRetry:
     async def test_attempt_keeps_replaced_artifacts_first_and_survives_failed_copy(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         events: list[str] = []
         copy_failure = OSError("copy failed")
@@ -1973,17 +1982,13 @@ class TestTaskExecutionRetry:
             raise BenchmarkServiceError("policy lookup failed")
 
         capture_exception = Mock()
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module, "keep_replaced_attempts", _failed_copy)
         monkeypatch.setattr(task_execution_module, "capture_exception", capture_exception)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _failed_policy_lookup)
 
         with pytest.raises(SandboxSetupError, match="policy lookup failed"):
-            await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+            await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert events[:2] == ["keep", "retrieve"]
         assert capture_exception.call_args_list[0].args == (copy_failure,)
@@ -1992,20 +1997,20 @@ class TestTaskExecutionRetry:
     async def test_eval_resume_policy_lookup_failure_preserves_sandbox_loss(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
         task_row.status = TaskStatus.EVALUATING
         task_row.eval_resume_state = {"artifact_prefix": "s3://bucket/run"}
-        database_session.add(task_row)
-        database_session.commit()
-        bind_task_to_dispatch(database_session, task_row, authority)
-        install_sqlite_evaluation_lock(database_session, monkeypatch)
+        control_postgres_session.add(task_row)
+        control_postgres_session.commit()
 
         async def _failed_policy_lookup(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             raise BenchmarkServiceError("policy lookup failed")
@@ -2014,21 +2019,18 @@ class TestTaskExecutionRetry:
             raise SandboxNotFoundError("grading sandbox was preempted")
 
         capture_exception = Mock()
-        monkeypatch.setattr(task_execution_module, "engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
+
         monkeypatch.setattr(task_execution_module.TaskLogBuffer, "buffer_logs", Mock())
         monkeypatch.setattr(task_execution_module.sentry_sdk, "capture_exception", capture_exception)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _failed_policy_lookup)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _lost_grading_sandbox, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message, phase = database_session.exec(
+        error_message, phase = control_postgres_session.exec(
             select(ErrorResult.error_message, ErrorResult.phase)
             .where(ErrorResult.task == task_row.id)
             .order_by(desc(ErrorResult.created_at))
@@ -2042,15 +2044,17 @@ class TestTaskExecutionRetry:
     async def test_process_task_spans_timed_status_transitions(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         caplog: pytest.LogCaptureFixture,
         request: pytest.FixtureRequest,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
-            database_session,
+            control_postgres_session,
+            bound_controls,
         )
 
         create_sandbox_kwargs: dict[str, Any] = {}
@@ -2113,10 +2117,6 @@ class TestTaskExecutionRetry:
             finally:
                 record["exited"] = True
 
-        monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
         monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.buffer_logs", Mock())
         monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
         monkeypatch.setattr("tracker.services.tasks.execute.upload_agent_artifacts", _mock_upload_agent_artifacts)
@@ -2130,7 +2130,7 @@ class TestTaskExecutionRetry:
         request.addfinalizer(lambda: tasks_logger.removeHandler(caplog.handler))
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         transition_records = [record for record in span_records if record["message"] == "task.status_transition"]
         lifecycle_records = [

@@ -1,7 +1,6 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -9,24 +8,23 @@ from sqlmodel import Session
 
 from executor_protocol import (
     DATASET_VERSION_PROTOCOL_VERSION,
+    DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS,
+    ExecutorDispatchStatus,
     MANAGED_EXECUTION_PROTOCOL_VERSION,
     RESERVED_QUEUE_PROTOCOL_VERSION,
     SHARED_POOL_QUEUE_PROTOCOL_VERSION,
 )
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     ErrorResult,
     ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
     ExecutorRelease,
-    FailureCategory,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, FailureCategory, TaskStatus
 from tracker.exceptions import TrackerServiceError
-from tracker.executor.dispatch_payload import SealedPayload, open_payload
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.executor.release_control import (
     ReleaseControlError,
     create_executor_dispatch,
@@ -35,12 +33,13 @@ from tracker.executor.release_control import (
     resolve_current_execution_release,
     select_active_release,
 )
-from tracker.repositories.benchmark import BenchmarkRepository
-from tracker.repositories.executor_dispatch import _ACTIVE_DISPATCH_STATUSES, ExecutorDispatchRepository
-from tracker.scheduler.store import is_reserved_queue_pool_id, reserved_queue_pool_id
+from tracker.executor.control_queue import is_reserved_queue_pool_id, reserved_queue_pool_id
 
-DISPATCH_CLAIM_WINDOW = timedelta(seconds=120)
-LOCAL_DISPATCH_LEASE = timedelta(minutes=5)
+DISPATCH_CLAIM_WINDOW = timedelta(seconds=DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS)
+_ACTIVE_DISPATCH_STATUSES = (
+    ExecutorDispatchStatus.QUEUED,
+    ExecutorDispatchStatus.RUNNING,
+)
 
 
 class EnqueueFailureResolution(str, Enum):
@@ -157,58 +156,8 @@ def terminalize_active_dispatches(
     )
 
 
-@dataclass(frozen=True)
-class ClaimedDispatch:
-    dispatch_id: UUID
-    benchmark_id: UUID
-    release_id: str
-    assigned_task_ids: list[str]
-    payload: dict[str, Any]
-
-
-def claim_dispatch(session: Session, dispatch_id: UUID, *, task_arn: str | None) -> ClaimedDispatch | None:
-    repository = ExecutorDispatchRepository(session)
-    now = repository.now()
-    dispatch = repository.lock_claimable(dispatch_id, now - DISPATCH_CLAIM_WINDOW)
-    if dispatch is None:
-        return None
-    sealed = repository.take_payload(dispatch_id)
-    payload = open_payload(dispatch_id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
-    dispatch.status = ExecutorDispatchStatus.RUNNING
-    dispatch.started_at = datetime.now(ZoneInfo("UTC"))
-    if task_arn is not None:
-        dispatch.ecs_task_arn = task_arn
-    else:
-        dispatch.lease_expires_at = now + LOCAL_DISPATCH_LEASE
-    return ClaimedDispatch(
-        dispatch.id, dispatch.benchmark_id, dispatch.executor_release_id, dispatch.assigned_task_ids or [], payload
-    )
-
-
-def renew_local_dispatch(session: Session, dispatch_id: UUID) -> bool:
-    repository = ExecutorDispatchRepository(session)
-    now = repository.now()
-    return repository.renew_lease(dispatch_id, now, now + LOCAL_DISPATCH_LEASE)
-
-
-def finish_dispatch(session: Session, claimed: ClaimedDispatch) -> None:
-    benchmark = BenchmarkRepository(session).lock_by_id(claimed.benchmark_id)
-    repository = ExecutorDispatchRepository(session)
-    dispatch = repository.lock(claimed.dispatch_id, status=ExecutorDispatchStatus.RUNNING)
-    if dispatch is None:
-        return
-    now = datetime.now(ZoneInfo("UTC"))
-    dispatch.status = ExecutorDispatchStatus.FINISHED
-    dispatch.finished_at = now
-    session.flush()
-    if not repository.has_active(benchmark.id):
-        if benchmark.status == BenchmarkStatus.IN_PROGRESS:
-            benchmark.status = BenchmarkStatus.ERROR
-            benchmark.finished_at = now
-            benchmark.error_message = "Executor exited without finalizing the benchmark"
-        elif benchmark.status == BenchmarkStatus.STOPPING:
-            benchmark.status = BenchmarkStatus.STOPPED
-            benchmark.finished_at = now
+def dispatch_now(session: Session) -> datetime:
+    return ExecutorDispatchRepository(session).now()
 
 
 @dataclass(frozen=True)
@@ -306,10 +255,17 @@ def record_dispatch_failure(
     failure_reason: str | None = None,
     dispatch_status: ExecutorDispatchStatus = ExecutorDispatchStatus.RUNNING,
     expired_before: datetime | None = None,
+    ecs_task_arn: str | None = None,
+    claim_expired_before: datetime | None = None,
 ) -> bool:
     benchmark = BenchmarkRepository(session).lock_by_id(benchmark_id)
     dispatch = ExecutorDispatchRepository(session).lock(
-        dispatch_id, benchmark_id=benchmark_id, status=dispatch_status, expired_before=expired_before
+        dispatch_id,
+        benchmark_id=benchmark_id,
+        status=dispatch_status,
+        expired_before=expired_before,
+        claim_expired_before=claim_expired_before,
+        ecs_task_arn=ecs_task_arn,
     )
     if dispatch is None:
         return False

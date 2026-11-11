@@ -12,7 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.exceptions import S3Error
 from tracker.logging import get_logger
-from tracker.runtime.storage import ArtifactLocations, StoredObject, StoredObjectCopy
+from tracker.runtime.storage import STREAM_CHUNK_BYTES, ArtifactLocations, StoredObject, StoredObjectCopy
 from tracker.runtime.artifacts import agent_bundle_key, benchmark_agent_bundle_key
 
 logger = get_logger(__name__)
@@ -358,6 +358,19 @@ class S3ObjectStore:
     async def get_bytes(self, key: str) -> bytes:
         async with self.read_session() as reader:
             return await reader.get_bytes(key)
+
+    async def get_stream(self, key: str) -> AsyncIterator[bytes]:
+        try:
+            async with self._runtime.clients.s3_client() as client:
+                response = await client.get_object(
+                    Bucket=self._runtime.resources.s3_bucket, Key=key, **s3_owner_arguments(self._runtime)
+                )
+                body = response["Body"]
+                async with body:
+                    async for chunk in body.iter_chunks(STREAM_CHUNK_BYTES):
+                        yield chunk
+        except (ClientError, BotoCoreError) as error:
+            raise S3Error(f"Failed to download from S3: {error}") from error
 
     async def get_many(self, keys: AsyncIterable[str]) -> AsyncIterator[tuple[str, bytes]]:
         owner_arguments = s3_owner_arguments(self._runtime)

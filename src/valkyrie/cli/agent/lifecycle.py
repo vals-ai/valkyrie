@@ -1,9 +1,7 @@
-import json
 from datetime import datetime
 from pathlib import Path
 
 import click
-from valkyrie.sdk import ValkyrieClient
 
 from valkyrie.display import terminal_safe
 
@@ -72,30 +70,18 @@ def download(agent_name: str, output_dir: Path | None, overwrite: bool):
 @format_option("Output format. JSON includes every agent without interactive paging.")
 def list_installed_agents(all_agents: bool, output_format: str):
 
-    async def list_agents(client: ValkyrieClient) -> list[tuple[str, datetime | None]]:
-        response = await client.agents.list()
-        try:
-            return [
-                (agent.name, datetime.fromisoformat(agent.last_modified) if agent.last_modified else None)
-                for agent in response.agents
-            ]
-        except ValueError as error:
-            raise click.ClickException(terminal_safe(str(error), preserve_newlines=True)) from error
-
-    agents = call(list_agents)
-
+    response = call(lambda client: client.agents.list())
     if output_format == "json":
-        click.echo(
-            json.dumps(
-                {
-                    "agents": [
-                        {"name": name, "last_modified": modified.isoformat() if modified else None}
-                        for name, modified in agents
-                    ]
-                }
-            )
-        )
+        click.echo(response.model_dump_json())
         return
+
+    try:
+        agents = [
+            (agent.name, datetime.fromisoformat(agent.last_modified) if agent.last_modified else None)
+            for agent in response.agents
+        ]
+    except ValueError as error:
+        raise click.ClickException(terminal_safe(str(error), preserve_newlines=True)) from error
 
     if not agents:
         click.echo(click.style("No agents found.", fg="yellow"))

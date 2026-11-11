@@ -4,8 +4,10 @@ description: "Install the CLI, connect Daytona, and run a test agent on one SWE-
 ---
 
 In this tutorial you run a small test agent on one SWE-bench task with Vals AI's hosted
-Valkyrie, and read the result. The test agent reads the task and changes nothing, so the
-run scores 0. That's expected: the goal is to see each step of a run work.
+Valkyrie, and read the result.
+
+The test agent reads the task and changes nothing, so the run scores 0. That's expected,
+since the goal is to see each step of a run work.
 
 You need:
 
@@ -20,10 +22,12 @@ uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false \
   --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
 ```
 
-If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
-
 This installs the Valkyrie CLI as `valkyrie`, with the short alias `valk`. To check it,
-run `valkyrie --help`, which lists the commands.
+run `valkyrie --help`, which lists the commands. To remove it once you're done, run:
+
+```bash
+uv tool uninstall valkyrie-cli
+```
 
 ## Sign in
 
@@ -104,17 +108,19 @@ your organization's library as `hello-agent`.
 ## Run one task
 
 ```bash
-valkyrie project create my-project --name "My Project" --spend-type development \
-  --subcategory new_benchmark_generation \
-  --budget 300 --budget-reason "3 runs, about 100 each"
-valkyrie run start --agent hello-agent --benchmark swebench --slice 0:1 --connect \
-  --project my-project
+valkyrie run start --agent hello-agent --benchmark swebench --slice 0:1 --connect
 ```
 
+The run goes in your organization's `default` project. If your organization requires a
+project, the Tracker refuses the start and says so; see
+[Put the run in a project](/runs/start#put-the-run-in-a-project).
+
 Valkyrie creates a sandbox in your Daytona account, sets up the first SWE-bench task in it,
-runs the agent, and grades the result. The output starts with a summary of the benchmark
-and the agent, followed by a **Run ID** line. Notice the progress updates that follow: they
-stream until the run finishes, after a few minutes.
+runs the agent, and grades the result.
+
+- The output starts with a summary of the benchmark and the agent, followed by a **Run ID**
+  line.
+- Progress updates follow. They stream until the run finishes, after a few minutes.
 
 ## Read the result
 
@@ -122,9 +128,11 @@ stream until the run finishes, after a few minutes.
 valkyrie run results RUN_ID
 ```
 
-Replace *`RUN_ID`* with the ID from the **Run ID** line. The CLI confirms with
-`Results saved to 'results-RUN_ID.json'`. In that file, `final_evaluation.final_score` is
-`0.0`, because the test agent didn't fix the task.
+Replace *`RUN_ID`* with the ID from the **Run ID** line.
+
+- The CLI confirms with `Results saved to 'results-RUN_ID.json'`.
+- In that file, `final_evaluation.final_score` is `0.0`, because the test agent didn't fix
+  the task.
 
 You've run an agent on a benchmark task, from sandbox to score.
 

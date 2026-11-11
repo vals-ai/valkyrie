@@ -69,6 +69,7 @@ EXPECTED_ALL = [
     "RegradeBenchmarkRequest",
     "RegradeBenchmarkResponse",
     "RetryOrResumeBenchmarkResponse",
+    "RunSnapshot",
     "RunStreamEvent",
     "ResultsExistResponse",
     "S3UploadResultsResponse",

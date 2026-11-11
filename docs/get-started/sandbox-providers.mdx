@@ -5,9 +5,11 @@ description: "Store your Daytona or Modal credentials and choose which provider 
 ---
 
 Valkyrie creates each task's sandbox with your organization's own sandbox provider
-account. An organization sets up each provider once: store its credentials as an
-organization secret, then map the provider to that secret. Every member's runs on that
-provider use the mapping.
+account.
+
+- An organization sets up each provider once: store its credentials as an organization
+  secret, then map the provider to that secret.
+- Every member's runs on that provider use the mapping.
 
 ## Set up Daytona
 
@@ -72,19 +74,19 @@ A run uses the provider you pass with `--provider`, otherwise your default provi
 otherwise `daytona`:
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --provider modal \
-  --project my-project
+valkyrie run start --agent my-agent --benchmark swebench --provider modal
 ```
 
-Set your own default with `valkyrie provider default modal`. The default is yours alone in
-the current organization and needs a login. `valkyrie provider list` shows each mapped
-provider's secret and marks your default.
+- Set your own default with `valkyrie provider default modal`. The default is yours alone
+  in the current organization and needs a login.
+- `valkyrie provider list` shows each mapped provider's secret and marks your default.
 
 ## Rotate or remove credentials
 
-To replace the credentials, run `valkyrie secret set` again with the new file. The mapping
-keeps pointing at the same secret. Remove a mapping with `valkyrie provider remove modal`.
-A run on a provider with no mapping fails with `No secret is set for provider modal`.
+- To replace the credentials, run `valkyrie secret set` again with the new file. The
+  mapping keeps pointing at the same secret.
+- Remove a mapping with `valkyrie provider remove modal`.
+- A run on a provider with no mapping fails with `No secret is set for provider modal`.
 
 ## Limits
 

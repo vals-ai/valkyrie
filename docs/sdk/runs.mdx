@@ -5,10 +5,13 @@ description: "Start, follow, recover, and download Valkyrie runs from Python."
 ---
 
 `client.runs` does from Python what [`valkyrie run`](/runs/start) does from the Valkyrie
-CLI. The rules for each action, such as which tasks a retry reruns, are on the CLI guides
-that each section links to. Every parameter is in the [`client.runs`
-reference](/reference/sdk/runs). The examples run inside
-`async with ValkyrieClient() as client:`, as in the [quickstart](/sdk/quickstart).
+CLI.
+
+- The rules for each action, such as which tasks a retry reruns, are on the CLI guides that
+  each section links to.
+- Every parameter is in the [`client.runs` reference](/reference/sdk/runs).
+- The examples run inside `async with ValkyrieClient() as client:`, as in the
+  [quickstart](/sdk/quickstart).
 
 ## Start a run
 
@@ -77,11 +80,12 @@ await client.runs.retry(
 await client.runs.retag(run_id, "google-report-xyz")
 ```
 
-`stop(force=True)` also deletes running sandboxes. `resume` and `retry` take the same
-options as the CLI, such as `from_scratch`, `update_agent`, `secrets`, and
-`service_headers`. See [Manage a run](/runs/manage) for what each one reruns. `retag`
-moves the run to another project in any run state and returns that project;
-`metadata(run_id).project` shows the newest.
+- `stop(force=True)` also deletes running sandboxes.
+- `resume` and `retry` take the same options as the CLI, such as `from_scratch`,
+  `update_agent`, `secrets`, and `service_headers`. See [Manage a run](/runs/manage) for
+  what each one reruns.
+- `retag` moves the run to another project in any run state and returns that project.
+  `metadata(run_id).project` shows the newest.
 
 ## Get results
 

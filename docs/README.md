@@ -1,9 +1,10 @@
 # Work on the documentation
 
 `docs/` is the Mintlify site published at [docs.valkyrie.vals.ai](https://docs.valkyrie.vals.ai).
-Follow the [writing rules](AGENTS.md) and the
-[updating-docs skill](../.agents/updating-docs/SKILL.md). This file and `AGENTS.md` are
-listed in `.mintignore`, so they stay off the site.
+
+- Follow the [writing rules](AGENTS.md) and the
+  [updating-docs skill](../.agents/updating-docs/SKILL.md).
+- This file and `AGENTS.md` are listed in `.mintignore`, so they stay off the site.
 
 ## Preview the site
 

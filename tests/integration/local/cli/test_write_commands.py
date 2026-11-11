@@ -6,7 +6,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 from sqlmodel import Session, select
-from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
+from tracker.database.models import Benchmark, Task
+from tracker.domain import BenchmarkStatus, TaskStatus
 
 
 from valkyrie.cli.main import cli
@@ -201,7 +202,7 @@ def test_cli_updates_active_run_concurrency_through_tracker(
     fetch_result = cli_runner.invoke(cli, ["run", "fetch", str(running.id), "--format", "json"])
 
     assert fetch_result.exit_code == 0, fetch_result.output
-    assert json.loads(fetch_result.output)["max_concurrency"] == 4
+    assert json.loads(fetch_result.output)["metadata"]["benchmark_arguments"]["concurrency"] == 4
 
     database_session.expire_all()
     stored_run = database_session.get(Benchmark, running.id)

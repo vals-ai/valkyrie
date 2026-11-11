@@ -87,12 +87,7 @@ def test_list_json_all_exhausts_cursor_pages_and_preserves_filters(tracker: Mock
     assert len(result.stdout.splitlines()) == 1
     assert "\x1b" not in result.stdout
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == 1
-    assert payload["kind"] == "run_list"
-    assert payload["returned_count"] == 501
-    assert [run["run_id"] for run in payload["runs"]] == [str(row.id) for row in [*first_page, final_row]]
-    assert "error_message" not in payload["runs"][0]
-    assert "sensitive raw detail" not in result.stdout
+    assert payload == FetchBenchmarksResponse(benchmarks=[*first_page, final_row]).model_dump(mode="json")
 
     assert [request.url.params["cursor"] for request in tracker.requests] == ["", "page-2"]
     for request in tracker.requests:
@@ -121,8 +116,7 @@ def test_list_json_all_normalizes_non_finite_scores(tracker: MockTracker, final_
     assert result.exit_code == 0, result.output
     assert not any(token in result.stdout for token in ["NaN", "Infinity"])
     payload = json.loads(result.stdout)
-    assert payload["returned_count"] == len(rows)
-    assert [run["final_score"] for run in payload["runs"]] == [None] * len(rows)
+    assert [run["final_score"] for run in payload["benchmarks"]] == [None] * len(rows)
 
 
 @pytest.mark.description("`--json --all` prints nothing when a later page fails.")

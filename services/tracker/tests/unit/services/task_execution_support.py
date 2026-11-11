@@ -1,40 +1,48 @@
 import asyncio
 from asyncio import Semaphore
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
-from typing import Any
+from collections.abc import Awaitable, Callable, Generator
+from typing import Any, cast
 from uuid import UUID
 
-from benchmark_service import ImageSource, Resources
-from benchmark_service.schemas import RetrieveTaskResponse
 import pytest
-from sqlalchemy.engine import Connection, Engine
-from sqlmodel import Session
+from benchmark_service import ImageSource, Resources
+from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.schemas import RetrieveTaskResponse
+from fastapi.testclient import TestClient
+from sqlmodel import Session, select
 
-from executor_protocol import SUPPORTED_PROTOCOL_VERSION
+from main import app
 from tests.utils import TEST_ORG_ID
-from tracker.auth import RequestIdentity
+from tracker.auth import RequestIdentity, get_current_org
+from tracker.aws.runtime import AWSResources
+from tracker.database.models import Org, Task
+from tracker.database.session import get_session
+from tracker.domain import BenchmarkStatus
+from tracker.executor.control_protocol import TaskRef
+from tracker.executor.control_tasks import TaskControl
 from tracker.external_service_gateway import ExternalServiceDeadlineController, GenerationAccountingSummary
 from tracker.runtime.services import RuntimeServices
-from tracker.database.models import (
-    AgentContractRequest,
-    BenchmarkStatus,
-    ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
-    ExecutorRelease,
-    Org,
-    Task,
-)
-from tracker.executor.execution_authority import ExecutionAuthority
 from tracker.scheduler.admission import SandboxQueueContext
-from tracker.aws.runtime import AWSResources
-from tracker.types import StartBenchmarkRequest
+from tracker.types import AgentContractRequest, OrgContext, StartBenchmarkRequest
 from tracker.services.tasks.execute import process_task
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
 
 TEST_ORG = Org(id=TEST_ORG_ID, name="default")
 _TEST_STARTER = RequestIdentity(org=TEST_ORG)
+
+
+@pytest.fixture
+def task_api_client(control_postgres_session: Session, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    engine = control_postgres_session.bind
+    org = control_postgres_session.exec(select(Org).where(Org.id == TEST_ORG_ID)).one()
+
+    def request_session() -> Generator[Session, None, None]:
+        with Session(engine) as session:
+            yield session
+
+    monkeypatch.setitem(app.dependency_overrides, get_session, request_session)
+    monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: org)
+    return TestClient(app)
 
 
 async def finalize_agent_generation(
@@ -44,35 +52,6 @@ async def finalize_agent_generation(
 ) -> None:
     await deadline_controller.finalize_after_confirmed_stop(absence_confirmed_at=asyncio.get_running_loop().time())
     await on_external_service_finalized(deadline_controller.summary())
-
-
-class _UnitEvaluationLock:
-    def __init__(self, engine: Engine) -> None:
-        self._engine = engine
-        self._connection: Connection | None = None
-
-    @property
-    def connection(self) -> Connection:
-        assert self._connection is not None
-        return self._connection
-
-    async def __aenter__(self) -> bool:
-        self._connection = self._engine.connect()
-        return True
-
-    async def __aexit__(self, *_args: object) -> None:
-        self.connection.close()
-        self._connection = None
-
-
-def install_sqlite_evaluation_lock(database_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-    bind = database_session.get_bind()
-    assert isinstance(bind, Engine)
-
-    def evaluation_lock(_engine: Engine, _task_row_id: UUID) -> _UnitEvaluationLock:
-        return _UnitEvaluationLock(bind)
-
-    monkeypatch.setattr("tracker.services.tasks.execute.task_evaluation_lock", evaluation_lock)
 
 
 class MockLauncher:
@@ -95,8 +74,9 @@ def make_retrieve_task_response(problem_path: str = "/tmp/problem_statement.txt"
 def create_task_environment(
     contract: AgentContractRequest,
     database_session: Session,
+    bound_controls: Callable[..., dict[str, object]],
     run_starter: RequestIdentity | None = None,
-) -> tuple[StartBenchmarkRequest, Task, UUID, ExecutionAuthority]:
+) -> tuple[StartBenchmarkRequest, Task, UUID, TaskControl]:
     start_benchmark_request = StartBenchmarkRequest(
         benchmark_name="swebench",
         contract=contract,
@@ -123,38 +103,8 @@ def create_task_environment(
     database_session.add(task_row)
     database_session.commit()
 
-    release = ExecutorRelease(
-        id="task-execution-test-release",
-        artifact_uri="s3://artifacts/task-execution-test.pex",
-        artifact_digest="a" * 64,
-        protocol_version=SUPPORTED_PROTOCOL_VERSION,
-    )
-    database_session.add(release)
-    database_session.flush()
-    dispatch = ExecutorDispatch(
-        benchmark_id=benchmark_row.id,
-        kind=ExecutorDispatchKind.START,
-        status=ExecutorDispatchStatus.RUNNING,
-        executor_release_id=release.id,
-        executor_artifact_uri=release.artifact_uri,
-        executor_artifact_digest=release.artifact_digest,
-        executor_protocol_version=release.protocol_version,
-        started_at=datetime.now(UTC),
-    )
-    database_session.add(dispatch)
-    database_session.commit()
-
-    authority = ExecutionAuthority(benchmark_id=benchmark_row.id, dispatch_id=dispatch.id)
-    return start_benchmark_request, task_row, benchmark_row.id, authority
-
-
-def bind_task_to_dispatch(session: Session, task: Task, authority: ExecutionAuthority) -> None:
-    dispatch = session.get(ExecutorDispatch, authority.dispatch_id)
-    assert dispatch is not None
-    task.started_at = dispatch.created_at
-    session.add(task)
-    session.commit()
-    session.refresh(task)
+    controls = bound_controls(benchmark_row, session=database_session)
+    return start_benchmark_request, task_row, benchmark_row.id, cast(TaskControl, controls["task_control"])
 
 
 async def run_process_task(
@@ -162,26 +112,30 @@ async def run_process_task(
     task_row: Task,
     benchmark_id: UUID,
     runtime_services: RuntimeServices,
-    authority: ExecutionAuthority,
+    control: TaskControl,
     *,
     queue_context: SandboxQueueContext | None = None,
+    service: BenchmarkServiceClient | None = None,
 ) -> dict[str, dict[str, Any] | None]:
+    response = await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
+    state = response.task
     sandbox_provider_config = await runtime_services.get_sandbox_provider_config()
     async with (
-        start_benchmark_request.benchmark_service as benchmark_service,
+        service or start_benchmark_request.benchmark_service as benchmark_service,
         sandbox_provider_config.create_provider() as sandbox_provider,
     ):
         return await process_task(
-            task_row=task_row,
+            task_row=state,
             start_benchmark_request=start_benchmark_request,
             benchmark_service=benchmark_service,
             benchmark_id=benchmark_id,
-            task_id="task_0",
+            task_id=task_row.task_id,
             runtime=runtime_services,
-            org=TEST_ORG,
+            org=OrgContext(id=TEST_ORG_ID, name="default", storage_key="test-bucket"),
             sandbox_provider_config=sandbox_provider_config,
             sandbox_provider=sandbox_provider,
             creation_semaphore=Semaphore(1),
             queue_context=queue_context,
-            authority=authority,
+            control=control,
+            started_by_email=response.benchmark.started_by_email,
         )

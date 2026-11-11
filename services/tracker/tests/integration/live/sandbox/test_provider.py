@@ -14,6 +14,7 @@ from benchmark_service import (
 )
 
 from tracker.sandbox import SandboxCreationState, create_sandbox
+from tests.utils import unexpected_sandbox_record
 
 
 async def _wait_until_sandbox_not_found(
@@ -81,6 +82,7 @@ class TestProvider:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             await sandbox.exec("echo ready")
 
@@ -128,6 +130,7 @@ class TestProvider:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             ready = asyncio.Event()
             stream_task = asyncio.create_task(_read_stream_until_ready(sandbox, ready))
@@ -164,6 +167,7 @@ class TestProvider:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
             labels=labels,
         ) as sandbox:
             await _wait_until_sandbox_listed(sandbox_provider, query, sandbox.id)

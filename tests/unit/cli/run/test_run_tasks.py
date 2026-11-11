@@ -48,12 +48,13 @@ def test_tasks_text_shows_category_column_and_blank_for_legacy_rows(tracker: Moc
 
     assert result.exit_code == 0, result.output
     header, *body = [line for line in result.output.splitlines() if line.strip()]
-    assert header.split() == ["Task", "Status", "Category", "Error"]
+    assert header.split() == ["Task", "Status", "Category", "Error", "Started", "Finished"]
     category_start = header.index("Category")
     error_start = header.index("Error")
     rows = {line.split()[0]: line[category_start:error_start].strip() for line in body if line.startswith("task-")}
     assert rows == {"task-0": "agent", "task-1": "", "task-2": ""}
     assert "Agent command failed with exit code 2" in result.output
+    assert all(line.rstrip().endswith("-") for line in body if line.startswith("task-"))
 
 
 @pytest.mark.description("JSON tasks include the failure category.")

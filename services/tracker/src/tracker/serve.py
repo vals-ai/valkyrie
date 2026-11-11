@@ -1,12 +1,9 @@
 import argparse
-import base64
 import os
 from pathlib import Path
 
 import uvicorn
-from sqlalchemy.engine import make_url
 
-from tracker import config as tracker_config
 from tracker.local import config
 
 
@@ -18,17 +15,7 @@ def main() -> None:
     if args.config is not None:
         config.configure(args.config)
         os.environ["EXECUTOR_LAUNCHER"] = "local"
-        database_url = make_url(tracker_config.DATABASE_URL)
-        os.environ.update(
-            DB_HOST=str(database_url.host),
-            DB_PORT=str(database_url.port),
-            DB_NAME=str(database_url.database),
-            DB_USERNAME=str(database_url.username),
-            DB_PASSWORD=str(database_url.password),
-        )
         os.environ.pop("EXECUTOR_PAYLOAD_KMS_KEY_ID", None)
-        if "EXECUTOR_PAYLOAD_LOCAL_KEY" not in os.environ:
-            os.environ["EXECUTOR_PAYLOAD_LOCAL_KEY"] = base64.b64encode(os.urandom(32)).decode()
         from tracker.local.releases import register_checkout_release
 
         register_checkout_release()

@@ -6,14 +6,12 @@ from sqlmodel import SQLModel, Session, inspect
 
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     Org,
     Task,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
+from tracker.domain import BenchmarkStatus, TaskStatus
 
 
 @pytest.mark.description("The migrated `errorresult` provenance columns and foreign keys match the SQLModel metadata.")

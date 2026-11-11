@@ -14,9 +14,14 @@ from tracker.config import AUTH_REQUIRED, DESCOPE_ORG_ADMIN_ROLE, VALKYRIE_STAGE
 from tracker.exceptions import SecretNotFoundError
 from tracker.local import config as local_config
 from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
-from tracker.project_gateway import automatic_project_gateway, is_generated_project_gateway_secret_name
-from tracker.secret_access import may_use_shared_secrets, resolve_secret_name, tenant_secret_prefix
-from tracker.types import SecretEntry, SecretsResponse, SecretValueRequest
+from tracker.project_gateway import automatic_project_gateway
+from tracker.secret_access import (
+    is_generated_project_gateway_secret_name,
+    may_use_shared_secrets,
+    resolve_secret_name,
+    tenant_secret_prefix,
+)
+from tracker.types import OrgContext, SecretEntry, SecretsResponse, SecretValueRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/secrets")
@@ -77,7 +82,9 @@ def _entry(name: str, org: Org) -> SecretEntry:
 def secret_store(org: Org) -> SecretsManagerStore:
     resources = local_config.resources
     if resources is None:
-        return SecretsManagerStore(resolve_org_aws_runtime(org).clients)
+        return SecretsManagerStore(
+            resolve_org_aws_runtime(OrgContext(id=org.id, name=org.name, storage_key=org.storage_key)).clients
+        )
     if resources.secrets_manager_region is None:
         raise HTTPException(status_code=400, detail="This Tracker reads secrets from its secrets file")
     return SecretsManagerStore(AWSClientProvider(resources.secrets_manager_region))

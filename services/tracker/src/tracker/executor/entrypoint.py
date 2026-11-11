@@ -4,29 +4,42 @@ import argparse
 import asyncio
 import logging
 import os
+import secrets
 import signal
+import time
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from typing import Any, TypeVar
 from uuid import UUID
 
-import logfire
 import httpx
+import logfire
 import sentry_sdk
-from botocore.exceptions import ClientError
-from cryptography.exceptions import InvalidTag
-from sqlmodel import Session
-
-from executor_protocol import normalize_executor_telemetry_context
-from tracker.config import ENVIRONMENT
-from tracker.database.session import engine
-from tracker.database.models import ExecutorDispatchStatus, FailureCategory
-from tracker.executor.dispatch_control import (
-    LOCAL_DISPATCH_LEASE,
-    ClaimedDispatch,
-    claim_dispatch,
-    finish_dispatch,
-    record_dispatch_failure,
-    renew_local_dispatch,
+from executor_protocol import (
+    DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS,
+    DEFAULT_EXECUTOR_DISPATCH_LEASE_SECONDS,
+    DEFAULT_EXECUTOR_DISPATCH_LEASE_TICK_SECONDS,
+    executor_payload_benchmark_id,
+    normalize_executor_telemetry_context,
 )
+
+from tracker.config import ENVIRONMENT
+from tracker.executor.control_client import CONTROL_TIMEOUT, ControlClient
+from tracker.executor.control_protocol import (
+    AckDispatchRequest,
+    AckDispatchResponse,
+    ClaimDispatchRequest,
+    ClaimDispatchResponse,
+    DispatchRef,
+    FailedFinishDispatchRequest,
+    FinishDispatchRequest,
+    FinishDispatchResponse,
+    RenewDispatchRequest,
+    RenewDispatchResponse,
+)
+from tracker.executor.control_queue import QueueControl
+from tracker.executor.control_runs import RunControl
+from tracker.executor.control_tasks import TaskControl
 from tracker.executor.runner_observability import (
     capture_dispatch_error,
     capture_runner_failure,
@@ -34,157 +47,187 @@ from tracker.executor.runner_observability import (
     record_dispatch_cancellation,
     record_dispatch_completion,
 )
+from tracker.executor.watchdog import DeadlineChannel
 from tracker.logging import configure_logging
-from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.observability import configure_observability
 from tracker.services.runs.start import process_benchmark
 from tracker.services.failures import classify_failure
 
 logger = logging.getLogger(__name__)
-_LOCAL_RENEW_INTERVAL_SECONDS = 10
+_Response = TypeVar("_Response")
 
 
-def _claim(dispatch_id: UUID) -> ClaimedDispatch | None:
-    task_arn = None
-    if os.environ["EXECUTOR_LAUNCHER"] == "ecs":
-        response = httpx.get(f"{os.environ['ECS_CONTAINER_METADATA_URI_V4']}/task", timeout=5)
-        response.raise_for_status()
-        task_arn = response.json()["TaskARN"]
-    with Session(engine) as session:
+async def _retry(operation: Callable[[], Awaitable[_Response]], cutoff: float) -> _Response:
+    delay = 0.1
+    while True:
         try:
-            claimed = claim_dispatch(session, dispatch_id, task_arn=task_arn)
-        except (InvalidTag, ClientError, ValueError) as error:
-            session.rollback()
-            dispatch = ExecutorDispatchRepository(session).get(dispatch_id)
-            if dispatch is not None:
-                record_dispatch_failure(
-                    session,
-                    benchmark_id=dispatch.benchmark_id,
-                    dispatch_id=dispatch.id,
-                    task_ids=dispatch.assigned_task_ids or [],
-                    error_message=f"Executor payload decrypt failed: {type(error).__name__}",
-                    producer="executor_dispatch",
-                    operation="dispatch_claim",
-                    error_type=type(error).__name__,
-                    category=FailureCategory.INFRASTRUCTURE,
-                    cause_code="PAYLOAD_DECRYPT_FAILED",
-                    failure_reason="PAYLOAD_DECRYPT_FAILED",
-                    dispatch_status=ExecutorDispatchStatus.QUEUED,
-                )
-                session.commit()
-            raise
-        session.commit()
-    return claimed
+            async with asyncio.timeout_at(cutoff):
+                return await operation()
+        except (httpx.TransportError, httpx.HTTPStatusError) as error:
+            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in (502, 503, 504):
+                raise
+            remaining = cutoff - time.monotonic()
+            if remaining <= 0:
+                raise
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 5.0)
 
 
-def _finish(claimed: ClaimedDispatch) -> None:
-    with Session(engine) as session:
-        finish_dispatch(session, claimed)
-        session.commit()
+class LocalLease:
+    def __init__(self, client: ControlClient, ref: DispatchRef, confirmed_at: float) -> None:
+        self.client = client
+        self.ref = ref
+        self.lost = asyncio.Event()
+        self.expiry = confirmed_at + DEFAULT_EXECUTOR_DISPATCH_LEASE_SECONDS
+        self.timer = asyncio.get_running_loop().call_at(self.expiry, self.lost.set)
 
+    def set_expiry(self, expiry: float) -> None:
+        self.expiry = expiry
+        self.timer.cancel()
+        if expiry <= time.monotonic():
+            self.lost.set()
+        else:
+            self.timer = asyncio.get_running_loop().call_at(expiry, self.lost.set)
 
-def _renew_local(dispatch_id: UUID) -> bool:
-    with Session(engine) as session:
-        renewed = renew_local_dispatch(session, dispatch_id)
-        session.commit()
-        return renewed
-
-
-async def _watch_local_dispatch(dispatch_id: UUID, work: asyncio.Task[None], lease: asyncio.Timeout) -> None:
-    loop = asyncio.get_running_loop()
-    while not work.done():
-        await asyncio.sleep(_LOCAL_RENEW_INTERVAL_SECONDS)
-        renewal_started = loop.time()
-        try:
-            renewed = await asyncio.to_thread(_renew_local, dispatch_id)
-        except Exception:
-            logger.exception("Failed to renew local executor dispatch %s", dispatch_id)
-            continue
-        deadline = lease.when()
-        if not renewed or lease.expired() or (deadline is not None and loop.time() >= deadline):
-            work.cancel()
-            return
-        lease.reschedule(renewal_started + LOCAL_DISPATCH_LEASE.total_seconds())
-
-
-def _fail(
-    claimed: ClaimedDispatch, error_message: str, error_type: str, failure_reason: str, category: FailureCategory
-) -> None:
-    with Session(engine) as session:
-        record_dispatch_failure(
-            session,
-            benchmark_id=claimed.benchmark_id,
-            dispatch_id=claimed.dispatch_id,
-            task_ids=claimed.assigned_task_ids,
-            error_message=error_message,
-            producer="executor_dispatch",
-            operation="dispatch_execution",
-            error_type=error_type,
-            category=category,
-            cause_code=failure_reason,
-            failure_reason=failure_reason,
-        )
-        session.commit()
-
-
-async def run_dispatch(dispatch_id: UUID) -> None:
-    loop = asyncio.get_running_loop()
-    claim_started = loop.time()
-    claimed = await asyncio.to_thread(_claim, dispatch_id)
-    if claimed is None:
-        logger.info("Executor dispatch %s is no longer claimable", dispatch_id)
-        return
-    local = os.environ["EXECUTOR_LAUNCHER"] == "local"
-    deadline = claim_started + LOCAL_DISPATCH_LEASE.total_seconds() if local else None
-    payload = claimed.payload
-    telemetry_context = normalize_executor_telemetry_context(payload.get("telemetry_context_json"))
-    async with asyncio.timeout_at(deadline) as lease:
-        with dispatch_observability_context(
-            str(claimed.benchmark_id), str(dispatch_id), claimed.release_id, telemetry_context
-        ) as child_context:
-            work = asyncio.create_task(
-                process_benchmark(
-                    start_benchmark_request_json=payload.get("start_benchmark_request_json"),
-                    benchmark_id_str=payload.get("benchmark_id_str"),
-                    verified_task_ids=payload.get("verified_task_ids"),
-                    execution_context_json=payload.get("execution_context_json"),
-                    executor_dispatch_id=str(dispatch_id),
-                )
-            )
-            loop.add_signal_handler(signal.SIGTERM, work.cancel)
-            local_watch = asyncio.create_task(_watch_local_dispatch(dispatch_id, work, lease)) if local else None
+    async def renew(self) -> None:
+        while True:
+            await asyncio.sleep(DEFAULT_EXECUTOR_DISPATCH_LEASE_TICK_SECONDS)
+            started = time.monotonic()
             try:
-                await work
-            except asyncio.CancelledError:
-                await asyncio.to_thread(
-                    _fail,
-                    claimed,
-                    "Executor dispatch was cancelled",
-                    "ExecutorDispatchCancelled",
-                    "EXECUTOR_CANCELLED",
-                    FailureCategory.CANCELLED,
+                response = await self.client.call(
+                    "renew_dispatch", RenewDispatchRequest(ref=self.ref), RenewDispatchResponse
                 )
-                record_dispatch_cancellation(child_context)
+            except (httpx.TransportError, httpx.HTTPStatusError):
+                logger.exception("Failed to renew local executor dispatch %s", self.ref.dispatch_id)
+                continue
+            if response.live is False or response.stopped is True:
+                self.lost.set()
                 return
-            except Exception as error:
-                await asyncio.to_thread(
-                    _fail,
-                    claimed,
-                    f"Executor dispatch failed: {error}",
-                    type(error).__name__,
-                    "EXECUTOR_FAILED",
-                    classify_failure(error),
+            if response.renewed and started < self.expiry:
+                self.set_expiry(started + DEFAULT_EXECUTOR_DISPATCH_LEASE_SECONDS)
+
+    def close(self) -> None:
+        self.timer.cancel()
+
+
+async def _claim(client: ControlClient, dispatch_id: UUID) -> tuple[dict[str, Any], float] | None:
+    cutoff = time.monotonic() + DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS
+    request = ClaimDispatchRequest(dispatch_id=dispatch_id)
+    started = time.monotonic()
+    response = await _retry(lambda: client.send("claim_dispatch", request, ClaimDispatchResponse), cutoff)
+    if not response.claimed:
+        return None
+    assert response.payload is not None
+    return response.payload, started
+
+
+async def _run_dispatch(dispatch_id: UUID, watchdog: DeadlineChannel, shutdown_started: asyncio.Event) -> None:
+    client = ControlClient(
+        http=httpx.AsyncClient(base_url=os.environ["EXECUTOR_CONTROL_URL"], timeout=CONTROL_TIMEOUT),
+        dispatch_id=dispatch_id,
+        invocation_key=secrets.token_urlsafe(32),
+        bootstrap_key=os.environ["EXECUTOR_BOOTSTRAP_KEY"],
+    )
+    try:
+        claimed = await _claim(client, dispatch_id)
+        if claimed is None:
+            logger.info("Executor dispatch %s is no longer claimable", dispatch_id)
+            return
+        payload, claim_started = claimed
+        ref = DispatchRef(benchmark_id=UUID(executor_payload_benchmark_id(payload)), dispatch_id=dispatch_id)
+        await asyncio.to_thread(watchdog.identify, ref.benchmark_id, client.invocation_key)
+        telemetry = normalize_executor_telemetry_context(payload.get("telemetry_context_json"))
+        lease = LocalLease(client, ref, claim_started) if os.environ["EXECUTOR_LAUNCHER"] == "local" else None
+        with dispatch_observability_context(
+            str(ref.benchmark_id), str(dispatch_id), payload["executor_release_id"], telemetry
+        ) as context:
+            try:
+                receipt = await _retry(
+                    lambda: client.send("ack_dispatch", AckDispatchRequest(ref=ref), AckDispatchResponse),
+                    lease.expiry if lease is not None else float("inf"),
                 )
-                capture_dispatch_error(error, child_context)
+                if not receipt.acknowledged:
+                    raise RuntimeError("Executor ciphertext receipt was not acknowledged")
+                task_control = TaskControl(client, ref)
+                run_control = RunControl(client, ref)
+                queue_control = QueueControl(client, ref)
+                work = asyncio.create_task(
+                    process_benchmark(
+                        start_benchmark_request_json=payload.get("start_benchmark_request_json"),
+                        benchmark_id_str=payload.get("benchmark_id_str"),
+                        verified_task_ids=payload.get("verified_task_ids"),
+                        execution_context_json=payload.get("execution_context_json"),
+                        executor_dispatch_id=str(dispatch_id),
+                        run_control=run_control,
+                        task_control=task_control,
+                        queue_control=queue_control,
+                    )
+                )
+                renewal = asyncio.create_task(lease.renew()) if lease is not None else None
+                loss = asyncio.create_task(lease.lost.wait()) if lease is not None else None
+                finish_task: asyncio.Task[FinishDispatchResponse] | None = None
+                try:
+                    while True:
+                        pending = {finish_task or work}
+                        if loss is not None:
+                            pending.add(loss)
+                        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        if loss is not None and loss in done:
+                            raise RuntimeError("Executor local dispatch lease expired")
+                        if finish_task is not None and finish_task in done:
+                            finish = await finish_task
+                            if not finish.finished:
+                                raise RuntimeError("Executor dispatch finish was rejected")
+                            record_dispatch_completion(context)
+                            return
+                        if work in done:
+                            await work
+                            finish_task = asyncio.create_task(
+                                client.call(
+                                    "finish_dispatch",
+                                    FinishDispatchRequest(ref=ref, succeeded=True),
+                                    FinishDispatchResponse,
+                                )
+                            )
+                finally:
+                    shutdown_started.set()
+                    if finish_task is not None and not finish_task.done():
+                        finish_task.cancel()
+                        await asyncio.gather(finish_task, return_exceptions=True)
+                    if renewal is not None:
+                        renewal.cancel()
+                    if loss is not None:
+                        loss.cancel()
+                    await asyncio.gather(
+                        *(task for task in (renewal, loss) if task is not None), return_exceptions=True
+                    )
+                    if not work.done():
+                        work.cancel()
+                        await asyncio.gather(work, return_exceptions=True)
+            except asyncio.CancelledError:
+                record_dispatch_cancellation(context)
+                raise
+            except BaseException as error:
+                capture_dispatch_error(error, context)
+                if lease is None or not lease.lost.is_set():
+                    with suppress(Exception):
+                        await client.call(
+                            "finish_dispatch",
+                            FailedFinishDispatchRequest(
+                                ref=ref,
+                                succeeded=False,
+                                error_message=f"Executor dispatch failed: {error}",
+                                error_type=type(error).__name__,
+                                category=classify_failure(error),
+                            ),
+                            FinishDispatchResponse,
+                        )
                 raise
             finally:
-                loop.remove_signal_handler(signal.SIGTERM)
-                if local_watch is not None:
-                    local_watch.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await local_watch
-            await asyncio.to_thread(_finish, claimed)
-            record_dispatch_completion(child_context)
+                if lease is not None:
+                    lease.close()
+    finally:
+        await client.close()
 
 
 def _flush_observability() -> None:
@@ -200,16 +243,33 @@ def _flush_observability() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dispatch-id", required=True, type=UUID)
-    dispatch_id: UUID = parser.parse_args().dispatch_id
+    parser.add_argument("--dispatch-id", required=True, type=UUID, help="Dispatch ID to claim and execute.")
+    dispatch_id = parser.parse_args().dispatch_id
     configure_logging()
     configure_observability("valkyrie-executor", environment=ENVIRONMENT)
+    channel = DeadlineChannel(int(os.environ["TRACKER_WATCHDOG_FD"]))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    shutdown_started = asyncio.Event()
+    task = loop.create_task(_run_dispatch(dispatch_id, channel, shutdown_started))
+
+    def request_shutdown() -> None:
+        if not shutdown_started.is_set():
+            shutdown_started.set()
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, request_shutdown)
     try:
-        asyncio.run(run_dispatch(dispatch_id))
+        loop.run_until_complete(task)
+    except asyncio.CancelledError:
+        pass
     except Exception as error:
         capture_runner_failure(error, str(dispatch_id))
         raise
     finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        loop.close()
+        channel.close()
         _flush_observability()
 
 

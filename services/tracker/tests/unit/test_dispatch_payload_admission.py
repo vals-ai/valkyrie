@@ -20,19 +20,17 @@ from tests.conftest import TEST_ORG_ID
 from tracker import config
 from tracker.auth import RequestIdentity, get_current_runner, get_current_starter
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    BenchmarkStatus,
     ExecutorDispatch,
     ExecutorDispatchPayload,
     ExecutorRelease,
     Org,
     Project,
-    RunMonitoringRules,
     Task,
-    TaskStatus,
     UserBenchmarkService,
 )
+from tracker.types import AgentContractRequest, RunMonitoringRules
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.executor.release_control import promote_release
 from tracker.local import config as local_config
@@ -97,7 +95,7 @@ def _promote_test_release(
 ) -> None:
     release = ExecutorRelease(
         id=release_id,
-        artifact_uri=f"s3://artifacts/{release_id}.pex",
+        artifact_uri=f"source:///{release_id}",
         artifact_digest="a" * 64,
         protocol_version=protocol_version,
     )
@@ -227,7 +225,7 @@ def test_projectless_managed_run_keeps_supplied_gateway_references(
     response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
 
     assert response.status_code == 200, response.text
-    assert response.json()["project"] is None
+    assert response.json()["project"]["handle"] == "default"
     assert len(payloads) == 1
     assert payloads[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"] == {
         "MODEL_GATEWAY_URL": "caller-url",

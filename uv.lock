@@ -474,8 +474,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.67.0"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.67.0#8cfeef0d53c8f14b8642e25447b5c1454e98d9d7" }
+version = "0.72.0"
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.0#8c5a8e3a82a15ea7bbfeb43d36f706aeba7569ba" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -727,20 +727,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ef/4a/50822184bd67cc6493f0fb6a880749158fcd31ab3fa07409acfd91f9fc85/dnspython-2.9.0.tar.gz", hash = "sha256:b44dc6b18f07a8b1c56676a19fbfdb5209415b046a9cece286baafa87ff3f7f1", size = 423560, upload-time = "2026-10-09T00:07:24.352Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/02/cdcc9b7c051786a103c3b09e1003a82fa0c66bcb91ffbdabcfbf7b4163b9/dnspython-2.9.0-py3-none-any.whl", hash = "sha256:9a4aedb833c3c1b49214d04d44d3032ab7a9135f7c1d29a549b4ff78fd82fda9", size = 354822, upload-time = "2026-10-09T00:07:22.622Z" },
-]
-
-[[package]]
-name = "docstr-coverage"
-version = "2.3.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "click" },
-    { name = "pyyaml" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/75/86/d3f02e5baf426eac0f039849272204649137449f050d3fe0eb104c6f399c/docstr-coverage-2.3.2.tar.gz", hash = "sha256:e99a28c502ed21ae8a310cb9e14e8de2d7cff44d365b46fa6dca6de05bf156a0", size = 26750, upload-time = "2024-05-07T16:54:33.514Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/f7/7923d915a80aa2e04939260f7a000e1a353b25c7ffcf7771cd777559c27a/docstr_coverage-2.3.2-py3-none-any.whl", hash = "sha256:37a885d6560ad87e289b23bf0e54527885bacbf6b17cf55278d514dd0fef8ff5", size = 25816, upload-time = "2024-05-07T16:54:31.636Z" },
 ]
 
 [[package]]
@@ -2373,25 +2359,12 @@ wheels = [
 ]
 
 [[package]]
-name = "tqdm"
-version = "4.67.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/16/e1/3079a9ff9b8e11b846c6ac5c8b5bfb7ff225eee721825310c91b3b50304f/tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf", size = 78374, upload-time = "2026-02-03T17:35:50.982Z" },
-]
-
-[[package]]
 name = "tracker"
 version = "0.1.0"
 source = { editable = "services/tracker" }
 dependencies = [
     { name = "aioboto3" },
     { name = "aiobotocore" },
-    { name = "alembic" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "cachetools" },
@@ -2404,11 +2377,9 @@ dependencies = [
     { name = "modal" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
-    { name = "psycopg2-binary" },
     { name = "python-dotenv" },
     { name = "python-json-logger" },
     { name = "sentry-sdk", extra = ["fastapi"] },
-    { name = "sqlmodel" },
     { name = "starlette" },
     { name = "tenacity" },
 ]
@@ -2417,11 +2388,10 @@ dependencies = [
 requires-dist = [
     { name = "aioboto3", specifier = ">=7.0.0" },
     { name = "aiobotocore", specifier = ">=3.4.0" },
-    { name = "alembic", specifier = ">=1.18.4" },
     { name = "boto3", specifier = ">=1.42.20" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.67.0" },
+    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
@@ -2430,17 +2400,21 @@ requires-dist = [
     { name = "modal", specifier = ">=1.6.4.dev2" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "opentelemetry-sdk", specifier = ">=1.20.0" },
-    { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "python-json-logger", specifier = ">=3.2.1" },
     { name = "sentry-sdk", extras = ["fastapi"], specifier = "==2.58.0" },
-    { name = "sqlmodel", specifier = ">=0.0.38" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tenacity", specifier = ">=9.0.0" },
 ]
 
 [package.metadata.requires-dev]
+database = [
+    { name = "alembic", specifier = ">=1.18.4" },
+    { name = "psycopg2-binary", specifier = ">=2.9.11" },
+    { name = "sqlmodel", specifier = ">=0.0.38" },
+]
 dev = [
+    { name = "aws-cdk-lib", specifier = "==2.237.0" },
     { name = "basedpyright" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "pytest-alembic", specifier = ">=0.12.1" },
@@ -2616,17 +2590,19 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "alembic" },
     { name = "basedpyright" },
     { name = "check-wheel-contents" },
     { name = "datamodel-code-generator" },
-    { name = "docstr-coverage" },
     { name = "httpx" },
     { name = "packaging" },
+    { name = "psycopg2-binary" },
     { name = "pyinstaller" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "sqlmodel" },
     { name = "tracker" },
     { name = "twine" },
 ]
@@ -2642,28 +2618,31 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "alembic", specifier = ">=1.18.4" },
     { name = "basedpyright" },
     { name = "check-wheel-contents", specifier = ">=0.6,<1" },
     { name = "datamodel-code-generator", specifier = ">=0.80,<1" },
-    { name = "docstr-coverage", specifier = ">=2.3.2" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "packaging", specifier = ">=24,<26" },
+    { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "pyinstaller" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "ruff" },
+    { name = "sqlmodel", specifier = ">=0.0.38" },
     { name = "tracker", editable = "services/tracker" },
     { name = "twine", specifier = ">=6.2,<7" },
 ]
 
 [[package]]
 name = "valkyrie-sdk"
-version = "0.30.0"
+version = "0.32.0"
 source = { editable = "packages/valkyrie-sdk" }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
+    { name = "pathspec" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -2683,6 +2662,7 @@ test = [
 requires-dist = [
     { name = "filelock", specifier = ">=3.20,<4" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
+    { name = "pathspec", specifier = ">=1.0.3,<2" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
 ]

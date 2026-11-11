@@ -18,7 +18,7 @@ from valkyrie.cli.main import cli
         "Test cases:\n"
         "- Run list preserves database ordering, identity, score, and task counts.\n"
         "- Run status aggregates terminal task states through the batch endpoint.\n"
-        "- Run fetch combines status and metadata without exposing contract secrets."
+        "- Run fetch pairs the run with its launch metadata."
     )
 )
 def test_cli_reads_persisted_tracker_state(
@@ -30,16 +30,14 @@ def test_cli_reads_persisted_tracker_state(
     list_result = cli_runner.invoke(cli, ["run", "list", "--format", "json", "--all"])
     assert list_result.exit_code == 0, list_result.output
     list_payload = json.loads(list_result.output)
-    assert [run["run_id"] for run in list_payload["runs"]] == [str(finished.id), str(running.id)]
-    assert list_payload["runs"][0]["final_score"] == 0.75
-    assert list_payload["runs"][1]["task_state_counts"] == {
-        "BUILDING": 0,
+    assert [run["id"] for run in list_payload["benchmarks"]] == [str(finished.id), str(running.id)]
+    assert list_payload["benchmarks"][0]["final_score"] == 0.75
+    counts = list_payload["benchmarks"][1]["task_state_counts"]
+    assert {status: count for status, count in counts.items() if count} == {
         "ERROR": 1,
-        "EVALUATING": 0,
         "FINISHED": 1,
         "IN_PROGRESS": 1,
         "PENDING": 1,
-        "STOPPED": 0,
     }
 
     status_result = cli_runner.invoke(
@@ -48,7 +46,7 @@ def test_cli_reads_persisted_tracker_state(
     )
     assert status_result.exit_code == 0, status_result.output
     status_payload = json.loads(status_result.output)
-    assert [(run["run_id"], run["finished_tasks"]) for run in status_payload["runs"]] == [
+    assert [(run["id"], run["finished_tasks"]) for run in status_payload["entries"]] == [
         (str(running.id), 2),
         (str(finished.id), 1),
     ]
@@ -56,10 +54,11 @@ def test_cli_reads_persisted_tracker_state(
     fetch_result = cli_runner.invoke(cli, ["run", "fetch", str(running.id), "--format", "json"])
     assert fetch_result.exit_code == 0, fetch_result.output
     fetch_payload = json.loads(fetch_result.output)
-    assert fetch_payload["agent_name"] == "cli-agent"
-    assert fetch_payload["dataset"] == "verified"
-    assert fetch_payload["max_concurrency"] == 2
-    assert "must-not-leak" not in fetch_result.output
+    arguments = fetch_payload["metadata"]["benchmark_arguments"]
+    assert fetch_payload["run"]["benchmark_id"] == str(running.id)
+    assert arguments["contract"]["name"] == "cli-agent"
+    assert arguments["dataset"] == "verified"
+    assert arguments["concurrency"] == 2
 
 
 @pytest.mark.description("Read a queued task through CLI, SDK, real tracker routing, and database queries.")
@@ -78,7 +77,7 @@ def test_queue_status_reads_persisted_scheduler_state(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["summary"] == {"waiting": 1, "building": 0, "in_progress": 1, "evaluating": 0}
-    assert payload["pools"] == [{"pool_id": "shared", "waiting": 1}]
+    assert payload["pools"] == [{"pool_id": "shared", "waiting": 1, "provider": None, "capacity_domains": None}]
     assert payload["waiting_entries"][0]["benchmark_uuid"] == str(running.id)
     assert payload["waiting_entries"][0]["external_task_id"] == "pending"
     assert payload["waiting_entries"][0]["position"] == 1

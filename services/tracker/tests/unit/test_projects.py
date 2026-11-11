@@ -23,8 +23,6 @@ from tracker.aws.tags import ORG_ID_TAG
 from tracker.exceptions import ProjectNameTakenError
 from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
-    AgentContractRequest,
-    AWSBenchmarkArguments,
     Benchmark,
     BenchmarkStatus,
     ExecutorAdmission,
@@ -36,7 +34,7 @@ from tracker.database.models import (
     SpendType,
     Task,
 )
-from tracker.types import StartBenchmarkRequest
+from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
 
@@ -125,8 +123,8 @@ def vals_org(monkeypatch: MonkeyPatch, database_session: Session) -> Org:
 def active_executor_release(database_session: Session) -> None:
     release = ExecutorRelease(
         id="test-release",
-        artifact_uri="s3://artifacts/test-release.pex",
-        artifact_digest="digest-test-release",
+        artifact_uri="source:///test-release",
+        artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
         status=ExecutorReleaseStatus.ACTIVE,
     )
@@ -1146,18 +1144,25 @@ def test_start_cannot_use_another_orgs_project(database_session: Session, contra
 
 
 @pytest.mark.usefixtures("active_executor_release")
-async def test_start_without_a_project_is_accepted_and_saves_no_link(
+async def test_runs_started_without_a_project_share_the_organizations_default_project(
     monkeypatch: MonkeyPatch, database_session: Session, contract: AgentContractRequest, mock_launcher: Any
 ) -> None:
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
 
-    response = client.post("/start-benchmark", json=_start_request(contract, None))
+    first = client.post("/start-benchmark", json=_start_request(contract, None))
+    second = client.post("/start-benchmark", json=_start_request(contract, None))
 
-    assert response.status_code == 200, response.text
-    assert response.json()["project"] is None
-    run_id = UUID(response.json()["benchmark_id"])
-    assert _link_rows(database_session, run_id) == []
-    assert client.get(f"/fetch-benchmark-metadata/{run_id}").json()["project"] is None
+    assert first.status_code == 200, first.text
+    assert [response.json()["project"]["handle"] for response in (first, second)] == ["default", "default"]
+
+    defaults = database_session.exec(select(Project).where(col(Project.handle) == "default")).all()
+    assert [(project.spend_type, project.subcategory) for project in defaults] == [
+        (SpendType.DEVELOPMENT, "new_benchmark_generation")
+    ]
+
+    run_id = UUID(first.json()["benchmark_id"])
+    assert [link.project_id for link in _link_rows(database_session, run_id)] == [defaults[0].id]
+    assert client.get(f"/fetch-benchmark-metadata/{run_id}").json()["project"]["handle"] == "default"
 
 
 _PROJECT_REQUIRED_DETAIL = (
@@ -1505,3 +1510,33 @@ async def test_retry_whose_project_is_archived_after_the_first_check_is_refused_
     database_session.expire_all()
     stored = database_session.get(Benchmark, benchmark.id)
     assert stored is not None and stored.status == BenchmarkStatus.STOPPED
+
+
+@pytest.mark.description("Runs without a project get their own default project whatever names other projects hold.")
+@pytest.mark.parametrize(
+    ("taken", "expected"),
+    [
+        (["Default"], "Default (default)"),
+        (["Default", "Default (default)"], "Default (default 2)"),
+    ],
+)
+def test_runs_without_a_project_get_their_own_default_project_whatever_names_others_hold(
+    database_session: Session, taken: list[str], expected: str
+) -> None:
+    others = [
+        Project(
+            org_id=TEST_ORG_ID,
+            handle=f"team-{index}",
+            name=name,
+            spend_type=SpendType.DEVELOPMENT,
+            subcategory="new_benchmark_generation",
+        )
+        for index, name in enumerate(taken)
+    ]
+    database_session.add_all(others)
+    database_session.commit()
+
+    project = ProjectRepository(database_session).get_or_create_default(TEST_ORG_ID, "alice@vals.ai")
+
+    assert (project.handle, project.name) == ("default", expected)
+    assert ProjectRepository(database_session).get_or_create_default(TEST_ORG_ID, None).id == project.id

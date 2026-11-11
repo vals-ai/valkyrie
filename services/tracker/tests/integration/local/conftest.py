@@ -47,7 +47,8 @@ def local_app(
     monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_fake")
 
-    importlib.reload(config_module)
+    monkeypatch.setattr(config_module, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(config_module, "DESCOPE_PROJECT_ID", "P_fake")
     importlib.reload(auth_module)
     importlib.reload(main_module)
 

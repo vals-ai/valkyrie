@@ -4,9 +4,11 @@ sidebarTitle: "Tasks, logs, and more"
 description: "Read tasks, logs, artifacts, and the sandbox queue from Python, and manage agents, datasets, secrets, providers, and benchmark services."
 ---
 
-These clients cover everything beside `client.runs`. Every method is in the
-[Python SDK reference](/reference/sdk). The examples run inside
-`async with ValkyrieClient() as client:`, as in the [quickstart](/sdk/quickstart).
+These clients cover everything beside `client.runs`.
+
+- Every method is in the [Python SDK reference](/reference/sdk).
+- The examples run inside `async with ValkyrieClient() as client:`, as in the
+  [quickstart](/sdk/quickstart).
 
 ## Read tasks
 
@@ -51,8 +53,9 @@ async for event in client.logs.stream_task(run_id, task_id):
     print(event.timestamp, event.message)
 ```
 
-`query` matches text in log messages. Times need a time zone, and logs at exactly those
-times are included. `page_run` and `page_task` load one page at a time.
+- `query` matches text in log messages.
+- Times need a time zone, and logs at exactly those times are included.
+- `page_run` and `page_task` load one page at a time.
 
 ## Download artifacts
 
@@ -135,8 +138,7 @@ and `remove`.
 
 ## Manage datasets
 
-A benchmark your organization owns holds datasets, and each dataset holds task archives.
-To create a benchmark with one dataset and upload a task to it:
+A benchmark your organization owns holds datasets. To create a benchmark with one dataset:
 
 ```python
 await client.benchmark_definitions.create(
@@ -144,30 +146,15 @@ await client.benchmark_definitions.create(
 )
 
 await client.datasets.create("contract-review", "v1")
-
-await client.datasets.tasks.put("contract-review", "v1", "task-1", "./task-1.zip")
 ```
 
-Names use lowercase letters and digits joined by single `.`, `_`, or `-`. Uploading a task
-with an ID the dataset already has replaces that task.
+Names use lowercase letters and digits joined by single `.`, `_`, or `-`.
 
-To read the tasks back:
-
-```python
-listing = await client.datasets.tasks.list_all("contract-review", "v1")
-task_ids = [task.task_id for task in listing.tasks]
-
-await client.datasets.tasks.download(
-    "contract-review", "v1", "task-1", "./downloads/task-1.zip"
-)
-```
-
-`download` refuses to replace an existing file. To replace it, pass `overwrite=True`.
-
-To retire a dataset, call `client.datasets.remove("contract-review", "v1")`. It stays
-readable with `include_archived=True` and keeps its name, so bring it back with
-`client.datasets.restore` rather than creating it again. A benchmark can be archived with
-`client.benchmark_definitions.remove` only after all its datasets are archived.
+- To retire a dataset, call `client.datasets.remove("contract-review", "v1")`.
+- It stays readable with `include_archived=True` and keeps its name, so bring it back with
+  `client.datasets.restore` rather than creating it again.
+- A benchmark can be archived with `client.benchmark_definitions.remove` only after all its
+  datasets are archived.
 
 ## Store secrets and choose providers
 
@@ -198,7 +185,9 @@ settings = await client.settings.get()
 ```
 
 Changing settings needs a login. An access key reads its creator's settings but can't
-change them. See [Configure sandbox providers](/get-started/sandbox-providers) and
+change them.
+
+See [Configure sandbox providers](/get-started/sandbox-providers) and
 [Benchmark authentication](/benchmarks/authentication).
 
 ## Check your identity and organizations
@@ -225,7 +214,8 @@ catalog = await client.services.catalog()
 task_ids = await client.services.task_ids("swebench", dataset="default")
 ```
 
-`list` checks that every service responds, and `catalog` returns the hosted services
-without checking them. `task_ids` uses the URL you saved for the benchmark, if any. To ask
-the hosted service, pass `ignore_custom_services=True`. To send extra headers, pass
-`service_headers`.
+- `list` checks that every service responds, and `catalog` returns the hosted services
+  without checking them.
+- `task_ids` uses the URL you saved for the benchmark, if any. To ask the hosted service,
+  pass `ignore_custom_services=True`.
+- To send extra headers, pass `service_headers`.

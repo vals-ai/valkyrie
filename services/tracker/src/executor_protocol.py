@@ -12,12 +12,24 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
 MANAGED_EXECUTION_PROTOCOL_VERSION = "3"
 DATASET_VERSION_PROTOCOL_VERSION = "4"
 
+DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS = 300
+DEFAULT_EXECUTOR_DISPATCH_LEASE_SECONDS = 300
+DEFAULT_EXECUTOR_DISPATCH_LEASE_TICK_SECONDS = 10
+
+
+def executor_payload_benchmark_id(payload: Mapping[str, object]) -> str:
+    execution_context = payload.get("execution_context_json")
+    if execution_context is not None:
+        return cast(Mapping[str, str], execution_context)["benchmark_id"]
+    return cast(str, payload["benchmark_id_str"])
+
 
 class ExecutorDispatchStatus(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
     FAILED = "FAILED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class ExecutorTelemetryContext(TypedDict):

@@ -11,7 +11,7 @@ import pytest
 import yaml
 from benchmark_service import ImageSource, Resources, SandboxQuery
 
-from tracker.database.models import AgentContractRequest, OutputArtifact
+from tracker.types import AgentContractRequest, OutputArtifact
 from tracker.exceptions import AgentRunFailedError
 from tracker.external_service_gateway import ExternalServiceDeadlineController
 from tracker.generation_plan import GenerationPlan
@@ -23,6 +23,7 @@ from tracker.runtime.artifacts import agent_bundle_key, copy_agent_to_benchmark,
 from tracker.runtime.logs import TaskLogReference, task_log_stream_name
 from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.sandbox import SandboxCreationState, create_sandbox, run_agent, upload_agent_artifacts
+from tests.utils import unexpected_sandbox_record
 
 
 @pytest.mark.description("Execute a frozen local bundle without S3, curl, unzip, or package downloads.")
@@ -71,6 +72,7 @@ async def test_local_runtime_transfers_and_executes_frozen_agent(tmp_path: Path,
             Resources(vcpu=1, memory=1, disk=1),
             asyncio.Semaphore(1),
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
             env_vars=await resolve_secrets(contract.secrets, runtime.secrets),
         ) as sandbox:
             sandbox_id = sandbox.id

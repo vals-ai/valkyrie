@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Generator
 from typing import Any, Optional
 
 import pytest
@@ -6,12 +7,15 @@ from benchmark_service import ImageSource, Resources, Sandbox, SandboxNotFoundEr
 from benchmark_service.client import BenchmarkServiceClient
 from fastapi.testclient import TestClient
 from sqlmodel import Session, col, select
+from main import app
 
-from tests.utils import TEST_ORG_ID, random_task_id
+from tests.utils import TEST_ORG_ID, random_task_id, unexpected_sandbox_record
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.aws.services import CloudRuntimeFactory
-from tracker.database.models import Benchmark, BenchmarkStatus, Org, Task, TaskStatus
+from tracker.database.models import Benchmark, Org, Task
+from tracker.database.session import get_session
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.logging import get_logger
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.sandbox import SandboxCreationState, create_sandbox
@@ -174,6 +178,7 @@ class TestForceStop:
                 resources=test_resources,
                 creation_semaphore=creation_semaphore,
                 creation_state=SandboxCreationState(cleanup_pending=False),
+                record_sandbox=unexpected_sandbox_record,
                 labels=labels,
             ) as sandbox:
                 created_sandbox_name.append(sandbox.name)
@@ -245,6 +250,7 @@ class TestForceStop:
                     resources=test_resources,
                     creation_semaphore=creation_semaphore,
                     creation_state=SandboxCreationState(cleanup_pending=False),
+                    record_sandbox=unexpected_sandbox_record,
                     labels=labels,
                 ) as sandbox:
                     result = await sandbox.exec("true")
@@ -321,18 +327,30 @@ class TestForceStop:
     async def test_force_stop_end_to_end(
         self,
         example_benchmark_object: Benchmark,
-        database_session: Session,
+        control_postgres_session: Session,
         daytona_secret_name: str,
         live_aws_runtime: AWSRuntime,
         api_headers: dict[str, str],
         service_headers: dict[str, str],
         live_api_client: TestClient,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        database_session = control_postgres_session
+        org = database_session.get(Org, TEST_ORG_ID)
+        assert org is not None
+        org.storage_key = live_aws_runtime.resources.s3_bucket
+        database_session.add(org)
         example_benchmark_object.arguments.slice_str = ":5"
         example_benchmark_object.arguments.concurrency = 2
         database_session.add(example_benchmark_object)
         database_session.commit()
+
+        def get_control_session() -> Generator[Session, None, None]:
+            with Session(database_session.get_bind(), expire_on_commit=False) as request_session:
+                yield request_session
+
+        monkeypatch.setitem(app.dependency_overrides, get_session, get_control_session)
 
         benchmark_service = example_benchmark_object.benchmark_service(service_headers=service_headers)
         benchmark_task: Optional[asyncio.Task[None]] = None
@@ -345,7 +363,7 @@ class TestForceStop:
                 slice_str=example_benchmark_object.arguments.slice_str,
             )
 
-            authority_kwargs = executor_authority_kwargs(example_benchmark_object)
+            control_kwargs = bound_controls(example_benchmark_object, session=database_session)
             benchmark_task = asyncio.create_task(
                 process_benchmark(
                     execution_context_json=ManagedExecutionContext(
@@ -356,7 +374,7 @@ class TestForceStop:
                             service_headers=service_headers
                         ),
                     ).model_dump(mode="json"),
-                    **authority_kwargs,
+                    **control_kwargs,
                 )
             )
 

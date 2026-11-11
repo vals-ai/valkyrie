@@ -42,22 +42,28 @@ Replace the following:
 - *`TOKEN_ID`* and *`TOKEN_SECRET`*: your Modal token's ID and secret
 - *`OPENAI_KEY`*: an example agent secret, here an OpenAI API key
 
-Each task reads only the selected provider's settings and the variables its agent contract
-declares. Valkyrie saves the file's path with the run, never its values. Agent contracts
-can't declare `DAYTONA_*` or `MODAL_TOKEN_*` variables.
+- Each task reads only the selected provider's settings and the variables its agent
+  contract declares.
+- Valkyrie saves the file's path with the run, never its values.
+- Agent contracts can't declare `DAYTONA_*` or `MODAL_TOKEN_*` variables.
 
 ## Start the Tracker
 
-From the repository root:
+From the repository root, set the bootstrap secret used by local execution:
 
 ```bash
+export EXECUTOR_BOOTSTRAP_KEY=YOUR_BOOTSTRAP_SECRET
 make local-tracker
 ```
 
-This starts PostgreSQL in Docker, applies migrations, and serves the Tracker at
-`http://127.0.0.1:8000`. Runs use the code in your checkout, including retries and resumes
-after you change it. If you restart the Tracker while tasks are waiting to start, retry the
-run afterwards.
+This starts PostgreSQL in Docker, explicitly applies migrations, and serves Tracker at `http://127.0.0.1:8000`.
+
+- Runs, including retries and resumes, use code from your checkout after changes.
+- If you restart Tracker while tasks are waiting to start, retry the run afterwards.
+
+To keep access to queued tasks across a restart, set and retain a base64-encoded 32-byte
+`EXECUTOR_PAYLOAD_LOCAL_KEY` before starting the Tracker. Without it,
+`make local-tracker` generates a new key on each start.
 
 The default settings are in `local-server.yaml` at the repository root:
 
@@ -96,19 +102,16 @@ export VALKYRIE_URL=http://127.0.0.1:8000
 
 valkyrie agent push ./my-agent
 
-valkyrie project create my-project --name "My Project" --spend-type development \
-  --subcategory new_benchmark_generation \
-  --budget 300 --budget-reason "3 runs, about 100 each"
-
-valkyrie run start --agent my-agent --benchmark my-benchmark --project my-project \
+valkyrie run start --agent my-agent --benchmark my-benchmark \
   --provider daytona --concurrency 1
 ```
 
-Without `--provider` or a [default
-provider](/get-started/sandbox-providers#choose-the-provider-for-a-run), runs use
-`daytona`. Every other `valkyrie run` command works against the local Tracker, which
-serves artifacts over HTTP, so the CLI doesn't need access to `data_root`. Retries,
-resumes, and forced stops use the provider and secrets file saved on the run.
+- Without `--provider` or a [default
+  provider](/get-started/sandbox-providers#choose-the-provider-for-a-run), runs use
+  `daytona`.
+- Every other `valkyrie run` command works against the local Tracker, which serves artifacts
+  over HTTP, so the CLI doesn't need access to `data_root`.
+- Retries, resumes, and forced stops use the provider and secrets file saved on the run.
 
 ## Docker sandboxes
 

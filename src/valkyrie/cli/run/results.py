@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import click
@@ -6,6 +7,7 @@ from valkyrie.sdk import ValkyrieClient
 from valkyrie.sdk.models import FinalViewResponse, RetrieveResultsResponse
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import terminal_safe
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
 
@@ -93,6 +95,27 @@ def results(
                 )
             )
         download_final_view(path or Path(f"./results-{run_id}.json"), results_response, overwrite=yes)
+        evaluation = results_response.final_evaluation
+        if evaluation is not None and evaluation.final_score is None:
+            scorer = evaluation.properties.get("scorer")
+            error = cast(dict[str, object], scorer).get("error") if isinstance(scorer, dict) else None
+            if error:
+                click.echo(
+                    click.style(
+                        f"The dataset's metric script failed, so the run has no score: "
+                        f"{terminal_safe(str(error), preserve_newlines=True)}\n"
+                        f"Fix it and run `valkyrie run rescore {run_id}`.",
+                        fg="red",
+                    )
+                )
+            else:
+                click.echo(
+                    click.style(
+                        "The run has no single headline score: its tasks report several rewards and none is named "
+                        "'reward'. Every mean is in the results file under final_evaluation.properties.metrics.",
+                        fg="yellow",
+                    )
+                )
     else:
         click.echo(
             click.style(

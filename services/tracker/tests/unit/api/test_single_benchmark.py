@@ -15,12 +15,11 @@ from tests.utils import TEST_ORG_ID
 from tracker.aws.runtime import AWSResources
 from tracker.database.models import (
     Benchmark,
-    AWSBenchmarkArguments,
-    FailureCategory,
     FinalEvaluation,
     Org,
-    TaskStatus,
 )
+from tracker.types import AWSBenchmarkArguments
+from tracker.domain import FailureCategory, TaskStatus
 
 _client = TestClient(app)
 

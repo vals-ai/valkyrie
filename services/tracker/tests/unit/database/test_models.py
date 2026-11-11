@@ -8,15 +8,12 @@ from sqlmodel import Session
 
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import (
-    AgentContractRequest,
-    AWSBenchmarkArguments,
     Benchmark,
     BenchmarkArgumentsType,
-    LocalBenchmarkArguments,
-    OutputArtifact,
     Task,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments, LocalBenchmarkArguments, OutputArtifact
+from tracker.domain import TaskStatus
 from tracker.local.resources import LocalResources
 from tracker.services.results import build_benchmark_table_rows
 

@@ -21,11 +21,10 @@ from tracker.database.models import Org, Project
 from tracker.repositories.project import ProjectRepository
 from tracker.local import config as local_config
 from tracker.local.resources import reads_secrets_file
-from tracker.secret_access import tenant_secret_prefix
+from tracker.secret_access import GATEWAY_SECRET_NAME_PREFIX, tenant_secret_prefix
 
 
 _GATEWAY_PATH = "admin/managed-auth/machine"
-_GATEWAY_SECRET_NAME_PREFIX = "model-gateway-"
 
 
 def automatic_project_gateway(org: Org) -> bool:
@@ -70,18 +69,8 @@ def request_project_gateway_key(project: Project, budget: Decimal, budget_reason
     return asyncio.run(_request_project_gateway_key(project, budget, budget_reason))
 
 
-def is_generated_project_gateway_secret_name(name: str) -> bool:
-    if not name.startswith(_GATEWAY_SECRET_NAME_PREFIX):
-        return False
-    key_id = name.removeprefix(_GATEWAY_SECRET_NAME_PREFIX)
-    try:
-        return str(UUID(key_id)) == key_id
-    except ValueError:
-        return False
-
-
 def _gateway_secret_reference(org: Org, key_id: UUID) -> str:
-    return f"{tenant_secret_prefix(org.id)}{_GATEWAY_SECRET_NAME_PREFIX}{key_id}"
+    return f"{tenant_secret_prefix(org.id)}{GATEWAY_SECRET_NAME_PREFIX}{key_id}"
 
 
 async def _collect_project_gateway_key(project: Project, org: Org, secret_store: SecretsManagerStore) -> UUID:

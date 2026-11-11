@@ -3,9 +3,10 @@ title: "Monitor runs"
 description: "Follow a run's progress, find failed tasks, read logs, and search your run history."
 ---
 
-Follow a run while it goes, find out why tasks failed, and look up earlier runs. Every
-command is in the [`valkyrie run` reference](/reference/cli/run). To do the same from
-Python, see [Manage runs with Python](/sdk/runs).
+Follow a run while it goes, find out why tasks failed, and look up earlier runs.
+
+- Every command is in the [`valkyrie run` reference](/reference/cli/run).
+- To do the same from Python, see [Manage runs with Python](/sdk/runs).
 
 In the commands on this page, replace *`RUN_ID`* with the run's ID, which
 `valkyrie run start` prints, and *`TASK_ID`* with a task's
@@ -17,9 +18,11 @@ ID.
 valkyrie run fetch RUN_ID --connect
 ```
 
-This prints the run's details, then its progress until the run finishes. Press **Control+C**
-to stop watching; the run keeps going. Without `--connect`, `run fetch` prints one snapshot,
-and `--format json` prints it as JSON.
+This prints the run's details, then its progress until the run finishes.
+
+- Press **Control+C** to stop watching. The run keeps going.
+- Without `--connect`, `run fetch` prints one snapshot. `--format json` prints the SDK's
+  `RunSnapshot`: the run and its launch metadata.
 
 A run ends as `FINISHED`, `ERROR`, or `STOPPED`. The command exits with 0 whichever way the
 run ends, so check the status rather than the exit code.
@@ -30,11 +33,12 @@ run ends, so check the status rather than the exit code.
 valkyrie run fetch RUN_ID --connect --format jsonl
 ```
 
-Each line is a JSON record with an `event` field. The first record is a `snapshot`, then
-`update` records follow, and the last is one of `complete`, `error`, `stopped`,
-`disconnect`, or `interrupted`. If the stream ends without a final record, the command
-exits with 1. In these records, `finished_tasks` counts tasks that finished, failed, or
-stopped.
+Each line is an SDK model as JSON.
+
+- The first line is the `RunSnapshot`. Each line after it is a `RunStreamEvent` with an `event` field.
+- `update` lines carry the run. The last line is `complete`, `error`, or `disconnect`.
+- After `complete`, check `run.details.status` in the last `update` for how the run ended.
+- If the stream ends without a final event, the command exits with 1.
 
 ## Check several runs at once
 
@@ -45,8 +49,8 @@ valkyrie run status --ids RUN_ID_1,RUN_ID_2 --format json
 Replace *`RUN_ID_1`* and *`RUN_ID_2`* with the runs' IDs.
 
 
-The output keeps the order you gave. IDs that don't exist or that you can't see are listed
-under `missing_run_ids`, and the command then exits with 1.
+The output keeps the order you gave. IDs that don't exist or that you can't see are left out,
+and the command then exits with 1.
 
 ## Find failed tasks
 
@@ -119,8 +123,8 @@ list with **h** and **l**, and quit with **q**. To print every match as one JSON
 valkyrie run list --format json --all --status IN_PROGRESS
 ```
 
-JSON output leaves out agent secrets, parameters, and raw error messages. Missing values and
-scores that aren't finite numbers are `null`, and times are UTC in ISO 8601.
+JSON output is the SDK model the command reads, here `FetchBenchmarksResponse`. Scores that
+aren't finite numbers are `null`.
 
 `valkyrie run filter-options` lists the agents, benchmarks, models, and other values your
 organization's earlier runs used, which are the values the filters accept.
@@ -134,9 +138,10 @@ active tasks:
 valkyrie queue status
 ```
 
-Waiting tasks are ordered by priority, then by when they joined the queue. Positions count
-every task in the pool, including other organizations' tasks, which aren't listed. The
-command only reads the queue.
+- Waiting tasks are ordered by priority, then by when they joined the queue.
+- Positions count every task in the pool, including other organizations' tasks, which aren't
+  listed.
+- The command only reads the queue.
 
 Each list shows up to 100 entries. When there are more, the output prints the offset of the
 next page. Pass `--waiting-offset` and `--active-offset` to page through each list
@@ -154,8 +159,10 @@ The queue changes between calls, so a task can appear on two pages or on none.
 valkyrie ui
 ```
 
-`valkyrie ui` lists your recent runs with live status. It only reads: stop or retry a run
-with `valkyrie run`. To try it on sample data, add `--fake`.
+`valkyrie ui` lists your recent runs with live status. It only reads, so stop or retry a
+run with `valkyrie run`.
+
+To try it on sample data, add `--fake`.
 
 | Key | Action |
 | --- | --- |

@@ -17,7 +17,9 @@ from sqlmodel import Session
 
 from tests.factories import make_benchmark, make_task
 from tracker.api.dependencies import get_run_runtime
-from tracker.database.models import ActiveNativeOutput, Benchmark, Org, Task, TaskStatus
+from tracker.database.models import Benchmark, Org, Task
+from tracker.domain import TaskStatus
+from tracker.types import ActiveNativeOutput
 
 _STARTED_AT = datetime(2026, 7, 1, tzinfo=UTC)
 _HEADERS = {"X-Api-Key": "fake"}

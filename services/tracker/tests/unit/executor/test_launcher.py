@@ -7,17 +7,13 @@ from uuid import uuid4
 import pytest
 from sqlmodel import Session
 
-from tracker.database.models import Benchmark, ExecutorDispatch, ExecutorDispatchKind, ExecutorRelease
+from tracker.database.models import Benchmark, ExecutorDispatch, ExecutorRelease
+from tracker.domain import ExecutorDispatchKind
 from tracker.executor import launcher
 
 
 @pytest.fixture
-def ecs_launcher_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
-    monkeypatch.setenv("EXECUTOR_RUNNER_CLUSTER", "cluster")
-    monkeypatch.setenv("EXECUTOR_RUNNER_SUBNETS", "subnet-a,subnet-b")
-    monkeypatch.setenv("EXECUTOR_RUNNER_SECURITY_GROUP", "sg-runner")
-    monkeypatch.setenv("EXECUTOR_RUNNER_CONTAINER", "ExecutorRunner")
+def ecs_launcher_env(monkeypatch: pytest.MonkeyPatch, ecs_runner_env: None) -> None:
     monkeypatch.setattr(
         launcher, "_task_definition", lambda _dispatch: "arn:aws:ecs:us-east-1:123456789012:task-definition/runner:7"
     )
@@ -54,7 +50,7 @@ async def test_ecs_retries_ambiguous_error_with_same_token_and_records_one_arn(
     assert observed[0]["overrides"]["containerOverrides"][0]["command"] == [
         "/app/.venv/bin/python",
         "-m",
-        "tracker.executor.entrypoint",
+        "tracker.executor.watchdog",
         "--dispatch-id",
         str(dispatch_id),
     ]
@@ -103,8 +99,11 @@ async def test_ecs_accepted_launch_survives_arn_write_failure(
     "The local launcher starts one detached executor process with the Tracker environment off the event loop thread."
 )
 @pytest.mark.asyncio
-async def test_local_launcher_spawns_one_detached_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_local_launcher_spawns_one_detached_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
+    monkeypatch.setenv("DB_PASSWORD", "must-not-enter-executor")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://must-not-enter-executor")
+    monkeypatch.setenv("EXECUTOR_CONTROL_URL", "http://control.test")
     spawn_threads: list[int] = []
     popen = Mock(side_effect=lambda *_args, **_kwargs: spawn_threads.append(threading.get_ident()))
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
@@ -112,11 +111,14 @@ async def test_local_launcher_spawns_one_detached_executor(monkeypatch: pytest.M
 
     await launcher.launch_dispatch(SimpleNamespace(id=dispatch_id))
 
-    popen.assert_called_once_with(
-        [launcher.sys.executable, "-m", "tracker.executor.entrypoint", "--dispatch-id", str(dispatch_id)],
-        start_new_session=True,
-        env=launcher.os.environ,
-    )
+    popen.assert_called_once()
+    command = popen.call_args.args[0]
+    options = popen.call_args.kwargs
+    assert command == [launcher.sys.executable, "-m", "tracker.executor.watchdog", "--dispatch-id", str(dispatch_id)]
+    assert options["start_new_session"] is True
+    assert options["env"]["EXECUTOR_CONTROL_URL"] == "http://control.test"
+    assert "DB_PASSWORD" not in options["env"]
+    assert "DATABASE_URL" not in options["env"]
     assert spawn_threads != [threading.get_ident()]
 
 
@@ -130,9 +132,10 @@ async def test_ecs_task_arn_persists_on_dispatch_row(
 ) -> None:
     release = ExecutorRelease(
         id="arn-test-release",
-        artifact_uri="s3://artifacts/runner.pex",
+        artifact_uri=f"123456789012.dkr.ecr.us-east-1.amazonaws.com/valkyrie-executor@sha256:{'a' * 64}",
         artifact_digest="a" * 64,
         protocol_version="3",
+        task_definition_arn="arn:aws:ecs:us-east-1:123456789012:task-definition/runner:8",
     )
     benchmark = example_benchmark_object
     dispatch = ExecutorDispatch(

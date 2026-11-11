@@ -11,7 +11,8 @@ from sqlmodel import Session
 from tests.utils import TEST_ORG_ID
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import delete_from_s3, upload_to_s3
-from tracker.database.models import AgentContractRequest, Benchmark, AWSBenchmarkArguments, Task
+from tracker.database.models import Benchmark, Task
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
 
 
 @pytest.mark.description(

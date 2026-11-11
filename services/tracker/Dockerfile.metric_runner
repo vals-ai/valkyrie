@@ -1,0 +1,5 @@
+FROM public.ecr.aws/lambda/python:3.12
+RUN pip install --no-cache-dir uv==0.9.7
+RUN pip download --no-cache-dir --only-binary=:all: -d /opt/wheels numpy pandas scipy scikit-learn matplotlib pyarrow statsmodels
+COPY src/metric_process.py ${LAMBDA_TASK_ROOT}/
+CMD ["metric_process.handler"]

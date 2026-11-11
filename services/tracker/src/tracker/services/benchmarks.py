@@ -6,14 +6,13 @@ from sqlmodel import Session
 from tracker.auth import RequestIdentity
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     Org,
     Task,
-    benchmark_arguments_adapter,
 )
+from tracker.domain import BenchmarkStatus
 from tracker.exceptions import TrackerServiceError
 from tracker.repositories.benchmark import BenchmarkRepository
-from tracker.types import RunExecutionRequest, StartBenchmarkRequest
+from tracker.types import RunExecutionRequest, StartBenchmarkRequest, benchmark_arguments_adapter
 
 
 @dataclass(frozen=True)
@@ -53,6 +52,7 @@ def start_benchmark_request_to_benchmark(
                 "dataset_version": request.resolved_dataset_version
                 if isinstance(request, RunExecutionRequest)
                 else None,
+                "dataset_ref": request.dataset_ref,
                 "sandbox_provider": request.sandbox_provider,
                 "sandbox_provider_secret_name": provider_secret_name,
                 "monitoring": request.monitoring,

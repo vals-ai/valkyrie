@@ -10,65 +10,49 @@ from pathlib import Path
 import benchmark_service
 import pytest
 
-
 _CHILD_PROBE = """
 import asyncio
 import json
 import os
+import sys
+from importlib.abc import MetaPathFinder
 from pathlib import Path
-from types import SimpleNamespace
 
-from benchmark_service import ExecResult, GenerationContainment
-from tracker.database.models import AgentContractRequest
+class NoDatabaseImports(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "sqlmodel" or fullname.startswith("sqlmodel.") or fullname == "tracker.database" or fullname.startswith("tracker.database."):
+            raise AssertionError("Executor child imported database runtime: " + fullname)
+        return None
+
+sys.meta_path.insert(0, NoDatabaseImports())
+from benchmark_service import ExecResult
+from tracker.types import AgentContractRequest
 from tracker.external_service_gateway import ExternalServiceDeadlineController
 from tracker.generation_plan import GenerationPlan
 from tracker.sandbox import run_agent
-
-
-class Workload:
-    def __init__(self):
-        self.closed = asyncio.Event()
-        self.kills = 0
-        self.agent_absence_confirmed_at = None
-
-    async def output(self):
-        yield "generation started"
-        await self.closed.wait()
-
-    async def wait(self):
-        await self.closed.wait()
-        return SimpleNamespace(
-            result=ExecResult(exit_code=0),
-            absence_confirmed_at=self.agent_absence_confirmed_at,
-        )
-
-    async def kill(self):
-        self.kills += 1
-        self.agent_absence_confirmed_at = asyncio.get_running_loop().time()
-        self.closed.set()
 
 
 class Sandbox:
     id = "local-controlled"
     name = "local-controlled"
     state = "started"
-    generation_containment = GenerationContainment(type="linux_cgroup_v2", version=1)
 
     def __init__(self):
-        self.workload = Workload()
-        self.probes = 0
+        self.cancellations = 0
         self.commands = []
-
-    async def probe_generation_containment(self):
-        self.probes += 1
 
     async def exec(self, command):
         self.commands.append(command)
         return ExecResult(exit_code=0)
 
-    def controlled_workload(self, command, *, cwd=None, env_vars):
+    async def command(self, command, *, cwd=None, env_vars=None):
         self.commands.append(command)
-        return self.workload
+        try:
+            yield "generation started"
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            raise
 
 
 async def controlled_probe(*, benchmark_id_str, executor_dispatch_id, **_kwargs):
@@ -91,10 +75,9 @@ async def controlled_probe(*, benchmark_id_str, executor_dispatch_id, **_kwargs)
         "dispatch_id": executor_dispatch_id,
         "reason": reason.value if reason is not None else None,
         "duration": duration,
-        "kills": sandbox.workload.kills,
-        "probes": sandbox.probes,
-        "absence_confirmed": sandbox.workload.agent_absence_confirmed_at is not None,
-        "controlled_command": sandbox.commands[-1],
+        "cancellations": sandbox.cancellations,
+        "controlled_command": next(c for c in sandbox.commands if "PYTHONSAFEPATH=1" in c),
+        "kill_command": sandbox.commands[-1],
         "messages": messages,
     }))
 
@@ -133,9 +116,9 @@ def test_run_agent_child_enforces_selected_generation_deadline(tmp_path: Path, m
     assert observed["benchmark_id"] == "benchmark-source-controlled"
     assert observed["dispatch_id"] == "dispatch-source-controlled"
     assert observed["reason"] == "TIMEOUT"
-    assert observed["kills"] == 1
-    assert observed["probes"] == 1
-    assert observed["absence_confirmed"] is True
+    assert observed["cancellations"] == 1
     assert observed["duration"] >= 0.05
     assert "PYTHONSAFEPATH=1 echo task" in observed["controlled_command"]
     assert "timeout " not in observed["controlled_command"]
+    assert "setsid --wait" in observed["controlled_command"]
+    assert "kill -9" in observed["kill_command"]

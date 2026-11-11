@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+STREAM_CHUNK_BYTES = 1024 * 1024
+
 
 @dataclass(frozen=True)
 class StoredObject:
@@ -31,6 +33,9 @@ class ObjectStore(Protocol):
         raise NotImplementedError  # pragma: no cover
 
     async def get_bytes(self, key: str) -> bytes:
+        raise NotImplementedError  # pragma: no cover
+
+    def get_stream(self, key: str) -> AsyncIterator[bytes]:
         raise NotImplementedError  # pragma: no cover
 
     def get_many(self, keys: AsyncIterable[str]) -> AsyncIterator[tuple[str, bytes]]:

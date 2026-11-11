@@ -12,47 +12,41 @@ from benchmark_service.schemas import FinalScoreResponse, VerifyTaskIdsResponse
 import pytest
 from botocore.config import Config
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, col, select
 
 import tracker.services.runs.stop as run_control_module
-import tracker.services.runs.finalize as run_finalization_module
 import tracker.services.runs.start as run_orchestration_module
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tests.factories import make_benchmark, make_evaluation_result, make_task
 from tracker.aws.runtime import AWSRuntime
-from tracker.aws.services import CloudRuntimeFactory
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    BenchmarkStatus,
+    BenchmarkServiceWake,
     ErrorResult,
     EvaluationResult,
     ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
     FinalEvaluation,
     Org,
-    RetryMode,
     Task,
-    TaskStatus,
 )
-from tracker.exceptions import ExecutionAuthorityRevoked
+from executor_protocol import ExecutorDispatchStatus
+from tracker.types import AgentContractRequest
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, FailureCategory, RetryMode, TaskStatus
 from tracker.executor.dispatch_control import admit_recovery_dispatch, terminalize_active_dispatches
-from tracker.executor.execution_authority import ExecutionAuthority
+from tracker.executor.control_runs import RunFailure
+from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.executor.release_control import promote_release
 from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.services.runs.start import process_benchmark
-from tracker.services.runs.regrade import regrade_run, regrade_task_rows, regrade_tasks
 from tracker.auth import RequestIdentity
-from tracker.services.runs.finalize import fetch_final_score_inputs
+from tracker.services.results import fetch_final_score_inputs
+from tracker.services.runs.regrade import regrade_run, regrade_task_rows, regrade_tasks
 from tracker.services.runs.stop import initiate_stop_benchmark
 from tracker.services.runs.retry import regrade_rerun_error, reset_to_in_progress_status
-from tracker.services.final_views import create_final_view
 from tracker.services.benchmarks import fetch_benchmark_row
 from tracker.services.tasks.error_summary import summarize_task_errors
-from tracker.services.tasks.monitor import TaskMonitor
+from tracker.services.tasks.execute import TaskMonitor
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +62,6 @@ async def _service_ready(*_args: Any, **_kwargs: Any) -> None:
 def benchmark_service_ready(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     wait = AsyncMock(side_effect=_service_ready)
     monkeypatch.setattr(run_orchestration_module, "wait_for_benchmark_service", wait)
-    monkeypatch.setattr(run_orchestration_module, "was_woken", lambda *_args: True)
     return wait
 
 
@@ -89,6 +82,10 @@ async def _skip_log_group(*_args: Any, **_kwargs: Any) -> str:
     return "test-log-group"
 
 
+def _skip_log_write(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
 async def _provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
     return DaytonaProviderConfig(
         DAYTONA_API_KEY="test-key",
@@ -99,13 +96,12 @@ async def _provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig
 
 def _patch_process_dependencies(
     monkeypatch: pytest.MonkeyPatch,
-    postgres_engine: Engine,
     *,
     upload: Any = _skip_cloud_operation,
 ) -> None:
-    monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-    monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
+
     monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", _skip_log_group)
+    monkeypatch.setattr(CloudWatchBenchmarkLogSink, "write", _skip_log_write)
     monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", _provider_config)
     monkeypatch.setattr(run_orchestration_module, "upload_final_view", upload)
 
@@ -126,8 +122,7 @@ class TestRunFinalization:
         self,
         postgres_engine: Engine,
         postgres_session: Session,
-        monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"error-finalization-race-{uuid4()}")
         contract = AgentContractRequest(name="error-race-agent", install_cmd="true", run_cmd="true")
@@ -156,15 +151,19 @@ class TestRunFinalization:
             benchmarks.append(benchmark)
         postgres_session.commit()
 
-        def change_status_during_summary(task_errors: dict[str, str]) -> str:
-            task_id = next(iter(task_errors))
+        controls = [bound_controls(benchmark, session=postgres_session) for benchmark in benchmarks]
+        decisions = [await control["run_control"].prepare_finalization() for control in controls]
+        assert [decision.kind for decision in decisions] == ["all_error"] * 3
+
+        committed = []
+        for (task_id, status), control, decision in zip(target_statuses.items(), controls, decisions, strict=True):
             with Session(postgres_engine) as transition_session:
                 task = transition_session.exec(
                     select(Task).where(Task.task_id == task_id).where(Task.org_id == org.id)
                 ).one()
-                task.status = target_statuses[task_id]
+                task.status = status
                 transition_session.add(task)
-                if task.status == TaskStatus.FINISHED:
+                if status == TaskStatus.FINISHED:
                     transition_session.add(
                         EvaluationResult(
                             org_id=org.id,
@@ -175,34 +174,30 @@ class TestRunFinalization:
                     )
                 transition_session.commit()
 
-            return summarize_task_errors(task_errors)
-
-        monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
-        monkeypatch.setattr(run_finalization_module, "summarize_task_errors", change_status_during_summary)
-
-        authorities = [
-            ExecutionAuthority(
-                benchmark_id=benchmark.id,
-                dispatch_id=UUID(
-                    executor_authority_kwargs(benchmark, session=postgres_session)["executor_dispatch_id"]
-                ),
+            error_summary = summarize_task_errors(decision.task_errors)
+            committed.append(
+                (
+                    await control["run_control"].commit_run_error(
+                        RunFailure(
+                            error_message=error_summary,
+                            producer="tracker",
+                            operation="summarize_task_errors",
+                            error_type="AllTasksFailed",
+                            category=FailureCategory.UNKNOWN,
+                            cause_code=None,
+                            task_ids=[task_id],
+                            fingerprint=decision.fingerprint,
+                        )
+                    )
+                ).committed
             )
-            for benchmark in benchmarks
-        ]
-        deferred_results = [
-            await run_finalization_module.finalize_all_error_run(
-                benchmark.id,
-                org,
-                authority=authority,
-            )
-            for benchmark, authority in zip(benchmarks, authorities, strict=True)
-        ]
+            if status == TaskStatus.STOPPED:
+                assert (await control["run_control"].prepare_finalization()).kind == "stopped"
 
         with Session(postgres_engine) as assertion_session:
             persisted_benchmarks = [assertion_session.get(Benchmark, benchmark.id) for benchmark in benchmarks]
 
-        assert deferred_results == [True, True, False]
+        assert committed == [False, False, False]
         assert all(benchmark is not None for benchmark in persisted_benchmarks)
         assert [benchmark.status for benchmark in persisted_benchmarks if benchmark] == [
             BenchmarkStatus.IN_PROGRESS,
@@ -216,67 +211,68 @@ class TestRunFinalization:
     )
     async def test_retry_before_final_view_upload_skips_stale_publication(
         self,
-        postgres_engine: Engine,
         postgres_session: Session,
-        aws_runtime: AWSRuntime,
-        monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"final-view-race-{uuid4()}")
         benchmark = make_benchmark(
             name="final-view-race",
             org_id=org.id,
             contract=AgentContractRequest(name="race-agent", install_cmd="true", run_cmd="true"),
-            status=BenchmarkStatus.FINISHED,
+            status=BenchmarkStatus.IN_PROGRESS,
         )
         postgres_session.add(org)
         postgres_session.flush()
         postgres_session.add(benchmark)
         postgres_session.commit()
 
-        authority_kwargs = executor_authority_kwargs(benchmark, session=postgres_session)
-        authority = ExecutionAuthority(
-            benchmark_id=benchmark.id,
-            dispatch_id=UUID(str(authority_kwargs["executor_dispatch_id"])),
+        task = make_task(benchmark, "scored-task", status=TaskStatus.FINISHED)
+        postgres_session.add(task)
+        postgres_session.flush()
+        postgres_session.add(
+            EvaluationResult(
+                org_id=org.id,
+                task=task.id,
+                instance_id=f"publication-{task.id}",
+                result={"score": 1.0},
+            )
         )
+        postgres_session.commit()
+        controls = bound_controls(benchmark, session=postgres_session)
+        decision = await controls["run_control"].prepare_finalization()
+        assert decision.kind == "score"
+        inputs = decision.inputs
+        assert inputs is not None
+        claim = await controls["run_control"].commit_final_score(inputs.phase, inputs.fingerprint, 1.0, {})
+        assert claim.committed
         postgres_session.refresh(benchmark)
-        final_view = create_final_view(benchmark, postgres_session, org)
-
-        stale_dispatch = postgres_session.get(ExecutorDispatch, authority.dispatch_id)
-        assert stale_dispatch is not None
-        stale_dispatch.status = ExecutorDispatchStatus.FAILED
-        stale_dispatch.finished_at = datetime.now(UTC)
-        retry_dispatch = ExecutorDispatch(
-            benchmark_id=benchmark.id,
-            kind=ExecutorDispatchKind.RETRY,
-            status=ExecutorDispatchStatus.RUNNING,
-            executor_release_id=stale_dispatch.executor_release_id,
-            executor_artifact_uri=stale_dispatch.executor_artifact_uri,
-            executor_artifact_digest=stale_dispatch.executor_artifact_digest,
-            executor_protocol_version=stale_dispatch.executor_protocol_version,
-            started_at=datetime.now(UTC),
+        assert benchmark.current_execution_release_id is not None
+        promote_release(postgres_session, benchmark.current_execution_release_id)
+        reset_to_in_progress_status(
+            benchmark,
+            postgres_session,
+            retry=True,
+            retry_mode=RetryMode.FROM_SCRATCH,
+            rerun_task_ids=[task.task_id],
+            org=org,
+            verified_task_ids=[task.task_id],
         )
-        postgres_session.add(stale_dispatch)
-        postgres_session.add(retry_dispatch)
+        retry_dispatch = admit_recovery_dispatch(
+            postgres_session,
+            benchmark=benchmark,
+            pre_action_status=BenchmarkStatus.FINISHED,
+            dispatch_id=uuid4(),
+            kind=ExecutorDispatchKind.RETRY,
+        )
         postgres_session.commit()
 
-        upload_calls: list[UUID] = []
-
-        async def record_upload(*_args: Any, **_kwargs: Any) -> None:
-            upload_calls.append(benchmark.id)
-
-        monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
-        monkeypatch.setattr(run_orchestration_module, "upload_final_view", record_upload)
-
-        runtime = CloudRuntimeFactory.create_runtime(aws_runtime, sandbox_provider_secret_name="test-provider-secret")
         with pytest.raises(ExecutionAuthorityRevoked):
-            async with run_orchestration_module.hold_dispatch_authority(authority):
-                await run_orchestration_module.upload_final_view(final_view, runtime.objects)
+            await controls["run_control"].publish_final_view(inputs.phase, "upload_before")
 
-        assert upload_calls == []
+        postgres_session.refresh(benchmark)
+        assert benchmark.publication_status is None
         postgres_session.refresh(retry_dispatch)
-        assert retry_dispatch.status == ExecutorDispatchStatus.RUNNING
+        assert retry_dispatch.status == ExecutorDispatchStatus.QUEUED
 
     @pytest.mark.description(
         (
@@ -293,8 +289,8 @@ class TestRunFinalization:
         postgres_session: Session,
         aws_runtime: AWSRuntime,
         monkeypatch: pytest.MonkeyPatch,
+        bound_controls: Any,
         benchmark_service_ready: AsyncMock,
-        executor_authority_kwargs: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"finalization-race-{uuid4()}")
         contract = AgentContractRequest(name="race-agent", install_cmd="true", run_cmd="true")
@@ -321,6 +317,7 @@ class TestRunFinalization:
                 result={"score": 1.0},
             )
         )
+        postgres_session.add(BenchmarkServiceWake(name=benchmark.name))
         postgres_session.commit()
 
         request = StartBenchmarkRequest(
@@ -393,15 +390,13 @@ class TestRunFinalization:
                 retry_dispatch_ids.append(dispatch.id)
             return FinalScoreResponse(tasks_evaluated=[scored_task.task_id], final_score=0.25, metadata={})
 
-        monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", skip_cloud_operation)
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_retry_task)
         monkeypatch.setattr(BenchmarkServiceClient, "final_score", stale_final_score)
 
-        authority_kwargs = executor_authority_kwargs(benchmark, session=postgres_session)
+        authority_kwargs = bound_controls(benchmark, session=postgres_session)
         assert benchmark.current_execution_release_id is not None
         promote_release(postgres_session, benchmark.current_execution_release_id)
         postgres_session.commit()
@@ -437,7 +432,7 @@ class TestRunFinalization:
         postgres_session: Session,
         aws_runtime: AWSRuntime,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"finalizer-election-{uuid4()}")
         contract = AgentContractRequest(name="finalizer-agent", install_cmd="true", run_cmd="true")
@@ -472,8 +467,8 @@ class TestRunFinalization:
             sandbox_provider="daytona",
             sandbox_provider_secret_name="test-provider-secret",
         )
-        first_authority = executor_authority_kwargs(benchmark, dispatch_id=uuid4(), session=postgres_session)
-        second_authority = executor_authority_kwargs(benchmark, dispatch_id=uuid4(), session=postgres_session)
+        first_authority = bound_controls(benchmark, dispatch_id=uuid4(), session=postgres_session)
+        second_authority = bound_controls(benchmark, dispatch_id=uuid4(), session=postgres_session)
         upload_calls = 0
 
         async def skip_cloud_operation(*_args: Any, **_kwargs: Any) -> None:
@@ -510,8 +505,6 @@ class TestRunFinalization:
                 both_monitors_arrived.set()
             await both_monitors_arrived.wait()
 
-        monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
         monkeypatch.setattr(run_orchestration_module, "upload_final_view", skip_cloud_operation)
@@ -541,14 +534,16 @@ class TestRunFinalization:
         assert persisted_benchmark.status == BenchmarkStatus.FINISHED
         assert len(final_evaluations) == 1
 
-    @pytest.mark.description("Terminal side effects run while holding the run lock.")
-    async def test_terminal_side_effects_hold_benchmark_lock(
+    @pytest.mark.description(
+        "Finalized run status is visible before view upload and callback, with terminal publication recorded afterward."
+    )
+    async def test_terminal_status_precedes_upload_and_callback(
         self,
         postgres_engine: Engine,
         postgres_session: Session,
         aws_runtime: AWSRuntime,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"final-view-lock-{uuid4()}")
         contract = AgentContractRequest(name="final-view-lock-agent", install_cmd="true", run_cmd="true")
@@ -583,32 +578,24 @@ class TestRunFinalization:
             sandbox_provider="daytona",
             sandbox_provider_secret_name="test-provider-secret",
         )
-        authority_kwargs = executor_authority_kwargs(benchmark, dispatch_id=uuid4(), session=postgres_session)
+        authority_kwargs = bound_controls(benchmark, dispatch_id=uuid4(), session=postgres_session)
         benchmark.arguments = benchmark.arguments.model_copy(update={"lambda_function": "test-lambda"})
         postgres_session.add(benchmark)
         postgres_session.commit()
-        side_effects: dict[str, dict[str, int | bool]] = {
-            "upload": {"calls": 0, "lock_held": False},
-            "lambda": {"calls": 0, "lock_held": False},
-        }
+        effects: list[tuple[str, BenchmarkStatus, str]] = []
         lambda_configs: list[Config] = []
 
-        def assert_lock_held(benchmark_id: UUID) -> bool:
-            with Session(postgres_engine) as retry_session:
-                retry_session.connection().exec_driver_sql("SET LOCAL lock_timeout = '100ms'")
-                try:
-                    retry_session.exec(select(Benchmark).where(Benchmark.id == benchmark_id).with_for_update()).one()
-                except OperationalError:
-                    return True
-            return False
+        def record_effect(name: str) -> None:
+            with Session(postgres_engine) as observation_session:
+                persisted = observation_session.get(Benchmark, benchmark.id)
+                assert persisted is not None
+                effects.append((name, persisted.status, persisted.publication_status))
 
-        async def assert_upload_lock_held(*_args: Any, **_kwargs: Any) -> None:
-            side_effects["upload"]["calls"] += 1
-            side_effects["upload"]["lock_held"] = assert_lock_held(benchmark.id)
+        async def record_upload(*_args: Any, **_kwargs: Any) -> None:
+            record_effect("upload")
 
-        async def assert_lambda_lock_held(*_args: Any, **_kwargs: Any) -> None:
-            side_effects["lambda"]["calls"] += 1
-            side_effects["lambda"]["lock_held"] = assert_lock_held(benchmark.id)
+        async def record_callback(*_args: Any, **_kwargs: Any) -> None:
+            record_effect("callback")
             callback_config = _kwargs.get("config")
             assert isinstance(callback_config, Config)
             lambda_configs.append(callback_config)
@@ -626,24 +613,25 @@ class TestRunFinalization:
         async def final_score(*_args: Any, **_kwargs: Any) -> FinalScoreResponse:
             return FinalScoreResponse(tasks_evaluated=[task.task_id], final_score=1.0, metadata={})
 
-        monkeypatch.setattr(run_orchestration_module, "engine", postgres_engine)
-        monkeypatch.setattr("tracker.services.runs.finalize.engine", postgres_engine)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", skip_log_group)
         monkeypatch.setattr("tracker.runtime.services.RuntimeServices.get_sandbox_provider_config", provider_config)
-        monkeypatch.setattr(run_orchestration_module, "upload_final_view", assert_upload_lock_held)
-        monkeypatch.setattr("tracker.aws.services.invoke_lambda", assert_lambda_lock_held)
+        monkeypatch.setattr(run_orchestration_module, "upload_final_view", record_upload)
+        monkeypatch.setattr("tracker.aws.services.invoke_lambda", record_callback)
         monkeypatch.setattr(BenchmarkServiceClient, "final_score", final_score)
-        postgres_session.close()
 
         await process_benchmark(
             execution_context_json=_execution_context(request, benchmark),
             **authority_kwargs,
         )
 
-        assert side_effects == {
-            "upload": {"calls": 1, "lock_held": True},
-            "lambda": {"calls": 1, "lock_held": True},
-        }
+        assert effects == [
+            ("upload", BenchmarkStatus.FINISHED, "UPLOAD_ATTEMPTED"),
+            ("callback", BenchmarkStatus.FINISHED, "CALLBACK_ATTEMPTED"),
+        ]
+        with Session(postgres_engine) as observation_session:
+            persisted = observation_session.get(Benchmark, benchmark.id)
+            assert persisted is not None
+            assert persisted.publication_status == "CALLBACK_COMPLETED"
         assert lambda_configs[0].read_timeout == 60
         assert lambda_configs[0].retries == {"total_max_attempts": 1}
 
@@ -662,7 +650,7 @@ class TestRunFinalization:
         postgres_session: Session,
         aws_runtime: AWSRuntime,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"error-summary-{uuid4()}")
         contract = AgentContractRequest(name="error-summary-agent", install_cmd="true", run_cmd="true")
@@ -713,7 +701,7 @@ class TestRunFinalization:
             benchmarks.append((benchmark, expected_summary))
         postgres_session.commit()
 
-        _patch_process_dependencies(monkeypatch, postgres_engine)
+        _patch_process_dependencies(monkeypatch)
 
         for benchmark, expected_summary in benchmarks:
             request = StartBenchmarkRequest(
@@ -724,7 +712,7 @@ class TestRunFinalization:
                 sandbox_provider="daytona",
                 sandbox_provider_secret_name="test-provider-secret",
             )
-            authority_kwargs = executor_authority_kwargs(benchmark, session=postgres_session)
+            authority_kwargs = bound_controls(benchmark, session=postgres_session)
             await process_benchmark(execution_context_json=_execution_context(request, benchmark), **authority_kwargs)
 
             with Session(postgres_engine) as assertion_session:
@@ -742,7 +730,7 @@ class TestRunFinalization:
         postgres_engine: Engine,
         postgres_session: Session,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
+        bound_controls: Any,
     ) -> None:
         org = Org(id=uuid4(), name=f"force-stop-race-{uuid4()}")
         benchmark = make_benchmark(
@@ -758,7 +746,7 @@ class TestRunFinalization:
         task = make_task(benchmark, "task-0", status=TaskStatus.IN_PROGRESS)
         postgres_session.add(task)
         postgres_session.commit()
-        authority_kwargs = executor_authority_kwargs(benchmark, session=postgres_session)
+        authority_kwargs = bound_controls(benchmark, session=postgres_session)
         old_dispatch_id = UUID(str(authority_kwargs["executor_dispatch_id"]))
         assert benchmark.current_execution_release_id is not None
         promote_release(postgres_session, benchmark.current_execution_release_id)
@@ -899,7 +887,7 @@ async def test_regrade_run_evaluates_copied_states_and_finalizes(
     postgres_session: Session,
     aws_runtime: AWSRuntime,
     monkeypatch: pytest.MonkeyPatch,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     org = Org(id=uuid4(), name=f"regrade-{uuid4()}")
     contract = AgentContractRequest(name="regrade-agent", install_cmd="true", run_cmd="true")
@@ -919,7 +907,7 @@ async def test_regrade_run_evaluates_copied_states_and_finalizes(
     postgres_session.flush()
     postgres_session.add_all([*source_tasks, run])
     postgres_session.commit()
-    authority = executor_authority_kwargs(run, session=postgres_session)
+    authority = bound_controls(run, session=postgres_session)
     dispatch = postgres_session.get(ExecutorDispatch, UUID(authority["executor_dispatch_id"]))
     assert dispatch is not None
     BenchmarkRepository(postgres_session).add_tasks_with_errors(*regrade_task_rows(run, tasks, dispatch.created_at))
@@ -948,10 +936,8 @@ async def test_regrade_run_evaluates_copied_states_and_finalizes(
     async def invoke_lambda(*args: Any, **_kwargs: Any) -> None:
         callbacks.append(args)
 
-    _patch_process_dependencies(monkeypatch, postgres_engine, upload=upload)
+    _patch_process_dependencies(monkeypatch, upload=upload)
     monkeypatch.setattr("tracker.aws.services.invoke_lambda", invoke_lambda)
-    monkeypatch.setattr("tracker.services.tasks.execute.engine", postgres_engine)
-    monkeypatch.setattr("tracker.services.tasks.monitor.engine", postgres_engine)
     monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume_evaluation)
     monkeypatch.setattr(BenchmarkServiceClient, "final_score", final_score)
     request = StartBenchmarkRequest(
@@ -973,11 +959,14 @@ async def test_regrade_run_evaluates_copied_states_and_finalizes(
         assert persisted is not None
         assert persisted.status == BenchmarkStatus.FINISHED, persisted.error_message
         assert persisted.final_evaluation is not None
-        assert [task.status for task in session.exec(select(Task).where(Task.benchmark == source.id)).all()] == [
-            TaskStatus.FINISHED,
-            TaskStatus.FINISHED,
-            TaskStatus.ERROR,
-        ]
+        source_statuses = {
+            task.task_id: task.status for task in session.exec(select(Task).where(Task.benchmark == source.id)).all()
+        }
+        assert source_statuses == {
+            "pass": TaskStatus.FINISHED,
+            "fail": TaskStatus.FINISHED,
+            "stateless": TaskStatus.ERROR,
+        }
         assert session.exec(select(FinalEvaluation).where(FinalEvaluation.benchmark == source.id)).first() is None
     assert sorted(resumed) == [("fail", {"job": "fail"}, "target-dataset"), ("pass", {"job": "pass"}, "target-dataset")]
     assert scored == [{"fail": {"score": 0.0}, "pass": {"score": 1.0}, "stateless": None}]

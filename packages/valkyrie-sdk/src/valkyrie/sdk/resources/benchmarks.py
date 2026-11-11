@@ -18,6 +18,8 @@ from valkyrie.sdk.models import (
     TaskSummary,
 )
 
+_STATUS_BATCH_SIZE = 50
+
 if TYPE_CHECKING:
     from valkyrie.sdk.client import ValkyrieClient
 
@@ -33,13 +35,18 @@ class BenchmarksResource:
         return await self._sdk.request_model("GET", f"/benchmarks/{run_id}", SingleBenchmarkResponse)
 
     async def statuses(self, run_ids: Sequence[UUID]) -> BenchmarkStatusResponse:
-        """Fetch lightweight status and task counts for several runs."""
-        return await self._sdk.request_model(
-            "GET",
-            "/benchmarks/status",
-            BenchmarkStatusResponse,
-            params={"ids": ",".join(str(run_id) for run_id in run_ids)},
-        )
+        """Fetch lightweight status and task counts for several runs, 50 IDs per request."""
+        batches = [run_ids[start : start + _STATUS_BATCH_SIZE] for start in range(0, len(run_ids), _STATUS_BATCH_SIZE)]
+        responses = [
+            await self._sdk.request_model(
+                "GET",
+                "/benchmarks/status",
+                BenchmarkStatusResponse,
+                params={"ids": ",".join(str(run_id) for run_id in batch)},
+            )
+            for batch in batches or [[]]
+        ]
+        return BenchmarkStatusResponse(entries=[entry for response in responses for entry in response.entries])
 
     async def tasks(self, run_id: UUID, request: FetchTasksRequest | None = None) -> TasksResponse:
         """Fetch a filtered and paginated page of tasks for one run."""

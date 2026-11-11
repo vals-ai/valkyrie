@@ -33,7 +33,11 @@ def test_server_configuration_selects_execution_mode(
     from tracker.local import config
 
     monkeypatch.setattr(config, "resources", None)
-    monkeypatch.delenv("EXECUTOR_PAYLOAD_LOCAL_KEY", raising=False)
+    local_key = base64.b64encode(b"local-test-control-key".ljust(32, b"0")).decode()
+    if local:
+        monkeypatch.setenv("EXECUTOR_PAYLOAD_LOCAL_KEY", local_key)
+    else:
+        monkeypatch.delenv("EXECUTOR_PAYLOAD_LOCAL_KEY", raising=False)
     argv = ["tracker.serve"]
     if local:
         configuration = tmp_path / "server.yaml"
@@ -63,7 +67,6 @@ def test_server_configuration_selects_execution_mode(
         assert release.artifact_uri == source_executor_artifact_uri(Path(serve.__file__).resolve().parents[1])
         assert os.environ["EXECUTOR_LAUNCHER"] == "local"
         assert len(base64.b64decode(os.environ["EXECUTOR_PAYLOAD_LOCAL_KEY"])) == 32
-        assert os.environ["DB_NAME"] == "tracker"
 
 
 @pytest.mark.description("Persist artifacts without allowing another organization to read them.")
@@ -93,7 +96,8 @@ def test_local_resources_accept_one_secrets_source(tmp_path: Path) -> None:
     "Each dispatch rereads the declared secrets, and a missing provider key such as `DAYTONA_API_KEY` raises `SecretsError`."
 )
 async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(tmp_path: Path) -> None:
-    from tracker.database.models import AgentContractRequest, Benchmark, LocalBenchmarkArguments, Org
+    from tracker.database.models import Benchmark, Org
+    from tracker.types import AgentContractRequest, LocalBenchmarkArguments
     from tracker.executor.dependencies import get_execution_runtime
     from tracker.types import StartBenchmarkRequest
 
@@ -114,7 +118,18 @@ async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(
     )
     for value in ("first-key", "rotated-key"):
         source.write_text(f"MODEL_KEY={value}\nUNRELATED_KEY=must-not-inject\n", encoding="utf-8")
-        runtime = await get_execution_runtime(request, benchmark, org)
+        runtime = await get_execution_runtime(
+            request,
+            benchmark_id=benchmark.id,
+            org_id=org.id,
+            org_name=org.name,
+            org_storage_key=org.storage_key,
+            saved_environment=benchmark.arguments.environment,
+            saved_properties=benchmark.arguments.properties,
+            saved_sandbox_provider=benchmark.arguments.sandbox_provider,
+            saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
+            context_version=None,
+        )
         assert await resolve_secrets(contract.secrets, runtime.secrets) == {"MODEL_KEY": value}
         with pytest.raises(SecretsError, match="no values"):
             await runtime.secrets.get("UNRELATED_KEY")
@@ -123,7 +138,29 @@ async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(
     assert source.read_text(encoding="utf-8") == "MODEL_KEY=rotated-key\nUNRELATED_KEY=must-not-inject\n"
     source.write_text("UNRELATED_KEY=present\n", encoding="utf-8")
     with pytest.raises(SecretsError, match="missing keys: MODEL_KEY"):
-        await get_execution_runtime(request, benchmark, org)
+        await get_execution_runtime(
+            request,
+            benchmark_id=benchmark.id,
+            org_id=org.id,
+            org_name=org.name,
+            org_storage_key=org.storage_key,
+            saved_environment=benchmark.arguments.environment,
+            saved_properties=benchmark.arguments.properties,
+            saved_sandbox_provider=benchmark.arguments.sandbox_provider,
+            saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
+            context_version=None,
+        )
     provider_contract = AgentContractRequest(name="agent", secrets={"DAYTONA_API_KEY": "provider-key"})
     with pytest.raises(SecretsError, match="sandbox provider settings: DAYTONA_API_KEY"):
-        await get_execution_runtime(request.model_copy(update={"contract": provider_contract}), benchmark, org)
+        await get_execution_runtime(
+            request.model_copy(update={"contract": provider_contract}),
+            benchmark_id=benchmark.id,
+            org_id=org.id,
+            org_name=org.name,
+            org_storage_key=org.storage_key,
+            saved_environment=benchmark.arguments.environment,
+            saved_properties=benchmark.arguments.properties,
+            saved_sandbox_provider=benchmark.arguments.sandbox_provider,
+            saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
+            context_version=None,
+        )

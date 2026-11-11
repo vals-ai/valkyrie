@@ -8,7 +8,7 @@ import click
 from valkyrie.sdk import ValkyrieClient
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, one_line
+from valkyrie.cli.display import format_option, format_table, one_line, short_local_time
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
 
@@ -72,8 +72,15 @@ def artifacts(run_id: UUID, prefix: str, cursor: str | None, limit: int, attempt
         click.echo(response.model_dump_json(indent=2))
         return
     format_table(
-        [{"Path": one_line(entry.path), "Bytes": str(entry.size)} for entry in response.artifacts],
-        ["Path", "Bytes"],
+        [
+            {
+                "Path": one_line(entry.path),
+                "Bytes": str(entry.size),
+                "Modified": short_local_time(entry.last_modified) if entry.last_modified else "-",
+            }
+            for entry in response.artifacts
+        ],
+        ["Path", "Bytes", "Modified"],
         item_name="artifact",
     )
     if response.next_cursor is not None:

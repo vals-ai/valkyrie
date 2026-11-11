@@ -1,3 +1,4 @@
+import os
 import subprocess
 import traceback
 from collections.abc import Generator
@@ -20,25 +21,18 @@ from sqlmodel import Session, SQLModel, create_engine
 from testcontainers.postgres import PostgresContainer
 
 import tracker.config as tracker_config
+from executor_protocol import ExecutorDispatchStatus
 from tracker.database.models import (
-    AgentContractRequest,
-    AWSBenchmarkArguments,
     Benchmark,
-    BenchmarkStatus,
-    LocalBenchmarkArguments,
+    ExecutorDispatch,
+    ExecutorRelease,
     Project,
     RunProject,
-    SpendType,
-    ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
-    ExecutorRelease,
-    SandboxAdmissionCandidate,
-    SandboxBuildReservation,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, SpendType, TaskStatus
 from tracker.local.resources import LocalResources
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments, LocalBenchmarkArguments
 from tracker.repositories.project import ProjectRepository
 
 _TRACKER_ROOT = Path(__file__).resolve().parents[4]
@@ -47,8 +41,10 @@ _EXECUTOR_RELEASE_OWNERSHIP_REVISION = "c7d8e9f0a1b2"
 _EXECUTOR_RELEASE_OWNERSHIP_PREDECESSOR = "6f3c2d9a8b10"
 _CURRENT_OWNERSHIP_REVISION = "e9f0a1b2c3d4"
 _PREVIOUS_REVISION = "d8e9f0a1b2c3"
+_PROJECT_GATEWAY_REVISION = "a6e7d8f9b0c1"
 _MAINTENANCE_REVISION = "f0a1b2c3d4e5"
 _ERROR_RESULT_PROVENANCE_REVISION = "a3f4b5c6d7e8"
+_CONTROL_BOUNDARY_REVISION = "c1e2f3a4b5d6"
 _DISPATCH_LEASE_REVISION = "6a7b8c9d0e1f"
 _DROP_DISPATCH_LEASE_REVISION = "5b6c7d8e9f0a"
 _DROP_DISPATCH_LEASE_PREDECESSOR = "4a5b6c7d8e9f"
@@ -76,6 +72,7 @@ def test_migration_graph_has_single_head() -> None:
     heads = scripts.get_heads()
 
     assert len(heads) == 1, f"Expected one Alembic head, found {heads}"
+    assert scripts.get_revision(_CONTROL_BOUNDARY_REVISION) is not None
 
 
 @pytest.mark.description("The dispatch lease migration adds the lease columns and the status and lease expiry index.")
@@ -171,7 +168,7 @@ def migration_database_url(migration_postgres: PostgresContainer) -> Generator[s
 
 def _run_alembic(database_url: str, action: str, revision: str) -> subprocess.CompletedProcess[str]:
     try:
-        with patch.object(tracker_config, "DATABASE_URL", database_url), patch("logging.config.fileConfig"):
+        with patch.dict(os.environ, {"DATABASE_URL": database_url}), patch("logging.config.fileConfig"):
             getattr(command, action)(Config(str(_ALEMBIC_INI)), revision)
     except Exception:
         return subprocess.CompletedProcess([action, revision], 1, "", traceback.format_exc())
@@ -215,6 +212,32 @@ def test_failure_category_migration_aborts_on_busy_table_and_retries(
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
                 ScriptDirectory.from_config(Config(str(_ALEMBIC_INI))).get_current_head()
             )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.description("The headline score migration aborts on a busy table and succeeds on retry.")
+def test_headline_score_migration_aborts_on_busy_table_and_retries(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", _PROJECT_GATEWAY_REVISION)
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    try:
+        with engine.connect() as blocker:
+            blocker.execute(text("SELECT id FROM finalevaluation"))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_alembic, migration_database_url, "upgrade", "head")
+                try:
+                    blocked = future.result(timeout=10)
+                finally:
+                    blocker.rollback()
+        assert blocked.returncode != 0
+        assert "lock timeout" in blocked.stderr
+
+        retry = _run_alembic(migration_database_url, "upgrade", "head")
+        assert retry.returncode == 0, retry.stderr
+        with engine.connect() as connection:
+            columns = {column["name"]: column for column in inspect(connection).get_columns("finalevaluation")}
+            assert columns["final_score"]["nullable"] is True
     finally:
         engine.dispose()
 
@@ -670,8 +693,10 @@ def test_error_result_provenance_migration_preserves_legacy_rows(
     engine.dispose()
 
 
-@pytest.mark.description("The maintenance fence migration only adds schema.")
-def test_maintenance_fence_migration_is_additive(migration_database_url: str) -> None:
+@pytest.mark.description(
+    "The maintenance fence and control boundary migrations add their schema without removing existing columns."
+)
+def test_maintenance_fence_and_control_boundary_migrations_are_additive(migration_database_url: str) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", _MAINTENANCE_REVISION)
     assert upgrade.returncode == 0, upgrade.stderr
 
@@ -681,6 +706,15 @@ def test_maintenance_fence_migration_is_additive(migration_database_url: str) ->
     with engine.connect() as connection:
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     assert revision == _MAINTENANCE_REVISION
+    upgrade = _run_alembic(migration_database_url, "upgrade", _CONTROL_BOUNDARY_REVISION)
+    assert upgrade.returncode == 0, upgrade.stderr
+    inspector = inspect(engine)
+    assert "maintenance_target_sha" in {column["name"] for column in inspector.get_columns("executoradmission")}
+    assert "active_epoch_id" in {column["name"] for column in inspector.get_columns("executoradmission")}
+    assert {"migrationepoch", "migrationparticipant"} <= set(inspector.get_table_names())
+    assert {"invocation_key_digest", "claim_receipt_at", "frozen_epoch_id"} <= {
+        column["name"] for column in inspector.get_columns("executordispatch")
+    }
     engine.dispose()
 
 
@@ -753,7 +787,7 @@ def test_current_execution_ownership_migration_rejects_downgrade(
             ),
             {
                 "id": "migration-test-release",
-                "artifact_uri": "s3://artifacts/migration-test-release.pex",
+                "artifact_uri": "source:///artifacts/migration-test-release/src",
                 "artifact_digest": "a" * 64,
                 "created_at": datetime.now(UTC),
             },
@@ -824,18 +858,26 @@ def test_sandbox_build_reservation_upgrade_and_downgrade(
             text("INSERT INTO org (id, name) VALUES (:id, :name)"),
             {"id": org_id, "name": f"migration-reservation-{org_id}"},
         )
+    benchmark_id = uuid4()
+    arguments = AWSBenchmarkArguments(
+        contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"),
+        concurrency=1,
+        queue_pool_id="pool_migration",
+    )
     with Session(engine) as session:
-        benchmark = Benchmark(
-            org_id=org_id,
-            name="migration reservation",
-            arguments=AWSBenchmarkArguments(
-                contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"),
-                concurrency=1,
-                queue_pool_id="pool_migration",
+        session.execute(
+            text(
+                "INSERT INTO benchmark (id, org_id, name, started_at, status, arguments) "
+                "VALUES (:id, :org_id, :name, now(), CAST(:status AS benchmarkstatus), CAST(:arguments AS json))"
             ),
+            {
+                "id": benchmark_id,
+                "org_id": org_id,
+                "name": "migration reservation",
+                "status": BenchmarkStatus.IN_PROGRESS.value,
+                "arguments": arguments.model_dump_json(),
+            },
         )
-        session.add(benchmark)
-        session.flush()
         session.execute(
             text(
                 "INSERT INTO task (id, org_id, task_id, status, started_at, benchmark) "
@@ -847,7 +889,7 @@ def test_sandbox_build_reservation_upgrade_and_downgrade(
                 "task_id": "reserved-task",
                 "status": "BUILDING",
                 "started_at": attempt_started_at,
-                "benchmark": benchmark.id,
+                "benchmark": benchmark_id,
             },
         )
         session.commit()
@@ -910,18 +952,9 @@ class TestReservedAdmissionMigration:
         with Session(database, expire_on_commit=False) as session:
             release = ExecutorRelease(
                 id="migration-admission-release",
-                artifact_uri="s3://artifacts/migration-admission.pex",
+                artifact_uri="source:///artifacts/migration-admission/src",
                 artifact_digest="a" * 64,
                 protocol_version="test",
-            )
-            benchmark = Benchmark(
-                org_id=org_id,
-                name="reserved admission migration",
-                arguments=AWSBenchmarkArguments(
-                    contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"),
-                    concurrency=3,
-                    queue_pool_id="pool_migration",
-                ),
             )
             session.execute(
                 text(
@@ -938,10 +971,28 @@ class TestReservedAdmissionMigration:
                     "created_at": release.created_at,
                 },
             )
-            session.add(benchmark)
-            session.flush()
+            benchmark_id = uuid4()
+            arguments = AWSBenchmarkArguments(
+                contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"),
+                concurrency=3,
+                queue_pool_id="pool_migration",
+            )
+            session.execute(
+                text(
+                    "INSERT INTO benchmark (id, org_id, name, started_at, status, arguments) "
+                    "VALUES (:id, :org_id, :name, now(), CAST(:status AS benchmarkstatus), "
+                    "CAST(:arguments AS json))"
+                ),
+                {
+                    "id": benchmark_id,
+                    "org_id": org_id,
+                    "name": "reserved admission migration",
+                    "status": BenchmarkStatus.IN_PROGRESS.value,
+                    "arguments": arguments.model_dump_json(),
+                },
+            )
             dispatch = ExecutorDispatch(
-                benchmark_id=benchmark.id,
+                benchmark_id=benchmark_id,
                 kind=ExecutorDispatchKind.START,
                 status=ExecutorDispatchStatus.RUNNING,
                 executor_release_id=release.id,
@@ -953,7 +1004,7 @@ class TestReservedAdmissionMigration:
                 Task(
                     org_id=org_id,
                     task_id=name,
-                    benchmark=benchmark.id,
+                    benchmark=benchmark_id,
                     status=status,
                     started_at=datetime(2026, 10, 16, 12),
                 )
@@ -963,7 +1014,26 @@ class TestReservedAdmissionMigration:
                     ("rejected", TaskStatus.PENDING),
                 )
             ]
-            session.add(dispatch)
+            session.execute(
+                text(
+                    "INSERT INTO executordispatch (id, benchmark_id, kind, status, executor_release_id, "
+                    "executor_artifact_uri, executor_artifact_digest, executor_protocol_version, created_at) "
+                    "VALUES (:id, :benchmark_id, CAST(:kind AS executordispatchkind), "
+                    "CAST(:status AS executordispatchstatus), :executor_release_id, "
+                    ":executor_artifact_uri, :executor_artifact_digest, :executor_protocol_version, :created_at)"
+                ),
+                {
+                    "id": dispatch.id,
+                    "benchmark_id": benchmark_id,
+                    "kind": dispatch.kind.value,
+                    "status": dispatch.status.value,
+                    "executor_release_id": release.id,
+                    "executor_artifact_uri": release.artifact_uri,
+                    "executor_artifact_digest": release.artifact_digest,
+                    "executor_protocol_version": release.protocol_version,
+                    "created_at": dispatch.created_at,
+                },
+            )
             session.execute(
                 text(
                     "INSERT INTO task (id, org_id, task_id, status, started_at, benchmark) "
@@ -1017,21 +1087,23 @@ class TestReservedAdmissionMigration:
 
         with database.connect() as connection:
             assert connection.execute(text("SELECT count(*) FROM sandboxbuildreservation")).scalar_one() == 0
-        with Session(database) as session:
+        with database.begin() as connection:
             for attempt, released_at in (
                 (building.started_at - timedelta(minutes=1), building.started_at),
                 (building.started_at, None),
             ):
-                session.execute(
+                connection.execute(
                     text(
                         "INSERT INTO sandboxbuildreservation "
                         "(task_row_id, attempt_started_at, reserved_at, released_at, pool_id, "
-                        "target_id, sandbox_class, requested_vcpu, requested_memory, requested_disk, requested_gpu) "
-                        "VALUES (:id, :attempt, :attempt, :released_at, 'pool_migration', "
-                        "'region-a', 'sysbox', 1.25, 2.25, 20.25, 0)"
+                        "target_id, sandbox_class, requested_vcpu, requested_memory, "
+                        "requested_disk, requested_gpu) "
+                        "VALUES (:task_row_id, :attempt, :attempt, :released_at, "
+                        "'pool_migration', 'region-a', 'sysbox', 1.25, 2.25, 20.25, 0)"
                     ),
-                    {"id": building.id, "attempt": attempt, "released_at": released_at},
+                    {"task_row_id": building.id, "attempt": attempt, "released_at": released_at},
                 )
+        with Session(database) as session:
             session.execute(
                 text(
                     "INSERT INTO sandboxadmissioncandidate "
@@ -1182,61 +1254,98 @@ class TestReservedAdmissionMigration:
             key["constrained_columns"] == ["executor_dispatch_id"] and key["referred_table"] == "executordispatch"
             for key in inspector.get_foreign_keys("sandboxbuildreservation")
         )
-        with Session(database) as session:
-            historical = session.get(SandboxBuildReservation, (building.id, building.started_at))
-            assert historical is not None
+        with database.begin() as connection:
+            historical = connection.execute(
+                text(
+                    "SELECT reserved_at, accepted_at, executor_dispatch_id FROM sandboxbuildreservation "
+                    "WHERE task_row_id = :id AND attempt_started_at = :attempt"
+                ),
+                {"id": building.id, "attempt": building.started_at},
+            ).one()
             assert historical.accepted_at == historical.reserved_at
             assert historical.executor_dispatch_id is None
-            row = session.get(Task, ready.id)
-            assert row is not None
-            row.status = TaskStatus.BUILDING
-            grant = SandboxBuildReservation(
-                task_row_id=ready.id,
-                attempt_started_at=ready.started_at,
-                executor_dispatch_id=dispatch.id,
-                pool_id="pool_migration",
-                target_id="region-a",
-                sandbox_class="sysbox",
-                requested_vcpu=1,
-                requested_memory=2,
-                requested_disk=3,
-                requested_gpu=0,
+            assert (
+                connection.execute(
+                    text("UPDATE task SET status = 'BUILDING' WHERE id = :id RETURNING id"),
+                    {"id": ready.id},
+                ).scalar_one()
+                == ready.id
             )
-            session.add(grant)
-            session.commit()
-            session.refresh(grant)
+            grant = connection.execute(
+                text(
+                    "INSERT INTO sandboxbuildreservation "
+                    "(task_row_id, attempt_started_at, reserved_at, executor_dispatch_id, pool_id, target_id, "
+                    "sandbox_class, requested_vcpu, requested_memory, requested_disk, requested_gpu) "
+                    "VALUES (:id, :attempt, :reserved_at, :dispatch, 'pool_migration', 'region-a', "
+                    "'sysbox', 1, 2, 3, 0) RETURNING accepted_at, executor_dispatch_id"
+                ),
+                {
+                    "id": ready.id,
+                    "attempt": ready.started_at,
+                    "reserved_at": datetime.now(UTC),
+                    "dispatch": dispatch.id,
+                },
+            ).one()
             assert grant.accepted_at is None
             assert grant.executor_dispatch_id == dispatch.id
-            candidate = SandboxAdmissionCandidate(
-                task_row_id=rejected.id,
-                attempt_started_at=rejected.started_at,
-                executor_dispatch_id=dispatch.id,
-                admission_ready=False,
-                readiness_requested_at=datetime.now(UTC),
-                pool_id="pool_migration",
-                target_id="region-a",
-                sandbox_class="sysbox",
-                requested_vcpu=1,
-                requested_memory=2,
-                requested_disk=3,
-                requested_gpu=0,
+            connection.execute(
+                text(
+                    "INSERT INTO sandboxadmissioncandidate "
+                    "(task_row_id, attempt_started_at, executor_dispatch_id, admission_ready, "
+                    "readiness_checked_at, readiness_requested_at, pool_id, target_id, sandbox_class, "
+                    "requested_vcpu, requested_memory, requested_disk, requested_gpu) "
+                    "VALUES (:id, :attempt, :dispatch, false, :checked, :requested, "
+                    "'pool_migration', 'region-a', 'sysbox', 1, 2, 3, 0)"
+                ),
+                {
+                    "id": rejected.id,
+                    "attempt": rejected.started_at,
+                    "dispatch": dispatch.id,
+                    "checked": datetime.now(UTC),
+                    "requested": datetime.now(UTC),
+                },
             )
-            session.add(candidate)
-            session.commit()
-            session.refresh(candidate)
-            assert candidate.readiness_requested_at is not None
 
-            session.delete(candidate)
-            rejected_row = session.get(Task, rejected.id)
-            assert rejected_row is not None
-            rejected_row.status = TaskStatus.STOPPED
-            historical.released_at = datetime.now(UTC)
-            grant.released_at = datetime.now(UTC)
-            row.status = TaskStatus.STOPPED
-            building_row = session.get(Task, building.id)
-            assert building_row is not None
-            building_row.status = TaskStatus.STOPPED
-            session.commit()
+        with database.begin() as connection:
+            candidate = connection.execute(
+                text(
+                    "SELECT readiness_requested_at FROM sandboxadmissioncandidate "
+                    "WHERE task_row_id = :id AND attempt_started_at = :attempt"
+                ),
+                {"id": rejected.id, "attempt": rejected.started_at},
+            ).one()
+            assert candidate.readiness_requested_at is not None
+            assert (
+                connection.execute(
+                    text(
+                        "DELETE FROM sandboxadmissioncandidate "
+                        "WHERE task_row_id = :id AND attempt_started_at = :attempt RETURNING task_row_id"
+                    ),
+                    {"id": rejected.id, "attempt": rejected.started_at},
+                ).scalar_one()
+                == rejected.id
+            )
+            released = (
+                connection.execute(
+                    text(
+                        "UPDATE sandboxbuildreservation SET released_at = :now "
+                        "WHERE task_row_id IN (:building, :ready) RETURNING task_row_id"
+                    ),
+                    {"now": datetime.now(UTC), "building": building.id, "ready": ready.id},
+                )
+                .scalars()
+                .all()
+            )
+            assert set(released) == {building.id, ready.id}
+            stopped = (
+                connection.execute(
+                    text("UPDATE task SET status = 'STOPPED' WHERE id IN (:building, :ready, :rejected) RETURNING id"),
+                    {"building": building.id, "ready": ready.id, "rejected": rejected.id},
+                )
+                .scalars()
+                .all()
+            )
+            assert set(stopped) == {building.id, ready.id, rejected.id}
         downgrade = _run_alembic(migration_database_url, "downgrade", _SHARED_POOL_PREDECESSOR)
         assert downgrade.returncode == 0, downgrade.stderr
         columns_after = {column["name"] for column in inspect(database).get_columns("sandboxbuildreservation")}
@@ -1368,6 +1477,7 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
     with Session(engine) as session:
         run, reversed_run = (
             Benchmark(
+                id=uuid4(),
                 org_id=org_id,
                 name="projects",
                 arguments=AWSBenchmarkArguments(
@@ -1375,6 +1485,22 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
                 ),
             )
             for _ in range(2)
+        )
+        session.execute(
+            text(
+                "INSERT INTO benchmark (id, org_id, name, started_at, status, arguments) "
+                "VALUES (:id, :org_id, :name, now(), CAST(:status AS benchmarkstatus), CAST(:arguments AS json))"
+            ),
+            [
+                {
+                    "id": benchmark.id,
+                    "org_id": org_id,
+                    "name": benchmark.name,
+                    "status": BenchmarkStatus.IN_PROGRESS.value,
+                    "arguments": benchmark.arguments.model_dump_json(),
+                }
+                for benchmark in (run, reversed_run)
+            ],
         )
         router_bench = Project(
             org_id=org_id,
@@ -1392,7 +1518,7 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
             customer="google",
             extra_tags={"engagement": "q4"},
         )
-        session.add_all([run, reversed_run, router_bench, google_report])
+        session.add_all([router_bench, google_report])
         session.flush()
         moved_at = datetime.now(UTC)
         session.add_all(
@@ -1565,4 +1691,51 @@ def test_unique_project_name_migration_adds_the_index_and_downgrades(migration_d
     downgrade = _run_alembic(migration_database_url, "downgrade", _UNIQUE_PROJECT_NAME_PREDECESSOR)
     assert downgrade.returncode == 0, downgrade.stderr
     assert "uq_project_org_name" not in {index["name"] for index in inspect(engine).get_indexes("project")}
+    engine.dispose()
+
+
+def _schema_snapshot(engine: Engine) -> dict[str, object]:
+    inspector = inspect(engine)
+    tables = sorted(inspector.get_table_names())
+    return {
+        table: (
+            sorted(
+                (column["name"], str(column["type"]), column["nullable"]) for column in inspector.get_columns(table)
+            ),
+            sorted(
+                (key["name"], tuple(key["constrained_columns"]), key["referred_table"])
+                for key in inspector.get_foreign_keys(table)
+            ),
+            sorted(
+                (constraint["name"], tuple(constraint["column_names"]))
+                for constraint in inspector.get_unique_constraints(table)
+            ),
+        )
+        for table in tables
+    }
+
+
+@pytest.mark.description(
+    "The epoch cleanup migration drops the epoch tables and columns, and its downgrade restores the previous schema."
+)
+def test_epoch_cleanup_migration_round_trips(migration_database_url: str) -> None:
+    engine = create_engine(migration_database_url)
+    upgrade = _run_alembic(migration_database_url, "upgrade", "a7d2c4e9f1b3")
+    assert upgrade.returncode == 0, upgrade.stderr
+    before = _schema_snapshot(engine)
+    upgrade = _run_alembic(migration_database_url, "upgrade", "d4e8a1c6b9f2")
+    assert upgrade.returncode == 0, upgrade.stderr
+    inspector = inspect(engine)
+    assert not {"migrationepoch", "migrationparticipant"} & set(inspector.get_table_names())
+    assert "active_epoch_id" not in {column["name"] for column in inspector.get_columns("executoradmission")}
+    assert not {
+        "frozen_epoch_id",
+        "frozen_remaining_seconds",
+        "queued_park_invocation_digest",
+        "superseded_by_dispatch_id",
+        "successor_launch_claimed_at",
+    } & {column["name"] for column in inspector.get_columns("executordispatch")}
+    downgrade = _run_alembic(migration_database_url, "downgrade", "a7d2c4e9f1b3")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert _schema_snapshot(engine) == before
     engine.dispose()

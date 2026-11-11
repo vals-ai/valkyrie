@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from tests.factories import make_benchmark
-from tracker.database.models import BenchmarkStatus
+from tracker.domain import BenchmarkStatus
 
 
 @pytest.mark.description("Filter option responses and authentication.")

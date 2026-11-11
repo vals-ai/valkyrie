@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from tracker.api.parsing import parse_csv
 from tracker.auth import get_current_org
-from tracker.database.models import Org, TaskStatus
+from tracker.database.models import Org
+from tracker.domain import TaskStatus
 from tracker.repositories.benchmark import BenchmarkRepositoryDependency
 from tracker.types import BenchmarkStatusEntry, BenchmarkStatusResponse
 

@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS build
+FROM python:3.12-slim AS build-base
 
 WORKDIR /app
 
@@ -14,9 +14,15 @@ COPY pyproject.toml uv.lock alembic.ini ./
 COPY src ./src
 COPY main.py ./
 
-RUN uv sync --locked --no-dev
+FROM build-base AS executor-build
+RUN uv sync --locked --no-dev --no-group database --compile-bytecode \
+    && .venv/bin/python -m compileall -q src
 
-FROM python:3.12-slim
+FROM build-base AS server-build
+RUN uv sync --locked --no-dev --compile-bytecode \
+    && .venv/bin/python -m compileall -q src
+
+FROM python:3.12-slim AS runtime
 # Pick up distro ca-certificates updates (e.g. the eMudhra intermediate CA distrust) before base images refresh.
 RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/*
 
@@ -27,12 +33,15 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app /app
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENV PATH="/app/.venv/bin:$PATH"
-
-EXPOSE 8000
-
 ENTRYPOINT ["/entrypoint.sh"]
+
+FROM runtime AS executor
+COPY --from=executor-build /app /app
+
+FROM runtime AS server
+COPY --from=server-build /app /app
+EXPOSE 8000

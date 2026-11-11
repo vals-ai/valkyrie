@@ -16,7 +16,7 @@ from valkyrie.cli.display import one_line
     )
 )
 @click.argument("run_id", type=UUID)
-@project_option
+@project_option(required=True)
 def retag(run_id: UUID, project: str) -> None:
     response = call(lambda client: client.runs.retag(run_id, project))
     click.echo(

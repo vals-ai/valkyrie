@@ -12,13 +12,12 @@ from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID, FakeAccessKeys
 from tracker.config import BenchmarkServiceDestination
 from tracker.database.models import (
-    BenchmarkStatus,
     ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
     Org,
     RunAccessKey,
 )
+from executor_protocol import ExecutorDispatchStatus
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind
 from tracker import run_access_keys as run_access_keys_module
 from tracker.run_access_keys import delete_finished_run_keys, issued_run_keys, run_service_key
 
@@ -94,7 +93,7 @@ def _run_with_key(
                 kind=ExecutorDispatchKind.START,
                 status=dispatch_status,
                 executor_release_id="sweep-test-release",
-                executor_artifact_uri="s3://artifacts/sweep.pex",
+                executor_artifact_uri="source:///sweep-test-release",
                 executor_artifact_digest="a" * 64,
                 executor_protocol_version=SUPPORTED_PROTOCOL_VERSION,
             )

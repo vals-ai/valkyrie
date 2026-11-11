@@ -18,7 +18,7 @@ import sentry_sdk
 from botocore.exceptions import ClientError
 from pythonjsonlogger.json import JsonFormatter
 from fastapi.testclient import TestClient
-from benchmark_service import ExecResult, GenerationContainment, SandboxCreatedData
+from benchmark_service import ExecResult, SandboxCreatedData
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
@@ -39,13 +39,11 @@ from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tracker.aws.secrets import SecretsManagerStore
 import tracker.services.tasks.execute as utils_module
-from main import app
+from tests.unit.services import task_execution_support
 from tests.unit.services.task_execution_support import (
     TEST_ORG,
-    bind_task_to_dispatch,
     create_task_environment,
     finalize_agent_generation,
-    install_sqlite_evaluation_lock,
     make_retrieve_task_response,
     run_process_task,
 )
@@ -53,18 +51,17 @@ from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.secrets import SecretValue
 from tracker.runtime.services import RuntimeServices
 from tracker.database.models import (
-    AgentContractRequest,
-    AgentCausedExitReason,
-    BenchmarkStatus,
     EgressProxyPolicy,
     ErrorResult,
     EvaluationResult,
-    FailureCategory,
     SandboxRecord,
     Task,
     TaskBreakdown,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest
+from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, TaskStatus
+from tracker.executor.control_queue import QueueControl
+from tracker.executor.control_runs import RunControl
 from tracker.egress_proxy.settings import EgressProxyEndpoint
 from tracker.logging.config import DevFormatter
 from tracker.types import ManagedExecutionContext, RunExecutionRequest
@@ -72,6 +69,7 @@ from tracker.services.benchmarks import fetch_benchmark_row
 from tracker.services.runs.start import process_benchmark
 
 _GET_SECRET = SecretsManagerStore.get
+task_api_client = task_execution_support.task_api_client
 
 
 def _context(request: Any, benchmark_id: Any, task_ids: list[str]) -> dict[str, Any]:
@@ -100,13 +98,17 @@ class TestBenchmarkServiceFailures:
     async def test_connection_closed_after_messages_produces_elapsed_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        task_api_client: TestClient,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 10)
@@ -124,16 +126,16 @@ class TestBenchmarkServiceFailures:
             utils_module.logger.addHandler(caplog.handler)
             try:
                 result = await run_process_task(
-                    start_benchmark_request, task_row, benchmark_id, runtime_services, authority
+                    start_benchmark_request, task_row, benchmark_id, runtime_services, control
                 )
             finally:
                 utils_module.logger.removeHandler(caplog.handler)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_result = self._latest_task_error_result(database_session, task_row)
+        error_result = self._latest_task_error_result(control_postgres_session, task_row)
         assert (
             "Benchmark service WebSocket disconnected: ConnectionClosedError: no close frame received or sent"
             in error_result.error_message
@@ -148,11 +150,11 @@ class TestBenchmarkServiceFailures:
         assert error_result.retry_scheduled is False
         assert error_result.failed_attempt_number is None
 
-        api_response = TestClient(app).get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
+        api_response = task_api_client.get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
         assert api_response.status_code == 200
         assert api_response.json()["failure_category"] == "benchmark_service"
         assert api_response.json()["error_message"] == error_result.error_message
-        client = TestClient(app)
+        client = task_api_client
         task_list = client.get(f"/benchmarks/{benchmark_id}/tasks")
         assert task_list.status_code == 200
         assert task_list.json()["tasks"][0]["failure_category"] == error_result.category.value
@@ -194,24 +196,27 @@ class TestBenchmarkServiceFailures:
         code: int,
         reason: str,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise ConnectionClosedError(Close(code, reason), Close(code, reason), True)
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert f"received {code}" in error_message
         assert reason in error_message
         assert "last application message received" in error_message
@@ -222,16 +227,19 @@ class TestBenchmarkServiceFailures:
         self,
         stream_failure: str,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
         resume_calls = 0
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             if stream_failure == "raw":
                 raise ConnectionClosedError(None, None)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
@@ -247,32 +255,37 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert resume_calls == 1
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
-        evaluation = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
+        evaluation = control_postgres_session.exec(
+            select(EvaluationResult).where(EvaluationResult.task == task_row.id)
+        ).one()
         assert evaluation.instance_id == "mock-sandbox-id"
-        assert not database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
+        assert not control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_resumed_evaluation_gets_its_child_profiles_fresh_egress(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         task_response = make_retrieve_task_response().model_copy(
             update={"egress": BenchmarkEgressPlan(children={"judge": ChildPolicy(egress=["example.com"])})}
         )
         sent: dict[str, ChildEgress] = {}
 
         def granted_keys() -> list[str]:
-            with Session(database_session.get_bind()) as session:
+            with Session(control_postgres_session.get_bind()) as session:
                 return list(session.exec(select(EgressProxyPolicy.key_id)).all())
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
@@ -282,7 +295,7 @@ class TestBenchmarkServiceFailures:
             *_args: Any, on_eval_resume_state: Any, child_egress: dict[str, ChildEgress], **_kwargs: Any
         ) -> Never:
             sent["evaluate"] = child_egress["judge"]
-            on_eval_resume_state({"job_id": "job-1"})
+            await on_eval_resume_state({"job_id": "job-1"})
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def resume_evaluation(
@@ -299,7 +312,7 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert sent["resume"].proxy_url != sent["evaluate"].proxy_url
@@ -309,11 +322,14 @@ class TestBenchmarkServiceFailures:
     async def test_sandbox_created_chunk_saves_one_row_even_when_repeated(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_evaluate_instance(*_args: Any, on_sandbox_created: Any, **_kwargs: Any) -> dict[str, Any]:
             created = SandboxCreatedData(provider="daytona", sandbox_id="verifier-1")
@@ -323,29 +339,34 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
-        rows = database_session.exec(select(SandboxRecord).where(col(SandboxRecord.sandbox_id) == "verifier-1")).all()
+        rows = control_postgres_session.exec(
+            select(SandboxRecord).where(col(SandboxRecord.sandbox_id) == "verifier-1")
+        ).all()
         assert [(row.provider, row.benchmark_id) for row in rows] == [("daytona", benchmark_id)]
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_cancelled_attempt_still_saves_every_pending_announced_sandbox(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         write_started = threading.Event()
         release_write = threading.Event()
-        record_sandbox = utils_module.record_sandbox
+        record_sandbox = control.record_sandbox
 
-        def blocked_write(*args: Any) -> None:
+        async def blocked_write(*args: Any) -> None:
             write_started.set()
-            release_write.wait(5)
-            record_sandbox(*args)
+            await asyncio.to_thread(release_write.wait, 5)
+            await record_sandbox(*args)
 
         async def _mock_evaluate_instance(*_args: Any, on_sandbox_created: Any, **_kwargs: Any) -> dict[str, Any]:
             on_sandbox_created(SandboxCreatedData(provider="daytona", sandbox_id="verifier-running"))
@@ -354,10 +375,10 @@ class TestBenchmarkServiceFailures:
             return {"status": "success", "score": 1.0}
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
-        monkeypatch.setattr(utils_module, "record_sandbox", blocked_write)
+        monkeypatch.setattr(control, "record_sandbox", blocked_write)
 
         attempt = asyncio.create_task(
-            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+            run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
         )
         await asyncio.to_thread(write_started.wait, 5)
         for _ in range(3):
@@ -367,7 +388,7 @@ class TestBenchmarkServiceFailures:
         with pytest.raises(asyncio.CancelledError):
             await attempt
 
-        rows = database_session.exec(
+        rows = control_postgres_session.exec(
             select(SandboxRecord).where(col(SandboxRecord.sandbox_id).in_(["verifier-running", "verifier-queued"]))
         ).all()
         assert sorted(row.sandbox_id for row in rows) == ["verifier-queued", "verifier-running"]
@@ -376,18 +397,21 @@ class TestBenchmarkServiceFailures:
     async def test_resumed_evaluation_saves_the_sandboxes_it_creates(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
 
         async def _mock_evaluate_instance(
             *_args: Any, on_eval_resume_state: Any, on_sandbox_created: Any, **_kwargs: Any
         ) -> dict[str, Any]:
             on_sandbox_created(SandboxCreatedData(provider="daytona", sandbox_id="verifier-before"))
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def _mock_resume_evaluation(*_args: Any, on_sandbox_created: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -397,9 +421,9 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
-        rows = database_session.exec(
+        rows = control_postgres_session.exec(
             select(SandboxRecord).where(col(SandboxRecord.sandbox_id).in_(["verifier-before", "verifier-after"]))
         ).all()
         assert sorted(row.sandbox_id for row in rows) == ["verifier-after", "verifier-before"]
@@ -409,11 +433,14 @@ class TestBenchmarkServiceFailures:
     async def test_stream_recovery_preserves_sandbox_metadata(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
 
         async def _mock_run_agent(
@@ -425,7 +452,7 @@ class TestBenchmarkServiceFailures:
             return AgentCausedExitReason.TIMEOUT, 12.5
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def _mock_resume_evaluation(
@@ -438,14 +465,16 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
-        evaluation = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
+        evaluation = control_postgres_session.exec(
+            select(EvaluationResult).where(EvaluationResult.task == task_row.id)
+        ).one()
         assert evaluation.instance_id == "mock-sandbox-id"
         assert evaluation.agent_caused_exit_reason == AgentCausedExitReason.TIMEOUT
-        database_session.refresh(task_row)
-        breakdown = database_session.get(TaskBreakdown, task_row.task_breakdown)
+        control_postgres_session.refresh(task_row)
+        breakdown = control_postgres_session.get(TaskBreakdown, task_row.task_breakdown)
         assert breakdown is not None
         assert breakdown.evaluation_run_duration is not None
         assert breakdown.evaluation_run_duration > 0
@@ -456,17 +485,18 @@ class TestBenchmarkServiceFailures:
     async def test_durable_resume_without_breakdown_can_recover(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
         task_row.status = TaskStatus.EVALUATING
         task_row.eval_resume_state = saved_state
-        database_session.commit()
-        bind_task_to_dispatch(database_session, task_row, authority)
-        install_sqlite_evaluation_lock(database_session, monkeypatch)
+        control_postgres_session.commit()
         resume_calls = 0
 
         async def _mock_resume_evaluation(
@@ -481,37 +511,40 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert resume_calls == 2
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.FINISHED
         assert task_row.task_breakdown is None
-        assert database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
-        assert not database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
+        assert control_postgres_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
+        assert not control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_stream_close_without_saved_state_produces_stream_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "Benchmark service WebSocket stream failed" in error_message
         assert "keepalive timeout" in error_message
 
@@ -536,18 +569,21 @@ class TestBenchmarkServiceFailures:
     async def test_stream_resume_failure_produces_terminal_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         resume_error: Exception,
         expected_message: str,
         expected_transient: bool | None,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def _mock_resume_evaluation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -556,12 +592,12 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error = self._latest_task_error_result(database_session, task_row)
+        error = self._latest_task_error_result(control_postgres_session, task_row)
         assert "resuming evaluation from durable benchmark state" in error.error_message
         assert expected_message in error.error_message
         assert error.transient is expected_transient
@@ -570,19 +606,22 @@ class TestBenchmarkServiceFailures:
     async def test_stream_resume_stops_when_task_is_stopped_during_retry(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def _mock_resume_evaluation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-            with Session(bind=database_session.bind) as session:
+            with Session(bind=control_postgres_session.bind) as session:
                 stopped_task = session.get(Task, task_row.id)
                 assert stopped_task is not None
                 stopped_task.status = TaskStatus.STOPPED
@@ -592,85 +631,85 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.STOPPED
-        assert not database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
+        assert not control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_stream_recovery_is_abandoned_if_task_stops_during_error_handling(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
-        original_exception_message = utils_module.exception_message
+        original_exception_message = utils_module._exception_message
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         def _stop_task_before_recovery(error: BaseException) -> str:
-            with Session(bind=database_session.bind) as session:
+            with Session(bind=control_postgres_session.bind) as session:
                 stopped_task = session.get(Task, task_row.id)
                 assert stopped_task is not None
                 stopped_task.status = TaskStatus.STOPPED
                 session.commit()
+            control.invalidate(task_row.id)
             return original_exception_message(error)
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
-        monkeypatch.setattr(utils_module, "exception_message", _stop_task_before_recovery)
+        monkeypatch.setattr(utils_module, "_exception_message", _stop_task_before_recovery)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.STOPPED
-        assert not database_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
+        assert not control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).first()
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_stream_recovery_does_not_finish_a_stale_task(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
-        commit_calls = 0
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         saved_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
-        original_commit_task_status_transition = utils_module.commit_task_status_transition
 
         async def _mock_evaluate_instance(*_args: Any, on_eval_resume_state: Any, **_kwargs: Any) -> dict[str, Any]:
-            on_eval_resume_state(saved_state)
+            await on_eval_resume_state(saved_state)
             raise BenchmarkServiceStreamClosedError(close_code=1011, close_reason="keepalive timeout", idle_s=30.0)
 
         async def _mock_resume_evaluation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            with Session(bind=control_postgres_session.bind) as session:
+                stopped_task = session.get(Task, task_row.id)
+                assert stopped_task is not None
+                stopped_task.status = TaskStatus.STOPPED
+                session.commit()
             return {"status": "success", "score": 1.0}
-
-        def _reject_finish(*args: Any, **kwargs: Any) -> bool:
-            nonlocal commit_calls
-            commit_calls += 1
-            if commit_calls == 4:
-                return False
-            return original_commit_task_status_transition(*args, **kwargs)
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
-        monkeypatch.setattr(utils_module, "commit_task_status_transition", _reject_finish)
-        monkeypatch.setattr("tracker.services.tasks.status.commit_task_status_transition", _reject_finish)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        assert commit_calls == 4
-        database_session.refresh(task_row)
-        assert task_row.status == TaskStatus.EVALUATING
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.STOPPED
 
     @pytest.mark.parametrize("failure", ["dns", "raw", "stream"])
     @pytest.mark.usefixtures("process_benchmark_env")
@@ -678,18 +717,22 @@ class TestBenchmarkServiceFailures:
         self,
         failure: str,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_retrieve_task(*_args: Any, **_kwargs: Any) -> Never:
-            with Session(bind=database_session.bind) as session:
+            with Session(bind=control_postgres_session.bind) as session:
                 stopped_task = session.get(Task, task_row.id)
                 assert stopped_task is not None
                 stopped_task.status = TaskStatus.STOPPED
                 session.commit()
+            control.invalidate(task_row.id)
             if failure == "dns":
                 raise socket.gaierror(-2, "Name or service not known")
             if failure == "raw":
@@ -698,33 +741,36 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.STOPPED
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_dns_failure_is_reported_as_preconnection_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_evaluate_instance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise socket.gaierror(-2, "Name or service not known")
 
         monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "WebSocket connection failed during DNS resolution" in error_message
         assert "Name or service not known" in error_message
 
@@ -732,23 +778,26 @@ class TestBenchmarkServiceFailures:
     async def test_retrieve_task_dns_failure_is_not_reported_as_websocket_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_retrieve_task(*_args: Any, **_kwargs: Any) -> Never:
             raise socket.gaierror(-2, "unrelated DNS failure")
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_result = self._latest_task_error_result(database_session, task_row)
+        error_result = self._latest_task_error_result(control_postgres_session, task_row)
         assert "unrelated DNS failure" in error_result.error_message
         assert "WebSocket" not in error_result.error_message
         assert error_result.producer == "tracker"
@@ -760,11 +809,14 @@ class TestBenchmarkServiceFailures:
     async def test_validation_error_produces_human_readable_message(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_retrieve_task_invalid(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             return RetrieveTaskResponse.model_validate(
@@ -773,13 +825,13 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task_invalid)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "Missing or invalid fields" in error_message
         assert "source.image.image" in error_message
         assert "resources.vcpu" in error_message
@@ -791,22 +843,25 @@ class TestBenchmarkServiceFailures:
     async def test_validation_error_keeps_rejected_inputs_out_of_task_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_retrieve_task_invalid(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             return RetrieveTaskResponse.model_validate({"detail": "SYNTHETIC_SECRET"})
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task_invalid)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
-        database_session.refresh(task_row)
-        error_message = self._latest_task_error(database_session, task_row)
+        control_postgres_session.refresh(task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "Missing or invalid fields" in error_message
         assert "SYNTHETIC_SECRET" not in error_message
 
@@ -815,11 +870,14 @@ class TestBenchmarkServiceFailures:
     async def test_invalid_status_produces_human_readable_message(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_setup_task(*_args: Any, **_kwargs: Any) -> Never:
             raise InvalidStatus(Response(404, "Not Found", Headers())) from ConnectionError(
@@ -828,13 +886,13 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", _mock_setup_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "rejected the WebSocket connection" in error_message
         assert "InvalidStatus: server rejected WebSocket connection: HTTP 404" in error_message
         assert "caused by ConnectionError: controlled handshake failure" in error_message
@@ -844,41 +902,30 @@ class TestBenchmarkServiceFailures:
     async def test_required_missing_output_artifact_persists_compatible_error(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
         contract.output_artifacts = ["artifacts/missing.json"]
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         expected_error = "OutputArtifactError: Output artifact error: Required output artifact missing: /tmp/valkyrie/artifacts/missing.json"
         expected_log = f"[ERROR] {expected_error}"
         logged_messages: list[str] = []
         expected_log_written = asyncio.Event()
         event_loop = asyncio.get_running_loop()
 
-        class CompletedWorkload:
-            def __init__(self) -> None:
-                self.result = ExecResult(exit_code=0)
-                self.absence_confirmed_at = event_loop.time()
-
-        class ControlledWorkload:
-            agent_absence_confirmed_at: float | None = None
-
-            async def output(self) -> AsyncIterator[str]:
-                yield "agent output"
-
-            async def wait(self) -> CompletedWorkload:
-                completed = CompletedWorkload()
-                self.agent_absence_confirmed_at = completed.absence_confirmed_at
-                return completed
+        async def _agent_command(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:
+            yield "agent output"
 
         @asynccontextmanager
         async def _mock_create_sandbox(*_args: Any, **_kwargs: Any) -> AsyncIterator[AsyncMock]:
             sandbox = AsyncMock()
             sandbox.id = "mock-sandbox-id"
             sandbox.name = "mock-sandbox-name"
-            sandbox.generation_containment = GenerationContainment(type="linux_cgroup_v2", version=1)
-            sandbox.controlled_workload = Mock(return_value=ControlledWorkload())
+            sandbox.command = _agent_command
             yield sandbox
 
         async def _mock_install_agent_dependencies(*_args: Any, **_kwargs: Any) -> None:
@@ -903,14 +950,14 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(sandbox_module, "_exec", _mock_exec)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "write", _mock_write_benchmark_log_event)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
         await asyncio.wait_for(expected_log_written.wait(), timeout=10)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_result = self._latest_task_error_result(database_session, task_row)
+        error_result = self._latest_task_error_result(control_postgres_session, task_row)
         assert error_result.error_message == expected_error
         assert error_result.producer == "output_artifact"
         assert error_result.operation == "upload_output_artifacts"
@@ -934,11 +981,14 @@ class TestBenchmarkServiceFailures:
     async def test_benchmark_service_error_produces_human_readable_message(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _mock_setup_task(*_args: Any, **_kwargs: Any) -> Never:
             raise BenchmarkServiceError(
@@ -948,13 +998,13 @@ class TestBenchmarkServiceFailures:
 
         monkeypatch.setattr(BenchmarkServiceClient, "setup_task", _mock_setup_task)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        error_message = self._latest_task_error(database_session, task_row)
+        error_message = self._latest_task_error(control_postgres_session, task_row)
         assert "Task programbench-0042 not found in dataset programbench/test" in error_message
 
     @pytest.mark.description(
@@ -978,7 +1028,9 @@ class TestBenchmarkServiceFailures:
     async def test_agent_reported_error_reaches_task_api(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        task_api_client: TestClient,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         secret_source: str,
@@ -1031,7 +1083,9 @@ class TestBenchmarkServiceFailures:
                 update={"sandbox_secrets": {"PROVIDER_TOKEN": "provider-key-reference"}}
             )
             monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=task_data))
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         error_files: dict[str, str] = {}
         error_reads: list[str] = []
         logged_messages: list[str] = []
@@ -1043,10 +1097,15 @@ class TestBenchmarkServiceFailures:
                 else "AgentError: rejected fake-sensitive-value\n"
             )
 
-        async def _command(command: str) -> AsyncIterator[str]:
-            match = re.search(r"export VALKYRIE_ERROR_PATH=([^;\s]+)", command)
-            assert match is not None
-            record_error(match.group(1))
+        async def _command(
+            command: str, *, env_vars: dict[str, str] | None = None, **_kwargs: Any
+        ) -> AsyncIterator[str]:
+            if env_vars is not None:
+                record_error(env_vars["VALKYRIE_ERROR_PATH"])
+            else:
+                match = re.search(r"export VALKYRIE_ERROR_PATH=([^;\s]+)", command)
+                assert match is not None
+                record_error(match.group(1))
             yield "raw model output\n"
             raise ProviderSandboxCommandError(1)
 
@@ -1087,21 +1146,6 @@ class TestBenchmarkServiceFailures:
                     error_files.pop(path, None)
             return ExecResult(exit_code=0)
 
-        class FailedControlledWorkload:
-            agent_absence_confirmed_at: float | None = None
-
-            async def output(self) -> AsyncIterator[str]:
-                yield "raw model output\n"
-
-            async def wait(self) -> Any:
-                completed = Mock(result=ExecResult(exit_code=1), absence_confirmed_at=asyncio.get_running_loop().time())
-                self.agent_absence_confirmed_at = completed.absence_confirmed_at
-                return completed
-
-        def controlled_workload(_command: str, *, cwd: str, env_vars: dict[str, str]) -> FailedControlledWorkload:
-            record_error(env_vars["VALKYRIE_ERROR_PATH"])
-            return FailedControlledWorkload()
-
         @asynccontextmanager
         async def _mock_create_sandbox(*_args: Any, **_kwargs: Any) -> AsyncGenerator[Mock]:
             if secret_source == "gateway":
@@ -1111,9 +1155,6 @@ class TestBenchmarkServiceFailures:
             sandbox.name = "mock-sandbox"
             sandbox.command = _command
             sandbox.exec = _exec
-            sandbox.generation_containment = GenerationContainment(type="linux_cgroup_v2", version=1)
-            sandbox.probe_generation_containment = AsyncMock()
-            sandbox.controlled_workload = controlled_workload
             yield sandbox
 
         monkeypatch.setattr(utils_module, "create_sandbox", _mock_create_sandbox)
@@ -1138,17 +1179,17 @@ class TestBenchmarkServiceFailures:
             utils_module.logger.addHandler(caplog.handler)
             try:
                 result = await run_process_task(
-                    start_benchmark_request, task_row, benchmark_id, runtime_services, authority
+                    start_benchmark_request, task_row, benchmark_id, runtime_services, control
                 )
             finally:
                 utils_module.logger.removeHandler(caplog.handler)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
 
-        error_results = database_session.exec(
+        error_results = control_postgres_session.exec(
             select(ErrorResult)
             .where(ErrorResult.task == task_row.id)
             .where(ErrorResult.org_id == task_row.org_id)
@@ -1170,7 +1211,7 @@ class TestBenchmarkServiceFailures:
         assert error_result.category == FailureCategory.AGENT
         assert error_files == {}
 
-        api_response = TestClient(app).get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
+        api_response = task_api_client.get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
         assert api_response.status_code == 200
 
         body = api_response.json()
@@ -1188,8 +1229,8 @@ class TestBenchmarkServiceFailures:
         record = next(record for record in caplog.records if record.getMessage() == "Task execution failed")
         assert "fake-sensitive-value" not in JsonFormatter().format(record)
 
-        task_list = TestClient(app).get(f"/benchmarks/{benchmark_id}/tasks")
-        results = TestClient(app).get("/retrieve-results", params={"benchmark_id": str(benchmark_id)})
+        task_list = task_api_client.get(f"/benchmarks/{benchmark_id}/tasks")
+        results = task_api_client.get("/retrieve-results", params={"benchmark_id": str(benchmark_id)})
         assert task_list.status_code == results.status_code == 200
         assert task_list.json()["tasks"][0]["error_message"] == expected_error
         assert results.json()["task_errors"] == {task_row.task_id: expected_error}
@@ -1208,7 +1249,9 @@ class TestBenchmarkServiceFailures:
     async def test_secret_lookup_sanitizes_task_views_but_preserves_diagnostic_traceback(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        task_api_client: TestClient,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         caplog: pytest.LogCaptureFixture,
@@ -1216,7 +1259,9 @@ class TestBenchmarkServiceFailures:
         public_detail: str,
     ) -> None:
         contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         provider_role = "arn:aws:sts::999999999999:assumed-role/tracker-runtime/task-session"
         provider_secret = "arn:aws:secretsmanager:us-east-1:999999999999:secret:tenant-secret"
         provider_error = ClientError(
@@ -1271,17 +1316,17 @@ class TestBenchmarkServiceFailures:
             utils_module.logger.addHandler(caplog.handler)
             try:
                 result = await run_process_task(
-                    start_benchmark_request, task_row, benchmark_id, runtime_services, authority
+                    start_benchmark_request, task_row, benchmark_id, runtime_services, control
                 )
             finally:
                 utils_module.logger.removeHandler(caplog.handler)
 
         assert result == {"task_0": None}
         expected = f"SecretNotFoundError: Secret error: {public_detail}"
-        error_result = self._latest_task_error_result(database_session, task_row)
+        error_result = self._latest_task_error_result(control_postgres_session, task_row)
         assert error_result.error_message == expected
 
-        client = TestClient(app)
+        client = task_api_client
         task_response = client.get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
         task_list = client.get(f"/benchmarks/{benchmark_id}/tasks")
         results = client.get("/retrieve-results", params={"benchmark_id": str(benchmark_id)})
@@ -1318,13 +1363,17 @@ class TestBenchmarkServiceFailures:
     async def test_wrapped_failure_preserves_diagnostic_traceback(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        task_api_client: TestClient,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         caplog: pytest.LogCaptureFixture,
         explicit_cause: bool,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
 
         async def _failing_retrieve_task(*_args: Any, **_kwargs: Any) -> Never:
             try:
@@ -1345,7 +1394,7 @@ class TestBenchmarkServiceFailures:
             utils_module.logger.addHandler(caplog.handler)
             try:
                 result = await run_process_task(
-                    start_benchmark_request, task_row, benchmark_id, runtime_services, authority
+                    start_benchmark_request, task_row, benchmark_id, runtime_services, control
                 )
             finally:
                 utils_module.logger.removeHandler(caplog.handler)
@@ -1353,8 +1402,8 @@ class TestBenchmarkServiceFailures:
         assert result == {"task_0": None}
         relationship = "caused by" if explicit_cause else "during handling of"
         expected = f"RuntimeError: retrieve failed ({relationship} ValueError: task input missing)"
-        assert self._latest_task_error(database_session, task_row) == expected
-        response = TestClient(app).get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
+        assert self._latest_task_error(control_postgres_session, task_row) == expected
+        response = task_api_client.get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
         assert response.status_code == 200
         assert response.json()["error_message"] == expected
 
@@ -1386,11 +1435,14 @@ class TestBenchmarkServiceFailures:
     async def test_empty_network_error_stores_visible_message(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
     ) -> None:
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         logged_messages: list[str] = []
 
         async def _mock_retrieve_task_timeout(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
@@ -1403,24 +1455,27 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task_timeout)
         monkeypatch.setattr(CloudWatchBenchmarkLogSink, "write", _mock_write_benchmark_log_event)
 
-        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, authority)
+        result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": None}
 
-        database_session.refresh(task_row)
+        control_postgres_session.refresh(task_row)
         assert task_row.status == TaskStatus.ERROR
-        assert self._latest_task_error(database_session, task_row) == "ConnectTimeout"
+        assert self._latest_task_error(control_postgres_session, task_row) == "ConnectTimeout"
         assert any("[ERROR] ConnectTimeout" in message for message in logged_messages)
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_process_benchmark_blocks_external_internal_custom_destination(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        start_benchmark_request, _task_row, benchmark_id, authority = create_task_environment(
-            contract, database_session
+        start_benchmark_request, _task_row, benchmark_id, control = create_task_environment(
+            contract,
+            control_postgres_session,
+            bound_controls,
         )
         start_benchmark_request = start_benchmark_request.model_copy(
             update={"custom_benchmark_service": "http://service.internal:8001"}
@@ -1433,10 +1488,13 @@ class TestBenchmarkServiceFailures:
 
         await process_benchmark(
             execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
-            executor_dispatch_id=str(authority.dispatch_id),
+            executor_dispatch_id=str(control.ref.dispatch_id),
+            run_control=RunControl(control.client, control.ref),
+            task_control=control,
+            queue_control=QueueControl(control.client, control.ref),
         )
 
-        with Session(bind=database_session.bind) as session:
+        with Session(bind=control_postgres_session.bind) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session, TEST_ORG)
             assert benchmark_row.status == BenchmarkStatus.ERROR
             assert benchmark_row.error_message is not None
@@ -1447,12 +1505,14 @@ class TestBenchmarkServiceFailures:
     async def test_benchmark_service_error_in_process_benchmark(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
-        executor_authority_kwargs: Any,
     ) -> None:
-        start_benchmark_request, _task_row, benchmark_id, _authority = create_task_environment(
-            contract, database_session
+        start_benchmark_request, _task_row, benchmark_id, control = create_task_environment(
+            contract,
+            control_postgres_session,
+            bound_controls,
         )
 
         html_error = (
@@ -1465,15 +1525,17 @@ class TestBenchmarkServiceFailures:
         monkeypatch.setattr(BenchmarkServiceClient, "final_score", _mock_final_score)
         capture_exception = Mock()
         monkeypatch.setattr(run_orchestration_module.sentry_sdk, "capture_exception", capture_exception)
-        benchmark_row = fetch_benchmark_row(benchmark_id, database_session, TEST_ORG)
-        authority_kwargs = executor_authority_kwargs(benchmark_row)
+        benchmark_row = fetch_benchmark_row(benchmark_id, control_postgres_session, TEST_ORG)
 
         await process_benchmark(
             execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
-            **authority_kwargs,
+            executor_dispatch_id=str(control.ref.dispatch_id),
+            run_control=RunControl(control.client, control.ref),
+            task_control=control,
+            queue_control=QueueControl(control.client, control.ref),
         )
 
-        with Session(bind=database_session.bind) as session:
+        with Session(bind=control_postgres_session.bind) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session, TEST_ORG)
             assert benchmark_row.status == BenchmarkStatus.ERROR
             assert benchmark_row.error_message is not None
@@ -1518,20 +1580,26 @@ class TestBenchmarkServiceFailures:
     async def test_run_start_secret_failure_stores_public_error_without_traceback(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
-        start_benchmark_request, task_row, benchmark_id, authority = create_task_environment(contract, database_session)
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
         _provider_error, provider_role, provider_secret = self._fail_run_start_secret(monkeypatch)
 
         await process_benchmark(
             execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
-            executor_dispatch_id=str(authority.dispatch_id),
+            executor_dispatch_id=str(control.ref.dispatch_id),
+            run_control=RunControl(control.client, control.ref),
+            task_control=control,
+            queue_control=QueueControl(control.client, control.ref),
         )
 
         expected = "SecretsError: Secret error: Failed to retrieve secret 'tenant-secret' (KMSAccessDeniedException)"
-        with Session(bind=database_session.bind) as session:
+        with Session(bind=control_postgres_session.bind) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session, TEST_ORG)
             assert benchmark_row.status == BenchmarkStatus.ERROR
             stored_task = session.get(Task, task_row.id)
@@ -1548,13 +1616,16 @@ class TestBenchmarkServiceFailures:
     async def test_run_start_secret_failure_reports_provider_cause_to_operators(
         self,
         contract: AgentContractRequest,
-        database_session: Session,
+        control_postgres_session: Session,
+        bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
-        start_benchmark_request, _task_row, benchmark_id, authority = create_task_environment(
-            contract, database_session
+        start_benchmark_request, _task_row, benchmark_id, control = create_task_environment(
+            contract,
+            control_postgres_session,
+            bound_controls,
         )
         provider_error, provider_role, provider_secret = self._fail_run_start_secret(monkeypatch)
         events: list[Any] = []
@@ -1568,7 +1639,10 @@ class TestBenchmarkServiceFailures:
             try:
                 await process_benchmark(
                     execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
-                    executor_dispatch_id=str(authority.dispatch_id),
+                    executor_dispatch_id=str(control.ref.dispatch_id),
+                    run_control=RunControl(control.client, control.ref),
+                    task_control=control,
+                    queue_control=QueueControl(control.client, control.ref),
                 )
             finally:
                 run_orchestration_module.logger.removeHandler(caplog.handler)

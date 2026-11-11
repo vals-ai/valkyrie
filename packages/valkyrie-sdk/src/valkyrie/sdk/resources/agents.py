@@ -20,7 +20,7 @@ from valkyrie.sdk.agent_bundle import (
     read_agent_name,
     validate_agent_name,
 )
-from valkyrie.sdk.agent_install import checkout_agent
+from valkyrie.sdk.github_download import download_github
 from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieTransportError
 from valkyrie.sdk.models import AgentDownloadURLResponse, AgentEntry, AgentsResponse
 
@@ -130,5 +130,5 @@ class AgentsResource:
         """
         if name is not None:
             validate_agent_name(name)
-        async with checkout_agent(github_url) as agent_path:
+        async with download_github(github_url) as agent_path:
             return await self.push(agent_path, name=name)

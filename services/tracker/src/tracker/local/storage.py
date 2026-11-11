@@ -9,7 +9,7 @@ from typing import BinaryIO, ParamSpec, TypeVar
 
 from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.runtime.lifecycle import finish_cleanup
-from tracker.runtime.storage import StoredObject, StoredObjectCopy
+from tracker.runtime.storage import STREAM_CHUNK_BYTES, StoredObject, StoredObjectCopy
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -97,6 +97,14 @@ class FilesystemObjectStore:
 
     async def get_bytes(self, key: str) -> bytes:
         return await asyncio.to_thread(lambda: local_path(self.root, key).read_bytes())
+
+    async def get_stream(self, key: str) -> AsyncIterator[bytes]:
+        stream = await asyncio.to_thread(local_path(self.root, key).open, "rb")
+        try:
+            while chunk := await asyncio.to_thread(stream.read, STREAM_CHUNK_BYTES):
+                yield chunk
+        finally:
+            await asyncio.to_thread(stream.close)
 
     async def get_many(self, keys: AsyncIterable[str]) -> AsyncIterator[tuple[str, bytes]]:
         async for key in keys:

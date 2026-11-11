@@ -6,7 +6,7 @@ import tarfile
 
 from benchmark_service import ImageSource, Resources, SandboxProvider
 
-from tests.utils import random_task_id
+from tests.utils import random_task_id, unexpected_sandbox_record
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import S3ObjectStore, delete_from_s3
 from tracker.database.models import Benchmark
@@ -70,6 +70,7 @@ class TestUploadToS3:
                 resources=test_resources,
                 creation_semaphore=creation_semaphore,
                 creation_state=SandboxCreationState(cleanup_pending=False),
+                record_sandbox=unexpected_sandbox_record,
             ) as sandbox:
                 await sandbox.exec(f"echo '{file_content}' > {file_path}")
                 await archive_and_upload_output(sandbox, file_path, file_s3_key, object_store)

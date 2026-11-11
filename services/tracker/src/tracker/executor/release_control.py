@@ -5,22 +5,16 @@ from uuid import UUID
 
 from sqlmodel import Session
 
-from tracker.database.models import (
-    Benchmark,
-    BenchmarkStatus,
-    ExecutorAdmission,
-    ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorRelease,
-    ExecutorReleaseStatus,
-)
-from tracker.repositories.benchmark import BenchmarkRepository
-from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
-from tracker.repositories.executor_release import ExecutorReleaseRepository
 from executor_protocol import (
+    DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS,
     SUPPORTED_PROTOCOL_VERSIONS,
     validate_executor_digest,
 )
+from tracker.database.models import Benchmark, ExecutorAdmission, ExecutorDispatch, ExecutorRelease
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, ExecutorReleaseStatus
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 
 _ACTIVE_BENCHMARK_STATUSES = (BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)
 _ARTIFACT_RETENTION_DAYS = 30
@@ -79,6 +73,7 @@ def activate_release(session: Session, candidate: ExecutorRelease) -> ExecutorRe
         release.artifact_uri != candidate.artifact_uri
         or release.artifact_digest != candidate.artifact_digest
         or release.protocol_version != candidate.protocol_version
+        or release.task_definition_arn != candidate.task_definition_arn
     ):
         raise ReleaseControlError(f"Executor release {candidate.id!r} already has a different immutable identity")
     if release.status in (ExecutorReleaseStatus.DRAINING, ExecutorReleaseStatus.RETIRED):
@@ -120,6 +115,7 @@ def create_executor_dispatch(
         executor_artifact_digest=release.artifact_digest,
         executor_protocol_version=release.protocol_version,
         created_at=created_at,
+        claim_deadline_at=created_at + timedelta(seconds=DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS),
         assigned_task_ids=list(task_ids) if task_ids is not None else None,
     )
 
@@ -275,6 +271,13 @@ def artifact_deletion_allowed(session: Session, release_id: str, *, now: datetim
 
 def get_executor_admission(session: Session, *, for_update: bool = False) -> ExecutorAdmission:
     admission = ExecutorReleaseRepository(session).admission(for_update=for_update)
+    if admission is None:
+        raise ReleaseControlError("Executor admission state is not initialized")
+    return admission
+
+
+def share_executor_admission(session: Session) -> ExecutorAdmission:
+    admission = ExecutorReleaseRepository(session).shared_admission()
     if admission is None:
         raise ReleaseControlError("Executor admission state is not initialized")
     return admission

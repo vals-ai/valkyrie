@@ -5,7 +5,7 @@ from uuid import UUID
 import httpx
 import pytest
 from click.testing import CliRunner
-from valkyrie.sdk.models import BenchmarkStatus, S3UploadResultsResponse
+from valkyrie.sdk.models import BenchmarkStatus, FinalEvaluation, S3UploadResultsResponse
 
 from valkyrie.cli.run.results import results
 
@@ -66,6 +66,51 @@ class TestResultsCommand:
         assert saved_payload["task_errors"] == {"task-b": "evaluation failed"}
         assert "secrets" not in saved_payload["benchmark_arguments"]["contract"]
         assert "kwargs" not in saved_payload["benchmark_arguments"]["contract"]
+
+    @pytest.mark.description("A run without a headline score says so, and a scored run does not.")
+    @pytest.mark.parametrize(("score", "says_no_headline"), [(None, True), (50.0, False)])
+    def test_a_run_without_a_headline_score_says_so_and_a_scored_run_does_not(
+        self,
+        tmp_path: Path,
+        tracker: MockTracker,
+        cli_runner: CliRunner,
+        score: float | None,
+        says_no_headline: bool,
+    ) -> None:
+        response = make_final_view(_RUN_ID, status=BenchmarkStatus.FINISHED, error_message=None).model_copy(
+            update={"final_evaluation": FinalEvaluation(org_id="org", benchmark=str(_RUN_ID), final_score=score)}
+        )
+        tracker.reply("GET", "/retrieve-results", ok(response))
+
+        result = cli_runner.invoke(results, [str(_RUN_ID), "--path", str(tmp_path / "results.json")])
+
+        assert result.exit_code == 0, result.output
+        assert ("no single headline score" in result.output) is says_no_headline
+
+    @pytest.mark.description("A failed metric script shows its error and the rescore command.")
+    def test_a_run_whose_metric_script_failed_shows_the_error_and_the_rescore_command(
+        self,
+        tmp_path: Path,
+        tracker: MockTracker,
+        cli_runner: CliRunner,
+    ) -> None:
+        evaluation = FinalEvaluation(
+            org_id="org",
+            benchmark=str(_RUN_ID),
+            final_score=None,
+            properties={"scorer": {"digest": "sha256:x", "error": "The script exited with status 1: boom"}},
+        )
+        response = make_final_view(_RUN_ID, status=BenchmarkStatus.FINISHED, error_message=None).model_copy(
+            update={"final_evaluation": evaluation}
+        )
+        tracker.reply("GET", "/retrieve-results", ok(response))
+
+        result = cli_runner.invoke(results, [str(_RUN_ID), "--path", str(tmp_path / "results.json")])
+
+        assert result.exit_code == 0, result.output
+        assert "metric script failed, so the run has no score: The script exited with status 1: boom" in result.output
+        assert f"valkyrie run rescore {_RUN_ID}" in result.output
+        assert "no single headline score" not in result.output
 
     @pytest.mark.description("S3 uploads print usable links, and only an explicit yes replaces results already in S3.")
     @pytest.mark.parametrize(

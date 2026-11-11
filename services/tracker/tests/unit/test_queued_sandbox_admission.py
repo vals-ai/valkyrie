@@ -1,5 +1,5 @@
-from collections.abc import AsyncGenerator, Generator
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -7,44 +7,28 @@ from uuid import uuid4
 import pytest
 from benchmark_service import ResourceCapacity, Sandbox, SandboxCapacity, SandboxReservationDemand
 
-from tracker.executor.execution_authority import ExecutionAuthority
-from tracker.repositories.scheduler import SchedulerRepository
+from tracker.executor.control_protocol import AttemptRef, PhaseRef
+from tracker.executor.control_queue import (
+    QueueBuildResponse,
+    QueueClaimResponse,
+    QueueStateResponse,
+    queue_pool_id,
+    reserved_queue_pool_id,
+)
 from tracker.sandbox import SandboxCreationState
 from tracker.scheduler import admission, store
-from tracker.scheduler.store import reserved_queue_pool_id
 
 
-@pytest.mark.description("Waiting for the build lock holds no database session and reads no provider capacity.")
-@pytest.mark.parametrize("accepted", [True, False])
-async def test_build_lock_waits_outside_authority_transactions(
-    monkeypatch: pytest.MonkeyPatch,
-    accepted: bool,
-) -> None:
-    active_sessions = 0
-
-    @contextmanager
-    def open_session(_bind: object) -> Generator[Mock, None, None]:
-        nonlocal active_sessions
-        active_sessions += 1
-        try:
-            yield Mock()
-        finally:
-            active_sessions -= 1
-
-    build_lock = Mock(held=False)
-
-    async def acquire() -> bool:
-        assert active_sessions == 0
-        build_lock.held = True
-
-        return True
-
-    async def release() -> None:
-        assert active_sessions == 0
-        build_lock.held = False
-
-    build_lock.acquire = AsyncMock(side_effect=acquire)
-    build_lock.release = AsyncMock(side_effect=release)
+@pytest.mark.parametrize(("queue_kind", "claims"), [("reserved", [True]), ("legacy", [False, True])])
+@pytest.mark.description(
+    "Control acceptance or legacy queue claim surrounds sandbox creation and publishes its build phase once."
+)
+async def test_claim_phase_surrounds_sandbox_creation(queue_kind: str, claims: list[bool]) -> None:
+    phase = PhaseRef(token=uuid4())
+    attempt = AttemptRef(
+        org_id=uuid4(), task_row_id=uuid4(), task_id="queued", started_at=datetime(2026, 7, 27, tzinfo=UTC)
+    )
+    events: list[object] = []
     provider = Mock()
     provider.check_admission = AsyncMock(return_value=True)
     provider.reservable_demand = AsyncMock(
@@ -57,73 +41,82 @@ async def test_build_lock_waits_outside_authority_transactions(
             gpu=0,
         )
     )
-    provider.get_capacity_domains = AsyncMock()
+    remaining_claims = iter(claims)
+
+    async def claim(*_args: object) -> QueueClaimResponse:
+        events.append("claim")
+        granted = next(remaining_claims)
+        return QueueClaimResponse(phase=phase if granted else None, waiting=True)
+
+    async def accept(*_args: object) -> PhaseRef | None:
+        events.append("claim")
+        assert next(remaining_claims)
+        return phase
+
+    async def build(*_args: object) -> QueueBuildResponse:
+        events.append("finish")
+        return QueueBuildResponse(started=True)
+
+    reserved = queue_kind == "reserved"
+    control = Mock(
+        eligibility=AsyncMock(return_value=True),
+        state=AsyncMock(
+            side_effect=[
+                QueueStateResponse(status="PENDING", readiness_requested_at=None),
+                QueueStateResponse(status="BUILDING", readiness_requested_at=None),
+            ]
+        ),
+        prepare=AsyncMock(),
+        claim=AsyncMock(side_effect=claim),
+        accept=AsyncMock(side_effect=accept),
+        build=AsyncMock(side_effect=build),
+        clear=AsyncMock(),
+    )
     context = admission.SandboxQueueContext(
         provider=provider,
-        pool_id=reserved_queue_pool_id("pool"),
-        engine=Mock(),
+        pool_id=reserved_queue_pool_id(queue_pool_id("pool")) if reserved else queue_pool_id("pool"),
+        control=control,
         poll_interval_seconds=0,
     )
     sandbox = Mock(spec=Sandbox)
-    claimed = False
-    cleaned_up = False
-
-    def claim(*_args: object) -> bool:
-        nonlocal claimed
-        assert active_sessions == 1
-        assert build_lock.held
-        claimed = accepted
-
-        return claimed
 
     @asynccontextmanager
     async def create() -> AsyncGenerator[Sandbox, None]:
-        nonlocal cleaned_up
-        assert active_sessions == 0
-        assert build_lock.held
-        assert claimed
+        events.append("create")
         try:
             yield sandbox
         finally:
-            cleaned_up = True
-
-    monkeypatch.setattr(admission, "Session", open_session)
-    monkeypatch.setattr(admission, "task_build_lock", Mock(return_value=build_lock))
-    monkeypatch.setattr(admission, "lock_execution_authority", Mock())
-    monkeypatch.setattr(context.admission_signals, "wait", AsyncMock(return_value=True))
-    monkeypatch.setattr(admission, "_is_waiting_without_lock", Mock(return_value=True))
-    monkeypatch.setattr(SchedulerRepository, "is_waiting", Mock(return_value=True))
-    monkeypatch.setattr(SchedulerRepository, "prepare_admission_candidate", Mock())
-    monkeypatch.setattr(SchedulerRepository, "clear_admission_candidate", Mock())
-    monkeypatch.setattr(SchedulerRepository, "accept_grant", claim)
-    release_reservation = Mock()
-    monkeypatch.setattr(SchedulerRepository, "release_reservation", release_reservation)
-    monkeypatch.setattr(admission, "_start_claimed_task", Mock(return_value=True))
+            events.append("cleanup")
 
     async with AsyncExitStack() as stack, AsyncExitStack() as preparation_stack:
         await preparation_stack.enter_async_context(context.preparation_slots)
         result = await admission.enter_queued_sandbox(
             stack=stack,
             context=context,
-            task_row_id=uuid4(),
-            expected_started_at=datetime(2026, 7, 27, tzinfo=UTC),
-            authority=ExecutionAuthority(benchmark_id=uuid4(), dispatch_id=uuid4()),
+            attempt=attempt,
             source=Mock(),
             resources=Mock(),
             creation_state=SandboxCreationState(cleanup_pending=False),
             create=create,
             preparation_stack=preparation_stack,
+            on_phase_claimed=lambda claimed: events.append(claimed),
+            on_phase_released=lambda started: events.append(started),
+            on_phase_abandon=lambda _phase: None,
         )
+        assert result is sandbox
 
-    assert result is (sandbox if accepted else None)
-    assert cleaned_up is accepted
-    assert not build_lock.held
-    assert active_sessions == 0
-    assert release_reservation.call_count == int(accepted)
-    provider.get_capacity_domains.assert_not_awaited()
+    assert events == ["claim"] * len(claims) + [phase, "create", "finish", True, "cleanup"]
+    if reserved:
+        control.prepare.assert_awaited_once()
+        control.accept.assert_awaited_once_with(context.pool_id, attempt)
+        control.clear.assert_awaited_once_with(context.pool_id, attempt)
+    else:
+        control.prepare.assert_not_awaited()
+        control.accept.assert_not_awaited()
+    control.build.assert_awaited_once_with("queue-finish", context.pool_id, attempt, phase)
 
 
-@pytest.mark.description("An exhausted quota does not block dimensions that charge nothing.")
+@pytest.mark.description("Zero-charge resource dimensions do not block otherwise fitting CPU or GPU work.")
 @pytest.mark.parametrize("gpu_work", [False, True], ids=["cpu", "gpu"])
 def test_unrelated_quota_exhaustion_does_not_block_zero_charge_dimensions(gpu_work: bool) -> None:
     demand = SandboxReservationDemand(

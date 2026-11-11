@@ -2,6 +2,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from uuid import UUID
 
+from typing import Any
+
 import click
 from valkyrie.sdk import (
     AgentContract,
@@ -11,10 +13,12 @@ from valkyrie.sdk import (
     ValkyrieClient,
     ValkyrieSDKError,
 )
+from valkyrie.sdk.models import HostedDataset, LocalDataset, folder_run_name
 
 from valkyrie.cli.client import call
 from valkyrie.cli.display import local_time, one_line
-from valkyrie.cli.project import describe_project, optional_project_option
+from valkyrie.cli.project import describe_project, project_option
+from valkyrie.cli.resource import validate_versioned_dataset_reference
 from valkyrie.cli.run.progress import follow_run_status
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
@@ -104,8 +108,10 @@ def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResp
         click.echo(row(label, str(value), RUN_COLUMN_WIDTH))
     if start_benchmark_response.dataset_version_warning:
         click.secho(start_benchmark_response.dataset_version_warning, fg="yellow")
-    click.echo(row("Logs:", start_benchmark_response.cloudwatch_url, RUN_COLUMN_WIDTH))
-    click.echo(row("Artifacts:", start_benchmark_response.s3_bucket_url, RUN_COLUMN_WIDTH))
+    if start_benchmark_response.cloudwatch_url:
+        click.echo(row("Logs:", start_benchmark_response.cloudwatch_url, RUN_COLUMN_WIDTH))
+    if start_benchmark_response.s3_bucket_url:
+        click.echo(row("Artifacts:", start_benchmark_response.s3_bucket_url, RUN_COLUMN_WIDTH))
     click.echo("├".ljust(BOX_WIDTH, "─"))
     for label, command in commands:
         click.echo(row(label, click.style(command, fg="cyan"), RUN_COLUMN_WIDTH))
@@ -122,6 +128,42 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
         click.echo(click.style(_UNKNOWN_START_OUTCOME, fg="yellow"))
 
 
+def _is_folder(path: str) -> bool:
+    try:
+        return Path(path).expanduser().is_dir()
+    except (RuntimeError, OSError):
+        return False
+
+
+def _local(path: str) -> LocalDataset:
+    return LocalDataset(path=str(Path(path).expanduser().resolve()))
+
+
+def _hosted(dataset: str) -> HostedDataset | None:
+    try:
+        owner, name, version = validate_versioned_dataset_reference(dataset)
+    except ValueError:
+        return None
+    return HostedDataset(benchmark=owner, dataset=name, ref=version)
+
+
+def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedDataset | LocalDataset | None:
+    if not dataset:
+        return None
+    if dataset.startswith((".", "/", "~")):
+        if not _is_folder(dataset):
+            raise click.UsageError(f"--dataset {dataset} is not a folder")
+        return _local(dataset)
+    if "/" not in dataset or benchmark not in (None, dataset.partition("/")[0]):
+        return None
+    hosted = _hosted(dataset)
+    if hosted is None:
+        raise click.UsageError(
+            "--dataset must be BENCHMARK/DATASET[@VERSION], such as swe-bench/verified@2, or a folder such as ./tasks"
+        )
+    return hosted
+
+
 @click.command(
     help=(
         "Start a run of an agent on a benchmark.\n"
@@ -134,7 +176,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     "--agent",
     type=str,
     required=True,
-    help="Published agent name, or a local agent directory given as a path (e.g., claude_code or ./claude_code).",
+    help="Published agent name or local agent path (e.g., claude_code or ./claude_code), or oracle to run each task's solution.",
 )
 @click.option(
     "--model",
@@ -145,7 +187,6 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
 @click.option(
     "--benchmark",
     type=str,
-    required=True,
     help="Name of the benchmark to run (e.g., swebench, finance).",
 )
 @click.option(
@@ -190,7 +231,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     type=str,
     required=False,
     default=None,
-    help="Dataset name to use from the benchmark service (defaults to 'default').",
+    help="Service dataset name, a hosted BENCHMARK/DATASET[@VERSION], or a folder starting with ./, / or ~.",
 )
 @click.option("--dataset-version", type=str, default=None, help="Fixed dataset version to use for this run.")
 @click.option(
@@ -215,7 +256,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
     default=None,
     help="Label to attach to the run.",
 )
-@optional_project_option
+@project_option(required=False)
 @click.option(
     "--kwarg",
     "-k",
@@ -269,7 +310,7 @@ def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unkn
 def start(
     agent: str,
     model: str | None,
-    benchmark: str,
+    benchmark: str | None,
     concurrency: int,
     lambda_function: str | None,
     task_ids: str | None,
@@ -293,12 +334,55 @@ def start(
         raise click.UsageError("--connect cannot be used when --count is greater than 1")
 
     monitoring = RunMonitoring() if monitor else None
+    reference = _dataset_reference(dataset, benchmark)
+    if reference is not None and (dataset_version or headers or ignore_custom_services):
+        raise click.UsageError(
+            "--dataset-version, --header and --ignore-custom-services belong to benchmark services "
+            "and cannot be used with a pushed dataset or a folder"
+        )
+    if reference is not None and monitoring is not None:
+        raise click.UsageError("--monitor cannot be used with a pushed dataset or a folder")
     formatted_task_ids = resolve_task_ids(task_ids, task_ids_file)
     agent_dir = _local_agent_dir(agent)
+    if reference is None and benchmark is None:
+        raise click.UsageError("Missing option '--benchmark'.")
+    shared_options: dict[str, Any] = {
+        "model": model,
+        "concurrency": concurrency,
+        "priority": priority,
+        "task_ids": formatted_task_ids,
+        "slice_str": slice_str,
+        "label": label,
+        "lambda_function": lambda_function,
+        "provider": provider,
+        "agent_kwargs": dict(kwargs),
+        "secrets": dict(secrets),
+        "project": project,
+    }
+
+    async def begin(client: ValkyrieClient, agent_name: str) -> StartBenchmarkResponse:
+        if reference is not None:
+            return await client.datasets.start_run(agent_name, reference, benchmark=benchmark, **shared_options)
+        assert benchmark is not None
+        return await client.runs.start(
+            agent_name,
+            benchmark,
+            dataset=dataset,
+            dataset_version=dataset_version,
+            service_headers=dict(headers),
+            ignore_custom_services=ignore_custom_services,
+            monitoring=monitoring,
+            **shared_options,
+        )
 
     async def start_runs(client: ValkyrieClient) -> list[UUID]:
         task_ids_display = ",".join(formatted_task_ids) if formatted_task_ids else None
-        format_run_start_details(benchmark, dataset, concurrency, slice_str, task_ids_display, priority)
+        shown_benchmark, shown_dataset = benchmark or "", dataset
+        if isinstance(reference, HostedDataset):
+            shown_benchmark, shown_dataset = reference.benchmark, reference.dataset
+        elif isinstance(reference, LocalDataset):
+            shown_benchmark, shown_dataset = benchmark or folder_run_name(reference.path), reference.path
+        format_run_start_details(shown_benchmark, shown_dataset, concurrency, slice_str, task_ids_display, priority)
         format_agent_start_details(agent, model, secrets, kwargs, dict(headers))
 
         agent_name = await _publish_local_agent(client, agent_dir, model, kwargs) if agent_dir else agent
@@ -306,26 +390,7 @@ def start(
         for _ in range(count):
             click.echo(f"{_CLEAR_LINE}Starting run for: {agent_name}...", nl=False)
             try:
-                response = await client.runs.start(
-                    agent_name,
-                    benchmark,
-                    model=model,
-                    concurrency=concurrency,
-                    priority=priority,
-                    task_ids=formatted_task_ids,
-                    slice_str=slice_str,
-                    dataset=dataset,
-                    dataset_version=dataset_version,
-                    label=label,
-                    lambda_function=lambda_function,
-                    provider=provider,
-                    agent_kwargs=dict(kwargs),
-                    secrets=dict(secrets),
-                    service_headers=dict(headers),
-                    ignore_custom_services=ignore_custom_services,
-                    project=project,
-                    monitoring=monitoring,
-                )
+                response = await begin(client, agent_name)
             except ValkyrieAPIError as error:
                 click.echo(_CLEAR_LINE, nl=False)
                 click.echo(click.style("Run failed to start!", fg="red", bold=True))

@@ -109,6 +109,7 @@ AGENT_ARCHIVE_MAX_ENTRIES = _positive_int_setting("AGENT_ARCHIVE_MAX_ENTRIES", 1
 
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "agentic-harness")
 AWS_SHARED_SECRET_TENANTS = os.environ.get("AWS_SHARED_SECRET_TENANTS", "")
+METRIC_RUNNER_FUNCTION = os.environ.get("METRIC_RUNNER_FUNCTION", "")
 AWS_TENANT_ACCESS_ROLE_ARN = os.environ.get("AWS_TENANT_ACCESS_ROLE_ARN")
 AWS_DEPLOYMENT_ACCOUNT_ID = os.environ.get("AWS_DEPLOYMENT_ACCOUNT_ID")
 AWS_DEPLOYMENT_REGION = os.environ.get("AWS_DEPLOYMENT_REGION") or os.environ.get("AWS_REGION")
@@ -119,7 +120,7 @@ AWS_DEPLOYMENT_LOG_RETENTION_DAYS = os.environ.get("AWS_DEPLOYMENT_LOG_RETENTION
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
 
-def _build_database_url() -> str:
+def build_database_url() -> str:
     if url := os.environ.get("DATABASE_URL"):
         return url
     db_user = os.environ.get("DB_USERNAME", "tracker")
@@ -128,9 +129,6 @@ def _build_database_url() -> str:
     db_port = os.environ.get("DB_PORT", "5432")
     db_name = os.environ.get("DB_NAME", "tracker")
     return f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
-
-
-DATABASE_URL = _build_database_url()
 
 
 AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"

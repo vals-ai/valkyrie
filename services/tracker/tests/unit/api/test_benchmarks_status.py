@@ -10,13 +10,11 @@ from tests.utils import TEST_ORG_ID
 from tracker.api.parsing import parse_csv
 from tracker.aws.s3 import S3ObjectStore
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     Task,
-    TaskStatus,
 )
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
+from tracker.domain import BenchmarkStatus, TaskStatus
 
 _client = TestClient(app)
 _RESULTS_RUN_ID = UUID("22222222-2222-4222-8222-222222222222")

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from tracker import config
 from tracker.agent.archive import ArchiveLimitError, validate_agent_archive
 from tracker.agent.schemas import validate_agent_name
+from tracker.services.datasets.oracle import ORACLE_AGENT
 from tracker.api.dependencies import AgentLibraryRuntimeDependency
 from tracker.api.download import local_file_response, resolve_download_url
 from tracker.exceptions import S3Error
@@ -128,7 +129,7 @@ async def get_agent_download_url(
         }
     },
     responses={
-        400: {"description": "Invalid agent archive"},
+        400: {"description": "Invalid agent archive, or a name reserved for a built-in agent"},
         403: {"description": "Storage permission denied"},
         409: {"description": "Agent already exists"},
         413: {"description": "Configured archive limit exceeded"},
@@ -142,6 +143,10 @@ async def push_agent_endpoint(
     overwrite: bool = True,
 ) -> AgentEntry:
     key = _agent_key(name)
+    if name == ORACLE_AGENT:
+        raise HTTPException(
+            status_code=400, detail=f"The name {ORACLE_AGENT!r} is reserved for the built-in oracle agent"
+        )
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/zip":
         raise HTTPException(status_code=415, detail="Expected application/zip")
     if (content_length := request.headers.get("content-length")) is not None:

@@ -160,3 +160,228 @@ async def restore(benchmark: str, name: str) -> DatasetResponse
 DatasetResponse
 
 For examples, see the [Python SDK guide](/sdk/resources).
+
+## `client.datasets.push` {#push}
+
+Publish the task folders under ``folder`` as a version of the dataset, creating it and its benchmark if they are missing.
+
+Only the tasks whose files the dataset does not store yet are uploaded, so pushing an unchanged folder uploads nothing and returns the version it already made. ``on_stored`` hears each task that was uploaded, ``on_created`` the name of each resource this call created, ``on_left_out`` each task and the entries in its folder that are not part of a task and so are not stored, and ``on_warning`` what a dataset.toml in ``folder`` leaves out or names differently.
+
+A dataset.toml in ``folder`` is a lock: the version holds exactly the tasks it lists, each task's files must still hash to the digest it lists, and its version label becomes a tag.
+
+```python Signature
+async def push(
+    benchmark: str,
+    dataset: str,
+    folder: str | Path,
+    *,
+    tags: Sequence[str] = (),
+    concurrency: int = 4,
+    on_stored: Callable[[str, BlobResponse], None] | None = None,
+    on_created: Callable[[str], None] | None = None,
+    on_left_out: Callable[[str, list[str]], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> DatasetVersionDetailResponse
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"benchmark"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"dataset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"folder"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str | Path</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"tags"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Sequence[str] · default: <code>{"()"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int · default: <code>{"4"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_stored"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str, BlobResponse], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_created"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_left_out"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str, list[str]], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_warning"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+**Returns**
+
+DatasetVersionDetailResponse
+
+For examples, see the [Python SDK guide](/sdk/resources).
+
+## `client.datasets.install` {#install}
+
+Download a dataset from Harbor, GitHub, or Hugging Face into a temporary folder and push it.
+
+``source`` is a Harbor registry name such as ``terminal-bench/terminal-bench`` for ``harbor``, and a repository as ``owner/name`` or its URL, optionally ending in ``/tree/<ref>/<subfolder>``, for ``github`` and ``hugging_face``. The push works as in `push`, and the temporary folder is removed afterwards.
+
+```python Signature
+async def install(
+    benchmark: str,
+    dataset: str,
+    source: str,
+    *,
+    location: DatasetLocation,
+    tags: Sequence[str] = (),
+    concurrency: int = 4,
+    on_stored: Callable[[str, BlobResponse], None] | None = None,
+    on_created: Callable[[str], None] | None = None,
+    on_left_out: Callable[[str, list[str]], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> DatasetVersionDetailResponse
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"benchmark"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"dataset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"source"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"location"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · DatasetLocation</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"tags"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Sequence[str] · default: <code>{"()"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int · default: <code>{"4"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_stored"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str, BlobResponse], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_created"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_left_out"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str, list[str]], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"on_warning"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Callable[[str], None] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+**Returns**
+
+DatasetVersionDetailResponse
+
+For examples, see the [Python SDK guide](/sdk/resources).
+
+## `client.datasets.start_run` {#start-run}
+
+Start a run on the tasks of a hosted dataset or of a folder on a local Tracker.
+
+```python Signature
+async def start_run(
+    agent: str | AgentContractRequest,
+    dataset: DatasetRef,
+    *,
+    benchmark: str | None = None,
+    model: str | None = None,
+    concurrency: int = 5,
+    priority: int | None = None,
+    task_ids: Sequence[str] | None = None,
+    slice_str: str | None = None,
+    label: str | None = None,
+    lambda_function: str | None = None,
+    provider: str | None = None,
+    agent_kwargs: Mapping[str, str] | None = None,
+    secrets: Mapping[str, str] | None = None,
+    project: str | None = None,
+) -> StartBenchmarkResponse
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"agent"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str | <a href="/reference/sdk/models/agents#agent-contract-request"><code>AgentContractRequest</code></a></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"dataset"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · DatasetRef</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"benchmark"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"model"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int · default: <code>{"5"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"priority"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · int | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"task_ids"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Sequence[str] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"slice_str"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"label"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"lambda_function"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"provider"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"agent_kwargs"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Mapping[str, str] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"secrets"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Mapping[str, str] | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"project"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+**Returns**
+
+<a href="/reference/sdk/models/runs#start-benchmark-response"><code>StartBenchmarkResponse</code></a>
+
+For examples, see the [Python SDK guide](/sdk/resources).

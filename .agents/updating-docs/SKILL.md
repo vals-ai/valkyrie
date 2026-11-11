@@ -7,7 +7,9 @@ description: Use when adding or changing Valkyrie public documentation, Mintlify
 
 Read this skill before editing `docs/`, the reference generator, documentation tests, or public behavior that changes documented commands, defaults, routes, SDK methods, or types.
 
-`docs/AGENTS.md` holds the binding rules: each navigation group's reader, the page types, what stays out of the site, and formatting. Read it before every docs change. Page types follow [Diátaxis](https://diataxis.fr), and style that the rules don't settle follows the [Google developer documentation style guide](https://developers.google.com/style).
+- `docs/AGENTS.md` holds the binding rules: each navigation group's reader, the page types, what stays out of the site, and formatting. Read it before every docs change.
+- The root `AGENTS.md` "Writing Markdown" rules cover every Markdown file, inside `docs/` or not: bullets over paragraphs, at most two sentences per block, and no em dashes. `make lint` runs `scripts/check_doc_paragraphs.py` on them.
+- Page types follow [Diátaxis](https://diataxis.fr). Style that the rules don't settle follows the [Google developer documentation style guide](https://developers.google.com/style).
 
 ## Canonical locations
 
@@ -18,7 +20,7 @@ Read this skill before editing `docs/`, the reference generator, documentation t
 | Public end-user documentation | `docs/` |
 | Public CLI and Python SDK reference generator | `scripts/generate_reference.py` entry point over the `scripts/reference_docs/` package: `collect` reads the public surface, `model` holds the manifest and `STATIC_REDIRECTS` for handwritten routes, `render` writes MDX, `generate` orchestrates |
 | Generated reference tests | `tests/unit/docs/test_generate_reference.py` |
-| Contributor setup and checks | `DEVELOPMENT.md` |
+| Contributor setup, checks and pull requests | `CONTRIBUTING.md` |
 | Tracker commands, tests and live-test settings | `services/tracker/README.md` |
 | Database and migrations | `services/tracker/src/tracker/database/README.md` |
 | Docs preview, generation and checks | `docs/README.md` |
@@ -49,7 +51,8 @@ Do not remove unique lifecycle, safety, cost, consequence, or recovery guidance 
 
 ## Generated reference architecture
 
-Always change the generator and its tests first. Never hand-edit generated files under `docs/reference/`. A redirect for a handwritten route belongs in `STATIC_REDIRECTS`, not in `docs/docs.json`.
+- Always change the generator and its tests first. Never hand-edit generated files under `docs/reference/`.
+- A redirect for a handwritten route belongs in `STATIC_REDIRECTS`, not in `docs/docs.json`.
 
 Group the current public surface by top-level CLI command, SDK resource, and SDK type family. Derive groups, pages, anchors, and redirects from source through the generator; do not copy current counts or route inventories into instructions.
 
@@ -73,13 +76,14 @@ Use compact OpenAI-style rows:
 - Thin dividers between rows.
 - Names and metadata that wrap naturally, code blocks that scroll inside their own box, and no horizontal document overflow.
 
-Keep index cards short, fully clickable, and limited to routing. Do not put exhaustive command or type lists inside cards. Mintlify equalizes card heights within a row; long card lists leave large blank areas in neighboring cards.
+- Keep index cards short, fully clickable, and limited to routing.
+- Do not put exhaustive command or type lists inside cards. Mintlify equalizes card heights within a row, so long card lists leave large blank areas in neighboring cards.
 
 Do not publish HTTP, cURL, base-URL, transport-header, or private wire-protocol examples in generated CLI or SDK references.
 
 Do not use `Panel` or `CodeGroup` around grouped sections. Those components replace or suppress Mintlify's native right TOC.
 
-Prefer native Mintlify components. Do not add custom JavaScript. Add CSS only when a verified native component cannot satisfy the layout.
+Prefer native Mintlify components, and do not add custom JavaScript. Add CSS only when a verified native component cannot satisfy the layout.
 
 ## Generator invariants
 
@@ -98,7 +102,9 @@ The generator must:
 
 The check path must report missing, stale, and unexpected generated files without modifying the worktree.
 
-Use JSX-safe generated text for literal names. Do not put Markdown backticks inside JSX strings. Escape literal braces so `{}` defaults do not become JSX. Confirm names contain no smart dashes, quotes, ellipses, or other typographic substitutions.
+- Use JSX-safe generated text for literal names, with no Markdown backticks inside JSX strings.
+- Escape literal braces so `{}` defaults do not become JSX.
+- Confirm names contain no smart dashes, quotes, ellipses, or other typographic substitutions.
 
 ## Redirect contract
 
@@ -137,7 +143,10 @@ Verify:
 
 Mintlify's `On this page` control can itself appear as an H2. Count content headings by expected IDs or source headings rather than asserting on every `main h2`.
 
-Rendered cards use a visible card surface plus an aria-hidden anchor with `display: contents`. Wait for hydration, click visible card text or surface, and verify the final pathname. Do not target the hidden anchor as the primary interaction.
+Rendered cards use a visible card surface plus an aria-hidden anchor with `display: contents`.
+
+- Wait for hydration, click visible card text or surface, and verify the final pathname.
+- Do not target the hidden anchor as the primary interaction.
 
 Measure `document.documentElement.scrollWidth` and `clientWidth`. Ignore intentional screen-reader-only and sidebar truncation, but reject document-level overflow or clipped reference content.
 
@@ -158,9 +167,11 @@ Before committing, run the current checks for:
 - Links, anchors, and redirects.
 - Whitespace errors.
 
-A documentation-only change does not justify unrelated product tests. When documentation accompanies product code, run the smallest suites that own the changed behavior. Cross-layer changes need the union of their owning suites; live tests require explicit approval.
+- A documentation-only change does not justify unrelated product tests.
+- When documentation accompanies product code, run the smallest suites that own the changed behavior.
+- Cross-layer changes need the union of their owning suites. Live tests require explicit approval.
 
-Use the local preview command and runtime requirement currently documented in `docs/README.md`. Basic preview needs no Mintlify credentials. Login is optional for account-backed features.
+Use the local preview command and runtime requirement currently documented in `docs/README.md`. Basic preview needs no Mintlify credentials, and login is optional for account-backed features.
 
 Any CI workflow edit requires explicit human attention.
 

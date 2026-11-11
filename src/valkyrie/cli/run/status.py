@@ -1,15 +1,11 @@
 from uuid import UUID
 
 import click
-from valkyrie.sdk import ValkyrieClient
-from valkyrie.sdk.models import BenchmarkStatusEntry
+from valkyrie.sdk.models import BenchmarkStatusEntry, BenchmarkStatusResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, progress_percent
+from valkyrie.cli.display import format_option, format_table, progress_percent, short_local_time
 from valkyrie.cli.run.progress import styled_status
-from valkyrie.cli.run.snapshot import format_run_status_json
-
-_STATUS_BATCH_SIZE = 50
 
 
 @click.command(
@@ -31,20 +27,14 @@ _STATUS_BATCH_SIZE = 50
 def status_runs(run_ids_value: str, output_format: str) -> None:
     run_ids = parse_run_ids(run_ids_value)
 
-    entries = call(lambda client: fetch_status_entries(client, run_ids))
+    response = call(lambda client: client.benchmarks.statuses(run_ids))
 
-    entries_by_id = {entry.id: entry for entry in entries}
+    entries_by_id = {entry.id: entry for entry in response.entries}
     ordered_entries = [entries_by_id[run_id] for run_id in run_ids if run_id in entries_by_id]
     missing_run_ids = [run_id for run_id in run_ids if run_id not in entries_by_id]
 
     if output_format == "json":
-        click.echo(
-            format_run_status_json(
-                ordered_entries,
-                missing_run_ids,
-                requested_count=len(run_ids),
-            )
-        )
+        click.echo(BenchmarkStatusResponse(entries=ordered_entries).model_dump_json())
     else:
         format_status_table(ordered_entries)
 
@@ -66,14 +56,6 @@ def parse_run_ids(value: str) -> list[UUID]:
     return list(dict.fromkeys(run_ids))
 
 
-async def fetch_status_entries(client: ValkyrieClient, run_ids: list[UUID]) -> list[BenchmarkStatusEntry]:
-    entries: list[BenchmarkStatusEntry] = []
-    for start in range(0, len(run_ids), _STATUS_BATCH_SIZE):
-        response = await client.benchmarks.statuses(run_ids[start : start + _STATUS_BATCH_SIZE])
-        entries.extend(response.entries)
-    return entries
-
-
 def format_status_table(entries: list[BenchmarkStatusEntry]) -> None:
     rows: list[dict[str, str]] = []
     for entry in entries:
@@ -83,6 +65,7 @@ def format_status_table(entries: list[BenchmarkStatusEntry]) -> None:
                 "ID": str(entry.id),
                 "Status": styled_status(entry.status),
                 "Progress": f"{entry.finished_tasks}/{entry.total_tasks} ({percent:.1f}%)",
+                "Finished": short_local_time(entry.finished_at) if entry.finished_at else "-",
             }
         )
-    format_table(rows, ["ID", "Status", "Progress"], total_count=len(entries), item_name="run")
+    format_table(rows, ["ID", "Status", "Progress", "Finished"], total_count=len(entries), item_name="run")

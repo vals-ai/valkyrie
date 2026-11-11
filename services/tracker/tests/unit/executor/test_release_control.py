@@ -1,5 +1,4 @@
 from datetime import UTC, datetime, timedelta
-import hashlib
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -7,17 +6,14 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session
 
+from executor_protocol import ExecutorDispatchStatus, source_executor_artifact_uri
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     ExecutorAdmission,
     ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchStatus,
     ExecutorRelease,
-    ExecutorReleaseStatus,
 )
-from executor_protocol import source_executor_artifact_uri
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, ExecutorReleaseStatus
 from tracker.local.releases import register_source_release
 from tracker.executor.release_control import (
     ReleaseControlError,
@@ -35,7 +31,7 @@ from tracker.executor.release_control import (
 def _release(release_id: str) -> ExecutorRelease:
     return ExecutorRelease(
         id=release_id,
-        artifact_uri=f"source:///artifacts/{release_id}.pex",
+        artifact_uri=f"source:///artifacts/{release_id}/src",
         artifact_digest="a" * 64,
         protocol_version="1",
         created_at=datetime.now(UTC),
@@ -58,13 +54,7 @@ def _dispatch(
 
 @pytest.mark.description("An activated release ends `ACTIVE` and becomes the admission target.")
 def test_activate_release_registers_verifies_and_promotes_in_one_session(database_session: Session) -> None:
-    content = b"executor artifact"
-    release = ExecutorRelease(
-        id="git-abc123-def456",
-        artifact_uri="source:///artifacts/releases/git-abc123-def456/executor.pex",
-        artifact_digest=hashlib.sha256(content).hexdigest(),
-        protocol_version="1",
-    )
+    release = _release("git-abc123-def456")
 
     activated = activate_release(
         database_session,
@@ -79,13 +69,7 @@ def test_activate_release_registers_verifies_and_promotes_in_one_session(databas
 
 @pytest.mark.description("Activating the exact active release again changes nothing.")
 def test_activate_release_is_idempotent_for_exact_active_release(database_session: Session) -> None:
-    content = b"executor artifact"
-    release = ExecutorRelease(
-        id="git-abc123-def456",
-        artifact_uri="source:///artifacts/releases/git-abc123-def456/executor.pex",
-        artifact_digest=hashlib.sha256(content).hexdigest(),
-        protocol_version="1",
-    )
+    release = _release("git-abc123-def456")
     first = activate_release(
         database_session,
         release,
@@ -110,19 +94,8 @@ def test_activate_release_is_idempotent_for_exact_active_release(database_sessio
 
 @pytest.mark.description("Activating a draining release is rejected.")
 def test_activate_release_rejects_draining_release(database_session: Session) -> None:
-    content = b"executor artifact"
-    previous = ExecutorRelease(
-        id="git-previous",
-        artifact_uri="source:///artifacts/releases/git-previous/executor.pex",
-        artifact_digest=hashlib.sha256(content).hexdigest(),
-        protocol_version="1",
-    )
-    current = ExecutorRelease(
-        id="git-current",
-        artifact_uri="source:///artifacts/releases/git-current/executor.pex",
-        artifact_digest=hashlib.sha256(content).hexdigest(),
-        protocol_version="1",
-    )
+    previous = _release("git-previous")
+    current = _release("git-current")
     activate_release(
         database_session,
         previous,
@@ -146,13 +119,7 @@ def test_activate_release_rejects_draining_release(database_session: Session) ->
 
 @pytest.mark.description("Activating a retired release is rejected.")
 def test_activate_release_rejects_retired_release(database_session: Session) -> None:
-    content = b"executor artifact"
-    release = ExecutorRelease(
-        id="git-retired",
-        artifact_uri="source:///artifacts/releases/git-retired/executor.pex",
-        artifact_digest=hashlib.sha256(content).hexdigest(),
-        protocol_version="1",
-    )
+    release = _release("git-retired")
     register_release(database_session, release)
     release.status = ExecutorReleaseStatus.RETIRED
     database_session.add(release)
@@ -172,12 +139,7 @@ def test_activate_release_rejects_retired_release(database_session: Session) -> 
 
 @pytest.mark.description("Reusing a release ID with different content is rejected.")
 def test_activate_release_rejects_release_id_reuse_with_different_content(database_session: Session) -> None:
-    existing = ExecutorRelease(
-        id="git-abc123-def456",
-        artifact_uri="source:///artifacts/releases/git-abc123-def456/executor.pex",
-        artifact_digest="a" * 64,
-        protocol_version="1",
-    )
+    existing = _release("git-abc123-def456")
     register_release(database_session, existing)
 
     with pytest.raises(ReleaseControlError, match="different immutable identity"):
@@ -390,8 +352,8 @@ def test_retirement_waits_for_owned_active_benchmark(
 
     benchmark = example_benchmark_object
     benchmark.executor_release_id = "v1"
-    benchmark.executor_artifact_uri = "source:///artifacts/v1.pex"
-    benchmark.executor_artifact_digest = "digest-v1"
+    benchmark.executor_artifact_uri = "source:///artifacts/v1/src"
+    benchmark.executor_artifact_digest = "a" * 64
     benchmark.executor_protocol_version = "1"
     database_session.add(benchmark)
     database_session.commit()
@@ -580,7 +542,7 @@ def test_active_retry_dispatch_blocks_its_release_across_successive_promotions(
 
     benchmark = example_benchmark_object
     benchmark.executor_release_id = "v1"
-    benchmark.executor_artifact_uri = "source:///artifacts/v1.pex"
+    benchmark.executor_artifact_uri = "source:///artifacts/v1/src"
     benchmark.executor_artifact_digest = "a" * 64
     benchmark.executor_protocol_version = "1"
     benchmark.status = BenchmarkStatus.FINISHED
@@ -666,19 +628,17 @@ def test_activate_release_pins_image_releases_to_their_registered_task_definitio
     assert activated.status == ExecutorReleaseStatus.ACTIVE
     assert activated.task_definition_arn == release.task_definition_arn
 
-    reactivated = activate_release(
-        database_session,
-        ExecutorRelease(
-            id=release.id,
-            artifact_uri=image,
-            artifact_digest="c" * 64,
-            protocol_version="1",
-            task_definition_arn="arn:aws:ecs:us-east-1:123456789012:task-definition/ExecutorRunner:9",
-        ),
-    )
-
-    assert reactivated.status == ExecutorReleaseStatus.ACTIVE
-    assert reactivated.task_definition_arn == release.task_definition_arn
+    with pytest.raises(ReleaseControlError, match="different immutable identity"):
+        activate_release(
+            database_session,
+            ExecutorRelease(
+                id=release.id,
+                artifact_uri=image,
+                artifact_digest="c" * 64,
+                protocol_version="1",
+                task_definition_arn="arn:aws:ecs:us-east-1:123456789012:task-definition/ExecutorRunner:9",
+            ),
+        )
 
 
 @pytest.mark.description("An image release without a task definition is rejected.")

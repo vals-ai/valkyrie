@@ -9,10 +9,11 @@ from tracker.auth import get_current_org
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogLocations
 from tracker.aws.resolver import resolve_run_metadata_aws_runtime
 from tracker.aws.s3 import create_benchmark_url
-from tracker.database.models import Org, TaskStatus
+from tracker.database.models import Org
+from tracker.domain import TaskStatus
 from tracker.database.scoping import assert_org
 from tracker.repositories.benchmark import BenchmarkRepositoryDependency, TaskSort
-from tracker.types import SingleBenchmarkResponse, TasksResponse, TaskSummary
+from tracker.types import OrgContext, SingleBenchmarkResponse, TasksResponse, TaskSummary
 
 router = APIRouter(prefix="/benchmarks")
 
@@ -47,7 +48,7 @@ async def get_single_benchmark(
     else:
         aws_runtime = resolve_run_metadata_aws_runtime(
             properties=benchmark.arguments.properties,
-            org=org,
+            org=OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
         )
         if aws_runtime:
             aws_resources = aws_runtime.resources

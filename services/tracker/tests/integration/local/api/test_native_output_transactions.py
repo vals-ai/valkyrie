@@ -19,8 +19,10 @@ from testcontainers.postgres import PostgresContainer
 from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
 from tracker.api.dependencies import get_run_runtime
-from tracker.database.models import ActiveNativeOutput, DEFAULT_ORG_NAME, Org, Task, TaskStatus
+from tracker.database.models import DEFAULT_ORG_NAME, Org, Task
+from tracker.domain import TaskStatus
 from tracker.database.session import get_session
+from tracker.types import ActiveNativeOutput
 
 
 @pytest.fixture(scope="module")

@@ -1,14 +1,13 @@
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
-from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from uuid import UUID
 
 from sqlalchemy import JSON, case, literal, tuple_, type_coerce
 from sqlalchemy import select as sa_select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased, selectinload
 from fastapi import Depends
-from pydantic import BaseModel
 from sqlmodel import Session, SQLModel, asc, col, desc, func, or_, select, update
 from sqlmodel.sql.expression import Select, SelectOfScalar
 
@@ -18,13 +17,17 @@ from tracker.database.models import (
     TaskBreakdown,
     Benchmark,
     BenchmarkStatus,
+    ExecutorDispatch,
+    ExecutorDispatchStatus,
     ErrorResult,
     EvaluationResult,
     FailureCategory,
     FinalEvaluation,
+    SandboxRecord,
     Task,
     TaskStatus,
 )
+from tracker.types import BenchmarkFilters, Order
 
 TaskSort = Literal["task_id", "started_at", "duration", "status"]
 
@@ -59,24 +62,6 @@ class FilterRow(NamedTuple):
     email: str | None
 
 
-class Order(str, Enum):
-    ASC = "asc"
-    DESC = "desc"
-
-
-class BenchmarkFilters(BaseModel):
-    agent_name: list[str] | None = None
-    benchmark_name: list[str] | None = None
-    model: str | None = None
-    dataset: str | None = None
-    label: str | None = None
-    status: list[BenchmarkStatus] | None = None
-    started_by: list[str] | None = None
-    started_after: datetime | None = None
-    started_before: datetime | None = None
-    order_by: Order = Order.DESC
-
-
 class BenchmarkRepository:
     def __init__(self, session: Session = Depends(get_session)) -> None:
         self._session = session
@@ -100,6 +85,17 @@ class BenchmarkRepository:
             .execution_options(populate_existing=True)
             .with_for_update()
         ).one()
+
+    def status_by_id(self, benchmark_id: UUID) -> BenchmarkStatus | None:
+        return self._session.exec(select(Benchmark.status).where(col(Benchmark.id) == benchmark_id)).one_or_none()
+
+    def lock_pool(self, pool_id: str) -> Sequence[Benchmark]:
+        return self._session.exec(
+            select(Benchmark)
+            .where(type_coerce(col(Benchmark.arguments), JSON)["queue_pool_id"].as_string() == pool_id)
+            .order_by(col(Benchmark.id))
+            .with_for_update()
+        ).all()
 
     def lock(self, org_id: UUID, benchmark_id: UUID) -> Benchmark | None:
         return self._session.exec(
@@ -384,6 +380,36 @@ class BenchmarkRepository:
     def get_task_by_id(self, task_row_id: UUID) -> Task | None:
         return self._session.get(Task, task_row_id)
 
+    def lock_task_by_row_id(self, task_row_id: UUID) -> Task:
+        return self._session.exec(
+            select(Task).where(col(Task.id) == task_row_id).execution_options(populate_existing=True).with_for_update()
+        ).one()
+
+    def task_by_row_id(self, task_row_id: UUID) -> Task:
+        return self._session.exec(
+            select(Task).where(col(Task.id) == task_row_id).execution_options(populate_existing=True)
+        ).one()
+
+    def tasks_by_row_ids(self, task_row_ids: Collection[UUID]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task)
+            .where(col(Task.id).in_(task_row_ids))
+            .order_by(col(Task.id))
+            .execution_options(populate_existing=True)
+        ).all()
+
+    def list_tasks_by_id_for_benchmark(self, benchmark_id: UUID, task_ids: Sequence[str]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task).where(col(Task.benchmark) == benchmark_id, col(Task.task_id).in_(task_ids))
+        ).all()
+
+    def record_sandbox_link(self, provider: str, sandbox_id: str, benchmark_id: UUID) -> None:
+        self._session.exec(
+            insert(SandboxRecord)
+            .values(provider=provider, sandbox_id=sandbox_id, benchmark_id=benchmark_id)
+            .on_conflict_do_nothing(index_elements=["provider", "sandbox_id"])
+        )
+
     def task_ids(self, org_id: UUID, benchmark_id: UUID, task_ids: Sequence[str] | None = None) -> set[str]:
         query = select(Task.task_id).where(col(Task.benchmark) == benchmark_id).where(col(Task.org_id) == org_id)
         if task_ids is not None:
@@ -431,6 +457,42 @@ class BenchmarkRepository:
             .with_for_update()
             .execution_options(populate_existing=True)
         ).all()
+
+    def lock_nonterminal_tasks(self, org_id: UUID, benchmark_id: UUID, task_ids: Sequence[str]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task)
+            .where(col(Task.benchmark) == benchmark_id, col(Task.org_id) == org_id)
+            .where(col(Task.status).notin_((TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED)))
+            .where(col(Task.task_id).in_(task_ids))
+            .with_for_update()
+        ).all()
+
+    def lock_owned_attempts(self, org_id: UUID, benchmark_id: UUID, row_ids: Sequence[UUID]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task)
+            .where(col(Task.benchmark) == benchmark_id, col(Task.org_id) == org_id)
+            .where(col(Task.id).in_(row_ids))
+            .with_for_update()
+        ).all()
+
+    def lock_tasks_for_benchmark_by_ids(self, benchmark_id: UUID, task_ids: Sequence[str]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task)
+            .where(col(Task.benchmark) == benchmark_id, col(Task.task_id).in_(task_ids))
+            .order_by(col(Task.id))
+            .with_for_update()
+        ).all()
+
+    def has_build_in_pool(self, pool_id: str) -> bool:
+        return (
+            self._session.exec(
+                select(Task.id)
+                .join(Benchmark, col(Task.benchmark) == col(Benchmark.id))
+                .where(col(Task.status) == TaskStatus.BUILDING)
+                .where(type_coerce(col(Benchmark.arguments), JSON)["queue_pool_id"].as_string() == pool_id)
+            ).first()
+            is not None
+        )
 
     def final_errors(
         self, org_id: UUID, task_row_ids: Sequence[UUID]
@@ -553,6 +615,23 @@ class BenchmarkRepository:
             .where(col(Task.status) == TaskStatus.PENDING)
             .order_by(col(Task.task_id))
         ).all()
+
+    def final_score_inputs(self, org_id: UUID, benchmark_id: UUID) -> dict[str, dict[str, Any] | None]:
+        task_rows = self._session.exec(
+            select(Task.id, Task.task_id, Task.status)
+            .where(col(Task.benchmark) == benchmark_id, col(Task.org_id) == org_id)
+            .order_by(col(Task.id))
+        ).all()
+        latest_results = {
+            task_row_id: result
+            for task_row_id, _result_id, result in self.latest_evaluation_results(org_id, benchmark_id)
+        }
+        return {
+            task_id: latest_results[task_row_id]
+            if status == TaskStatus.FINISHED and task_row_id in latest_results
+            else None
+            for task_row_id, task_id, status in task_rows
+        }
 
     def list_in_progress_with_pending_tasks(self) -> Sequence[Benchmark]:
         return self._session.exec(
@@ -682,8 +761,28 @@ class BenchmarkRepository:
             update(Task)
             .where(col(Task.id).in_(task_ids))
             .where(col(Task.status) == TaskStatus.EVALUATING)
-            .values(started_at=started_at)
+            .values(
+                started_at=started_at,
+                evaluation_phase_dispatch_id=None,
+                evaluation_phase_token=None,
+            )
         ).rowcount
+
+    def has_active_evaluation_owner(self, dispatch_id: UUID | None) -> bool:
+        if dispatch_id is None:
+            return False
+        return (
+            self._session.exec(
+                select(ExecutorDispatch.id)
+                .where(col(ExecutorDispatch.id) == dispatch_id)
+                .where(col(ExecutorDispatch.status) == ExecutorDispatchStatus.RUNNING)
+                .where(
+                    col(ExecutorDispatch.ecs_task_arn).is_not(None)
+                    | (col(ExecutorDispatch.lease_expires_at) > func.clock_timestamp())
+                )
+            ).first()
+            is not None
+        )
 
 
 BenchmarkRepositoryDependency = Annotated[BenchmarkRepository, Depends(BenchmarkRepository)]

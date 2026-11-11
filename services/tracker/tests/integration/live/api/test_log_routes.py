@@ -17,8 +17,9 @@ from tracker.aws.cloudwatch_logs import (
     task_log_stream_name,
 )
 from tracker.aws.runtime import AWSRuntime
+from tracker.database.models import Benchmark, Task
 from tracker.runtime.logs import TaskLogLine
-from tracker.database.models import AgentContractRequest, Benchmark, AWSBenchmarkArguments, Task
+from tracker.types import AgentContractRequest, AWSBenchmarkArguments
 
 
 def _wait_for_events(

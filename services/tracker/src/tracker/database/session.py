@@ -5,7 +5,7 @@ from typing import Any, TypeVar
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from tracker.config import DATABASE_URL
+from tracker.config import build_database_url
 from tracker.database.models import Benchmark, EvaluationResult, Org, Task
 from tracker.logging import get_logger
 
@@ -13,12 +13,22 @@ logger = get_logger(__name__)
 
 _exposed_models: list[type[SQLModel]] = [Benchmark, EvaluationResult, Org, Task]
 
-engine = create_engine(DATABASE_URL, poolclass=NullPool)
+engine = create_engine(build_database_url(), poolclass=NullPool)
+SERVER_POOL_SIZE = 10
+SERVER_POOL_OVERFLOW = 10
+SERVER_POOL_RECYCLE_SECONDS = 1800
+server_engine = create_engine(
+    build_database_url(),
+    pool_size=SERVER_POOL_SIZE,
+    max_overflow=SERVER_POOL_OVERFLOW,
+    pool_pre_ping=True,
+    pool_recycle=SERVER_POOL_RECYCLE_SECONDS,
+)
 _Result = TypeVar("_Result")
 
 
 def get_session() -> Generator[Session, Any, None]:
-    with Session(engine, expire_on_commit=False) as session:
+    with Session(server_engine, expire_on_commit=False) as session:
         yield session
 
 

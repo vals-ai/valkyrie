@@ -50,20 +50,12 @@ def test_status_json_deduplicates_and_restores_requested_order(tracker: MockTrac
     assert result.exit_code == 0, result.output
     assert len(result.stdout.splitlines()) == 1
     assert "\x1b" not in result.stdout
-    payload = json.loads(result.stdout)
-    assert payload["schema_version"] == 1
-    assert payload["kind"] == "run_status"
-    assert payload["requested_count"] == 2
-    assert payload["returned_count"] == 2
-    assert payload["missing_run_ids"] == []
-    assert [entry["run_id"] for entry in payload["runs"]] == [str(first.id), str(second.id)]
-    assert payload["runs"][0]["progress_percent"] == 25.0
-    assert payload["runs"][1]["finished_at"] == "2026-07-09T13:00:00Z"
+    assert json.loads(result.stdout) == BenchmarkStatusResponse(entries=[first, second]).model_dump(mode="json")
     assert _requested_ids(tracker) == [[str(first.id), str(second.id)]]
 
 
 @pytest.mark.description(
-    "`run status --json` lists unknown run IDs under `missing_run_ids`, warns on stderr, and exits nonzero."
+    "`run status --json` prints the runs it found, warns on stderr about the rest, and exits nonzero."
 )
 def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker) -> None:
     found = make_entry(0)
@@ -72,9 +64,7 @@ def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker)
     result = invoke_with_entries(tracker, [found], ["--ids", f"{found.id},{missing}", "--format", "json"])
 
     assert result.exit_code != 0
-    payload = json.loads(result.stdout)
-    assert payload["returned_count"] == 1
-    assert payload["missing_run_ids"] == [str(missing)]
+    assert [entry["id"] for entry in json.loads(result.stdout)["entries"]] == [str(found.id)]
     assert "not found or are not accessible" in result.stderr
 
 
@@ -88,7 +78,7 @@ def test_status_json_chunks_large_id_sets(tracker: MockTracker) -> None:
 
     assert result.exit_code == 0, result.output
     assert [len(ids) for ids in _requested_ids(tracker)] == [50, 1]
-    assert json.loads(result.stdout)["returned_count"] == 51
+    assert len(json.loads(result.stdout)["entries"]) == 51
 
 
 @pytest.mark.description("A malformed `--ids` value fails with an error naming the flag before any request.")

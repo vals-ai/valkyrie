@@ -107,10 +107,10 @@ RESOURCE_CARDS = {
         "creating, updating, archiving, and restoring the benchmarks your datasets belong to",
     ),
     "DatasetsResource": ("Datasets", "database", "creating, updating, archiving, and restoring benchmark datasets"),
-    "DatasetTasksResource": (
-        "Dataset tasks",
+    "DatasetVersionsResource": (
+        "Dataset versions",
         "file-archive",
-        "uploading, listing, downloading, and removing dataset tasks",
+        "publishing, listing, tagging, and downloading dataset versions",
     ),
 }
 
@@ -129,32 +129,6 @@ TYPE_CARDS = {
     "Account": ("user-round", "your identity, access keys, organizations, and members"),
     "Login": ("log-in", "saved browser logins and their refresh"),
 }
-
-READ_ONLY_COMMANDS = frozenset(
-    {
-        ("run", "artifacts"),
-        ("run", "filter-options"),
-        ("run", "task-artifacts"),
-        ("run", "task"),
-        ("run", "tasks"),
-        ("agent", "list"),
-        ("benchmark", "tasks"),
-        ("benchmark", "service", "list"),
-        ("run", "errors"),
-        ("run", "fetch"),
-        ("run", "list"),
-        ("run", "logs"),
-        ("run", "output"),
-        ("run", "outputs"),
-        ("run", "results"),
-        ("run", "status"),
-        ("queue", "status"),
-        ("project", "list"),
-        ("secret", "list"),
-        ("provider", "list"),
-        ("ui",),
-    }
-)
 
 
 class CLIParameterReference(NamedTuple):

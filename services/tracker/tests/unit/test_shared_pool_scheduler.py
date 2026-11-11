@@ -8,10 +8,12 @@ import pytest
 from benchmark_service import ResourceCapacity, SandboxCapacity, SandboxCapacityDomain, SandboxError
 
 from tests.factories import make_benchmark
-from tracker.database.models import LocalBenchmarkArguments, Org
+from tracker.database.models import Org
 from tracker.database.session import database_call
+from tracker.executor.control_queue import queue_pool_id, reserved_queue_pool_id
 from tracker.local.resources import LocalResources
-from tracker.scheduler import coordinator, store
+from tracker.scheduler import coordinator
+from tracker.types import LocalBenchmarkArguments, OrgContext
 
 
 @pytest.mark.description("The pool provider uses the run's saved runtime.")
@@ -39,9 +41,7 @@ async def test_pool_provider_uses_the_runs_persisted_runtime(
     monkeypatch.setattr(coordinator.LocalRuntimeFactory, "create_runtime", local_factory)
     monkeypatch.setattr(coordinator.CloudRuntimeFactory, "create_runtime", cloud_factory)
     monkeypatch.setattr(coordinator, "resolve_run_aws_runtime", resolve)
-    reference = coordinator.PoolReference(
-        store.reserved_queue_pool_id(store.queue_pool_id("unit-provider")), benchmark, org
-    )
+    reference = coordinator.PoolReference(reserved_queue_pool_id(queue_pool_id("unit-provider")), benchmark, org)
 
     assert await coordinator.open_pool_provider(reference) is provider
     if environment == "local":
@@ -54,7 +54,10 @@ async def test_pool_provider_uses_the_runs_persisted_runtime(
         cloud_factory.assert_not_called()
         resolve.assert_not_called()
     else:
-        resolve.assert_called_once_with(properties=benchmark.arguments.properties, org=org)
+        resolve.assert_called_once_with(
+            properties=benchmark.arguments.properties,
+            org=OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
+        )
         cloud_factory.assert_called_once_with(
             resolved, sandbox_provider="daytona", sandbox_provider_secret_name="test-provider-secret"
         )
@@ -74,9 +77,7 @@ async def test_wrong_pool_provider_is_closed_without_reading_capacity(
     runtime = Mock(get_sandbox_provider_config=AsyncMock(return_value=config))
     monkeypatch.setattr(coordinator.CloudRuntimeFactory, "create_runtime", Mock(return_value=runtime))
     monkeypatch.setattr(coordinator, "resolve_run_aws_runtime", Mock())
-    reference = coordinator.PoolReference(
-        store.reserved_queue_pool_id(store.queue_pool_id("unit-provider")), benchmark, org
-    )
+    reference = coordinator.PoolReference(reserved_queue_pool_id(queue_pool_id("unit-provider")), benchmark, org)
     with pytest.raises(ValueError, match="persisted admission pool"):
         await coordinator.open_pool_provider(reference)
     provider.close.assert_awaited_once()

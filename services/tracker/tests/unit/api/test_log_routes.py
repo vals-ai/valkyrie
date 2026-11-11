@@ -21,15 +21,9 @@ from tracker.api import logs as logs_api
 from tracker.api.dependencies import get_run_runtime
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchLogProvider
-from tracker.database.models import (
-    Benchmark,
-    BenchmarkStatus,
-    LocalBenchmarkArguments,
-    Org,
-    RunMonitoring,
-    RunMonitoringRules,
-    TaskStatus,
-)
+from tracker.database.models import Benchmark, Org
+from tracker.domain import BenchmarkStatus, TaskStatus
+from tracker.types import LocalBenchmarkArguments, RunMonitoring, RunMonitoringRules
 from tracker.local.logs import FilesystemLogs
 from tracker.runtime.logs import (
     LogEvent,

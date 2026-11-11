@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ import tracker.runtime.run_egress as run_egress
 import tracker.sandbox as sandbox_module
 from tests.factories import make_benchmark, make_task
 from tracker.database.models import Benchmark, BenchmarkStatus, EgressProxyPolicy, Org, Task, TaskStatus
+from tracker.executor.control_tasks import TaskControl
 from tracker.egress import EgressPolicy, child_key_id
 from tracker.egress_proxy.client import (
     install_proxy_ca,
@@ -441,26 +443,29 @@ async def test_allowlist_run_stage_applies_the_run_policy(monkeypatch: pytest.Mo
 
 @pytest.mark.description("A failed proxy run stage revokes its credential.")
 async def test_proxy_run_stage_revokes_the_credential_when_the_stage_fails(
-    database_session: Session, monkeypatch: pytest.MonkeyPatch
+    control_postgres_session: Session,
+    bound_controls: Callable[..., dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     apply = AsyncMock()
     monkeypatch.setattr(proxy_run_stage, "apply_egress_policy", apply)
     monkeypatch.setattr(proxy_run_stage, "install_proxy_ca", AsyncMock())
     monkeypatch.setattr(proxy_run_stage, "start_proxy_tunnel", AsyncMock(return_value=True))
-    benchmark = make_benchmark(session=database_session)
-    task = _running_task(database_session, benchmark)
-    egress = EgressProxy(_ENDPOINT, cast(Engine, database_session.get_bind()))
+    benchmark = make_benchmark(session=control_postgres_session)
+    task = _running_task(control_postgres_session, benchmark)
+    control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+    egress = EgressProxy(_ENDPOINT, control)
     attempt = _attempt(benchmark.id, task.id)
 
     with pytest.raises(RuntimeError):
         async with egress.run_stage(cast(Any, object()), ["example.com"], attempt) as access:
-            assert database_session.get(EgressProxyPolicy, "attempt-1") is not None
+            assert control_postgres_session.get(EgressProxyPolicy, "attempt-1") is not None
             assert access.secrets[0] in access.env_vars["HTTPS_PROXY"]
             raise RuntimeError
 
     assert apply.await_args is not None and apply.await_args.args[1] == ["192.0.2.1/32"]
-    database_session.expire_all()
-    assert database_session.get(EgressProxyPolicy, "attempt-1") is None
+    control_postgres_session.expire_all()
+    assert control_postgres_session.get(EgressProxyPolicy, "attempt-1") is None
 
 
 @pytest.mark.description("Inspected URLs are saved as lowercase hostnames.")
@@ -488,20 +493,23 @@ def test_wildcard_egress_entries_are_rejected(egress: list[str], inspect: list[s
 
 
 @pytest.mark.description("Child egress through the proxy has its own credential and policy.")
-async def test_proxy_child_egress_has_its_own_credential_and_policy(database_session: Session) -> None:
-    benchmark = make_benchmark(session=database_session)
-    task = _running_task(database_session, benchmark)
-    egress = EgressProxy(_ENDPOINT, cast(Engine, database_session.get_bind()))
+async def test_proxy_child_egress_has_its_own_credential_and_policy(
+    control_postgres_session: Session, bound_controls: Callable[..., dict[str, object]]
+) -> None:
+    benchmark = make_benchmark(session=control_postgres_session)
+    task = _running_task(control_postgres_session, benchmark)
+    control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+    egress = EgressProxy(_ENDPOINT, control)
     profile = ChildPolicy(egress=["example.com", "pypi.org"], inspect=["pypi.org"], models=["a/b"])
     key_id = child_key_id("attempt-1", "gpu")
 
     async with egress.child_egress(
         "gpu", profile, _attempt(benchmark.id, task.id), ScopedGateway("https://gw.test", "child-token")
     ) as child_egress:
-        stored = database_session.get(EgressProxyPolicy, key_id)
+        stored = control_postgres_session.get(EgressProxyPolicy, key_id)
         assert stored is not None
         assert (stored.domains, stored.inspect_domains) == (["example.com", "pypi.org"], ["pypi.org"])
-        assert database_session.get(EgressProxyPolicy, "attempt-1") is None
+        assert control_postgres_session.get(EgressProxyPolicy, "attempt-1") is None
         token = child_egress.proxy_url.split(":")[2].split("@")[0]
         assert stored.token_sha256 == hashlib.sha256(token.encode()).hexdigest()
         assert child_egress.proxy_url == f"https://{key_id}:{token}@proxy.example:3128"
@@ -509,18 +517,21 @@ async def test_proxy_child_egress_has_its_own_credential_and_policy(database_ses
         assert child_egress.ca_certificate == "certificate"
         assert (child_egress.gateway_url, child_egress.gateway_token) == ("https://gw.test", "child-token")
 
-    database_session.expire_all()
-    assert database_session.get(EgressProxyPolicy, key_id) is None
+    control_postgres_session.expire_all()
+    assert control_postgres_session.get(EgressProxyPolicy, key_id) is None
 
 
 @pytest.mark.description("A child profile with no egress gets a policy with no domains and no gateway token.")
-async def test_child_profile_without_egress_reaches_only_the_gateway(database_session: Session) -> None:
-    benchmark = make_benchmark(session=database_session)
-    task = _running_task(database_session, benchmark)
-    egress = EgressProxy(_ENDPOINT, cast(Engine, database_session.get_bind()))
+async def test_child_profile_without_egress_reaches_only_the_gateway(
+    control_postgres_session: Session, bound_controls: Callable[..., dict[str, object]]
+) -> None:
+    benchmark = make_benchmark(session=control_postgres_session)
+    task = _running_task(control_postgres_session, benchmark)
+    control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+    egress = EgressProxy(_ENDPOINT, control)
 
     async with egress.child_egress("judge", ChildPolicy(), _attempt(benchmark.id, task.id), None) as child_egress:
-        stored = database_session.get(EgressProxyPolicy, child_key_id("attempt-1", "judge"))
+        stored = control_postgres_session.get(EgressProxyPolicy, child_key_id("attempt-1", "judge"))
         assert stored is not None
         assert stored.domains == []
         assert child_egress.gateway_token is None

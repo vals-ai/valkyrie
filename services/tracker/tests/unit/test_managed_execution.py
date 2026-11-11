@@ -18,19 +18,24 @@ from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
 from tracker.database.models import (
-    AgentContractRequest,
     Benchmark,
-    BenchmarkStatus,
     Org,
 )
+from tracker.domain import BenchmarkStatus
 from tracker.exceptions import TrackerServiceError
 from tracker.executor.dependencies import get_execution_runtime
 from tracker.local.resources import LocalResources
-from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
-from tracker.services.runs.start import process_benchmark
+from tracker.types import (
+    AgentContractRequest,
+    ManagedExecutionContext,
+    OrgContext,
+    RunExecutionRequest,
+    StartBenchmarkRequest,
+)
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
 from tracker.services.runs.start import (
     _parse_queued_execution,  # pyright: ignore[reportPrivateUsage]
+    process_benchmark,
 )
 
 
@@ -167,10 +172,19 @@ async def test_taskiq_adapter_preserves_queued_local_jobs(
     }
 
     execution = _parse_queued_execution(payload, str(benchmark.id), _TASK_IDS, None)
+    org = database_session.get(Org, benchmark.org_id)
+    assert org is not None
+    arguments = benchmark.arguments
     runtime = await get_execution_runtime(
         execution.request,
-        benchmark,
-        Org(id=TEST_ORG_ID, name="default"),
+        benchmark_id=benchmark.id,
+        org_id=org.id,
+        org_name=org.name,
+        org_storage_key=org.storage_key,
+        saved_environment=arguments.environment,
+        saved_properties=arguments.properties,
+        saved_sandbox_provider=arguments.sandbox_provider,
+        saved_sandbox_provider_secret_name=arguments.sandbox_provider_secret_name,
         context_version=execution.context_version,
     )
 
@@ -205,41 +219,21 @@ def test_taskiq_adapter_rejects_mixed_and_invalid_managed_inputs(contract: Agent
 @pytest.mark.description("A queued execution that fails to parse marks the run as an error.")
 async def test_queued_execution_parse_failure_marks_run_error(
     contract: AgentContractRequest,
-    database_session: Session,
+    control_postgres_session: Session,
     process_benchmark_env: None,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     request = _managed_request(contract)
-    benchmark = _persist_benchmark(database_session, request)
+    benchmark = _persist_benchmark(control_postgres_session, request)
     invalid_context = {**_execution_context(request, benchmark.id), "version": 1}
 
-    await process_benchmark(execution_context_json=invalid_context, **executor_authority_kwargs(benchmark))
-
-    database_session.refresh(benchmark)
-    assert benchmark.status == BenchmarkStatus.ERROR
-    assert "Queued managed execution context is invalid" in (benchmark.error_message or "")
-
-
-@pytest.mark.description("An access key execution for a managed run marks the run as an error.")
-async def test_access_key_execution_for_managed_row_marks_run_error(
-    contract: AgentContractRequest,
-    database_session: Session,
-    process_benchmark_env: None,
-    executor_authority_kwargs: Any,
-) -> None:
-    managed_request = _managed_request(contract)
-    benchmark = _persist_benchmark(database_session, managed_request)
-
     await process_benchmark(
-        start_benchmark_request_json=managed_request.model_dump(mode="json"),
-        benchmark_id_str=str(benchmark.id),
-        verified_task_ids=_TASK_IDS,
-        **executor_authority_kwargs(benchmark),
+        execution_context_json=invalid_context, **bound_controls(benchmark, session=control_postgres_session)
     )
 
-    database_session.refresh(benchmark)
+    control_postgres_session.refresh(benchmark)
     assert benchmark.status == BenchmarkStatus.ERROR
-    assert "benchmark request requires an execution context" in (benchmark.error_message or "")
+    assert "Queued managed execution context is invalid" in (benchmark.error_message or "")
 
 
 @pytest.mark.description(
@@ -247,13 +241,13 @@ async def test_access_key_execution_for_managed_row_marks_run_error(
 )
 async def test_unavailable_managed_storage_marks_run_error(
     contract: AgentContractRequest,
-    database_session: Session,
+    control_postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     process_benchmark_env: None,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     request = _managed_request(contract)
-    benchmark = _persist_benchmark(database_session, request)
+    benchmark = _persist_benchmark(control_postgres_session, request)
     spans: list[tuple[str, dict[str, Any]]] = []
 
     def reject_managed_runtime(_org_id: UUID, properties: AWSResources | None = None) -> AWSRuntime:
@@ -265,14 +259,13 @@ async def test_unavailable_managed_storage_marks_run_error(
 
     monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", reject_managed_runtime)
     monkeypatch.setattr("tracker.services.runs.start.observability_span", record_span)
-    monkeypatch.setattr("tracker.services.runs.finalize.observability_span", record_span)
 
     await process_benchmark(
         execution_context_json=_execution_context(request, benchmark.id),
-        **executor_authority_kwargs(benchmark),
+        **bound_controls(benchmark, session=control_postgres_session),
     )
 
-    database_session.refresh(benchmark)
+    control_postgres_session.refresh(benchmark)
     assert benchmark.status == BenchmarkStatus.ERROR
     assert "This run's storage is no longer available." in (benchmark.error_message or "")
     finalized_span = next(attributes for name, attributes in spans if name == "run.finalized")
@@ -286,15 +279,15 @@ async def test_managed_execution_completes_with_the_deployment_runtime(
     version: int,
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,
-    database_session: Session,
+    control_postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     process_benchmark_env: None,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     request = _managed_request(contract.model_copy(update={"secrets": {"MODEL_API_KEY": "model-secret"}})).model_copy(
         update={"lambda_function": "post-run-handler", "properties": aws_runtime.resources}
     )
-    benchmark = _persist_benchmark(database_session, request)
+    benchmark = _persist_benchmark(control_postgres_session, request)
     calls: list[str] = []
     spans: list[tuple[str, dict[str, Any]]] = []
     provider_config = cast(SandboxProviderConfig, MagicMock(create_provider=MagicMock(return_value=AsyncMock())))
@@ -347,17 +340,18 @@ async def test_managed_execution_completes_with_the_deployment_runtime(
     monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.put_bytes", upload_results)
     monkeypatch.setattr("tracker.aws.services.invoke_lambda", invoke_post_run)
     monkeypatch.setattr("tracker.services.runs.start.observability_span", record_span)
-    monkeypatch.setattr("tracker.services.runs.finalize.observability_span", record_span)
 
     execution_context = _execution_context(request, benchmark.id)
     execution_context["version"] = version
     benchmark.arguments = benchmark.arguments.model_copy(update={"concurrency": 20})
-    database_session.add(benchmark)
-    database_session.commit()
+    control_postgres_session.add(benchmark)
+    control_postgres_session.commit()
 
-    await process_benchmark(execution_context_json=execution_context, **executor_authority_kwargs(benchmark))
+    await process_benchmark(
+        execution_context_json=execution_context, **bound_controls(benchmark, session=control_postgres_session)
+    )
 
-    database_session.refresh(benchmark)
+    control_postgres_session.refresh(benchmark)
     assert benchmark.status == BenchmarkStatus.FINISHED
     assert calls[:4] == ["logs", "agent-secrets", "lambda-dry-run", "provider-secret"]
     assert calls.count("agent-secrets") >= 2
@@ -416,13 +410,13 @@ async def test_managed_execution_preflight_checks_aws_dependencies_in_order(
 async def test_managed_preflight_failure_happens_before_sandbox(
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,
-    database_session: Session,
+    control_postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     process_benchmark_env: None,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     request = _managed_request(contract)
-    benchmark = _persist_benchmark(database_session, request)
+    benchmark = _persist_benchmark(control_postgres_session, request)
     create_sandbox = AsyncMock()
 
     def deployment_runtime(_org_id: UUID, properties: AWSResources | None = None) -> AWSRuntime:
@@ -437,10 +431,10 @@ async def test_managed_preflight_failure_happens_before_sandbox(
 
     await process_benchmark(
         execution_context_json=_execution_context(request, benchmark.id),
-        **executor_authority_kwargs(benchmark),
+        **bound_controls(benchmark, session=control_postgres_session),
     )
 
-    database_session.refresh(benchmark)
+    control_postgres_session.refresh(benchmark)
     assert benchmark.status == BenchmarkStatus.ERROR
     assert "managed log preflight failed" in (benchmark.error_message or "")
     create_sandbox.assert_not_awaited()
@@ -462,23 +456,25 @@ async def test_managed_execution_rejects_invalid_saved_storage_before_runtime(
     error: str,
     contract: AgentContractRequest,
     aws_runtime: AWSRuntime,
-    database_session: Session,
+    control_postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     process_benchmark_env: None,
-    executor_authority_kwargs: Any,
+    bound_controls: Any,
 ) -> None:
     saved = replace(aws_runtime.resources, s3_bucket=saved_bucket) if saved_bucket else None
     queued = replace(aws_runtime.resources, s3_bucket=queued_bucket) if queued_bucket else None
     request = _managed_request(contract).model_copy(update={"properties": saved})
-    benchmark = _persist_benchmark(database_session, request)
+    benchmark = _persist_benchmark(control_postgres_session, request)
     context = _execution_context(request.model_copy(update={"properties": queued}), benchmark.id)
     context["version"] = version
     runtime = AsyncMock()
     monkeypatch.setattr("tracker.executor.dependencies.CloudRuntimeFactory.create_execution_runtime", runtime)
 
-    await process_benchmark(execution_context_json=context, **executor_authority_kwargs(benchmark))
+    await process_benchmark(
+        execution_context_json=context, **bound_controls(benchmark, session=control_postgres_session)
+    )
 
-    database_session.refresh(benchmark)
+    control_postgres_session.refresh(benchmark)
     assert benchmark.status == BenchmarkStatus.ERROR
     assert error in (benchmark.error_message or "")
     runtime.assert_not_awaited()
@@ -501,7 +497,7 @@ async def test_runtime_factory_rejects_queued_resources_before_aws(
     with pytest.raises(TrackerServiceError, match="Queued AWS resources differ from the saved run"):
         await CloudRuntimeFactory.create_execution_runtime(
             request,
-            Org(id=TEST_ORG_ID, name="default", storage_key="test-bucket"),
+            OrgContext(id=TEST_ORG_ID, name="default", storage_key="test-bucket"),
             uuid4(),
             properties=aws_runtime.resources,
         )

@@ -27,6 +27,7 @@ _EXPECTED_CLI_PATHS = (
     "run output",
     "run outputs",
     "run results",
+    "run rescore",
     "run regrade",
     "run retag",
     "run resume",
@@ -88,6 +89,7 @@ _EXPECTED_RESOURCES = {
         "results",
         "preview",
         "metadata",
+        "snapshot",
         "results_exist",
         "analyze",
         "stream_outputs",
@@ -95,6 +97,7 @@ _EXPECTED_RESOURCES = {
         "update_concurrency",
         "retag",
         "shed",
+        "rescore",
         "stop",
         "resume",
         "retry",
@@ -104,8 +107,16 @@ _EXPECTED_RESOURCES = {
     "AgentsResource": ("list", "download_url", "push", "download", "remove", "install"),
     "BenchmarkServicesResource": ("catalog", "check", "list", "task_ids"),
     "BenchmarkDefinitionsResource": ("create", "list", "get", "update", "remove", "restore"),
-    "DatasetsResource": ("create", "list", "get", "update", "remove", "restore"),
-    "DatasetTasksResource": ("put", "list", "list_all", "get", "download", "remove"),
+    "DatasetsResource": ("create", "list", "get", "update", "remove", "restore", "push", "install", "start_run"),
+    "DatasetVersionsResource": (
+        "list",
+        "get",
+        "tasks",
+        "get_task",
+        "tag",
+        "untag",
+        "download",
+    ),
     "LogsResource": ("page_task", "fetch_task", "page_run", "fetch_run", "stream_task"),
     "SchedulerResource": ("overview",),
     "SecretsResource": ("list", "set", "remove"),
@@ -147,6 +158,7 @@ _EXPECTED_TYPES = {
         "RegradeBenchmarkRequest",
         "RegradeBenchmarkResponse",
         "RetryOrResumeBenchmarkResponse",
+        "RunSnapshot",
         "RunStreamEvent",
         "ResultsExistResponse",
         "S3UploadResultsResponse",
@@ -318,7 +330,7 @@ class TestCLIReference:
 
         start_section = _section(rendered, "## `valkyrie run start` {#start}")
         assert "[--secret|-s <TEXT> <TEXT>...]" in start_section
-        assert "# Example only, review before running" in start_section
+        assert "# Example only" not in start_section
         assert "valkyrie run stop $RUN_ID" in _section(rendered, "## `valkyrie run stop` {#stop}")
 
     @pytest.mark.description("An unsupported option default fails reference collection.")

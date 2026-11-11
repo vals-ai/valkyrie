@@ -1,6 +1,6 @@
 import base64
 import os
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from types import ModuleType
 from typing import Any, cast
@@ -19,6 +19,7 @@ import pytest
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 
+from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tests.unit.services.task_execution_support import (
     MockLauncher,
     finalize_agent_generation,
@@ -26,13 +27,21 @@ from tests.unit.services.task_execution_support import (
 )
 from tests.utils import TEST_ORG_ID, add_sqlite_btrim, inline_database_calls_in
 from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
-from tracker.database.models import ExecutorDispatch, ExecutorDispatchPayload, Org, OrgProviderSecret
+from tracker.database.models import (
+    ExecutorAdmission,
+    ExecutorDispatch,
+    ExecutorDispatchPayload,
+    ExecutorRelease,
+    ExecutorReleaseStatus,
+    Org,
+    OrgProviderSecret,
+)
 from tracker.database.session import get_session
 from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
-from tracker.services.tasks.monitor import TaskMonitor
+from tracker.services.tasks.execute import TaskMonitor
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
@@ -123,6 +132,24 @@ def mapped_providers(database_session: Session) -> None:
         OrgProviderSecret(org_id=TEST_ORG_ID, provider=provider, secret_name=secret)
         for provider, secret in {"daytona": "provider-secret", "modal": "ModalSecrets"}.items()
     )
+    database_session.commit()
+
+
+@pytest.fixture
+def active_executor_release(database_session: Session) -> None:
+    release = ExecutorRelease(
+        id="test-release",
+        artifact_uri="s3://artifacts/test-release.pex",
+        artifact_digest="digest-test-release",
+        protocol_version=SUPPORTED_PROTOCOL_VERSION,
+        status=ExecutorReleaseStatus.ACTIVE,
+    )
+    admission = database_session.get(ExecutorAdmission, 1)
+    assert admission is not None
+    database_session.add(release)
+    database_session.flush()
+    admission.release_id = release.id
+    database_session.add(admission)
     database_session.commit()
 
 
@@ -235,12 +262,8 @@ def mock_launcher(monkeypatch: pytest.MonkeyPatch, database_session: Session) ->
 
 
 @pytest.fixture
-def process_benchmark_env(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> None:
-
+def process_benchmark_env(monkeypatch: pytest.MonkeyPatch) -> None:
     sandbox_count = 0
-
-    async def inline_admission(function: Callable[..., Any], *args: Any) -> Any:
-        return function(*args)
 
     @asynccontextmanager
     async def _mock_create_sandbox(*_args: Any, **_kwargs: Any) -> AsyncGenerator[AsyncMock, None]:
@@ -267,11 +290,6 @@ def process_benchmark_env(monkeypatch: pytest.MonkeyPatch, database_session: Ses
     async def _mock_verify_task_ids(*_args: Any, task_ids: list[str], **_kwargs: Any) -> VerifyTaskIdsResponse:
         return VerifyTaskIdsResponse(task_ids=task_ids)
 
-    monkeypatch.setattr("tracker.services.tasks.execute.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.tasks.monitor.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.tasks.execute.to_thread", inline_admission)
-    monkeypatch.setattr("tracker.services.runs.start.engine", database_session.bind)
-    monkeypatch.setattr("tracker.services.runs.finalize.engine", database_session.bind)
     monkeypatch.setattr(TaskMonitor, "_TRACK_INTERVAL", 0)
     monkeypatch.setattr("tracker.services.tasks.execute.create_sandbox", _mock_create_sandbox)
     monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)

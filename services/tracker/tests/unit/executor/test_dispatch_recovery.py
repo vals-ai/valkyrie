@@ -1,46 +1,55 @@
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from threading import Event
 from unittest.mock import Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pytest import MonkeyPatch
-from sqlmodel import Session, select
+from sqlalchemy import update
+from sqlmodel import Session, col, select
 
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     ErrorResult,
-    FailureCategory,
     ExecutorDispatch,
-    ExecutorDispatchKind,
     ExecutorDispatchPayload,
-    ExecutorDispatchStatus,
     ExecutorRelease,
     Task,
-    TaskStatus,
 )
+from executor_protocol import ExecutorDispatchStatus
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, FailureCategory, TaskStatus
 from tracker.egress_proxy.policy import PolicyStore
-from tracker.executor import dispatch_recovery
+from tracker.executor import dispatch_recovery, launcher
+from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW
 from tracker.executor.dispatch_payload import generate_payload_key, seal_payload
 from tracker.executor.release_control import create_executor_dispatch, pin_benchmark_to_release, register_release
+
+_STOPPED_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/cluster/0123456789abcdef0123456789abcdef"
+_REPLACEMENT_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/cluster/replacement"
+_OTHER_TRACKER_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/cluster/other-tracker"
+_PULL_FAILURE = (
+    "CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref "
+    "123456789012.dkr.ecr.us-east-1.amazonaws.com/runner:missing: not found"
+)
 
 
 @pytest.mark.description("Dispatch recovery sweeps only payloads outside the queue.")
 @pytest.mark.parametrize(
     "terminal_status",
-    [ExecutorDispatchStatus.FAILED, ExecutorDispatchStatus.FINISHED, ExecutorDispatchStatus.RUNNING],
+    [ExecutorDispatchStatus.FAILED, ExecutorDispatchStatus.FINISHED],
 )
 def test_recovery_sweeps_only_nonqueued_payloads(
     terminal_status: ExecutorDispatchStatus,
-    database_session: Session,
+    control_postgres_session: Session,
     example_benchmark_object: Benchmark,
     monkeypatch: MonkeyPatch,
 ) -> None:
+    database_session = control_postgres_session
     release = ExecutorRelease(
         id="payload-sweep-release",
-        artifact_uri="source:///artifacts/runner.pex",
+        artifact_uri="source:///artifacts/runner/src",
         artifact_digest="a" * 64,
         protocol_version="3",
     )
@@ -203,12 +212,13 @@ def test_automatic_recovery_logs_if_owned_thread_does_not_stop(monkeypatch: Monk
     ],
 )
 def test_recovery_fails_dispatches_whose_task_stopped(
-    database_session: Session,
+    control_postgres_session: Session,
     example_benchmark_object: Benchmark,
     monkeypatch: MonkeyPatch,
     dispatch_status: ExecutorDispatchStatus,
     last_status: str,
 ) -> None:
+    database_session = control_postgres_session
     release = ExecutorRelease(
         id="ecs-stopped-release",
         artifact_uri="source:///artifacts/runner",
@@ -278,10 +288,184 @@ def test_recovery_fails_dispatches_whose_task_stopped(
         assert "OutOfMemoryError: Container killed due to memory usage" in error.error_message
 
 
+@pytest.mark.description("Recovery relaunches a dispatch whose runner failed to start, once.")
+@pytest.mark.usefixtures("ecs_runner_env")
+@pytest.mark.parametrize(
+    (
+        "age",
+        "prior_relaunches",
+        "run_task_outcome",
+        "concurrent_task_arn",
+        "expected_status",
+        "expected_task_arn",
+        "expected_recovered",
+    ),
+    [
+        pytest.param(
+            timedelta(0),
+            0,
+            _REPLACEMENT_TASK_ARN,
+            None,
+            ExecutorDispatchStatus.QUEUED,
+            _REPLACEMENT_TASK_ARN,
+            1,
+            id="relaunched",
+        ),
+        pytest.param(
+            timedelta(0),
+            1,
+            _REPLACEMENT_TASK_ARN,
+            None,
+            ExecutorDispatchStatus.FAILED,
+            _STOPPED_TASK_ARN,
+            1,
+            id="replacement_also_failed_to_start",
+        ),
+        pytest.param(
+            timedelta(0),
+            0,
+            RuntimeError("ECS throttled the request"),
+            None,
+            ExecutorDispatchStatus.QUEUED,
+            _STOPPED_TASK_ARN,
+            0,
+            id="run_task_failed",
+        ),
+        pytest.param(
+            timedelta(0),
+            0,
+            _REPLACEMENT_TASK_ARN,
+            _OTHER_TRACKER_TASK_ARN,
+            ExecutorDispatchStatus.QUEUED,
+            _OTHER_TRACKER_TASK_ARN,
+            0,
+            id="other_tracker_relaunched_first",
+        ),
+        pytest.param(
+            DISPATCH_CLAIM_WINDOW - timedelta(seconds=30),
+            0,
+            _REPLACEMENT_TASK_ARN,
+            None,
+            ExecutorDispatchStatus.FAILED,
+            _STOPPED_TASK_ARN,
+            1,
+            id="claim_window_closing",
+        ),
+    ],
+)
+def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    age: timedelta,
+    prior_relaunches: int,
+    run_task_outcome: str | Exception,
+    concurrent_task_arn: str | None,
+    expected_status: ExecutorDispatchStatus,
+    expected_task_arn: str,
+    expected_recovered: int,
+) -> None:
+    release = ExecutorRelease(
+        id="failed-start-release",
+        artifact_uri="source:///artifacts/runner",
+        artifact_digest="a" * 64,
+        protocol_version="3",
+        task_definition_arn="arn:aws:ecs:us-east-1:123456789012:task-definition/runner:7",
+    )
+    benchmark = example_benchmark_object
+    register_release(database_session, release)
+    pin_benchmark_to_release(benchmark, release)
+    dispatch = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["task-1"]
+    )
+    dispatch.ecs_task_arn = _STOPPED_TASK_ARN
+    dispatch.relaunch_count = prior_relaunches
+    dispatch.created_at -= age
+    task = Task(
+        org_id=benchmark.org_id,
+        benchmark=benchmark.id,
+        task_id="task-1",
+        status=TaskStatus.PENDING,
+        started_at=dispatch.created_at - timedelta(seconds=1),
+    )
+    database_session.add_all([benchmark, dispatch, task])
+    database_session.commit()
+    monkeypatch.setattr(dispatch_recovery, "engine", database_session.get_bind())
+    monkeypatch.setattr(launcher, "engine", database_session.get_bind())
+    stopped_task = {
+        "taskArn": _STOPPED_TASK_ARN,
+        "lastStatus": "STOPPED",
+        "stopCode": "TaskFailedToStart",
+        "stoppedReason": _PULL_FAILURE,
+    }
+    ecs = Mock()
+    ecs.describe_tasks.return_value = {"tasks": [stopped_task], "failures": []}
+    if concurrent_task_arn is not None:
+        ecs.describe_tasks.side_effect = lambda **_kwargs: _describe_after_another_tracker_relaunched(
+            database_session, dispatch.id, stopped_task
+        )
+    if isinstance(run_task_outcome, Exception):
+        ecs.run_task.side_effect = run_task_outcome
+    else:
+        ecs.run_task.return_value = {"tasks": [{"taskArn": run_task_outcome}], "failures": []}
+    monkeypatch.setattr(dispatch_recovery.boto3, "client", lambda *_args, **_kwargs: ecs)
+    monkeypatch.setattr(logging.getLogger(dispatch_recovery.__name__), "handlers", [caplog.handler])
+
+    recovered = dispatch_recovery.reconcile_dispatches_once()
+
+    database_session.expire_all()
+    stored = database_session.get(ExecutorDispatch, dispatch.id)
+    assert stored is not None
+    assert recovered == expected_recovered
+    assert (stored.status, stored.ecs_task_arn) == (expected_status, expected_task_arn)
+
+    relaunched = expected_task_arn == _REPLACEMENT_TASK_ARN
+    assert (stored.relaunch_count, stored.last_relaunch_reason) == (
+        (1, "CannotPullContainerError") if relaunched else (prior_relaunches, None)
+    )
+    assert [
+        (record.__dict__["benchmark_id"], record.__dict__["relaunch_reason"], record.__dict__["stopped_reason"])
+        for record in caplog.records
+        if record.getMessage() == "executor_dispatch_relaunched"
+    ] == ([(str(benchmark.id), "CannotPullContainerError", _PULL_FAILURE)] if relaunched else [])
+
+    stored_benchmark = database_session.get(Benchmark, benchmark.id)
+    assert stored_benchmark is not None
+    assert stored_benchmark.status == (
+        BenchmarkStatus.IN_PROGRESS if expected_status == ExecutorDispatchStatus.QUEUED else BenchmarkStatus.ERROR
+    )
+
+    errors = database_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).all()
+    assert len(errors) == (0 if expected_status == ExecutorDispatchStatus.QUEUED else 1)
+    assert all("CannotPullContainerError" in error.error_message for error in errors)
+
+    relaunches = [call.kwargs for call in ecs.run_task.call_args_list]
+    assert [(relaunch["clientToken"], relaunch["taskDefinition"]) for relaunch in relaunches] == (
+        [(f"{dispatch.id}-relaunch", release.task_definition_arn)]
+        if age == timedelta(0) and not prior_relaunches
+        else []
+    )
+
+
+def _describe_after_another_tracker_relaunched(
+    database_session: Session, dispatch_id: UUID, stopped_task: dict[str, str]
+) -> dict[str, object]:
+    database_session.exec(
+        update(ExecutorDispatch)
+        .where(col(ExecutorDispatch.id) == dispatch_id)
+        .values(ecs_task_arn=_OTHER_TRACKER_TASK_ARN)
+    )
+    database_session.commit()
+
+    return {"tasks": [stopped_task], "failures": []}
+
+
 @pytest.mark.description("An expired launch with no saved ARN recovers during an ECS outage.")
 def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
-    database_session: Session, example_benchmark_object: Benchmark, monkeypatch: MonkeyPatch
+    control_postgres_session: Session, example_benchmark_object: Benchmark, monkeypatch: MonkeyPatch
 ) -> None:
+    database_session = control_postgres_session
     benchmark = example_benchmark_object
     release = ExecutorRelease(
         id="lost-launch-release",
@@ -292,7 +476,7 @@ def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
     register_release(database_session, release)
     pin_benchmark_to_release(benchmark, release)
     lost_launch = create_executor_dispatch(benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4())
-    lost_launch.created_at -= timedelta(seconds=121)
+    lost_launch.claim_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
     other_launch = create_executor_dispatch(benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4())
     other_launch.ecs_task_arn = "arn:aws:ecs:us-east-1:123456789012:task/cluster/other"
     database_session.add_all([benchmark, lost_launch, other_launch])
@@ -318,10 +502,12 @@ def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
     "A PENDING task whose retry dispatch failed is reported every pass. One a live dispatch lists is not."
 )
 def test_recovery_flags_pending_tasks_whose_dispatch_failed(
-    database_session: Session,
+    control_postgres_session: Session,
     example_benchmark_object: Benchmark,
     monkeypatch: MonkeyPatch,
 ) -> None:
+    database_session = control_postgres_session
+    warning = Mock()
     release = ExecutorRelease(
         id="stranded-release",
         artifact_uri="source:///artifacts/runner",
@@ -352,8 +538,7 @@ def test_recovery_flags_pending_tasks_whose_dispatch_failed(
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
     monkeypatch.setattr(dispatch_recovery, "engine", database_session.get_bind())
 
-    warning = Mock()
-    monkeypatch.setattr(dispatch_recovery._logger, "warning", warning)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(dispatch_recovery._logger, "warning", warning)
 
     assert dispatch_recovery.reconcile_dispatches_once() == 0
     assert warning.call_count == 0

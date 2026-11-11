@@ -16,20 +16,17 @@ from tracker.auth import get_current_org
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tracker.database.models import (
     DEFAULT_ORG_NAME,
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     EvaluationResult,
     ExecutorAdmission,
     ExecutorRelease,
-    ExecutorReleaseStatus,
     FinalEvaluation,
     Org,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus, TaskStatus
 from tracker.database.session import get_session
+from tracker.types import AWSBenchmarkArguments, AgentContractRequest
 from valkyrie.sdk import ValkyrieClient
 
 from valkyrie.cli import client as cli_client
@@ -52,7 +49,7 @@ def database_session() -> Generator[Session, None, None]:
         with Session(engine, expire_on_commit=False) as session:
             release = ExecutorRelease(
                 id="cli-test-release",
-                artifact_uri="s3://test-artifacts/cli-test-release.pex",
+                artifact_uri="source:///cli-test-release",
                 artifact_digest="a" * 64,
                 protocol_version=SUPPORTED_PROTOCOL_VERSION,
                 status=ExecutorReleaseStatus.ACTIVE,

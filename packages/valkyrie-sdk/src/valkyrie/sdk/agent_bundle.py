@@ -8,9 +8,9 @@ import shutil
 import stat
 import tempfile
 import zipfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, cast
 
 import yaml
@@ -46,9 +46,41 @@ def read_agent_name(agent_path: Path) -> str:
     raise FileNotFoundError(f"No contract.yaml or contract.yml in {agent_path}")
 
 
+def _link_target(link: Path, root: Path) -> Path:
+    target = link.resolve()
+    if target != root and root not in target.parents:
+        raise ValkyrieInputError(f"Agent bundles cannot contain symlinks that leave the agent folder: {link}")
+    if not target.exists():
+        raise ValkyrieInputError(f"Agent bundles cannot contain broken symlinks: {link}")
+    return target
+
+
+def _bundle_files(
+    folder: Path, root: Path, prefix: PurePosixPath, is_excluded: Callable[[str], bool], walking: frozenset[Path]
+) -> Iterator[tuple[Path, str]]:
+    for directory, subdirectories, files in os.walk(folder):
+        subdirectories[:] = [name for name in subdirectories if not is_excluded(name)]
+        here = Path(directory)
+        for name in subdirectories:
+            if (here / name).is_symlink():
+                target = _link_target(here / name, root)
+                if target in walking or any(target in parent.parents for parent in walking):
+                    raise ValkyrieInputError(f"Agent bundles cannot contain symlink loops: {here / name}")
+                name_prefix = prefix / (here / name).relative_to(folder).as_posix()
+                yield from _bundle_files(target, root, name_prefix, is_excluded, walking | {target})
+        for name in files:
+            if is_excluded(name):
+                continue
+            path = here / name
+            source = _link_target(path, root) if path.is_symlink() else path
+            if not source.is_file():
+                raise ValkyrieInputError(f"Agent bundles require regular files: {path}")
+            yield source, (prefix / path.relative_to(folder).as_posix()).as_posix()
+
+
 @contextmanager
 def get_agent_zip_stream(agent_name: str, agent_path: Path) -> Generator[BinaryIO, None, None]:
-    """Bundle a directory, excluding caches and environment files without following symlinks."""
+    """Bundle a directory without caches or environment files, packing a link inside it as a copy of its target."""
     validate_agent_name(agent_name)
     excluded = (
         "__pycache__",
@@ -79,19 +111,11 @@ def get_agent_zip_stream(agent_name: str, agent_path: Path) -> Generator[BinaryI
     with tempfile.TemporaryFile() as stream:
         with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
             if agent_path.is_dir():
-                for root, directories, files in os.walk(agent_path):
-                    directories[:] = [directory for directory in directories if not is_excluded(directory)]
-                    for entry in [*directories, *files]:
-                        path = Path(root) / entry
-                        if path.is_symlink():
-                            raise ValkyrieInputError(f"Agent bundles cannot contain symlinks: {path}")
-                    for file in files:
-                        if is_excluded(file):
-                            continue
-                        path = Path(root) / file
-                        if not path.is_file():
-                            raise ValkyrieInputError(f"Agent bundles require regular files: {path}")
-                        archive.write(path, f"{agent_name}/{path.relative_to(agent_path).as_posix()}")
+                root = agent_path.resolve()
+                for source, name in _bundle_files(
+                    agent_path, root, PurePosixPath(agent_name), is_excluded, frozenset({root})
+                ):
+                    archive.write(source, name)
             else:
                 archive.write(agent_path, f"{agent_name}/{agent_path.name}")
         stream.seek(0)

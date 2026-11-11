@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import TypeVar
 
@@ -31,10 +30,6 @@ def one_line(value: str) -> str:
 
 def status_label(value: str) -> str:
     return value.replace("_", " ").title()
-
-
-def compact_json(payload: Mapping[str, object]) -> str:
-    return json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
 
 
 def utc_isoformat(value: datetime | None = None) -> str:

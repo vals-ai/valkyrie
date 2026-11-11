@@ -43,21 +43,13 @@ from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
 from tracker.database.models import (
-    LocalBenchmarkArguments,
-    AgentContractRequest,
     Benchmark,
-    AWSBenchmarkArguments,
-    BenchmarkStatus,
     BenchmarkServiceWake,
     ExecutorAdmission,
     ExecutorDispatch,
-    ExecutorDispatchKind,
     ExecutorDispatchPayload,
-    ExecutorDispatchStatus,
     ExecutorRelease,
-    ExecutorReleaseStatus,
     RunAccessKey,
-    DocentReadingStatus,
     ErrorResult,
     EvaluationResult,
     FinalEvaluation,
@@ -65,9 +57,17 @@ from tracker.database.models import (
     OrgProviderSecret,
     Task,
     TaskBreakdown,
-    TaskStatus,
     UserBenchmarkService,
     UserDefaultProvider,
+)
+from executor_protocol import ExecutorDispatchStatus
+from tracker.types import LocalBenchmarkArguments, AgentContractRequest, AWSBenchmarkArguments
+from tracker.domain import (
+    BenchmarkStatus,
+    DocentReadingStatus,
+    ExecutorDispatchKind,
+    ExecutorReleaseStatus,
+    TaskStatus,
 )
 from tracker.exceptions import SecretNotFoundError, TrackerServiceError
 from tracker.executor.launcher import DefinitiveLaunchFailure
@@ -85,7 +85,7 @@ from tracker.services.tasks.attempts import keep_replaced_attempts
 from tracker.services.tasks.execute import task_attempt_id
 from tracker.services.benchmarks import update_benchmark_concurrency
 
-pytestmark = pytest.mark.usefixtures("mapped_providers")
+pytestmark = pytest.mark.usefixtures("mapped_providers", "active_executor_release")
 client = TestClient(app)
 local_client = TestClient(app, base_url="http://localhost")
 _create_cloudwatch_benchmark = CloudWatchBenchmarkLogSink.create_benchmark
@@ -96,8 +96,8 @@ _write_cloudwatch_log = CloudWatchBenchmarkLogSink.write
 def active_executor_release(database_session: Session) -> None:
     release = ExecutorRelease(
         id="test-release",
-        artifact_uri="s3://artifacts/test-release.pex",
-        artifact_digest="digest-test-release",
+        artifact_uri="source:///test-release",
+        artifact_digest="a" * 64,
         protocol_version=SUPPORTED_PROTOCOL_VERSION,
         status=ExecutorReleaseStatus.ACTIVE,
     )
@@ -1411,8 +1411,8 @@ class TestTrackerAPI:
 
         assert benchmark_row.executor_release_id == "test-release"
         assert benchmark_row.current_execution_release_id == "test-release"
-        assert benchmark_row.executor_artifact_uri == "s3://artifacts/test-release.pex"
-        assert benchmark_row.executor_artifact_digest == "digest-test-release"
+        assert benchmark_row.executor_artifact_uri == "source:///test-release"
+        assert benchmark_row.executor_artifact_digest == "a" * 64
         assert benchmark_row.executor_protocol_version == SUPPORTED_PROTOCOL_VERSION
         queued_call = mock_launcher.queued_calls[0]
         dispatch_id = UUID(queued_call["executor_dispatch_id"])
@@ -1422,8 +1422,8 @@ class TestTrackerAPI:
         assert dispatch.kind == ExecutorDispatchKind.START
         assert dispatch.status == ExecutorDispatchStatus.QUEUED
         assert dispatch.executor_release_id == "test-release"
-        assert dispatch.executor_artifact_uri == "s3://artifacts/test-release.pex"
-        assert dispatch.executor_artifact_digest == "digest-test-release"
+        assert dispatch.executor_artifact_uri == "source:///test-release"
+        assert dispatch.executor_artifact_digest == "a" * 64
         assert dispatch.executor_protocol_version == SUPPORTED_PROTOCOL_VERSION
         assert queued_call["execution_context_json"]["verified_task_ids"] == [f"task_{i}" for i in range(500)]
         task_rows = database_session.exec(select(Task).where(Task.benchmark == benchmark_row.id)).all()
@@ -1434,7 +1434,7 @@ class TestTrackerAPI:
         assert json_response["agent_name"] == request.contract.name
         assert json_response["executor_release_id"] == "test-release"
         assert json_response["current_execution_release_id"] == "test-release"
-        assert json_response["executor_artifact_digest"] == "digest-test-release"
+        assert json_response["executor_artifact_digest"] == "a" * 64
         assert json_response["executor_protocol_version"] == SUPPORTED_PROTOCOL_VERSION
         assert json_response["concurrency"] == request.concurrency
 
@@ -2119,7 +2119,7 @@ class TestTrackerAPI:
         benchmark_row = example_benchmark_object
         benchmark_row.executor_release_id = "initial-release"
         benchmark_row.current_execution_release_id = "current-release"
-        benchmark_row.executor_artifact_uri = "s3://artifacts/initial-release.pex"
+        benchmark_row.executor_artifact_uri = "source:///initial-release"
         benchmark_row.executor_artifact_digest = "a" * 64
         benchmark_row.executor_protocol_version = "1"
 
@@ -2819,7 +2819,7 @@ class TestTrackerAPI:
 
         example_benchmark_object.executor_release_id = "initial-release"
         example_benchmark_object.current_execution_release_id = "current-release"
-        example_benchmark_object.executor_artifact_uri = "s3://artifacts/initial-release.pex"
+        example_benchmark_object.executor_artifact_uri = "source:///initial-release"
         example_benchmark_object.executor_artifact_digest = "a" * 64
         example_benchmark_object.executor_protocol_version = "1"
         database_session.add(example_benchmark_object)
@@ -3440,6 +3440,7 @@ class TestTrackerAPI:
         monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_S3_BUCKET", "new-shared-default")
         monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_GROUP", "new-log-group")
         monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "7")
+        monkeypatch.setattr("tracker.config.AWS_SHARED_SECRET_TENANTS", "default")
 
         fetch_response = client.get("/fetch-benchmark", params={"benchmark_id": str(benchmark.id)})
         metadata_response = client.get(f"/fetch-benchmark-metadata/{benchmark.id}")
@@ -3453,6 +3454,30 @@ class TestTrackerAPI:
         detail_response = client.get(f"/benchmarks/{benchmark.id}")
         assert detail_response.status_code == 200, detail_response.text
         assert detail_response.json()["cloudwatch_url"].endswith(f"/saved-log-group$252F{benchmark.id}")
+
+    @pytest.mark.description("A customer organization's fetch hides the console link.")
+    async def test_fetch_hides_console_link_from_customer_orgs(
+        self, contract: AgentContractRequest, database_session: Session
+    ) -> None:
+        benchmark = Benchmark(
+            org_id=TEST_ORG_ID,
+            name="swebench",
+            arguments=AWSBenchmarkArguments(
+                contract=contract,
+                concurrency=1,
+                properties=AWSResources(
+                    region="us-east-1", s3_bucket="test-bucket", log_group="saved-log-group", log_retention_days=30
+                ),
+                sandbox_provider_secret_name="provider-secret",
+            ),
+        )
+        database_session.add(benchmark)
+        database_session.commit()
+
+        response = client.get("/fetch-benchmark", params={"benchmark_id": str(benchmark.id)})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["s3_bucket_url"] == ""
 
     @pytest.mark.description(
         "A run saved in another bucket, such as one started with the caller's own AWS keys, has no storage bucket."
@@ -3700,8 +3725,8 @@ class TestTrackerAPI:
             name="swebench",
             status=BenchmarkStatus.ERROR,
             executor_release_id="test-release",
-            executor_artifact_uri="s3://artifacts/test-release.pex",
-            executor_artifact_digest="digest-test-release",
+            executor_artifact_uri="source:///test-release",
+            executor_artifact_digest="a" * 64,
             executor_protocol_version=SUPPORTED_PROTOCOL_VERSION,
             arguments=AWSBenchmarkArguments(
                 contract=contract,
@@ -3790,6 +3815,7 @@ async def test_storage_lifecycle_keeps_saved_bucket_and_logs(
         "AWS_DEPLOYMENT_S3_BUCKET": "deployment-bucket",
         "AWS_DEPLOYMENT_LOG_GROUP": "deployment-log-group",
         "AWS_DEPLOYMENT_LOG_RETENTION_DAYS": "30",
+        "AWS_SHARED_SECRET_TENANTS": "default",
     }.items():
         monkeypatch.setattr(f"tracker.config.{name}", value)
 

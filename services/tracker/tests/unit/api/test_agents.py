@@ -174,6 +174,7 @@ class TestAgentWrites:
         "name, headers, status",
         [
             ("invalid name", {"Content-Type": "application/zip"}, 400),
+            ("oracle", {"Content-Type": "application/zip"}, 400),
             ("demo", {"Content-Type": "application/json"}, 415),
             ("demo", {"Content-Type": "application/zip", "Content-Length": "invalid"}, 400),
             ("demo", {"Content-Type": "application/zip", "Content-Length": "-1"}, 400),

@@ -1,11 +1,10 @@
-from datetime import datetime
 from uuid import UUID
 
 import click
 from valkyrie.sdk.models import FinalViewResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import compact_json, format_option, one_line, status_label, utc_isoformat
+from valkyrie.cli.display import format_option, one_line, status_label
 from valkyrie.display import group_task_errors, terminal_safe
 
 _TASK_ID_PREVIEW_LIMIT = 5
@@ -30,33 +29,6 @@ def _format_task_id_preview(task_ids: tuple[str, ...]) -> str:
     preview = ", ".join(one_line(task_id) for task_id in visible_ids)
     omitted_count = len(task_ids) - len(visible_ids)
     return f"{preview} (+{omitted_count} more)" if omitted_count else preview
-
-
-def build_run_errors_payload(
-    response: FinalViewResponse,
-    *,
-    observed_at: datetime | None = None,
-) -> dict[str, object]:
-    task_errors = dict(sorted((response.task_errors or {}).items()))
-    task_failure_categories = {
-        task_id: category.value for task_id, category in sorted((response.task_failure_categories or {}).items())
-    }
-    return {
-        "schema_version": 1,
-        "kind": "run_errors",
-        "observed_at": utc_isoformat(observed_at),
-        "run_id": str(response.benchmark_id),
-        "benchmark_name": response.benchmark_name,
-        "status": response.status.value,
-        "error_message": response.error_message,
-        "task_error_count": len(task_errors),
-        "task_errors": task_errors,
-        "task_failure_categories": task_failure_categories,
-    }
-
-
-def format_run_errors_json(response: FinalViewResponse) -> str:
-    return compact_json(build_run_errors_payload(response))
 
 
 def format_run_errors_text(response: FinalViewResponse) -> None:
@@ -108,6 +80,6 @@ def format_run_errors_text(response: FinalViewResponse) -> None:
 def errors(run_id: UUID, output_format: str) -> None:
     response = call(lambda client: client.runs.results(run_id))
     if output_format == "json":
-        click.echo(format_run_errors_json(response))
+        click.echo(response.model_dump_json())
     else:
         format_run_errors_text(response)

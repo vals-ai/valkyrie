@@ -8,7 +8,8 @@ from sqlmodel import Session
 
 import main as main_module
 from tracker.executor import release_retirement
-from tracker.database.models import ExecutorRelease, ExecutorReleaseStatus
+from tracker.database.models import ExecutorRelease
+from tracker.domain import ExecutorReleaseStatus
 from tracker.executor.release_control import promote_release, register_release
 
 
@@ -21,7 +22,7 @@ def test_retirement_loop_retires_a_blocker_free_release(
         database_session,
         ExecutorRelease(
             id="old",
-            artifact_uri="source:///artifacts/old.pex",
+            artifact_uri="source:///artifacts/old/src",
             artifact_digest="a" * 64,
             protocol_version="1",
         ),
@@ -30,7 +31,7 @@ def test_retirement_loop_retires_a_blocker_free_release(
         database_session,
         ExecutorRelease(
             id="active",
-            artifact_uri="source:///artifacts/active.pex",
+            artifact_uri="source:///artifacts/active/src",
             artifact_digest="b" * 64,
             protocol_version="1",
         ),

@@ -50,6 +50,15 @@ class ValkyrieAPIError(ValkyrieSDKError):
         return cls(response.status_code, detail)
 
 
+class ValkyrieDatasetPushError(ValkyrieSDKError):
+    """Some tasks of a dataset push were not stored."""
+
+    def __init__(self, stored: list[str], failed: dict[str, str]) -> None:
+        self.stored = stored
+        self.failed = failed
+        super().__init__(f"{len(failed)} of {len(stored) + len(failed)} tasks were not stored: {', '.join(failed)}")
+
+
 class ValkyrieStreamError(ValkyrieSDKError):
     """A Tracker stream or paginated listing returned an error, an invalid event, or a repeated cursor."""
 

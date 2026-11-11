@@ -103,8 +103,7 @@ MODELS: dict[str, ModelOverlay] = {
     },
     "DatasetTaskResponse": {
         "module": "datasets",
-        "doc": "One task archive stored for a dataset.",
-        "fields": {"last_modified": {**DATETIME}},
+        "doc": "One task of a dataset version, with the digest of its files and the size of its archive.",
     },
     "ResourceResponse": {
         "module": "datasets",
@@ -130,11 +129,63 @@ MODELS: dict[str, ModelOverlay] = {
         "module": "datasets",
         "doc": "A task and a temporary URL to download its archive.",
         "parent": "DatasetTaskResponse",
-        "fields": {"last_modified": {**DATETIME}},
     },
-    "DatasetTasksResponse": {
+    "DatasetVersionResponse": {
         "module": "datasets",
-        "doc": "A page of a dataset's tasks, and where the next page starts.",
+        "doc": "One version of a dataset: a numbered revision holding exactly the tasks it was published with.",
+        "fields": {"created_at": {**DATETIME}},
+    },
+    "DatasetTasksPage": {
+        "module": "datasets",
+        "doc": "One page of a dataset version's tasks in task ID order, and the cursor of the next page if any.",
+    },
+    "DatasetVersionDetailResponse": {
+        "module": "datasets",
+        "doc": "A dataset version with the digest of its metric script and the dataset.toml it was published with, if any.",
+        "parent": "DatasetVersionResponse",
+    },
+    "DatasetVersionsResponse": {"module": "datasets", "doc": "A dataset's versions, newest first."},
+    "BlobResponse": {
+        "module": "datasets",
+        "doc": "A task archive the dataset stores under the digest of its files, with what the Tracker warns about.",
+        "fields": {"warnings": {"default": []}},
+    },
+    "Digest": {"module": "datasets", "doc": "A content digest written as sha256: and 64 lowercase hex digits."},
+    "MissingBlobsResponse": {
+        "module": "datasets",
+        "doc": "The digests among those asked about whose archive the dataset does not store yet.",
+    },
+    "ManifestAuthor": {"module": "datasets", "doc": "An author named in a dataset.toml."},
+    "ManifestInfo": {
+        "module": "datasets",
+        "doc": "What a dataset.toml says about its dataset, as stored with a version.",
+        "fields": {"authors": {"default": []}, "keywords": {"default": []}, "metadata": {"default": {}}},
+    },
+    "ManifestTask": {
+        "module": "datasets",
+        "doc": "A task a dataset.toml lists, by the name in its task.toml, with the digest of its files.",
+        "base": REQUEST,
+    },
+    "ManifestFile": {"module": "datasets", "doc": "A dataset file a dataset.toml pins.", "base": REQUEST},
+    "VersionManifest": {
+        "module": "datasets",
+        "doc": "A dataset.toml sent with a version, whose tasks are keyed by task ID.",
+        "fields": {
+            "authors": {"default": []},
+            "keywords": {"default": []},
+            "metadata": {"default": {}},
+            "files": {"default": []},
+        },
+    },
+    "HostedDataset": {
+        "module": "datasets",
+        "doc": "A dataset stored in the Tracker, named by its benchmark and its own name.",
+        "base": REQUEST,
+    },
+    "LocalDataset": {
+        "module": "datasets",
+        "doc": "A folder of tasks on the machine of a local Tracker.",
+        "base": REQUEST,
     },
     "DatasetsResponse": {"module": "datasets", "doc": "A benchmark's active datasets, by name."},
     "LogEvent": {"module": "logs", "schema": "LogEventResponse", "doc": "One log message returned by the tracker."},
@@ -212,6 +263,10 @@ MODELS: dict[str, ModelOverlay] = {
     },
     "LocalBenchmarkArguments": {"module": "runs", "doc": "Stored arguments for a local run."},
     "Order": {"module": "runs", "doc": "Sort order for run listings."},
+    "RescoreBenchmarkResponse": {
+        "module": "runs",
+        "doc": "The score a finished dataset run has after its metric script ran again.",
+    },
     "RetryMode": {"module": "runs", "doc": "Supported retry strategies."},
     "StatusResponse": {
         "module": "runs",
@@ -261,6 +316,7 @@ MODELS: dict[str, ModelOverlay] = {
             "service_headers": {"x-repr": False, "default": {}},
             "environment": {"x-enum-field-as-literal": True},
             "sandbox_provider": {"replace": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}},
+            "dataset_ref": {"x-discriminator": "kind"},
         },
         "base": "valkyrie.sdk.models._validation.StartBenchmarkRequestBase",
         "drop": (

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from tests.unit.sdk.conftest import ClientFactory
-from valkyrie.sdk import ValkyrieAPIError, agent_install
+from valkyrie.sdk import ValkyrieAPIError, github_download
 from valkyrie.sdk.agent_bundle import extract_agent_archive, get_agent_zip_stream
 
 _CONTRACT = "name: demo\ninstall_cmd: 'true'\nrun_cmd: 'echo {problem_statement_path}'\n"
@@ -133,7 +133,7 @@ class TestAgentsResource:
 
             return httpx.Response(200, json={"name": "alias"})
 
-        monkeypatch.setattr(agent_install, "_run_git_command", git)
+        monkeypatch.setattr(github_download, "_run_git_command", git)
         async with make_client(upload) as client:
             response = await client.agents.install(
                 "https://github.com/example/agents/tree/main/agents/demo", name="alias"
@@ -167,8 +167,8 @@ class TestAgentsResource:
                 return "refs/remotes/origin/HEAD\nrefs/remotes/origin/main\nrefs/remotes/origin/feature/demo\nrefs/tags/v1\n"
             return ""
 
-        monkeypatch.setattr(agent_install, "_run_git_command", git)
-        async with agent_install.checkout_agent(f"https://github.com/example/agents/tree/{tree_path}") as path:
+        monkeypatch.setattr(github_download, "_run_git_command", git)
+        async with github_download.download_github(f"https://github.com/example/agents/tree/{tree_path}") as path:
             checked_out = path
 
         assert ("checkout", reference, "--") in commands
@@ -216,14 +216,14 @@ class TestAgentsResource:
                     (child / ".gitmodules").touch()
             return ""
 
-        monkeypatch.setattr(agent_install, "_run_git_command", git)
+        monkeypatch.setattr(github_download, "_run_git_command", git)
         if nested_url.startswith("https://github.com/"):
-            async with agent_install.checkout_agent("https://github.com/example/parent") as path:
+            async with github_download.download_github("https://github.com/example/parent") as path:
                 assert (path / "child" / "child").is_dir()
             assert len(fetched) == 2
         else:
             with pytest.raises(ValueError, match="HTTPS GitHub"):
-                async with agent_install.checkout_agent("https://github.com/example/parent"):
+                async with github_download.download_github("https://github.com/example/parent"):
                     pytest.fail("unvalidated submodule accepted")
             assert fetched == [str(repositories[0])]
 
@@ -260,9 +260,43 @@ class TestAgentArchive:
 
         (source / "link").symlink_to(tmp_path)
 
-        with pytest.raises(ValueError, match="symlinks"):
+        with pytest.raises(ValueError, match="symlinks that leave the agent folder"):
             with get_agent_zip_stream("alias", source):
                 pytest.fail("symlink accepted")
+
+    @pytest.mark.description("A symlink inside the agent folder is bundled as a copy of its target.")
+    def test_a_link_inside_the_agent_folder_is_bundled_as_a_copy_of_its_target(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        (source / "assets").mkdir(parents=True)
+        (source / "assets" / "icon.png").write_bytes(b"icon")
+        (source / "AGENTS.md").write_text("notes")
+        (source / "CLAUDE.md").symlink_to("AGENTS.md")
+        (source / "public").symlink_to("assets", target_is_directory=True)
+
+        with get_agent_zip_stream("alias", source) as stream, zipfile.ZipFile(stream) as archive:
+            assert sorted(archive.namelist()) == [
+                "alias/AGENTS.md",
+                "alias/CLAUDE.md",
+                "alias/assets/icon.png",
+                "alias/public/icon.png",
+            ]
+            assert archive.read("alias/CLAUDE.md") == b"notes"
+            assert all(info.external_attr >> 16 & 0o170000 != 0o120000 for info in archive.infolist())
+
+    @pytest.mark.description("A broken symlink or a symlink loop is refused.")
+    @pytest.mark.parametrize(
+        ("link", "target", "complaint"),
+        [("missing", "nowhere.txt", "broken symlinks"), ("loop", ".", "symlink loops")],
+    )
+    def test_a_broken_link_or_a_loop_is_refused(self, tmp_path: Path, link: str, target: str, complaint: str) -> None:
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "run.py").write_text("run")
+        (source / link).symlink_to(target)
+
+        with pytest.raises(ValueError, match=complaint):
+            with get_agent_zip_stream("alias", source):
+                pytest.fail("link accepted")
 
     @pytest.mark.description(
         "Exclusions match whole names, so excluded suffixes are dropped and lookalike names are kept."

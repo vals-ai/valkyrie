@@ -1,6 +1,8 @@
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from time import monotonic
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, SQLModel, create_engine
 from testcontainers.postgres import PostgresContainer
@@ -33,3 +35,28 @@ def postgres_engine(postgres_container: PostgresContainer) -> Generator[Engine, 
 def postgres_session(postgres_engine: Engine) -> Generator[Session, None, None]:
     with Session(postgres_engine, expire_on_commit=False) as session:
         yield session
+
+
+@pytest.fixture
+def wait_for_database_lock(postgres_engine: Engine) -> Callable[[], None]:
+    def wait() -> None:
+        deadline = monotonic() + 5
+        with Session(postgres_engine) as observer:
+            while monotonic() < deadline:
+                blocked = (
+                    observer.connection()
+                    .execute(
+                        text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                            "AND pid <> pg_backend_pid())"
+                        )
+                    )
+                    .scalar_one()
+                )
+                if blocked:
+                    return
+                observer.rollback()
+        raise AssertionError("the second transaction never waited on a PostgreSQL lock")
+
+    return wait

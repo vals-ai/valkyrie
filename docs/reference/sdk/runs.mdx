@@ -342,6 +342,28 @@ async def metadata(run_id: UUID) -> FetchBenchmarkMetadataResponse
 
 For examples, see the [Python SDK guide](/sdk/runs).
 
+## `client.runs.snapshot` {#snapshot}
+
+Fetch a run's current state and its launch metadata together.
+
+`metadata` is None when its request fails, so the run still loads.
+
+```python Signature
+async def snapshot(run_id: UUID) -> RunSnapshot
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"run_id"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · UUID</span></div>
+</div>
+
+**Returns**
+
+<a href="/reference/sdk/models/runs#run-snapshot"><code>RunSnapshot</code></a>
+
+For examples, see the [Python SDK guide](/sdk/runs).
+
 ## `client.runs.results_exist` {#results-exist}
 
 Check whether the canonical result file already exists in S3.
@@ -557,6 +579,26 @@ async def shed(
 **Returns**
 
 <a href="/reference/sdk/models/runs#shed-benchmark-response"><code>ShedBenchmarkResponse</code></a>
+
+For examples, see the [Python SDK guide](/sdk/runs).
+
+## `client.runs.rescore` {#rescore}
+
+Run a finished dataset run's metric script again and replace its stored score.
+
+```python Signature
+async def rescore(run_id: UUID) -> RescoreBenchmarkResponse
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"run_id"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · UUID</span></div>
+</div>
+
+**Returns**
+
+RescoreBenchmarkResponse
 
 For examples, see the [Python SDK guide](/sdk/runs).
 

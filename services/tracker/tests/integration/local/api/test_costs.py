@@ -4,11 +4,22 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
-from tracker.database.models import BenchmarkStatus, Org, Project, RunCost, RunProject, SpendType
+import tracker.api.costs as costs_api
+from tracker.database.models import (
+    BenchmarkStatus,
+    Org,
+    OrgProviderSecret,
+    Project,
+    RunCost,
+    RunCostUsageEndBackfill,
+    RunProject,
+    SandboxUnmatchedUsage,
+    SpendType,
+)
 
 
 def _run_with_cost(
@@ -1139,3 +1150,151 @@ class TestSandboxCostRows:
         response = client.get("/costs/sandbox-rows", params={"start": "2026-11-01", "end": "2026-11-06"})
 
         assert response.status_code == 401
+
+
+class TestDaytonaUnmatchedCosts:
+    @pytest.mark.description(
+        "Unmatched Daytona usage is summed for this organization's hours in [start, end) only.\n"
+        "\n"
+        "Test cases:\n"
+        "- Hours inside the window are summed, with their unpriced sandbox counts.\n"
+        "- The hour at end and another organization's hour are left out."
+    )
+    def test_sums_this_orgs_hours_before_end(self, client: TestClient, database_session: Session) -> None:
+        utc = ZoneInfo("UTC")
+        other_org = Org(id=uuid4(), name="other-tenant")
+        database_session.add(other_org)
+        database_session.commit()
+        for org_id, hour, amount, unpriced in [
+            (TEST_ORG_ID, datetime(2026, 11, 1, 0, tzinfo=utc), 1.25, 1),
+            (TEST_ORG_ID, datetime(2026, 11, 1, 23, tzinfo=utc), 0.5, 0),
+            (TEST_ORG_ID, datetime(2026, 11, 2, 0, tzinfo=utc), 4.0, 2),
+            (other_org.id, datetime(2026, 11, 1, 5, tzinfo=utc), 8.0, 3),
+        ]:
+            database_session.add(
+                SandboxUnmatchedUsage(
+                    org_id=org_id,
+                    secret_name="daytona",
+                    hour=hour,
+                    amount_usd=amount,
+                    sandboxes=unpriced + 1,
+                    unpriced_sandboxes=unpriced,
+                )
+            )
+        database_session.commit()
+
+        response = client.get(
+            "/costs/daytona-unmatched",
+            params={"start": "2026-11-01", "end": "2026-11-02"},
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "start": "2026-11-01",
+            "end": "2026-11-02",
+            "total_usd": 1.75,
+            "unpriced_sandboxes": 1,
+        }
+
+
+def _usage_ends(session: Session, rows: dict[str, RunCost]) -> dict[str, datetime | None]:
+    session.expire_all()
+    ends = {name: session.get_one(RunCost, row.id).usage_end for name, row in rows.items()}
+    return {name: end and end.replace(tzinfo=ZoneInfo("UTC")) for name, end in ends.items()}
+
+
+@pytest.mark.description("A Daytona row with no `usage_end` gets its sandbox's last usage time from Daytona.")
+class TestFillSandboxUsageEnd:
+    @pytest.mark.description(
+        (
+            "A dry run lists the rows it would date and writes nothing, and an applied run dates them and saves their IDs.\n"
+            "\n"
+            "Test cases:\n"
+            "- A row with no `usage_end` whose sandbox Daytona lists gets its last usage time.\n"
+            "- A row that already has a `usage_end` keeps it.\n"
+            "- A row whose sandbox Daytona does not list keeps no `usage_end`.\n"
+            "- Another organization's row is not touched, even when Daytona lists its sandbox."
+        )
+    )
+    def test_dry_run_then_apply(
+        self, client: TestClient, database_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        finished = datetime(2026, 11, 5, 12, tzinfo=ZoneInfo("UTC"))
+        ended = datetime(2026, 10, 20, 8, tzinfo=ZoneInfo("UTC"))
+        kept = datetime(2026, 10, 21, tzinfo=ZoneInfo("UTC"))
+        other_org = Org(id=uuid4(), name="other-org")
+        database_session.add_all(
+            [other_org, OrgProviderSecret(org_id=TEST_ORG_ID, provider="daytona", secret_name="DaytonaSecret")]
+        )
+        database_session.commit()
+        ours = make_benchmark(
+            status=BenchmarkStatus.FINISHED, started_at=ended, org_id=TEST_ORG_ID, session=database_session
+        )
+        theirs = make_benchmark(
+            status=BenchmarkStatus.FINISHED, started_at=ended, org_id=other_org.id, session=database_session
+        )
+        ours.finished_at = theirs.finished_at = finished
+        rows = {
+            "missing": RunCost(
+                benchmark_id=ours.id, cost_type="sandbox", source_id="sb-a", provider="daytona", amount_usd=2.0
+            ),
+            "dated": RunCost(
+                benchmark_id=ours.id,
+                cost_type="sandbox",
+                source_id="sb-b",
+                provider="daytona",
+                amount_usd=3.0,
+                usage_end=kept,
+            ),
+            "unlisted": RunCost(
+                benchmark_id=ours.id, cost_type="sandbox", source_id="sb-c", provider="daytona", amount_usd=4.0
+            ),
+            "other_org": RunCost(
+                benchmark_id=theirs.id, cost_type="sandbox", source_id="sb-d", provider="daytona", amount_usd=5.0
+            ),
+        }
+        database_session.add_all([ours, theirs, *rows.values()])
+        database_session.commit()
+        reads: list[tuple[str, datetime, datetime]] = []
+
+        async def last_ends(_org: Org, secret_name: str, start: datetime, end: datetime) -> dict[str, datetime]:
+            reads.append((secret_name, start, end))
+            return {"sb-a": ended, "sb-b": ended, "sb-d": ended}
+
+        monkeypatch.setattr(costs_api, "daytona_last_ends", last_ends)
+        window = {"start": "2026-10-20T00:00:00Z", "end": "2026-10-21T00:00:00Z"}
+
+        dry_run = client.post("/costs/sandbox-usage-end", params=window, headers={"X-Api-Key": "fake"})
+        after_dry_run = _usage_ends(database_session, rows)
+        applied = client.post(
+            "/costs/sandbox-usage-end", params=window | {"apply": "true"}, headers={"X-Api-Key": "fake"}
+        )
+
+        assert dry_run.status_code == 200
+        assert [row["run_cost_id"] for row in dry_run.json()["rows"]] == [str(rows["missing"].id)]
+        assert dry_run.json()["rows"][0]["placed_at"].startswith("2026-11-05T12:00:00")
+        assert after_dry_run == {"missing": None, "dated": kept, "unlisted": None, "other_org": None}
+        assert applied.status_code == 200
+        assert [row["run_cost_id"] for row in applied.json()["rows"]] == [str(rows["missing"].id)]
+        assert _usage_ends(database_session, rows) == {
+            "missing": ended,
+            "dated": kept,
+            "unlisted": None,
+            "other_org": None,
+        }
+        assert [saved.run_cost_id for saved in database_session.exec(select(RunCostUsageEndBackfill)).all()] == [
+            rows["missing"].id
+        ]
+        assert [row.amount_usd for row in rows.values()] == [2.0, 3.0, 4.0, 5.0]
+        assert reads[0][0] == "DaytonaSecret"
+
+    @pytest.mark.description("An organization without a Daytona secret gets a 409.")
+    def test_an_org_without_a_daytona_secret_gets_409(self, client: TestClient) -> None:
+        response = client.post(
+            "/costs/sandbox-usage-end",
+            params={"start": "2026-10-20", "end": "2026-10-21", "apply": "true"},
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 409

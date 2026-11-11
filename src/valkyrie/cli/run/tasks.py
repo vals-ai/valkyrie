@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from valkyrie.sdk.models import FetchTasksRequest, Order, TaskStatus
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, one_line
+from valkyrie.cli.display import format_option, format_table, one_line, short_local_time
 
 
 @click.command(name="tasks", help="List one page of tasks, including their status and error messages.")
@@ -67,10 +67,17 @@ def tasks(
             "Status": task.status.value,
             "Category": task.failure_category.value if task.failure_category else "",
             "Error": one_line(task.error_message or ""),
+            "Started": short_local_time(task.started_at),
+            "Finished": short_local_time(task.finished_at) if task.finished_at else "-",
         }
         for task in response.tasks
     ]
-    format_table(rows, ["Task", "Status", "Category", "Error"], total_count=response.total_count, item_name="task")
+    format_table(
+        rows,
+        ["Task", "Status", "Category", "Error", "Started", "Finished"],
+        total_count=response.total_count,
+        item_name="task",
+    )
 
 
 @click.command(name="task", help="Inspect one task's status, evaluation result, and failure reason.")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -11,20 +12,19 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from tracker.aws.s3 import S3ObjectStore
+from tracker.runtime.storage import StoredObject
 from tracker import auth
 from tracker.auth import get_current_org
 from tracker.local.resources import LocalResources
 from main import app
 from tests.factories import make_error_result, make_evaluation_result, make_task
 from tracker.database.models import (
-    LocalBenchmarkArguments,
-    AgentCausedExitReason,
     Benchmark,
-    FailureCategory,
     Org,
     TaskBreakdown,
-    TaskStatus,
 )
+from tracker.types import LocalBenchmarkArguments
+from tracker.domain import AgentCausedExitReason, FailureCategory, TaskStatus
 
 _client = TestClient(app)
 
@@ -183,6 +183,12 @@ def test_task_artifacts_only_presign_existing_output(
 
     object_exists = AsyncMock(return_value=True)
     create_presigned_url = AsyncMock(return_value="https://example.test/presigned")
+
+    async def no_objects(_store: S3ObjectStore, _prefix: str) -> AsyncIterator[StoredObject]:
+        return
+        yield
+
+    monkeypatch.setattr(S3ObjectStore, "list_objects", no_objects)
     monkeypatch.setattr(S3ObjectStore, "exists", object_exists)
     monkeypatch.setattr(S3ObjectStore, "temporary_download_url", create_presigned_url)
 
@@ -211,6 +217,59 @@ def test_task_artifacts_only_presign_existing_output(
     assert missing_response.json()["agent_output_url"] is None
     assert missing_response.json()["agent_output_expires_in"] is None
     assert create_presigned_url.await_count == 1
+
+
+@pytest.mark.description("Task artifacts link the newest step output when the task has none of its own.")
+@pytest.mark.parametrize(
+    ("status", "root_present"),
+    [
+        (TaskStatus.FINISHED, False),
+        (TaskStatus.ERROR, False),
+        (TaskStatus.IN_PROGRESS, False),
+        (TaskStatus.FINISHED, True),
+    ],
+)
+def test_task_artifacts_link_the_newest_steps_output_when_the_task_has_none_of_its_own(
+    status: TaskStatus,
+    root_present: bool,
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = example_benchmark_object
+    task = make_task(benchmark, "stepped-task", status=status)
+    database_session.add_all([benchmark, task])
+    database_session.commit()
+    prefix = f"benchmarks/{benchmark.id}/{task.task_id}/"
+    now = datetime.now(ZoneInfo("UTC"))
+    stored = [
+        StoredObject(f"{prefix}steps/beta/agent_output.tar.gz", now - timedelta(minutes=1), size=1),
+        StoredObject(f"{prefix}steps/alpha/agent_output.tar.gz", now - timedelta(minutes=3), size=1),
+        StoredObject(f"{prefix}steps/epsilon/agent_output.tar.gz", None, size=1),
+        StoredObject(f"{prefix}steps/beta/artifacts/agent_output.tar.gz", now, size=1),
+        StoredObject(f"{prefix}steps/delta/agent_output.tar.gz.old", now, size=1),
+        StoredObject(f"{prefix}steps/gamma/agent_output.tar.gz", now - timedelta(minutes=2), size=1),
+    ]
+
+    async def exists(_store: S3ObjectStore, _key: str) -> bool:
+        return root_present
+
+    async def list_objects(_store: S3ObjectStore, listed: str) -> AsyncIterator[StoredObject]:
+        assert listed == f"{prefix}steps/"
+        for item in stored:
+            yield item
+
+    create_presigned_url = AsyncMock(return_value="https://example.test/presigned")
+    monkeypatch.setattr(S3ObjectStore, "exists", exists)
+    monkeypatch.setattr(S3ObjectStore, "list_objects", list_objects)
+    monkeypatch.setattr(S3ObjectStore, "temporary_download_url", create_presigned_url)
+
+    response = _client.get(f"/benchmarks/{benchmark.id}/tasks/{task.task_id}/artifacts")
+
+    expected = f"{prefix}agent_output.tar.gz" if root_present else f"{prefix}steps/beta/agent_output.tar.gz"
+    assert response.status_code == 200
+    assert response.json()["agent_output_url"] == "https://example.test/presigned"
+    create_presigned_url.assert_awaited_once_with(expected, expires_in=300)
 
 
 @pytest.mark.description("Run artifacts are scoped to the run, and storage errors map to HTTP statuses.")
@@ -347,3 +406,7 @@ def test_local_task_artifacts_use_existing_files(
     output.unlink()
     assert _client.get(endpoint).json()["agent_output_url"] is None
     assert _client.get(download_url).status_code == 404
+    step_output = output.parent / "steps" / "v1.2" / "agent_output.tar.gz"
+    step_output.parent.mkdir(parents=True)
+    step_output.write_bytes(b"step archive")
+    assert _client.get(_client.get(endpoint).json()["agent_output_url"]).content == b"step archive"

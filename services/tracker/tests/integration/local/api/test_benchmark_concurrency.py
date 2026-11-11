@@ -4,7 +4,8 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from tests.factories import make_benchmark
-from tracker.database.models import Benchmark, BenchmarkStatus
+from tracker.database.models import Benchmark
+from tracker.domain import BenchmarkStatus
 
 
 @pytest.mark.description("An authenticated update must return and persist the requested active-run limit.")

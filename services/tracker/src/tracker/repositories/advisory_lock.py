@@ -5,6 +5,9 @@ from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlmodel import Session
+
+from tracker.executor.control_queue import queue_pool_lock_id
 
 _TASK_EVALUATION_LOCK_SCOPE = "task-evaluation"
 _TASK_BUILD_LOCK_SCOPE = "task-build"
@@ -25,6 +28,17 @@ def task_evaluation_lock_resource_id(task_row_id: UUID) -> str:
 
 def task_build_lock_resource_id(task_row_id: UUID) -> str:
     return f"{_TASK_BUILD_LOCK_SCOPE}:{task_row_id}"
+
+
+class QueuePoolAdvisoryLock:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock(self, pool_id: str) -> None:
+        self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:pool_id, 0))"),
+            {"pool_id": queue_pool_lock_id(pool_id)},
+        )
 
 
 class PostgresAdvisoryLock:

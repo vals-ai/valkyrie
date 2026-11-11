@@ -17,9 +17,10 @@ from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
 import tracker.api.scheduler_overview as scheduler_overview_api
 from tracker.api.scheduler_overview import read_scheduler_overview
-from tracker.database.models import Benchmark, BenchmarkStatus, Org, Task, TaskStatus
+from tracker.database.models import Benchmark, Org, Task
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.repositories.scheduler import PoolProviderReference, SchedulerRepository
-from tracker.scheduler.store import queue_pool_id, reserved_queue_pool_id
+from tracker.executor.control_queue import queue_pool_id, reserved_queue_pool_id
 from tracker.types import SchedulerOverviewResponse, SchedulerPoolResponse, SchedulerSummaryResponse
 
 

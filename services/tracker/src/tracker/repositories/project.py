@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from itertools import count
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -6,8 +8,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, func, select
 
 from tracker.database.session import get_session
-from tracker.database.models import Project, RunProject
+from tracker.database.models import Project, RunProject, SpendType
 from tracker.exceptions import ProjectHandleTakenError, ProjectNameTakenError
+
+
+DEFAULT_PROJECT_HANDLE = "default"
+DEFAULT_PROJECT_NAME = "Default"
+
+
+def _default_names() -> Iterator[str]:
+    yield DEFAULT_PROJECT_NAME
+    yield f"{DEFAULT_PROJECT_NAME} ({DEFAULT_PROJECT_HANDLE})"
+    for number in count(2):
+        yield f"{DEFAULT_PROJECT_NAME} ({DEFAULT_PROJECT_HANDLE} {number})"
 
 
 class ProjectRepository:
@@ -25,6 +38,38 @@ class ProjectRepository:
             self._reject_taken_name(org_id, name, project.id)
             raise ProjectHandleTakenError(handle) from error
         return project
+
+    def get_or_create(self, project: Project) -> Project:
+        existing = self.get(project.org_id, project.handle)
+        if existing is not None:
+            return existing
+        self._session.add(project)
+        try:
+            self._session.commit()
+        except IntegrityError:
+            self._session.rollback()
+            existing = self.get(project.org_id, project.handle)
+            if existing is None:
+                raise
+            return existing
+        self._session.refresh(project)
+        return project
+
+    def get_or_create_default(self, org_id: UUID, created_by_email: str | None) -> Project:
+        existing = self.get(org_id, DEFAULT_PROJECT_HANDLE)
+        if existing is not None:
+            return existing
+        name = next(name for name in _default_names() if self.get_by_name(org_id, name) is None)
+        return self.get_or_create(
+            Project(
+                org_id=org_id,
+                handle=DEFAULT_PROJECT_HANDLE,
+                name=name,
+                spend_type=SpendType.DEVELOPMENT,
+                subcategory="new_benchmark_generation",
+                created_by_email=created_by_email,
+            )
+        )
 
     def update(self, project: Project) -> Project:
         org_id, name, project_id = project.org_id, project.name, project.id

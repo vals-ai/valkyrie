@@ -92,7 +92,7 @@ class TrackerSource:
         return [dataset for listing in listings for dataset in listing.datasets]
 
     async def dataset_tasks(self, benchmark: str, dataset: str) -> list[DatasetTaskResponse]:
-        return (await self._client.datasets.tasks.list_all(benchmark, dataset)).tasks
+        return await self._client.datasets.versions.tasks(benchmark, dataset)
 
     def watch_run(self, run_id: UUID) -> AsyncIterator[FetchBenchmarkResponse]:
         return self._client.runs.stream(run_id)

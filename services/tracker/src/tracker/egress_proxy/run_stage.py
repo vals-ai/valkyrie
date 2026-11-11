@@ -1,9 +1,7 @@
-import asyncio
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 
 from benchmark_service import ChildEgress, ChildPolicy, Sandbox
-from sqlalchemy.engine import Engine
 
 from tracker.egress import EgressPolicy, child_key_id
 from tracker.egress_proxy.client import (
@@ -12,11 +10,8 @@ from tracker.egress_proxy.client import (
     route_providers_through_gateway,
     start_proxy_tunnel,
 )
-from tracker.egress_proxy.policy import (
-    PolicyStore,
-    resolve_child_egress_proxy,
-    resolve_run_egress_proxy,
-)
+from tracker.egress_proxy.resolve import resolve_child_egress_proxy, resolve_run_egress_proxy
+from tracker.executor.control_tasks import TaskControl
 from tracker.egress_proxy.settings import EgressProxyEndpoint
 from tracker.logging import get_logger
 from tracker.runtime.run_egress import RunAttempt, RunStageAccess, SandboxEnvironment, ScopedGateway
@@ -27,9 +22,9 @@ logger = get_logger(__name__)
 
 
 class EgressProxy:
-    def __init__(self, endpoint: EgressProxyEndpoint, engine: Engine) -> None:
+    def __init__(self, endpoint: EgressProxyEndpoint, control: TaskControl) -> None:
         self._endpoint = endpoint
-        self._policies = PolicyStore(engine)
+        self._control = control
 
     def sandbox_environment(self, environment: SandboxEnvironment, gateway: ScopedGateway | None) -> SandboxEnvironment:
         if gateway is None or not gateway.url.startswith("https://"):
@@ -52,9 +47,7 @@ class EgressProxy:
             yield RunStageAccess()
             return
 
-        await asyncio.to_thread(
-            self._policies.grant, proxy, attempt.benchmark_id, attempt.task_row_id, attempt.expires_at
-        )
+        await self._control.grant_egress_policy(proxy, attempt)
         try:
             await apply_egress_policy(sandbox, list(self._endpoint.cidrs))
             await install_proxy_ca(sandbox, self._endpoint.ca_certificate)
@@ -65,7 +58,7 @@ class EgressProxy:
             )
         finally:
             try:
-                await asyncio.to_thread(self._policies.revoke, proxy.key_id)
+                await self._control.revoke_egress_policy(proxy.key_id, attempt)
             except Exception:
                 logger.exception(
                     "Failed to revoke egress proxy policy",
@@ -77,9 +70,7 @@ class EgressProxy:
         self, name: str, profile: ChildPolicy, attempt: RunAttempt, gateway: ScopedGateway | None
     ) -> AsyncGenerator[ChildEgress]:
         proxy = resolve_child_egress_proxy(profile, child_key_id(attempt.attempt_id, name), attempt.gateway_url)
-        await asyncio.to_thread(
-            self._policies.grant, proxy, attempt.benchmark_id, attempt.task_row_id, attempt.expires_at
-        )
+        await self._control.grant_egress_policy(proxy, attempt)
         try:
             yield ChildEgress(
                 proxy_url=f"https://{proxy.key_id}:{proxy.token}@{self._endpoint.hosts[0]}:{self._endpoint.port}",
@@ -90,7 +81,7 @@ class EgressProxy:
             )
         finally:
             try:
-                await asyncio.to_thread(self._policies.revoke, proxy.key_id)
+                await self._control.revoke_egress_policy(proxy.key_id, attempt)
             except Exception:
                 logger.exception(
                     "Failed to revoke child egress proxy policy",

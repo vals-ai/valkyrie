@@ -22,6 +22,7 @@ from valkyrie.cli.lazy import LazyGroup
         "output": ("valkyrie.cli.run.outputs:output_path", "Download files from a run by its ID."),
         "outputs": ("valkyrie.cli.run.outputs:outputs", "Download a run's outputs by its ID."),
         "results": ("valkyrie.cli.run.results:results", "Save a run's results by its ID."),
+        "rescore": ("valkyrie.cli.run.rescore:rescore", "Score a finished dataset run again with its metric script."),
         "regrade": (
             "valkyrie.cli.run.regrade:regrade",
             "Regrade a finished run into a new run on another dataset.",

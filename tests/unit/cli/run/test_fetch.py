@@ -8,11 +8,17 @@ import httpx
 import pytest
 from click.testing import CliRunner
 from valkyrie.sdk import ValkyrieClient
-from valkyrie.sdk.models import BenchmarkStatus, FetchBenchmarkMetadataResponse, ProjectResponse, SpendType, TaskStatus
+from valkyrie.sdk.models import (
+    BenchmarkStatus,
+    FetchBenchmarkMetadataResponse,
+    ProjectResponse,
+    RunSnapshot,
+    SpendType,
+    TaskStatus,
+)
 
 from valkyrie.cli.run.fetch import fetch
 from valkyrie.cli.run.progress import stream_benchmark_status
-from valkyrie.cli.run.snapshot import build_run_snapshot, format_run_snapshot_json
 
 from tests.unit.cli.conftest import MockTracker
 from tests.unit.cli.factories import make_fetch_metadata, make_fetch_response, run_stream, serve_run
@@ -40,36 +46,26 @@ def _records(output: str) -> list[dict[str, object]]:
     return [json.loads(line) for line in output.splitlines()]
 
 
-@pytest.mark.description("A run snapshot is versioned, limited to known fields, and stable.")
-def test_run_snapshot_is_versioned_allowlisted_and_stable() -> None:
-    response = make_fetch_response(_RUN_ID)
-    metadata = make_fetch_metadata(_RUN_ID)
-    observed_at = datetime(2026, 7, 9, 13, 0, tzinfo=timezone.utc)
+@pytest.mark.description("JSON fetch prints the SDK `RunSnapshot`, with regrade fields and launch metadata.")
+def test_fetch_json_prints_the_sdk_run_snapshot(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    regraded_from = UUID(int=7)
+    run = make_fetch_response(_RUN_ID).model_copy(
+        update={"regraded_from_run_id": regraded_from, "regrade_skipped_task_ids": ["task-9"]}
+    )
+    metadata = _tagged_metadata()
+    serve_run(tracker, run, metadata=metadata)
 
-    snapshot = build_run_snapshot(response, metadata, event="snapshot", observed_at=observed_at)
-    serialized = format_run_snapshot_json(response, metadata, event="snapshot")
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
 
-    assert snapshot["schema_version"] == 1
-    assert snapshot["event"] == "snapshot"
-    assert snapshot["observed_at"] == "2026-07-09T13:00:00Z"
-    assert snapshot["run_id"] == str(_RUN_ID)
-    assert snapshot["agent_name"] == "mini_sweagent"
-    assert snapshot["model"] == "openai/gpt-5"
-    assert snapshot["dataset"] == "verified"
-    assert snapshot["progress_percent"] == 25.0
-    assert snapshot["task_state_counts"] == {
-        "PENDING": 0,
-        "BUILDING": 0,
-        "IN_PROGRESS": 3,
-        "EVALUATING": 0,
-        "STOPPED": 0,
-        "FINISHED": 1,
-        "ERROR": 0,
-    }
-    assert not any(secret in serialized for secret in _SECRETS)
+    assert result.exit_code == 0, result.output
+    assert len(result.output.splitlines()) == 1
+    payload = json.loads(result.output)
+    assert payload == RunSnapshot(run=run, metadata=metadata).model_dump(mode="json")
+    assert payload["run"]["regraded_from_run_id"] == str(regraded_from)
+    assert payload["metadata"]["benchmark_arguments"]["contract"]["model"] == "openai/gpt-5"
 
 
-@pytest.mark.description("Non-finite scores become null, and missing metadata nulls the identity instead of failing.")
+@pytest.mark.description("Non-finite scores print as null, and unavailable metadata prints as null instead of failing.")
 @pytest.mark.parametrize(
     ("final_score", "metadata_available"),
     [(None, True), (float("nan"), True), (float("inf"), True), (float("-inf"), True), (None, False)],
@@ -79,19 +75,37 @@ def test_fetch_json_outputs_one_clean_object(
 ) -> None:
     metadata = make_fetch_metadata(_RUN_ID) if metadata_available else None
     serve_run(tracker, make_fetch_response(_RUN_ID, final_score=final_score), metadata=metadata)
+    if not metadata_available:
+        tracker.reply("GET", f"/fetch-benchmark-metadata/{_RUN_ID}", httpx.Response(404, json={"detail": "missing"}))
 
     result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
 
     assert result.exit_code == 0, result.output
-    assert len(result.output.splitlines()) == 1
     assert not any(token in result.output for token in ("\x1b", "NaN", "Infinity"))
-
     payload = json.loads(result.output)
-    assert payload["event"] == "snapshot"
-    assert payload["run_id"] == str(_RUN_ID)
-    assert payload["final_score"] is None
-    assert payload["metadata_available"] is metadata_available
-    assert payload["agent_name"] == ("mini_sweagent" if metadata_available else None)
+    assert payload["run"]["benchmark_id"] == str(_RUN_ID)
+    assert payload["run"]["final_score"] is None
+    assert (payload["metadata"] is not None) is metadata_available
+
+
+@pytest.mark.description(
+    "Text fetch shows the agent, model, dataset, starter, and concurrency from the run's metadata."
+)
+def test_fetch_text_shows_the_runs_launch_details(tracker: MockTracker, cli_runner: CliRunner) -> None:
+    serve_run(tracker, make_fetch_response(_RUN_ID), metadata=make_fetch_metadata(_RUN_ID))
+
+    result = cli_runner.invoke(fetch, [str(_RUN_ID)])
+
+    assert result.exit_code == 0, result.output
+    for line in (
+        "│ Agent:       mini_sweagent",
+        "│ Model:       openai/gpt-5",
+        "│ Dataset:     verified",
+        "│ Started by:  runner@vals.ai",
+        "│ Concurrency: 20",
+    ):
+        assert line in result.output
+    assert not any(secret in result.output for secret in _SECRETS)
 
 
 @pytest.mark.description("Text fetch shows the run's project.")
@@ -168,13 +182,11 @@ def test_fetch_json_carries_the_runs_project(
     result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["project"] == project
+    assert json.loads(result.output)["metadata"]["project"] == project
 
 
-@pytest.mark.description("JSONL fetch writes snapshot updates and the final record.")
-def test_fetch_jsonl_writes_snapshot_updates_and_the_terminal_record(
-    tracker: MockTracker, cli_runner: CliRunner
-) -> None:
+@pytest.mark.description("JSONL fetch writes the `RunSnapshot`, then each SDK stream event through the final one.")
+def test_fetch_jsonl_writes_the_snapshot_then_sdk_stream_events(tracker: MockTracker, cli_runner: CliRunner) -> None:
     finished = make_fetch_response(_RUN_ID, status=BenchmarkStatus.FINISHED, finished_tasks=4, final_score=75.0)
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=run_stream(finished), metadata=make_fetch_metadata(_RUN_ID))
 
@@ -182,41 +194,44 @@ def test_fetch_jsonl_writes_snapshot_updates_and_the_terminal_record(
 
     assert result.exit_code == 0, result.output
     assert "\x1b" not in result.output
-    assert not any(secret in result.output for secret in _SECRETS)
-
     records = _records(result.output)
-    assert [record["event"] for record in records] == ["snapshot", "update", "complete"]
-    assert all(record["schema_version"] == 1 and record["run_id"] == str(_RUN_ID) for record in records)
-    assert records[-1]["status"] == "FINISHED"
-    assert records[-1]["final_score"] == 75.0
+    assert set(records[0]) == {"run", "metadata"}
+    assert [record["event"] for record in records[1:]] == ["update", "complete"]
+    update = records[1]["run"]
+    assert isinstance(update, dict)
+    assert update["details"]["status"] == "FINISHED"
+    assert update["final_score"] == 75.0
 
 
-@pytest.mark.description("`complete` maps to the run's final status. A body without an ending event exits 1.")
+@pytest.mark.description("JSONL fetch ends on the stream's own final event. A body without one exits 1.")
 @pytest.mark.parametrize(
     ("stream", "events", "exit_code"),
     [
-        (run_stream(make_fetch_response(_RUN_ID, status=BenchmarkStatus.ERROR)), ["update", "error"], 0),
-        (run_stream(make_fetch_response(_RUN_ID, status=BenchmarkStatus.STOPPED)), ["update", "stopped"], 0),
+        (run_stream(make_fetch_response(_RUN_ID, status=BenchmarkStatus.ERROR)), ["update", "complete"], 0),
         (run_stream(end="error"), ["error"], 0),
         (run_stream(end="disconnect"), ["disconnect"], 0),
-        (KeyboardInterrupt(), ["interrupted"], 0),
-        (run_stream(end=None), ["disconnect"], 1),
+        (KeyboardInterrupt(), [], 0),
+        (run_stream(end=None), ["update"], 1),
     ],
-    ids=["errored-run", "stopped-run", "error-event", "disconnect", "ctrl-c", "body-ends-early"],
+    ids=["errored-run", "error-event", "disconnect", "ctrl-c", "body-ends-early"],
 )
-def test_fetch_jsonl_names_how_the_stream_ended(
+def test_fetch_jsonl_ends_on_the_streams_final_event(
     tracker: MockTracker,
     cli_runner: CliRunner,
     stream: httpx.Response | BaseException,
     events: list[str],
     exit_code: int,
 ) -> None:
+    if isinstance(stream, httpx.Response) and events == ["update"]:
+        stream = run_stream(make_fetch_response(_RUN_ID), end=None)
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=stream, metadata=make_fetch_metadata(_RUN_ID))
 
     result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect", "--format", "jsonl"])
 
     assert result.exit_code == exit_code
-    assert [record["event"] for record in _records(result.stdout)] == ["snapshot", *events]
+    records = _records(result.stdout)
+    assert set(records[0]) == {"run", "metadata"}
+    assert [record["event"] for record in records[1:]] == events
     assert ("ended without a terminal event" in result.stderr) is bool(exit_code)
 
 
@@ -231,7 +246,7 @@ def test_fetch_jsonl_interrupted_before_streaming_aborts(tracker: MockTracker, c
     assert _records(result.stdout) == []
 
 
-@pytest.mark.description("A cancelled run stream writes its `interrupted` record and stays cancelled.")
+@pytest.mark.description("A cancelled JSONL run stream stops after the records it already wrote and stays cancelled.")
 async def test_cancelled_run_stream_stays_cancelled(tracker: MockTracker, capsys: pytest.CaptureFixture[str]) -> None:
     streaming = asyncio.Event()
 
@@ -250,7 +265,8 @@ async def test_cancelled_run_stream_stays_cancelled(tracker: MockTracker, capsys
         with pytest.raises(asyncio.CancelledError):
             await following
 
-    assert [record["event"] for record in _records(capsys.readouterr().out)] == ["snapshot", "update", "interrupted"]
+    records = _records(capsys.readouterr().out)
+    assert [record.get("event") for record in records] == [None, "update"]
 
 
 @pytest.mark.description("A live run that ends ERROR prints the failure, even though the stream's event is `complete`.")

@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
+from aiobotocore.response import StreamingBody
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from starlette.requests import Request
@@ -69,6 +70,8 @@ class MockS3Client:
 class DownloadBody:
     def __init__(self, content: bytes) -> None:
         self._content = content
+        self._offset = 0
+        self.content = self
 
     async def __aenter__(self) -> "DownloadBody":
         return self
@@ -76,8 +79,11 @@ class DownloadBody:
     async def __aexit__(self, *_exc: object) -> None:
         pass
 
-    async def read(self) -> bytes:
-        return self._content
+    async def read(self, amount: int = -1) -> bytes:
+        end = len(self._content) if amount < 0 else self._offset + amount
+        chunk = self._content[self._offset : end]
+        self._offset += len(chunk)
+        return chunk
 
 
 class DownloadClient:
@@ -94,14 +100,38 @@ class DownloadClient:
     async def __aexit__(self, *_exc: object) -> None:
         pass
 
-    async def get_object(self, **request: str) -> dict[str, DownloadBody]:
+    async def get_object(self, **request: str) -> dict[str, StreamingBody]:
         self.requests.append(request)
         key = request["Key"]
         self.keys.append(key)
         response = self._responses[key]
         if isinstance(response, ClientError):
             raise response
-        return {"Body": DownloadBody(response)}
+        return {"Body": StreamingBody(DownloadBody(response), str(len(response)))}
+
+
+@pytest.mark.description("A stored object streams in chunks without being read whole.")
+async def test_a_stored_object_streams_in_chunks_without_being_read_whole(
+    monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
+) -> None:
+    client = DownloadClient({"task.zip": b"x" * 2_500_000})
+    monkeypatch.setattr(type(aws_runtime.clients), "s3_client", lambda _provider: client)
+
+    chunks = [chunk async for chunk in S3ObjectStore(aws_runtime).get_stream("task.zip")]
+
+    assert [len(chunk) for chunk in chunks] == [1_048_576, 1_048_576, 402_848]
+    assert client.keys == ["task.zip"]
+
+
+@pytest.mark.description("Streaming a missing object raises the storage error.")
+async def test_streaming_a_missing_object_raises_the_storage_error(
+    monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime
+) -> None:
+    missing = ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+    monkeypatch.setattr(type(aws_runtime.clients), "s3_client", lambda _provider: DownloadClient({"gone": missing}))
+
+    with pytest.raises(S3Error, match="Failed to download from S3"):
+        _ = [chunk async for chunk in S3ObjectStore(aws_runtime).get_stream("gone")]
 
 
 @pytest.mark.description("`get_many` opens one S3 client and returns only the keys that downloaded.")

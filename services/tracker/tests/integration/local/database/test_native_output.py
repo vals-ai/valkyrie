@@ -1,21 +1,23 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
+import httpx
 import pytest
 from benchmark_service import ComposeSource, SnapshotSource
 from sqlmodel import Session
 
 from tests.factories import make_benchmark, make_task
 from tracker.database.models import (
-    ActiveNativeOutput,
-    Benchmark,
     ExecutorDispatch,
-    ExecutorDispatchStatus,
     Org,
-    TaskStatus,
 )
+from executor_protocol import ExecutorDispatchStatus
+from tracker.types import ActiveNativeOutput
+from tracker.domain import TaskStatus
 from tracker.exceptions import ExecutionAuthorityRevoked
-from tracker.executor.execution_authority import ExecutionAuthority
+from tracker.executor.control_protocol import AttemptRef, DispatchRef
+from tracker.executor.control_tasks import NativeOutputRequest, TaskControl
 from tracker.executor.native_output import clear_native_output, publish_native_output
 from tracker.services.runs.stop import apply_shed_benchmark, apply_stop_benchmark
 
@@ -42,42 +44,37 @@ class TestNativeOutputPersistence:
     )
     @pytest.mark.parametrize("status", [TaskStatus.BUILDING, TaskStatus.IN_PROGRESS])
     def test_old_cleanup_preserves_replacement_and_revocation_allows_own_cleanup(
-        self,
-        database_session: Session,
-        executor_authority: Callable[[Benchmark], ExecutionAuthority],
-        status: TaskStatus,
+        self, database_session: Session, status: TaskStatus
     ) -> None:
         benchmark = make_benchmark(session=database_session)
         task = make_task(benchmark, "task", status=status, started_at=_STARTED_AT)
         database_session.add(task)
         database_session.commit()
-        authority = executor_authority(benchmark)
         old = _descriptor("old-sandbox")
         current = _descriptor("replacement-sandbox")
 
-        publish_native_output(database_session, task.id, old, authority)
+        publish_native_output(database_session, task, old)
+        database_session.commit()
         database_session.refresh(task)
 
         assert task.active_native_output is not None
         assert task.active_native_output == old
-        assert task.active_native_output.generation == old.generation
+        assert task.active_native_output.attempt_started_at == old.attempt_started_at
 
-        publish_native_output(database_session, task.id, current, authority)
-        clear_native_output(database_session, task.id, old)
+        publish_native_output(database_session, task, current)
+        clear_native_output(database_session, task, old)
+        database_session.commit()
         database_session.refresh(task)
 
         assert task.active_native_output == current
-        assert current.generation != old.generation
+        assert current.sandbox_id != old.sandbox_id
 
-        dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
-        assert dispatch is not None
-        dispatch.status = ExecutorDispatchStatus.FINISHED
         task.status = TaskStatus.STOPPED
-        database_session.add(dispatch)
         database_session.add(task)
         database_session.commit()
 
-        clear_native_output(database_session, task.id, current)
+        clear_native_output(database_session, task, current)
+        database_session.commit()
         database_session.refresh(task)
 
         assert task.active_native_output is None
@@ -133,32 +130,48 @@ class TestNativeOutputPersistence:
 
     @pytest.mark.description("A stale native output publish is rejected.")
     @pytest.mark.parametrize("changed", ["attempt", "status", "evaluating", "dispatch", "benchmark"])
-    def test_stale_publish_is_rejected(
-        self, database_session: Session, executor_authority: Callable[[Benchmark], ExecutionAuthority], changed: str
+    async def test_stale_publish_is_rejected(
+        self, control_postgres_session: Session, bound_controls: Callable[..., dict[str, object]], changed: str
     ) -> None:
-        benchmark = make_benchmark(session=database_session)
+        session = control_postgres_session
+        benchmark = make_benchmark(session=session)
         task = make_task(benchmark, "task", status=TaskStatus.BUILDING, started_at=_STARTED_AT)
-        database_session.add(task)
-        database_session.commit()
-        authority = executor_authority(benchmark)
+        session.add(task)
+        session.commit()
+        controls = bound_controls(benchmark, session=session)
+        session.refresh(task)
+        dispatch = session.get(ExecutorDispatch, UUID(str(controls["executor_dispatch_id"])))
+        assert dispatch is not None
+        request = NativeOutputRequest(
+            ref=DispatchRef(benchmark_id=benchmark.id, dispatch_id=dispatch.id),
+            attempt=AttemptRef(
+                org_id=task.org_id, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at
+            ),
+            descriptor=_descriptor("stale-sandbox").model_copy(update={"attempt_started_at": task.started_at}),
+        )
         if changed == "attempt":
             task.started_at += timedelta(seconds=1)
         elif changed in ("status", "evaluating"):
             task.status = TaskStatus.EVALUATING if changed == "evaluating" else TaskStatus.STOPPED
         elif changed == "dispatch":
-            dispatch = database_session.get(ExecutorDispatch, authority.dispatch_id)
-            assert dispatch is not None
             dispatch.status = ExecutorDispatchStatus.FINISHED
-            database_session.add(dispatch)
+            session.add(dispatch)
         else:
-            other = make_benchmark(session=database_session)
+            other = make_benchmark(session=session)
             task.benchmark = other.id
-        database_session.add(task)
-        database_session.commit()
+        session.add(task)
+        session.commit()
 
-        with pytest.raises(ExecutionAuthorityRevoked):
-            publish_native_output(database_session, task.id, _descriptor("stale-sandbox"), authority)
-        database_session.rollback()
-        database_session.refresh(task)
-
+        task_control = controls["task_control"]
+        assert isinstance(task_control, TaskControl)
+        if changed in ("status", "evaluating"):
+            assert await task_control.publish_native_output(request) is False
+        elif changed in ("attempt", "dispatch"):
+            with pytest.raises(ExecutionAuthorityRevoked):
+                await task_control.publish_native_output(request)
+        else:
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                await task_control.publish_native_output(request)
+            assert caught.value.response.status_code == 409
+        session.refresh(task)
         assert task.active_native_output is None

@@ -5,16 +5,20 @@ import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import boto3
 from pydantic import BaseModel, ConfigDict, Field
+from sqlmodel import Session
 
 from executor_protocol import (
     SUPPORTED_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
     validate_executor_image_uri,
 )
+
+if TYPE_CHECKING:
+    from tracker.database.models import ExecutorRelease
 
 
 class ReleaseInput(BaseModel):
@@ -53,11 +57,11 @@ class ServicesStableWaiter(Protocol):
 class EcsClient(Protocol):
     def get_waiter(self, name: str) -> ServicesStableWaiter: ...
 
+    def update_service(self, **kwargs: object) -> Mapping[str, object]: ...
+
     def list_tasks(self, **kwargs: object) -> Mapping[str, object]: ...
 
     def stop_task(self, **kwargs: object) -> Mapping[str, object]: ...
-
-    def update_service(self, **kwargs: object) -> Mapping[str, object]: ...
 
     def describe_services(self, **kwargs: object) -> Mapping[str, object]: ...
 
@@ -108,16 +112,16 @@ _CALLER_CONTROLLED_ENV = (
 def create_secrets_manager_client() -> SecretsManagerClient:
     return cast(
         SecretsManagerClient,
-        boto3.client("secretsmanager"),  # pyright: ignore[reportUnknownMemberType]
+        boto3.client("secretsmanager"),
     )
 
 
 def create_ecs_client() -> EcsClient:
-    return cast(EcsClient, boto3.client("ecs"))  # pyright: ignore[reportUnknownMemberType]
+    return cast(EcsClient, boto3.client("ecs"))
 
 
 def create_ecr_client() -> EcrClient:
-    return cast(EcrClient, boto3.client("ecr"))  # pyright: ignore[reportUnknownMemberType]
+    return cast(EcrClient, boto3.client("ecr"))
 
 
 def _configure_database(task: ReleaseTaskConfig) -> None:
@@ -170,30 +174,33 @@ def _register_release_task_definition(client: EcsClient, task: ReleaseTaskConfig
     return str(cast(Mapping[str, object], registered["taskDefinition"])["taskDefinitionArn"])
 
 
-def _activate_sealed_release(release: ReleaseInput, ecs: EcsClient, task: ReleaseTaskConfig) -> None:
-    from sqlmodel import Session
-
+def _sealed_candidate(
+    session: Session, release: ReleaseInput, ecs: EcsClient, task: ReleaseTaskConfig
+) -> ExecutorRelease:
     from tracker.database.models import ExecutorRelease
+    from tracker.repositories.executor_release import ExecutorReleaseRepository
+
+    existing = ExecutorReleaseRepository(session).get(release.release_id)
+    task_definition_arn = existing.task_definition_arn if existing is not None else None
+    if task_definition_arn is None:
+        task_definition_arn = _register_release_task_definition(ecs, task, release)
+    return ExecutorRelease(
+        id=release.release_id,
+        artifact_uri=release.artifact_uri,
+        artifact_digest=release.artifact_digest,
+        protocol_version=release.protocol_version,
+        task_definition_arn=task_definition_arn,
+    )
+
+
+def _activate_sealed_release(release: ReleaseInput, ecs: EcsClient, task: ReleaseTaskConfig) -> None:
     from tracker.database.session import engine
     from tracker.executor.release_control import ReleaseControlError, activate_release
-    from tracker.repositories.executor_release import ExecutorReleaseRepository
 
     try:
         with Session(engine) as session:
-            existing = ExecutorReleaseRepository(session).get(release.release_id)
-            task_definition_arn = existing.task_definition_arn if existing is not None else None
-            if task_definition_arn is None:
-                task_definition_arn = _register_release_task_definition(ecs, task, release)
-            activate_release(
-                session,
-                ExecutorRelease(
-                    id=release.release_id,
-                    artifact_uri=release.artifact_uri,
-                    artifact_digest=release.artifact_digest,
-                    protocol_version=release.protocol_version,
-                    task_definition_arn=task_definition_arn,
-                ),
-            )
+            candidate = _sealed_candidate(session, release, ecs, task)
+            activate_release(session, candidate)
             session.commit()
     except ReleaseControlError as error:
         raise SystemExit(f"Executor release activation failed: {error}") from error
@@ -304,6 +311,48 @@ def _finish_maintenance(task: ReleaseTaskConfig, maintenance: MaintenanceInput) 
         raise SystemExit(f"Maintenance finish failed: {error}") from error
 
 
+def _migration_operation(operation: str, arguments: list[str]) -> None:
+    from alembic import command
+    from alembic.config import Config
+    from sqlmodel import Session
+    from tracker.database.session import engine
+    from tracker.repositories.executor_release import ExecutorReleaseRepository
+
+    if operation == "migration-check-admission" and len(arguments) == 1:
+        expected_revision = arguments[0]
+        with Session(engine) as session:
+            actual_revision = ExecutorReleaseRepository(session).schema_revision()
+        if actual_revision != expected_revision:
+            raise SystemExit("Candidate schema revision does not match deployed database")
+        return
+    if operation == "migration-safe-migrate" and len(arguments) == 3:
+        target_sha, source_revision, destination_revision = arguments
+        MaintenanceInput(target_sha=target_sha)
+        with Session(engine) as session:
+            repository = ExecutorReleaseRepository(session)
+            current_revision = repository.schema_revision()
+            owner = repository.maintenance_owner()
+        if current_revision != source_revision or owner not in (None, target_sha):
+            raise SystemExit("Safe migration source revision or admission ownership does not match")
+        command.upgrade(Config("alembic.ini"), destination_revision)
+        with Session(engine) as session:
+            upgraded_revision = ExecutorReleaseRepository(session).schema_revision()
+        if upgraded_revision != destination_revision:
+            raise SystemExit("Safe migration destination revision was not verified")
+        return
+    if operation == "migration-adoption-migrate" and len(arguments) == 3:
+        target_sha, source_revision, destination_revision = arguments
+        with Session(engine) as session:
+            repository = ExecutorReleaseRepository(session)
+            owner = repository.maintenance_owner()
+            current_revision = repository.schema_revision()
+        if owner != target_sha or current_revision != source_revision:
+            raise SystemExit("One-time adoption owner or old schema revision does not match")
+        command.upgrade(Config("alembic.ini"), destination_revision)
+        return
+    raise SystemExit(f"Invalid migration operation: {operation}")
+
+
 def main() -> None:
     arguments = sys.argv[1:]
     if len(arguments) < 11 or arguments[8] != "--runner-task-family":
@@ -338,6 +387,10 @@ def main() -> None:
         _activate_sealed_release(release, create_ecs_client(), task)
         return
 
+    if operation.startswith("migration-"):
+        _configure_database(task)
+        _migration_operation(operation, arguments[11:])
+        return
     if operation not in ("maintenance-begin", "maintenance-finish") or len(arguments) != 12:
         raise SystemExit(f"Invalid sealed release task operation: {operation}")
     maintenance = MaintenanceInput(target_sha=arguments[11])

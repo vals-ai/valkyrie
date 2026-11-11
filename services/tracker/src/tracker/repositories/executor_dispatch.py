@@ -4,16 +4,10 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import and_, delete, func, or_, update
+from sqlalchemy import and_, delete, func, or_, text, update
 from sqlmodel import Session, SQLModel, col, select
 
-from tracker.database.models import (
-    Benchmark,
-    BenchmarkStatus,
-    ExecutorDispatch,
-    ExecutorDispatchPayload,
-    ExecutorDispatchStatus,
-)
+from tracker.database.models import ExecutorDispatch, ExecutorDispatchPayload, ExecutorDispatchStatus
 from tracker.database.session import get_session
 
 _ACTIVE_DISPATCH_STATUSES = (ExecutorDispatchStatus.QUEUED, ExecutorDispatchStatus.RUNNING)
@@ -26,8 +20,31 @@ class ExecutorDispatchRepository:
     def now(self) -> datetime:
         return self._session.exec(select(func.current_timestamp())).one().replace(tzinfo=None)
 
+    def clock_timestamp(self) -> datetime:
+        return self._session.exec(select(func.clock_timestamp())).one()
+
+    def benchmark_id(self, dispatch_id: UUID) -> UUID | None:
+        return self._session.exec(
+            select(ExecutorDispatch.benchmark_id).where(col(ExecutorDispatch.id) == dispatch_id)
+        ).one_or_none()
+
     def get(self, dispatch_id: UUID) -> ExecutorDispatch | None:
         return self._session.get(ExecutorDispatch, dispatch_id)
+
+    def get_current(self, dispatch_id: UUID) -> ExecutorDispatch | None:
+        return self._session.exec(
+            select(ExecutorDispatch)
+            .where(col(ExecutorDispatch.id) == dispatch_id)
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+
+    def set_short_lock_timeout(self) -> None:
+        self._session.exec(text("SET LOCAL lock_timeout = '1s'"))
+
+    def payload(self, dispatch_id: UUID) -> ExecutorDispatchPayload | None:
+        return self._session.exec(
+            select(ExecutorDispatchPayload).where(col(ExecutorDispatchPayload.dispatch_id) == dispatch_id)
+        ).one_or_none()
 
     def created_at(self, dispatch_id: UUID) -> datetime:
         return self._session.exec(
@@ -49,6 +66,8 @@ class ExecutorDispatchRepository:
         benchmark_id: UUID | None = None,
         status: ExecutorDispatchStatus | None = None,
         expired_before: datetime | None = None,
+        ecs_task_arn: str | None = None,
+        claim_expired_before: datetime | None = None,
     ) -> ExecutorDispatch | None:
         query = select(ExecutorDispatch).where(col(ExecutorDispatch.id) == dispatch_id)
         if benchmark_id is not None:
@@ -57,37 +76,30 @@ class ExecutorDispatchRepository:
             query = query.where(ExecutorDispatch.status == status)
         if expired_before is not None:
             query = query.where(col(ExecutorDispatch.lease_expires_at) <= expired_before)
+        if ecs_task_arn is not None:
+            query = query.where(ExecutorDispatch.ecs_task_arn == ecs_task_arn)
+        if claim_expired_before is not None:
+            query = query.where(col(ExecutorDispatch.claim_deadline_at) <= claim_expired_before)
         return self._session.exec(query.execution_options(populate_existing=True).with_for_update()).one_or_none()
 
-    def lock_claimable(self, dispatch_id: UUID, created_after: datetime) -> ExecutorDispatch | None:
+    def lock_skip_locked(self, dispatch_id: UUID) -> ExecutorDispatch | None:
         return self._session.exec(
             select(ExecutorDispatch)
-            .join(Benchmark, col(Benchmark.id) == col(ExecutorDispatch.benchmark_id))
             .where(col(ExecutorDispatch.id) == dispatch_id)
-            .where(ExecutorDispatch.status == ExecutorDispatchStatus.QUEUED)
-            .where(ExecutorDispatch.created_at > created_after)
-            .where(Benchmark.status == BenchmarkStatus.IN_PROGRESS)
-            .where(Benchmark.current_execution_release_id == ExecutorDispatch.executor_release_id)
-            .with_for_update(of=ExecutorDispatch)
+            .execution_options(populate_existing=True)
+            .with_for_update(skip_locked=True)
         ).one_or_none()
-
-    def take_payload(self, dispatch_id: UUID) -> ExecutorDispatchPayload:
-        payload = self._session.exec(
-            select(ExecutorDispatchPayload).where(ExecutorDispatchPayload.dispatch_id == dispatch_id).with_for_update()
-        ).one()
-        self._session.delete(payload)
-        return payload
 
     def delete_payload(self, dispatch_id: UUID) -> None:
         self._session.exec(
             delete(ExecutorDispatchPayload).where(col(ExecutorDispatchPayload.dispatch_id) == dispatch_id)
         )
 
-    def delete_unqueued_payloads(self) -> None:
+    def delete_terminal_payloads(self) -> None:
         self._session.exec(
             delete(ExecutorDispatchPayload).where(
                 col(ExecutorDispatchPayload.dispatch_id).in_(
-                    select(ExecutorDispatch.id).where(col(ExecutorDispatch.status) != ExecutorDispatchStatus.QUEUED)
+                    select(ExecutorDispatch.id).where(col(ExecutorDispatch.status).notin_(_ACTIVE_DISPATCH_STATUSES))
                 )
             )
         )
@@ -177,21 +189,41 @@ class ExecutorDispatchRepository:
             .where(col(ExecutorDispatch.ecs_task_arn).is_not(None))
         ).all()
 
-    def list_expired(self, claim_cutoff: datetime, now: datetime) -> Sequence[ExecutorDispatch]:
+    def list_expired(self, now: datetime) -> Sequence[ExecutorDispatch]:
         return self._session.exec(
             select(ExecutorDispatch).where(
                 or_(
                     and_(
                         col(ExecutorDispatch.status) == ExecutorDispatchStatus.QUEUED,
-                        col(ExecutorDispatch.created_at) <= claim_cutoff,
+                        col(ExecutorDispatch.claim_deadline_at) <= now,
                     ),
                     and_(
                         col(ExecutorDispatch.status) == ExecutorDispatchStatus.RUNNING,
+                        col(ExecutorDispatch.ecs_task_arn).is_(None),
                         col(ExecutorDispatch.lease_expires_at) <= now,
                     ),
                 )
             )
         ).all()
+
+    def record_relaunch(
+        self, dispatch_id: UUID, stopped_task_arn: str, replacement_task_arn: str, reason: str | None
+    ) -> bool:
+        return (
+            self._session.exec(
+                update(ExecutorDispatch)
+                .where(col(ExecutorDispatch.id) == dispatch_id)
+                .where(col(ExecutorDispatch.status) == ExecutorDispatchStatus.QUEUED)
+                .where(col(ExecutorDispatch.ecs_task_arn) == stopped_task_arn)
+                .values(
+                    ecs_task_arn=replacement_task_arn,
+                    relaunch_count=col(ExecutorDispatch.relaunch_count) + 1,
+                    last_relaunch_reason=reason,
+                )
+                .returning(col(ExecutorDispatch.id))
+            ).first()
+            is not None
+        )
 
     def save(self, *rows: SQLModel) -> None:
         self._session.add_all(rows)

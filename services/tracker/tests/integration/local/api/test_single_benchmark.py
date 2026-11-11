@@ -20,16 +20,15 @@ from testcontainers.postgres import PostgresContainer
 from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import (
-    LocalBenchmarkArguments,
     DEFAULT_ORG_NAME,
     Benchmark,
-    BenchmarkStatus,
     ErrorResult,
     ExecutorRelease,
     FinalEvaluation,
     Org,
-    TaskStatus,
 )
+from tracker.types import LocalBenchmarkArguments
+from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.aws.runtime import AWSResources
 from tracker.local.resources import LocalResources
 from tracker.database.session import get_session
@@ -88,13 +87,13 @@ class TestSingleBenchmark:
     def test_get_single_benchmark_returns_payload(self, client: TestClient, database_session: Session) -> None:
         initial_release = ExecutorRelease(
             id="initial-release",
-            artifact_uri="s3://artifacts/initial.pex",
+            artifact_uri="source:///initial-release",
             artifact_digest="a" * 64,
             protocol_version="1",
         )
         current_release = ExecutorRelease(
             id="current-release",
-            artifact_uri="s3://artifacts/current.pex",
+            artifact_uri="source:///current-release",
             artifact_digest="b" * 64,
             protocol_version="1",
         )
@@ -347,13 +346,13 @@ class TestBenchmarkStatusStream:
     ) -> None:
         initial_release = ExecutorRelease(
             id="initial-release",
-            artifact_uri="s3://artifacts/initial.pex",
+            artifact_uri="source:///initial-release",
             artifact_digest="a" * 64,
             protocol_version="1",
         )
         current_release = ExecutorRelease(
             id="current-release",
-            artifact_uri="s3://artifacts/current.pex",
+            artifact_uri="source:///current-release",
             artifact_digest="b" * 64,
             protocol_version="1",
         )

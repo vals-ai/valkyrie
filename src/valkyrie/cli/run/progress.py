@@ -18,7 +18,6 @@ from valkyrie.cli.client import call
 from valkyrie.cli.display import local_time, progress_percent, status_label
 from valkyrie.display import terminal_safe
 from valkyrie.cli.project import describe_run_spend
-from valkyrie.cli.run.snapshot import RunEvent, fetch_run_metadata, format_run_snapshot_json
 
 STATUS_COLORS = {
     "PENDING": "yellow",
@@ -82,8 +81,13 @@ def _display_run_error(benchmark_response: FetchBenchmarkResponse) -> None:
         click.secho(f"Error: {safe_error}", fg="red")
 
 
-def format_benchmark_status(benchmark_response: FetchBenchmarkResponse, spend: str | None = None) -> None:
+def format_benchmark_status(
+    benchmark_response: FetchBenchmarkResponse,
+    spend: str | None = None,
+    metadata: FetchBenchmarkMetadataResponse | None = None,
+) -> None:
     details = benchmark_response.details
+    arguments = metadata.benchmark_arguments if metadata is not None else None
     progress_line, breakdown_line = _progress_lines(details)
 
     click.echo("┌─ Run Status " + "─" * 66)
@@ -92,6 +96,11 @@ def format_benchmark_status(benchmark_response: FetchBenchmarkResponse, spend: s
             ("Benchmark:", benchmark_response.benchmark_name),
             ("Run ID:", str(benchmark_response.benchmark_id)),
             ("Label:", benchmark_response.label),
+            ("Agent:", arguments.contract.name if arguments else None),
+            ("Model:", (arguments.contract.model or "-") if arguments else None),
+            ("Dataset:", (arguments.dataset or "default") if arguments else None),
+            ("Started by:", metadata.started_by_email if metadata else None),
+            ("Concurrency:", str(arguments.concurrency) if arguments else None),
             (
                 "Regraded:",
                 f"from run {benchmark_response.regraded_from_run_id}"
@@ -192,33 +201,28 @@ async def stream_benchmark_status(
     output_format: Literal["text", "jsonl"] = "text",
     on_interrupt: Callable[[], None] = lambda: None,
 ) -> None:
-    initial = await client.runs.fetch(benchmark_id)
-    jsonl = output_format == "jsonl"
-    if not jsonl and initial.details.status in TERMINAL_STATUSES:
-        spend = describe_run_spend(await fetch_run_metadata(client, benchmark_id)) if show_identity else None
-        format_benchmark_status(initial, spend)
+    if output_format == "jsonl":
+        await _stream_jsonl(client, benchmark_id, on_interrupt)
+        return
+    snapshot = await client.runs.snapshot(benchmark_id) if show_identity else None
+    initial = snapshot.run if snapshot is not None else await client.runs.fetch(benchmark_id)
+    metadata = snapshot.metadata if snapshot is not None else None
+    if initial.details.status in TERMINAL_STATUSES:
+        format_benchmark_status(initial, describe_run_spend(metadata) if show_identity else None, metadata)
         return
 
-    metadata = await fetch_run_metadata(client, benchmark_id) if show_identity or jsonl else None
-    if jsonl:
-        click.echo(format_run_snapshot_json(initial, metadata, event="snapshot"))
-    else:
-        if show_identity:
-            format_run_identity(initial, metadata)
-        click.echo(click.style("Streaming run updates (Ctrl+C to stop)...", fg="cyan"))
-        progress_line, breakdown_line = _progress_lines(initial.details)
-        click.echo(f"{progress_line}\n{breakdown_line}", nl=False)
+    if show_identity:
+        format_run_identity(initial, metadata)
+    click.echo(click.style("Streaming run updates (Ctrl+C to stop)...", fg="cyan"))
+    progress_line, breakdown_line = _progress_lines(initial.details)
+    click.echo(f"{progress_line}\n{breakdown_line}", nl=False)
 
     latest = initial
 
-    def finish(event: RunEvent, message: str | None = None, *, next_steps: bool = True) -> None:
-        if jsonl:
-            click.echo(format_run_snapshot_json(latest, metadata, event=event))
-            return
+    def finish(message: str, *, error: bool = False, next_steps: bool = True) -> None:
         click.echo("\n")
-        if message:
-            click.echo(message)
-        if event == "error":
+        click.echo(message)
+        if error:
             _display_run_error(latest)
         if next_steps:
             echo_next_steps(benchmark_id, outputs=True, s3_url=initial.s3_bucket_url)
@@ -228,27 +232,37 @@ async def stream_benchmark_status(
         async for event in client.runs.events(benchmark_id):
             if event.run is not None:
                 latest = event.run
-                if jsonl:
-                    click.echo(format_run_snapshot_json(latest, metadata, event="update"))
-                else:
-                    progress_line, breakdown_line = _progress_lines(latest.details)
-                    click.echo(f"\033[F\033[K{progress_line}\n\033[K{breakdown_line}", nl=False)
+                progress_line, breakdown_line = _progress_lines(latest.details)
+                click.echo(f"\033[F\033[K{progress_line}\n\033[K{breakdown_line}", nl=False)
             elif event.event == "complete":
                 outcome = _completion_event(latest)
-                finish(outcome, OUTCOME_MESSAGES[outcome])
+                finish(OUTCOME_MESSAGES[outcome], error=outcome == "error")
                 return
             elif event.event == "error":
-                finish("error", OUTCOME_MESSAGES["error"])
+                finish(OUTCOME_MESSAGES["error"], error=True)
                 return
             else:
-                finish("disconnect", disconnected, next_steps=False)
+                finish(disconnected, next_steps=False)
                 return
     except (KeyboardInterrupt, asyncio.CancelledError):
-        finish("interrupted", click.style("Streaming stopped.", fg="yellow"))
+        finish(click.style("Streaming stopped.", fg="yellow"))
         on_interrupt()
         raise
 
-    finish("disconnect", disconnected, next_steps=False)
+    finish(disconnected, next_steps=False)
+    raise click.ClickException("Run stream ended without a terminal event.")
+
+
+async def _stream_jsonl(client: ValkyrieClient, benchmark_id: UUID, on_interrupt: Callable[[], None]) -> None:
+    click.echo((await client.runs.snapshot(benchmark_id)).model_dump_json())
+    try:
+        async for event in client.runs.events(benchmark_id):
+            click.echo(event.model_dump_json())
+            if event.event != "update":
+                return
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        on_interrupt()
+        raise
     raise click.ClickException("Run stream ended without a terminal event.")
 
 

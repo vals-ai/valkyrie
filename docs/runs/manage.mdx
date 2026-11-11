@@ -3,9 +3,10 @@ title: "Manage a run"
 description: "Change a run's concurrency, stop it, shed load, and rerun stopped or failed tasks."
 ---
 
-Change a run while it goes, stop it, and rerun the tasks that didn't finish. Every command
-is in the [`valkyrie run` reference](/reference/cli/run). To do the same from Python, see
-[Manage runs with Python](/sdk/runs).
+Change a run while it goes, stop it, and rerun the tasks that didn't finish.
+
+- Every command is in the [`valkyrie run` reference](/reference/cli/run).
+- To do the same from Python, see [Manage runs with Python](/sdk/runs).
 
 In the commands on this page, replace *`RUN_ID`* with the run's ID, which
 `valkyrie run start` prints.
@@ -16,8 +17,10 @@ In the commands on this page, replace *`RUN_ID`* with the run's ID, which
 valkyrie run update RUN_ID --concurrency 20
 ```
 
-Raising the limit starts more tasks. Lowering it lets running tasks finish and holds back
-new ones until the run is under the limit. Only a run in progress can be updated.
+- Raising the limit starts more tasks.
+- Lowering it lets running tasks finish and holds back new ones until the run is under the
+  limit.
+- Only a run in progress can be updated.
 
 ## Stop a run
 
@@ -25,9 +28,12 @@ new ones until the run is under the limit. Only a run in progress can be updated
 valkyrie run stop RUN_ID
 ```
 
-The Valkyrie CLI asks you to confirm. Tasks that haven't started, and tasks being set up
-or graded, stop. Agents that are already running finish their task. The run shows
-`STOPPING` until they do, then `STOPPED`, or `FINISHED` if no task was stopped.
+The Valkyrie CLI asks you to confirm.
+
+- Tasks that haven't started, and tasks being set up or graded, stop.
+- Agents that are already running finish their task.
+- The run shows `STOPPING` until they do, then `STOPPED`, or `FINISHED` if no task was
+  stopped.
 
 To stop only some tasks and let the rest of the run go on, name them:
 
@@ -58,10 +64,11 @@ the new limit:
 valkyrie run shed RUN_ID --concurrency 10
 ```
 
-The CLI lists the tasks to stop and asks you to confirm; `--dry-run` only lists
-them. The new limit must be lower than the current one. Tasks being graded count toward
-the limit but are never stopped. After the rate limits clear, rerun the stopped tasks with
-`valkyrie run retry`. They start over.
+- The CLI lists the tasks to stop and asks you to confirm. `--dry-run` only lists them.
+- The new limit must be lower than the current one.
+- Tasks being graded count toward the limit but are never stopped.
+- After the rate limits clear, rerun the stopped tasks with `valkyrie run retry`. They start
+  over.
 
 ## Resume or retry
 

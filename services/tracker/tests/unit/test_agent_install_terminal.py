@@ -14,7 +14,7 @@ import pytest
 from benchmark_service.sandbox import SandboxCommandError
 
 from tracker import sandbox as sandbox_module
-from tracker.database.models import AgentContractRequest
+from tracker.types import AgentContractRequest
 from tracker.exceptions import AgentRunFailedError, SandboxError
 from tracker.sandbox import DependencySetupMode, install_agent_dependencies
 

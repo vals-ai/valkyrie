@@ -11,7 +11,7 @@ from sqlmodel import Session
 
 from tracker._lambda import invoke_lambda
 from tracker.aws.clients import AWSClientProvider
-from tracker.database.models import DocentReadingStatus
+from tracker.domain import DocentReadingStatus
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.database.session import engine
 

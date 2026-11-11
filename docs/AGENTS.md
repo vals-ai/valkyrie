@@ -1,9 +1,12 @@
 # Documentation rules
 
-These rules are binding for every page in this directory. The updating-docs skill
-(`.agents/updating-docs/SKILL.md`) has the procedures: checking facts against the code, the
-generated reference, redirects, and the checks to run. For style these rules don't settle,
-follow the [Google developer documentation style guide](https://developers.google.com/style).
+These rules are binding for every page in this directory, on top of the Markdown rules in the
+root [AGENTS.md](../AGENTS.md#writing-markdown) that every file follows.
+
+- The updating-docs skill (`.agents/updating-docs/SKILL.md`) has the procedures: checking facts
+  against the code, the generated reference, redirects, and the checks to run.
+- For style these rules don't settle, follow the
+  [Google developer documentation style guide](https://developers.google.com/style).
 
 The site is public, and so is every file the public repository sync copies. Write for
 people outside Vals AI.
@@ -25,10 +28,10 @@ and doesn't mix in another: a tutorial, a how-to guide, reference, or an explana
 | Self-hosting | People running their own Tracker | How-to guides, and settings reference |
 
 - **Tutorial:** one path from nothing to a working result, with no choices. The quickstart
-  is the only tutorial. Alternatives go in a guide.
+  is the only tutorial, and alternatives go in a guide.
 - **How-to guide:** open with what the reader can do. Order sections as tasks, then this
   page's own reference tables, then a closing Limits list when something isn't supported.
-  Say how the reader knows a task worked when it isn't obvious.
+- **Checking a task:** say how the reader knows a task worked when it isn't obvious.
 - **Reference:** complete and terse, ordered for lookup. The CLI and SDK reference is
   generated; never edit it by hand.
 - **Explanation:** behavior and trade-offs that change a decision. Link to the guides that
@@ -40,20 +43,20 @@ Ask of every sentence: would this reader do or decide anything differently after
 it? If not, cut it.
 
 - **How it works inside:** locks, leases, transactions, queues, admission turns, payload
-  encryption, retry mechanics, token minting, and class, function, module, table, column,
-  and internal service names. Say what the reader sees. When a behavior changes a decision,
-  say so in one sentence.
+  encryption, retry mechanics, token minting, and internal names of any kind.
+  - Internal names include classes, functions, modules, tables, columns, and services.
+  - Say what the reader sees. When a behavior changes a decision, say so in one sentence.
 - **Vals AI operations:** deployment stages, Descope project setup, tenant roles, bucket
-  tagging, release and rollout procedures, incident handling, internal hostnames, private
-  repositories, credentials, and configuration only Vals AI can use. These go in
-  `internal/`, which the public sync never copies. Document the path an outside reader can
-  follow instead.
+  tagging, release and rollout procedures, incident handling, and internal hostnames.
+  - The same goes for private repositories, credentials, and configuration only Vals AI can use.
+  - These go in `internal/`, which the public sync never copies. Document the path an outside
+    reader can follow instead.
 - **Another reader's details:** no HTTP routes or headers on CLI pages, and no Tracker
   environment variables outside Self-hosting. Link to the page for that reader.
 - **Why it was built this way:** design history, alternatives, tests, CI, evidence, and
   hedges such as "this does not prove". These belong in the pull request.
 - **Contributor chores:** setup, tests, migrations, regenerating files, and docs tooling go
-  in `DEVELOPMENT.md`, the service READMEs and `docs/README.md`, outside site navigation.
+  in `CONTRIBUTING.md`, the service READMEs and `docs/README.md`, outside site navigation.
   Those files are commands plus a few short bullets.
 - **Plans and unshipped work:** describe shipped behavior only, without "now", "currently",
   or "no longer". Never document a feature that no deployment turns on.
@@ -68,12 +71,13 @@ it? If not, cut it.
   longer than about four words.
 - Use headings and numbered lists rather than Steps, Tabs, or Accordion. Keep callouts rare:
   a Warning for what can't be undone, a Note for a requirement that is easy to miss.
-- Hard-wrap prose at about 90 columns. Keep code lines within 88 characters: break long
-  commands with `\` and format Python as a formatter would. Code blocks scroll rather than
-  wrap; add Mintlify's `wrap` option only to prose-like output. Give every code fence a
-  language. Put runnable
-  commands in code blocks, not inline in prose. In a block, put each comment on its own line
-  above its command, and leave a blank line between commands.
+- Hard-wrap prose at about 90 columns.
+- Keep code lines within 88 characters: break long commands with `\` and format Python as a
+  formatter would.
+- Code blocks scroll rather than wrap. Add Mintlify's `wrap` option only to prose-like output.
+- Give every code fence a language, and put runnable commands in code blocks, not inline in prose.
+- In a block, put each comment on its own line above its command, and leave a blank line
+  between commands.
 - Show real commands and values. Use placeholders only for the reader's own values, written
   in uppercase like `RUN_ID` and explained on first use: after a code block with
   "Replace *`RUN_ID`* with ...", and inside a sentence with "where *`RUN_ID`* is ...".

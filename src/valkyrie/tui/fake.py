@@ -203,12 +203,11 @@ class FakeSource:
         ]
 
     async def dataset_tasks(self, benchmark: str, dataset: str) -> list[DatasetTaskResponse]:
-        now = self._clock()
         return [
-            DatasetTaskResponse(task_id=task_id, size=size, last_modified=now - age)
-            for task_id, size, age in (
-                (f"{dataset}-{number:03}", 4096 * number + 512, timedelta(hours=number)) for number in range(1, 6)
+            DatasetTaskResponse(
+                task_id=f"{dataset}-{number:03}", digest=f"sha256:{number:064x}", size=4096 * number + 512
             )
+            for number in range(1, 6)
         ]
 
     async def watch_run(self, run_id: UUID) -> AsyncIterator[FetchBenchmarkResponse]:

@@ -1,18 +1,18 @@
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Annotated, cast
+from typing import Annotated, Any, TypeVar, cast
 from uuid import UUID
 
 from benchmark_service import SandboxCapacity, SandboxReservationDemand
 from fastapi import Depends
-from sqlalchemy import JSON, and_, case, or_, text, tuple_, type_coerce
+from sqlalchemy import JSON, Subquery, and_, case, or_, text, tuple_, type_coerce
 from sqlalchemy import select as sa_select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, col, delete, func, select, update
-from sqlmodel.sql.expression import Select
+from sqlmodel.sql.expression import Select, SelectOfScalar
 
 from tracker.database.models import (
     Benchmark,
@@ -39,33 +39,26 @@ from tracker.scheduler.store import (
     queue_pool_lock_id,
 )
 
+_Statement = TypeVar("_Statement", Select[Any], SelectOfScalar[Any])
+_ADMISSION_SCAN_CHUNK = 256
 _ACTIVE_STATUSES = (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 
 _ARGUMENTS = type_coerce(col(Benchmark.arguments), JSON)
 _IS_QUEUED = _ARGUMENTS["queue_pool_id"].as_string().is_not(None)
 
 
-def _active_task_count():
+def _open_runs(pool_id: str):
+    concurrency = _ARGUMENTS["concurrency"].as_integer()
     active_task = aliased(Task)
+    active = func.count(col(active_task.id))
     return (
-        select(func.count(col(active_task.id)))
-        .where(col(active_task.benchmark) == col(Benchmark.id))
-        .where(col(active_task.status).in_(_ACTIVE_STATUSES))
-        .correlate(Benchmark)
-        .scalar_subquery()
-    )
-
-
-def _eligible_tasks(pool_id: str):
-    arguments = type_coerce(col(Benchmark.arguments), JSON)
-    concurrency = arguments["concurrency"].as_integer()
-    return (
-        select(col(Task.id))
-        .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .where(col(Task.status) == TaskStatus.PENDING)
+        select(col(Benchmark.id).label("benchmark_id"), (concurrency - active).label("slots"))
+        .outerjoin(
+            active_task,
+            and_(col(active_task.benchmark) == col(Benchmark.id), col(active_task.status).in_(_ACTIVE_STATUSES)),
+        )
         .where(col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS)
-        .where(arguments["queue_pool_id"].as_string() == pool_id)
-        .where(_active_task_count() < concurrency)
+        .where(_ARGUMENTS["queue_pool_id"].as_string() == pool_id)
         .where(
             col(Benchmark.id).in_(
                 select(col(ExecutorDispatch.benchmark_id)).where(
@@ -73,8 +66,23 @@ def _eligible_tasks(pool_id: str):
                 )
             )
         )
+        .group_by(col(Benchmark.id))
+        .having(active < concurrency)
+        .subquery()
+    )
+
+
+def _pending_tasks(statement: _Statement, open_runs: Subquery) -> _Statement:
+    return (
+        statement.join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
+        .join(open_runs, open_runs.c.benchmark_id == col(Benchmark.id))
+        .where(col(Task.status) == TaskStatus.PENDING)
         .where(~_blocking_reservation_exists())
     )
+
+
+def _eligible_tasks(pool_id: str):
+    return _pending_tasks(select(col(Task.id)), _open_runs(pool_id))
 
 
 def _blocking_reservation_exists():
@@ -88,6 +96,14 @@ def _blocking_reservation_exists():
         .correlate(Task)
         .exists()
     )
+
+
+def _admissible_ids(pool_id: str, limit: int | None):
+    eligible = _eligible_tasks(pool_id)
+    if limit is None:
+        return eligible
+    priority = type_coerce(col(Benchmark.arguments), JSON)["priority"].as_integer()
+    return eligible.order_by(priority, col(Task.started_at), col(Task.id)).limit(limit)
 
 
 def _current_candidate_attempt():
@@ -113,6 +129,50 @@ class PoolProviderReference:
 class SchedulerRepository:
     def __init__(self, session: Session = Depends(get_session)) -> None:
         self._session = session
+
+    def eligible_task_ids(self, pool_id: str, task_row_ids: Sequence[UUID]) -> set[UUID]:
+        return set(self._session.exec(_eligible_tasks(pool_id).where(col(Task.id).in_(task_row_ids))).all())
+
+    def eligible_task_is(
+        self, pool_id: str, task_row_id: UUID, expected_started_at: datetime, limit: int | None
+    ) -> bool:
+        return (
+            self._session.exec(
+                select(col(Task.id))
+                .where(col(Task.id) == task_row_id)
+                .where(col(Task.started_at) == expected_started_at)
+                .where(col(Task.id).in_(_admissible_ids(pool_id, limit)))
+            ).first()
+            is not None
+        )
+
+    def claim_eligible_task(self, pool_id: str, task_row_id: UUID, expected_started_at: datetime) -> bool:
+        result = self._session.exec(
+            update(Task)
+            .where(col(Task.id) == task_row_id)
+            .where(col(Task.started_at) == expected_started_at)
+            .where(col(Task.id).in_(_admissible_ids(pool_id, 1)))
+            .values(status=TaskStatus.BUILDING)
+        )
+        return result.rowcount == 1
+
+    def reserved_builds(self, pool_id: str) -> dict[UUID, SandboxReservationDemand]:
+        rows = self._session.exec(
+            select(SandboxBuildReservation)
+            .where(col(SandboxBuildReservation.pool_id) == queue_pool_lock_id(pool_id))
+            .where(col(SandboxBuildReservation.released_at).is_(None))
+        ).all()
+        return {
+            row.task_row_id: SandboxReservationDemand(
+                target_id=row.target_id,
+                sandbox_class=row.sandbox_class,
+                vcpu=row.requested_vcpu,
+                memory=row.requested_memory,
+                disk=row.requested_disk,
+                gpu=row.requested_gpu,
+            )
+            for row in rows
+        }
 
     def waiting_rows(
         self,
@@ -268,6 +328,39 @@ class SchedulerRepository:
             .where(Task.benchmark == benchmark_id)
             .where(Task.org_id == org_id)
         ).all()
+
+    def candidate_state(
+        self, task_row_id: UUID, expected_started_at: datetime, dispatch_id: UUID
+    ) -> tuple[TaskStatus | None, datetime | None]:
+        row = self._session.exec(
+            select(Task.status, SandboxAdmissionCandidate.readiness_requested_at)
+            .outerjoin(
+                SandboxAdmissionCandidate,
+                (col(SandboxAdmissionCandidate.task_row_id) == col(Task.id))
+                & (col(SandboxAdmissionCandidate.attempt_started_at) == col(Task.started_at))
+                & (col(SandboxAdmissionCandidate.executor_dispatch_id) == dispatch_id),
+            )
+            .where(col(Task.id) == task_row_id, col(Task.started_at) == expected_started_at)
+        ).first()
+        return (row[0], row[1]) if row is not None else (None, None)
+
+    def readiness_requests(
+        self, attempts: Collection[tuple[UUID, datetime]], dispatch_id: UUID
+    ) -> dict[tuple[UUID, datetime], datetime | None]:
+        rows = self._session.exec(
+            select(
+                SandboxAdmissionCandidate.task_row_id,
+                SandboxAdmissionCandidate.attempt_started_at,
+                SandboxAdmissionCandidate.readiness_requested_at,
+            )
+            .where(
+                tuple_(
+                    col(SandboxAdmissionCandidate.task_row_id), col(SandboxAdmissionCandidate.attempt_started_at)
+                ).in_(list(attempts))
+            )
+            .where(col(SandboxAdmissionCandidate.executor_dispatch_id) == dispatch_id)
+        ).all()
+        return {(row_id, started_at): requested_at for row_id, started_at, requested_at in rows}
 
     def reserved_task_row_ids(self, task_row_ids: Collection[UUID]) -> set[UUID]:
         return set(
@@ -426,11 +519,11 @@ class SchedulerRepository:
     ) -> Iterator[SandboxAdmissionCandidate]:
         arguments = type_coerce(col(Benchmark.arguments), JSON)
         priority = arguments["priority"].as_integer()
+        open_runs = _open_runs(pool_id)
         candidates = self._session.exec(
-            select(
-                Task, SandboxAdmissionCandidate, priority, arguments["concurrency"].as_integer() - _active_task_count()
+            _pending_tasks(
+                select(col(Task.benchmark), SandboxAdmissionCandidate, priority, open_runs.c.slots), open_runs
             )
-            .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
             .outerjoin(
                 SandboxAdmissionCandidate,
                 and_(
@@ -440,21 +533,20 @@ class SchedulerRepository:
                     _current_candidate_attempt().correlate(SandboxAdmissionCandidate).exists(),
                 ),
             )
-            .where(col(Task.id).in_(_eligible_tasks(pool_id).correlate(None)))
             .order_by(priority, col(Task.started_at), col(Task.id))
+            .execution_options(yield_per=_ADMISSION_SCAN_CHUNK)
         )
         charged = {key: ActiveReservations(count=0, vcpu=0, memory=0, disk=0, gpu=0) for key in capacities}
         charged.update(self.charged_reservations_by_domain(pool_id, capacity_read_at))
         slots: dict[UUID, int] = {}
         selected = 0
         unknown_priority: int | None = None
-        for task, joined_candidate, rank, available_slots in candidates:
+        for benchmark_id, joined_candidate, rank, available_slots in candidates:
             if limit is not None and selected >= limit:
                 return
             if unknown_priority is not None and rank > unknown_priority:
                 return
             candidate = cast(SandboxAdmissionCandidate | None, joined_candidate)
-            benchmark_id = task.benchmark
             if benchmark_id not in slots:
                 slots[benchmark_id] = available_slots
             if slots[benchmark_id] <= 0:
@@ -639,7 +731,15 @@ class SchedulerRepository:
             (col(SandboxBuildReservation.reserved_at) <= now - GRANT_ACCEPTANCE_TIMEOUT) | ~live_owner,
         )
         candidates = self._session.exec(select(col(SandboxBuildReservation.task_row_id)).where(revocable)).all()
-        locked = self.try_task_build_transaction_locks(candidates)
+        claimed = self.try_task_build_transaction_locks(candidates)
+        if not claimed:
+            return
+        locked = self._session.exec(
+            select(col(Task.id))
+            .where(col(Task.id).in_(claimed))
+            .order_by(col(Task.id))
+            .with_for_update(skip_locked=True)
+        ).all()
         if not locked:
             return
 
@@ -745,12 +845,38 @@ class SchedulerRepository:
             .where(col(SandboxBuildReservation.released_at) < released_before)
         )
 
+    def handoff_dispatch_phases(self, dispatch_id: UUID) -> None:
+        self._session.exec(
+            update(SandboxBuildReservation)
+            .where(col(SandboxBuildReservation.phase_dispatch_id) == dispatch_id)
+            .where(col(SandboxBuildReservation.accepted_at).is_not(None))
+            .where(col(SandboxBuildReservation.released_at).is_(None))
+            .values(phase_dispatch_id=None, phase_token=None)
+        )
+
+    def pending_owned_ecs_task_arns(self, pool_id: str) -> dict[UUID, str]:
+        rows = self._session.exec(
+            select(col(ExecutorDispatch.id), col(ExecutorDispatch.ecs_task_arn))
+            .join(
+                SandboxBuildReservation,
+                col(SandboxBuildReservation.phase_dispatch_id) == col(ExecutorDispatch.id),
+            )
+            .where(col(SandboxBuildReservation.pool_id) == queue_pool_lock_id(pool_id))
+            .where(col(SandboxBuildReservation.accepted_at).is_not(None))
+            .where(col(SandboxBuildReservation.released_at).is_(None))
+            .where(col(ExecutorDispatch.status) != ExecutorDispatchStatus.RUNNING)
+            .where(col(ExecutorDispatch.ecs_task_arn).is_not(None))
+            .distinct()
+        ).all()
+        return {dispatch_id: cast(str, task_arn) for dispatch_id, task_arn in rows}
+
     def lock_abandoned_reservations(self, pool_id: str) -> list[SandboxBuildReservation]:
         candidates = self._session.exec(
             select(SandboxBuildReservation.task_row_id)
             .where(col(SandboxBuildReservation.pool_id) == queue_pool_lock_id(pool_id))
             .where(col(SandboxBuildReservation.released_at).is_(None))
             .where(col(SandboxBuildReservation.accepted_at).is_not(None))
+            .where(col(SandboxBuildReservation.phase_dispatch_id).is_(None))
         ).all()
         abandoned = self.try_task_build_transaction_locks(candidates)
         if not abandoned:
@@ -762,8 +888,33 @@ class SchedulerRepository:
                 .where(col(SandboxBuildReservation.task_row_id).in_(abandoned))
                 .where(col(SandboxBuildReservation.released_at).is_(None))
                 .where(col(SandboxBuildReservation.accepted_at).is_not(None))
+                .where(col(SandboxBuildReservation.phase_dispatch_id).is_(None))
             ).all()
         )
+
+    def abandoned_reservation(
+        self,
+        pool_id: str,
+        task_row_id: UUID,
+        expected_started_at: datetime,
+        dispatch_id: UUID,
+        reserved_at: datetime,
+        phase_dispatch_id: UUID | None,
+        phase_token: UUID | None,
+    ) -> SandboxBuildReservation | None:
+        return self._session.exec(
+            select(SandboxBuildReservation)
+            .where(col(SandboxBuildReservation.pool_id) == queue_pool_lock_id(pool_id))
+            .where(col(SandboxBuildReservation.task_row_id) == task_row_id)
+            .where(col(SandboxBuildReservation.attempt_started_at) == expected_started_at)
+            .where(col(SandboxBuildReservation.executor_dispatch_id) == dispatch_id)
+            .where(col(SandboxBuildReservation.reserved_at) == reserved_at)
+            .where(col(SandboxBuildReservation.phase_dispatch_id) == phase_dispatch_id)
+            .where(col(SandboxBuildReservation.phase_token) == phase_token)
+            .where(col(SandboxBuildReservation.accepted_at).is_not(None))
+            .where(col(SandboxBuildReservation.released_at).is_(None))
+            .where(col(SandboxBuildReservation.phase_dispatch_id).is_(None))
+        ).one_or_none()
 
     def try_task_build_transaction_locks(self, task_row_ids: Sequence[UUID]) -> set[UUID]:
         if not task_row_ids:
@@ -783,15 +934,16 @@ class SchedulerRepository:
             col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
             arguments["queue_pool_id"].as_string() == pool_id,
         )
-        unaccepted_grants = select(col(SandboxBuildReservation.task_row_id)).where(
+        unhanded_reservations = select(col(SandboxBuildReservation.task_row_id)).where(
             col(SandboxBuildReservation.released_at).is_(None),
-            col(SandboxBuildReservation.accepted_at).is_(None),
+            col(SandboxBuildReservation.accepted_at).is_(None)
+            | col(SandboxBuildReservation.phase_dispatch_id).is_not(None),
         )
         building = (
             select(col(Task.id))
             .where(col(Task.status) == TaskStatus.BUILDING)
             .where(col(Task.benchmark).in_(queued_benchmarks))
-            .where(col(Task.id).not_in(unaccepted_grants))
+            .where(col(Task.id).not_in(unhanded_reservations))
         )
         abandoned = self.try_task_build_transaction_locks(self._session.exec(building).all())
         if not abandoned:
@@ -802,6 +954,7 @@ class SchedulerRepository:
             .where(col(Task.id).in_(abandoned))
             .where(col(Task.status) == TaskStatus.BUILDING)
             .where(col(Task.benchmark).in_(queued_benchmarks))
+            .where(col(Task.id).not_in(unhanded_reservations))
             .values(
                 status=TaskStatus.PENDING,
                 started_at=case(

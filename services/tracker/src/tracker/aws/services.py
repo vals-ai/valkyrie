@@ -11,13 +11,12 @@ from tracker.aws.cloudwatch_logs import (
 )
 from tracker.aws.resolver import deployment_aws_runtime
 from tracker.aws.runtime import AWSResources, AWSRuntime
-from tracker.database.models import Org
 from tracker.aws.s3 import S3ArtifactLocations, S3ObjectStore
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import TrackerServiceError
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.secrets import resolve_secrets
-from tracker.types import FinalViewResponse, StartBenchmarkRequest
+from tracker.types import FinalViewResponse, OrgContext, StartBenchmarkRequest
 
 
 _COMPLETION_CALLBACK_CONFIG = Config(read_timeout=60, retries={"total_max_attempts": 1})
@@ -80,7 +79,7 @@ class CloudRuntimeFactory:
     async def create_execution_runtime(
         cls,
         request: StartBenchmarkRequest,
-        org: Org,
+        org: OrgContext,
         benchmark_id: UUID,
         *,
         properties: AWSResources | None = None,

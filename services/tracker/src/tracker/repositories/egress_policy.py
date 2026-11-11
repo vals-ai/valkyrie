@@ -29,6 +29,17 @@ class EgressPolicyRepository:
     def revoke(self, key_id: str) -> None:
         self._session.exec(delete(EgressProxyPolicy).where(col(EgressProxyPolicy.key_id) == key_id))
 
+    def revoke_owned(self, benchmark_id: UUID, task_row_id: UUID, key_id: str) -> None:
+        task_owner = (
+            select(col(Task.id)).where(col(Task.id) == task_row_id, col(Task.benchmark) == benchmark_id).exists()
+        )
+        self._session.exec(
+            delete(EgressProxyPolicy)
+            .where(col(EgressProxyPolicy.benchmark_id) == benchmark_id)
+            .where(col(EgressProxyPolicy.key_id) == key_id)
+            .where(task_owner)
+        )
+
     def revoke_finished(self) -> int:
         finished_runs = select(col(Benchmark.id)).where(col(Benchmark.status).in_(FINISHED_BENCHMARK_STATUSES))
         result = self._session.exec(

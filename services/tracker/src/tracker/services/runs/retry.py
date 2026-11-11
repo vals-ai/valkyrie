@@ -133,6 +133,11 @@ def reset_to_in_progress_status(
         existing_rows, new_task_ids = _retry_candidates(
             benchmark_row, session, retry, rerun_task_ids, org, for_update=True
         )
+        if existing_rows or new_task_ids or benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
+            benchmark_row.publication_phase_dispatch_id = None
+            benchmark_row.publication_phase_token = None
+            benchmark_row.publication_phase_fingerprint = None
+            benchmark_row.publication_status = None
 
         if not existing_rows and not new_task_ids:
             if benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
@@ -166,6 +171,10 @@ def reset_to_in_progress_status(
                 retry_started_at = task.started_at + timedelta(microseconds=1)
             task.started_at = retry_started_at
             task.finished_at = None
+            task.build_phase_dispatch_id = None
+            task.build_phase_token = None
+            task.evaluation_phase_dispatch_id = None
+            task.evaluation_phase_token = None
             if retry_mode == RetryMode.FROM_SCRATCH:
                 task.eval_resume_state = None
             repository.save(task)

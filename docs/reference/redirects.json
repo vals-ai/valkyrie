@@ -128,6 +128,10 @@
     "destination": "/reference/cli/run#results"
   },
   {
+    "source": "/reference/cli/run/rescore",
+    "destination": "/reference/cli/run#rescore"
+  },
+  {
     "source": "/reference/cli/run/regrade",
     "destination": "/reference/cli/run#regrade"
   },
@@ -352,6 +356,10 @@
     "destination": "/reference/sdk/runs#metadata"
   },
   {
+    "source": "/reference/sdk/runs/snapshot",
+    "destination": "/reference/sdk/runs#snapshot"
+  },
+  {
     "source": "/reference/sdk/runs/results_exist",
     "destination": "/reference/sdk/runs#results-exist"
   },
@@ -378,6 +386,10 @@
   {
     "source": "/reference/sdk/runs/shed",
     "destination": "/reference/sdk/runs#shed"
+  },
+  {
+    "source": "/reference/sdk/runs/rescore",
+    "destination": "/reference/sdk/runs#rescore"
   },
   {
     "source": "/reference/sdk/runs/stop",
@@ -508,28 +520,44 @@
     "destination": "/reference/sdk/datasets#restore"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/put",
-    "destination": "/reference/sdk/datasets-tasks#put"
+    "source": "/reference/sdk/datasets/push",
+    "destination": "/reference/sdk/datasets#push"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/list",
-    "destination": "/reference/sdk/datasets-tasks#list"
+    "source": "/reference/sdk/datasets/install",
+    "destination": "/reference/sdk/datasets#install"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/list_all",
-    "destination": "/reference/sdk/datasets-tasks#list-all"
+    "source": "/reference/sdk/datasets/start_run",
+    "destination": "/reference/sdk/datasets#start-run"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/get",
-    "destination": "/reference/sdk/datasets-tasks#get"
+    "source": "/reference/sdk/datasets-versions/list",
+    "destination": "/reference/sdk/datasets-versions#list"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/download",
-    "destination": "/reference/sdk/datasets-tasks#download"
+    "source": "/reference/sdk/datasets-versions/get",
+    "destination": "/reference/sdk/datasets-versions#get"
   },
   {
-    "source": "/reference/sdk/datasets-tasks/remove",
-    "destination": "/reference/sdk/datasets-tasks#remove"
+    "source": "/reference/sdk/datasets-versions/tasks",
+    "destination": "/reference/sdk/datasets-versions#tasks"
+  },
+  {
+    "source": "/reference/sdk/datasets-versions/get_task",
+    "destination": "/reference/sdk/datasets-versions#get-task"
+  },
+  {
+    "source": "/reference/sdk/datasets-versions/tag",
+    "destination": "/reference/sdk/datasets-versions#tag"
+  },
+  {
+    "source": "/reference/sdk/datasets-versions/untag",
+    "destination": "/reference/sdk/datasets-versions#untag"
+  },
+  {
+    "source": "/reference/sdk/datasets-versions/download",
+    "destination": "/reference/sdk/datasets-versions#download"
   },
   {
     "source": "/reference/sdk/logs/page_task",
@@ -834,6 +862,10 @@
   {
     "source": "/reference/sdk/models/runs/retry-or-resume-benchmark-response",
     "destination": "/reference/sdk/models/runs#retry-or-resume-benchmark-response"
+  },
+  {
+    "source": "/reference/sdk/models/runs/run-snapshot",
+    "destination": "/reference/sdk/models/runs#run-snapshot"
   },
   {
     "source": "/reference/sdk/models/runs/run-stream-event",

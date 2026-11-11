@@ -6,7 +6,8 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from tests.factories import make_benchmark
-from tracker.database.models import BenchmarkStatus, ExecutorRelease
+from tracker.database.models import ExecutorRelease
+from tracker.domain import BenchmarkStatus
 
 
 @pytest.mark.description("Bulk benchmark status responses, scoping, and authentication.")
@@ -22,7 +23,7 @@ class TestBenchmarksStatus:
     def test_status_returns_requested_ids(self, client: TestClient, database_session: Session) -> None:
         release = ExecutorRelease(
             id="status-release",
-            artifact_uri="s3://artifacts/status.pex",
+            artifact_uri="source:///status-release",
             artifact_digest="a" * 64,
             protocol_version="1",
         )

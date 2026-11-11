@@ -5,7 +5,7 @@ import pytest
 
 from valkyrie.sdk.models import FinalViewResponse, SingleTaskResponse, TasksResponse
 
-from valkyrie.cli.run.errors import format_run_errors_json, format_run_errors_text
+from valkyrie.cli.run.errors import format_run_errors_text
 
 
 @pytest.mark.description("Fixture was emitted by the SQLite producer/API test, not hand-built SDK data.")
@@ -27,7 +27,7 @@ def test_stored_failure_crosses_sdk_and_cli(
     assert task.error_message is not None
     assert results.task_failure_categories[task.task_id] == task.failure_category
     assert results.task_errors[task.task_id] == task.error_message
-    payload = json.loads(format_run_errors_json(results))
+    payload = json.loads(results.model_dump_json())
     assert payload["task_failure_categories"] == {task.task_id: category}
     assert payload["task_errors"] == {task.task_id: task.error_message}
     format_run_errors_text(results)

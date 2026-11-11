@@ -14,9 +14,11 @@ valkyrie login
 ```
 
 Your browser opens to sign in with your Google account. On a machine without a browser,
-add `--no-browser` and open the printed link yourself. The login is saved for this Tracker
-under `~/.config/valkyrie/sessions`, readable only by you, and refreshes itself. When it
-can't, the CLI tells you to run `valkyrie login` again.
+add `--no-browser` and open the printed link yourself.
+
+- The login is saved for this Tracker under `~/.config/valkyrie/sessions`, readable only by
+  you, and refreshes itself.
+- When it can't refresh, the CLI tells you to run `valkyrie login` again.
 
 ```bash
 # Show the Tracker, organization, and account your requests use
@@ -75,9 +77,9 @@ in, create one:
 valkyrie token create github-actions --expires-in-days 30
 ```
 
-The key is printed once, on standard output, and its ID and expiry on standard error. Set
-the key as `VALKYRIE_API_KEY` where the job runs. Keys last from 1 to 90 days, 30 by
-default.
+- The key is printed once, on standard output, and its ID and expiry on standard error.
+- Set the key as `VALKYRIE_API_KEY` where the job runs.
+- Keys last from 1 to 90 days, 30 by default.
 
 There is no command to list keys, so keep the key ID. Revoke a key with:
 
@@ -107,10 +109,11 @@ with `VALKYRIE_URL`:
 VALKYRIE_URL=https://tracker.example.com valkyrie login
 ```
 
-Later commands use the Tracker you last signed in to. Logins are saved per Tracker, so you
-can stay signed in to several and pick one for a single command with `VALKYRIE_URL`.
-`valkyrie logout` forgets the current Tracker's login, and commands go back to the hosted
-Tracker.
+- Later commands use the Tracker you last signed in to.
+- Logins are saved per Tracker, so you can stay signed in to several and pick one for a
+  single command with `VALKYRIE_URL`.
+- `valkyrie logout` forgets the current Tracker's login, and commands go back to the hosted
+  Tracker.
 
 Requests go to the first Tracker set by:
 

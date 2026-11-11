@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from tracker.database.models import AgentContractRequest
+from tracker.types import AgentContractRequest
 from tracker.egress import EgressPolicy, combine_run_egress_policies
 
 

@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from tracker.database.models import FailurePhase
+    from tracker.domain import FailurePhase
 
 
 class TrackerServiceError(Exception):
@@ -53,6 +53,10 @@ class SandboxError(TrackerServiceError):
         return "Sandbox error: " + super().__str__()
 
 
+class SandboxImageBuildError(SandboxError):
+    transient = False
+
+
 class InvalidSandboxConfigurationError(SandboxError):
     transient = False
 
@@ -86,10 +90,6 @@ class ControlledGenerationTerminationUnconfirmedError(ControlledGenerationError)
 
 class GenerationTerminationUnconfirmedError(ControlledGenerationTerminationUnconfirmedError):
     pass
-
-
-class GenerationContainmentUnavailableError(SandboxError):
-    transient = True
 
 
 class SandboxDNSResolutionError(SandboxError):
@@ -161,6 +161,21 @@ class BenchmarkHasDatasetsError(TrackerServiceError):
 class ResourceArchivedError(TrackerServiceError):
     def __init__(self, kind: str, name: str) -> None:
         super().__init__(f"{kind} '{name}' is archived; restore it first")
+
+
+class ManifestMismatchError(TrackerServiceError): ...
+
+
+class TagExistsError(TrackerServiceError):
+    def __init__(self, tag: str) -> None:
+        super().__init__(
+            f"Tag '{tag}' already points at another version. Move it with `valkyrie dataset tag --force`, or publish under a new tag"
+        )
+
+
+class AmbiguousDigestError(TrackerServiceError):
+    def __init__(self, prefix: str) -> None:
+        super().__init__(f"The digest prefix '{prefix}' matches more than one version")
 
 
 class DatasetNameTakenError(TrackerServiceError):

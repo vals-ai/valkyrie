@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from typing import Generic, TypeVar
 
 import click
 from pydantic import BaseModel
@@ -8,12 +9,15 @@ from valkyrie.cli.display import format_table, local_time, one_line
 from valkyrie.display import terminal_safe
 
 
-class _Validated(click.types.StringParamType):
-    def __init__(self, validate: Callable[[str], str]) -> None:
+T = TypeVar("T")
+
+
+class _Validated(click.types.StringParamType, Generic[T]):
+    def __init__(self, validate: Callable[[str], T]) -> None:
         super().__init__()
         self._validate = validate
 
-    def convert(self, value: object, param: click.Parameter | None, ctx: click.Context | None) -> str:
+    def convert(self, value: object, param: click.Parameter | None, ctx: click.Context | None) -> T:
         text = super().convert(value, param, ctx).strip()
         try:
             return self._validate(text)
@@ -21,10 +25,33 @@ class _Validated(click.types.StringParamType):
             self.fail(str(error), param, ctx)
 
 
+def validate_dataset_reference(reference: str) -> str:
+    benchmark, separator, dataset = reference.partition("/")
+    if not separator:
+        raise ValueError("must be BENCHMARK/DATASET, such as swe-bench/verified")
+    for label, name in (("benchmark", benchmark), ("dataset", dataset)):
+        try:
+            validate_name(name)
+        except ValueError as error:
+            raise ValueError(f"the {label} {error}") from error
+    return reference
+
+
+def validate_versioned_dataset_reference(reference: str) -> tuple[str, str, str]:
+    dataset, separator, version = reference.partition("@")
+    validate_dataset_reference(dataset)
+    if separator and not version:
+        raise ValueError("write a version after @, such as swe-bench/verified@2")
+    benchmark, _, name = dataset.partition("/")
+    return benchmark, name, version or "latest"
+
+
 INCLUDE_ARCHIVED = click.option(
     "--include-archived", is_flag=True, help="Also list archived ones, with when each was archived."
 )
 RESOURCE_NAME = _Validated(validate_name)
+DATASET_REFERENCE = _Validated(validate_dataset_reference)
+VERSIONED_DATASET_REFERENCE = _Validated(validate_versioned_dataset_reference)
 TASK_ID = _Validated(validate_task_id)
 
 

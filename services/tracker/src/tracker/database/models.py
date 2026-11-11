@@ -1,25 +1,23 @@
-from datetime import UTC, datetime
-from hashlib import sha256
-from enum import Enum
-from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field as PydanticField,
-    SerializerFunctionWrapHandler,
-    TypeAdapter,
-    field_serializer,
-    field_validator,
-    model_serializer,
-    model_validator,
+from pydantic import field_serializer
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Connection,
+    DateTime,
+    Dialect,
+    ForeignKeyConstraint,
+    Identity,
+    Index,
+    Integer,
+    LargeBinary,
+    event,
+    text,
 )
-from benchmark_service import SandboxSource
-from benchmark_service.schemas import DatasetVersion
-from sqlalchemy import Boolean, Connection, DateTime, Dialect, Identity, Index, Integer, event, text
 from sqlalchemy.orm import Mapped, Mapper
 from sqlmodel import (
     JSON,
@@ -34,11 +32,21 @@ from sqlmodel import (
     func,
 )
 
-from tracker.aws.runtime import AWSResources
-from tracker.local.resources import LocalResources
 from tracker.database.utils import has_field_changed
-from tracker.egress import EgressPolicy
+from tracker.domain import (
+    AgentCausedExitReason,
+    BenchmarkStatus,
+    DocentReadingStatus,
+    ExecutorDispatchKind,
+    ExecutorReleaseStatus,
+    FailureCategory,
+    FailurePhase,
+    RetryMode as RetryMode,
+    SpendType,
+    TaskStatus,
+)
 from executor_protocol import ExecutorDispatchStatus as ExecutorDispatchStatus
+from tracker.types import ActiveNativeOutput, BenchmarkArguments, benchmark_arguments_adapter
 
 if TYPE_CHECKING:
     from benchmark_service.client import BenchmarkServiceClient
@@ -50,6 +58,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_ORG_NAME = "default"
+FINISHED_BENCHMARK_STATUSES = (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED)
 
 
 class Org(SQLModel, table=True):
@@ -62,256 +71,11 @@ class Org(SQLModel, table=True):
     )
 
 
-class TaskStatus(str, Enum):
-    PENDING = "PENDING"
-    BUILDING = "BUILDING"
-    IN_PROGRESS = "IN_PROGRESS"
-    EVALUATING = "EVALUATING"
-    STOPPED = "STOPPED"
-    FINISHED = "FINISHED"
-    ERROR = "ERROR"
-
-
-class BenchmarkStatus(str, Enum):
-    IN_PROGRESS = "IN_PROGRESS"
-    STOPPING = "STOPPING"
-    STOPPED = "STOPPED"
-    FINISHED = "FINISHED"
-    ERROR = "ERROR"
-
-
-FINISHED_BENCHMARK_STATUSES = (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED)
-
-
-class ExecutorReleaseStatus(str, Enum):
-    CANDIDATE = "CANDIDATE"
-    ACTIVE = "ACTIVE"
-    DRAINING = "DRAINING"
-    RETIRED = "RETIRED"
-
-
-class ExecutorDispatchKind(str, Enum):
-    START = "START"
-    RETRY = "RETRY"
-    RESUME = "RESUME"
-
-
-class DocentReadingStatus(str, Enum):
-    IDLE = "IDLE"
-    RUNNING = "RUNNING"
-    ERROR = "ERROR"
-    DONE = "DONE"
-
-
-class AgentCausedExitReason(str, Enum):
-    TIMEOUT = "TIMEOUT"
-    OS_KILLED = "OS_KILLED"
-
-
-class FailureCategory(str, Enum):
-    INFRASTRUCTURE = "infrastructure"
-    BENCHMARK_SERVICE = "benchmark_service"
-    AGENT = "agent"
-    CANCELLED = "cancelled"
-    UNKNOWN = "unknown"
-
-
-FailureCategory.__doc__ = "Coarse classification of a task or run failure, decided where the failure is caught."
-
-
-class FailurePhase(str, Enum):
-    ADMISSION = "admission"
-    SANDBOX = "sandbox"
-    SETUP = "setup"
-    AGENT = "agent"
-    EVALUATION = "evaluation"
-
-
-class RetryMode(str, Enum):
-    AUTO = "auto"
-    FROM_SCRATCH = "from_scratch"
-
-
-class SpendType(str, Enum):
-    DEVELOPMENT = "development"
-    INTERNAL = "internal"
-    CUSTOMER = "customer"
-
-
-MAX_OUTPUT_ARTIFACT_BYTES = 250 * 1024 * 1024
-MAX_OUTPUT_ARTIFACT_COUNT = 10
-
-
-def _source_has_glob(source: str) -> bool:
-    return any(char in source for char in "*?[")
-
-
-def _source_glob_root(source: str) -> str:
-    glob_indices = [source.find(char) for char in "*?[" if source.find(char) != -1]
-    first_glob_index = min(glob_indices)
-    root = source[:first_glob_index].rsplit("/", 1)[0]
-    return root or "/"
-
-
-class OutputArtifact(BaseModel):
-    path: str
-    source: str | None = None
-    required: bool = True
-
-    @model_serializer(mode="wrap")
-    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        data = handler(self)
-        if self.required:
-            data.pop("required", None)
-        return data
-
-    @field_validator("source")
-    @classmethod
-    def validate_source(cls, value: str | None) -> str | None:
-        if not value:
-            return None
-        if not value.startswith("/"):
-            raise ValueError("output_artifacts source paths must be absolute sandbox paths")
-
-        path = PurePosixPath(value)
-        if not path.parts or ".." in path.parts or "." in path.parts:
-            raise ValueError("output_artifacts source paths cannot contain empty, '.', or '..' path parts")
-        if _source_has_glob(value) and _source_glob_root(value) == "/":
-            raise ValueError("output_artifacts glob sources must include a non-root directory prefix")
-
-        return value
-
-
-OutputArtifactSpec = str | OutputArtifact
-
-
-class AgentTurns(BaseModel):
-    continue_cmd: str | None = None
-    interrupt_grace_seconds: float | None = None
-    container_name: str | None = None
-
-
-class AgentContractRequest(BaseModel):
-    name: str
-    model: str | None = None
-    install_cmd: str = ""
-    run_cmd: str = ""
-    turns: AgentTurns | None = None
-    final_output: str | None = None
-    output_artifacts: list[OutputArtifactSpec] = []
-    egress_allowlist: list[str] = []
-    install_egress: EgressPolicy | None = None
-    allow_provider_tools: bool = False
-    secrets: dict[str, str] = {}
-    kwargs: dict[str, str] = {}
-    inference_settings_attested: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_obsolete_egress(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "egress" in value:
-            raise ValueError("'egress' is no longer supported; use 'install_egress'")
-        return value
-
-    @property
-    def install_egress_policy(self) -> EgressPolicy:
-        return self.install_egress if self.install_egress is not None else "*"
-
-    @field_validator("output_artifacts")
-    @classmethod
-    def validate_output_artifacts(cls, value: list[OutputArtifactSpec]) -> list[OutputArtifactSpec]:
-        if len(value) > MAX_OUTPUT_ARTIFACT_COUNT:
-            raise ValueError(f"output_artifacts cannot contain more than {MAX_OUTPUT_ARTIFACT_COUNT} entries")
-
-        normalized_artifacts: list[OutputArtifactSpec] = []
-        normalized_paths: set[str] = set()
-        for artifact in value:
-            artifact_path = artifact if isinstance(artifact, str) else artifact.path
-            path = PurePosixPath(artifact_path)
-            if path.is_absolute():
-                raise ValueError("output_artifacts paths must be relative paths")
-            if not path.parts or ".." in path.parts or "." in path.parts:
-                raise ValueError("output_artifacts paths cannot contain empty, '.', or '..' path parts")
-            normalized_path = str(path)
-            if normalized_path in normalized_paths:
-                raise ValueError(f"output_artifacts cannot contain duplicate paths: {normalized_path}")
-            normalized_paths.add(normalized_path)
-            if isinstance(artifact, str):
-                normalized_artifacts.append(normalized_path)
-            else:
-                normalized_artifacts.append(artifact.model_copy(update={"path": normalized_path}))
-
-        return normalized_artifacts
-
-
-class RunMonitoring(BaseModel):
-    model_config = ConfigDict(
-        extra="ignore",
-        json_schema_extra={"description": "Opt-in external monitoring requested by whoever starts the run."},
-    )
-
-
-class RunMonitoringRules(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        json_schema_extra={"description": "Monitor rules the benchmark service declares for its runs."},
-    )
-
-    policy: str | None = None
-    watcher_policy_pack: str | None = None
-    allowed_cidrs: list[str] = []
-    allowed_hosts: list[str] = []
-
-
-class _BenchmarkArguments(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    contract: AgentContractRequest
-    concurrency: int
-    priority: int | None = PydanticField(default=None, exclude=True, strict=True, ge=0, le=4)
-    queue_pool_id: str | None = Field(default=None, exclude=True)
-    selected_project_gateway_secret_ref: str | None = PydanticField(default=None, exclude=True)
-    task_ids: list[str] | None = None
-    slice_str: str | None = None
-    lambda_function: str | None = None
-    dataset: str | None = None
-    dataset_version: DatasetVersion | None = None
-    sandbox_provider: str = "daytona"
-    sandbox_provider_secret_name: str | None = None
-    monitoring: RunMonitoring | None = None
-    monitoring_rules: RunMonitoringRules | None = None
-    regraded_from_run_id: UUID | None = PydanticField(default=None, exclude=True)
-    regrade_skipped_task_ids: list[str] | None = PydanticField(default=None, exclude=True)
-
-
-class AWSBenchmarkArguments(_BenchmarkArguments):
-    model_config = ConfigDict(
-        json_schema_extra={"description": "Stored arguments for an AWS run, including legacy rows without resources."}
-    )
-    environment: Literal["aws"] = "aws"
-    properties: AWSResources | None = None
-
-
-class LocalBenchmarkArguments(_BenchmarkArguments):
-    model_config = ConfigDict(
-        json_schema_extra={"description": "Stored arguments with the filesystem resources selected at admission."}
-    )
-    environment: Literal["local"] = "local"
-    properties: LocalResources
-
-
-BenchmarkArguments = Annotated[
-    AWSBenchmarkArguments | LocalBenchmarkArguments,
-    PydanticField(discriminator="environment"),
-]
-benchmark_arguments_adapter: TypeAdapter[BenchmarkArguments] = TypeAdapter(BenchmarkArguments)
-
-
 class FinalEvaluation(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     org_id: UUID = Field(foreign_key="org.id")
     benchmark: UUID = Field(foreign_key="benchmark.id")
-    final_score: float = Field(nullable=False)
+    final_score: float | None = None
     properties: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 
     @field_serializer("id", "benchmark")
@@ -337,6 +101,8 @@ class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
         serialized = value.model_dump(mode="json", exclude=excluded_fields)
         if value.priority is not None:
             serialized["priority"] = value.priority
+        if value.dataset_ref is not None:
+            serialized["dataset_ref"] = value.dataset_ref.model_dump(mode="json")
         if value.queue_pool_id is not None:
             serialized["queue_pool_id"] = value.queue_pool_id
         if value.selected_project_gateway_secret_ref is not None:
@@ -393,9 +159,15 @@ class ExecutorDispatch(SQLModel, table=True):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     assigned_task_ids: list[str] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    claim_deadline_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    invocation_key_digest: bytes | None = Field(default=None, sa_column=Column(LargeBinary, nullable=True))
+    claim_receipt_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
     failure_reason: str | None = None
     ecs_task_arn: str | None = None
     lease_expires_at: datetime | None = None
+    relaunch_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
+    last_relaunch_reason: str | None = None
 
 
 class OrganizationInvite(SQLModel, table=True):
@@ -474,12 +246,30 @@ class RunCost(SQLModel, table=True):
     usage_end: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
+class RunCostUsageEndBackfill(SQLModel, table=True):
+    __tablename__ = "run_cost_usage_end_backfill"
+
+    run_cost_id: UUID = Field(foreign_key="run_cost.id", primary_key=True)
+    backfilled_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+
+
 class SandboxCostCursor(SQLModel, table=True):
     __tablename__ = "sandbox_cost_cursor"
 
     org_id: UUID = Field(foreign_key="org.id", primary_key=True)
     secret_name: str = Field(primary_key=True)
     next_hour: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+
+
+class SandboxUnmatchedUsage(SQLModel, table=True):
+    __tablename__ = "sandbox_unmatched_usage"
+
+    org_id: UUID = Field(foreign_key="org.id", primary_key=True)
+    secret_name: str = Field(primary_key=True)
+    hour: datetime = Field(sa_column=Column(DateTime(timezone=True), primary_key=True))
+    amount_usd: float
+    sandboxes: int
+    unpriced_sandboxes: int
 
 
 class OrgProviderSecret(SQLModel, table=True):
@@ -536,6 +326,8 @@ class SandboxBuildReservation(SQLModel, table=True):
     attempt_started_at: datetime = Field(primary_key=True)
     reserved_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     released_at: datetime | None = None
+    phase_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
+    phase_token: UUID | None = None
     executor_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
     accepted_at: datetime | None = None
     pool_id: str
@@ -583,6 +375,12 @@ class Benchmark(SQLModel, table=True):
             "AND executor_artifact_digest IS NOT NULL AND executor_protocol_version IS NOT NULL)",
             name="benchmark_executor_ownership_complete",
         ),
+        ForeignKeyConstraint(
+            ["publication_phase_dispatch_id"],
+            ["executordispatch.id"],
+            name="fk_benchmark_publication_dispatch",
+            use_alter=True,
+        ),
         Index(
             "ix_benchmark_org_started_at_id",
             "org_id",
@@ -603,6 +401,10 @@ class Benchmark(SQLModel, table=True):
     executor_artifact_uri: str | None = None
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
+    publication_phase_dispatch_id: UUID | None = Field(default=None)
+    publication_phase_token: UUID | None = None
+    publication_phase_fingerprint: str | None = None
+    publication_status: str | None = None
 
     error_message: str | None = Field(default=None)
     custom_benchmark_service: str | None = Field(default=None)
@@ -628,6 +430,7 @@ class Benchmark(SQLModel, table=True):
         return RunExecutionRequest(
             **self.arguments.model_dump(exclude={"dataset_version"}),
             resolved_dataset_version=self.arguments.dataset_version,
+            dataset_ref=self.arguments.dataset_ref,
             benchmark_name=self.name,
             label=self.label,
             custom_benchmark_service=self.custom_benchmark_service,
@@ -652,6 +455,7 @@ class Benchmark(SQLModel, table=True):
             lambda_function=self.arguments.lambda_function,
             dataset=self.arguments.dataset,
             resolved_dataset_version=self.arguments.dataset_version,
+            dataset_ref=self.arguments.dataset_ref,
             sandbox_provider=self.arguments.sandbox_provider,
             sandbox_provider_secret_name=self.arguments.sandbox_provider_secret_name,
             custom_benchmark_service=self.custom_benchmark_service,
@@ -686,7 +490,7 @@ class Benchmark(SQLModel, table=True):
         return FetchBenchmarkMetadataResponse(
             benchmark_id=self.id,
             benchmark_name=self.name,
-            benchmark_arguments=self.arguments,
+            benchmark_arguments=self.arguments.with_hosted_dataset(),
             storage_bucket=None,
             started_by_email=self.started_by_email,
             executor_release_id=self.executor_release_id,
@@ -775,37 +579,54 @@ class Dataset(SQLModel, table=True):
     archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
+class DatasetVersion(SQLModel, table=True):
+    __tablename__ = "dataset_version"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "revision", name="uq_dataset_version_revision"),
+        UniqueConstraint("dataset_id", "digest", name="uq_dataset_version_digest"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    dataset_id: UUID = Field(foreign_key="dataset.id")
+    revision: int
+    digest: str
+    task_count: int
+    metric_digest: str | None = None
+    manifest: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    created_by_email: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class DatasetVersionTask(SQLModel, table=True):
+    __tablename__ = "dataset_version_task"
+
+    version_id: UUID = Field(foreign_key="dataset_version.id", primary_key=True)
+    task_id: str = Field(primary_key=True)
+    digest: str
+    size_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    source_name: str | None = None
+
+
+class DatasetTag(SQLModel, table=True):
+    __tablename__ = "dataset_tag"
+
+    dataset_id: UUID = Field(foreign_key="dataset.id", primary_key=True)
+    tag: str = Field(primary_key=True)
+    version_id: UUID = Field(foreign_key="dataset_version.id", index=True)
+
+
 @event.listens_for(Benchmark, "before_insert")
 @event.listens_for(Benchmark, "before_update")
 def set_finished_at_when_benchmark_finished(_mapper: Mapper[Benchmark], _connection: Connection, target: Benchmark):
-
     finished_states = [BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR]
 
     status_changed = has_field_changed(target, "status")
 
     if status_changed and target.status in finished_states:
         target.finished_at = datetime.now(ZoneInfo("UTC"))
-
-
-class ActiveNativeOutput(BaseModel):
-    attempt_started_at: datetime
-    sandbox_id: str
-    runtime_source: SandboxSource
-    output_path: str
-
-    @property
-    def generation(self) -> str:
-        started_at = self.attempt_started_at
-        if started_at.tzinfo is None:
-            started_at = started_at.replace(tzinfo=UTC)
-        identity = f"{started_at.astimezone(UTC).isoformat()}\0{self.sandbox_id}"
-        return sha256(identity.encode()).hexdigest()
-
-    def matches_attempt(self, started_at: datetime) -> bool:
-        def utc(value: datetime) -> datetime:
-            return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-        return utc(self.attempt_started_at) == utc(started_at)
 
 
 class ActiveNativeOutputType(TypeDecorator[ActiveNativeOutput]):
@@ -840,6 +661,10 @@ class Task(SQLModel, table=True):
     status: TaskStatus = Field(default=TaskStatus.PENDING)
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     finished_at: datetime | None = None
+    build_phase_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
+    build_phase_token: UUID | None = None
+    evaluation_phase_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
+    evaluation_phase_token: UUID | None = None
     eval_resume_state: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     active_native_output: ActiveNativeOutput | None = Field(
         default=None, exclude=True, sa_column=Column(ActiveNativeOutputType(), nullable=True)
@@ -854,7 +679,6 @@ class Task(SQLModel, table=True):
 @event.listens_for(Task, "before_insert")
 @event.listens_for(Task, "before_update")
 def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Connection, target: Task):
-
     finished_states = [TaskStatus.FINISHED, TaskStatus.ERROR]
 
     status_changed = has_field_changed(target, "status")

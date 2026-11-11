@@ -5,9 +5,11 @@ description: "Require a credential in your benchmark service, and have Valkyrie 
 ---
 
 To keep a deployed benchmark service private, have it answer only callers that hold its
-credential. You set the check in the service, and save the credential in Valkyrie, which
-sends it with every request to that service. This credential is separate from your
-Valkyrie login and access keys.
+credential.
+
+- You set the check in the service, and save the credential in Valkyrie, which sends it with
+  every request to that service.
+- This credential is separate from your Valkyrie login and access keys.
 
 Services that Vals AI hosts need none of this: Valkyrie authenticates to them for you.
 
@@ -28,10 +30,11 @@ class MyBenchmark(BenchmarkService):
         return headers.get("authorization") == f"Bearer {os.environ['SERVICE_TOKEN']}"
 ```
 
-Header names arrive in lowercase. Requests that fail the check get `401 Unauthorized`. The
-[create-benchmark-service
-README](https://github.com/vals-ai/create-benchmark-service#authentication) shows how to
-allow some callers only some datasets.
+- Header names arrive in lowercase.
+- Requests that fail the check get `401 Unauthorized`.
+- The [create-benchmark-service
+  README](https://github.com/vals-ai/create-benchmark-service#authentication) shows how to
+  allow some callers only some datasets.
 
 ## Save the credential with the service
 
@@ -47,9 +50,10 @@ valkyrie benchmark service set swebench https://benchmark.example.com \
 ```
 
 Valkyrie sends the secret's value as the `Authorization` header on every request to that
-service, for your runs and task listings. To use another header, add
-`--auth-header X-Service-Token`. Headers that Valkyrie controls, such as `Host` and
-`X-Api-Key`, are refused.
+service, for your runs and task listings.
+
+- To use another header, add `--auth-header X-Service-Token`.
+- Headers that Valkyrie controls, such as `Host` and `X-Api-Key`, are refused.
 
 - To change the credential, run `valkyrie secret set swebench-token` again. To stop sending
   it, save the service again without `--auth-secret`.
@@ -66,7 +70,7 @@ service, for your runs and task listings. To use another header, add
 more headers:
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --project my-project \
+valkyrie run start --agent my-agent --benchmark swebench \
   -H X-Experiment sweep-a \
   -H X-Team research
 ```

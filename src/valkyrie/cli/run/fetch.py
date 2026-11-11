@@ -1,11 +1,9 @@
 from uuid import UUID
 
 import click
-from valkyrie.sdk import ValkyrieClient
 
 from valkyrie.cli.client import call
 from valkyrie.cli.run.progress import follow_run_status, format_benchmark_status
-from valkyrie.cli.run.snapshot import fetch_run_metadata, format_run_snapshot_json
 from valkyrie.cli.project import describe_run_spend
 from valkyrie.cli.display import format_option
 
@@ -35,12 +33,8 @@ def fetch(run_id: UUID, connect: bool, output_format: str):
         follow_run_status(run_id, show_identity=True)
         return
 
-    async def show(client: ValkyrieClient) -> None:
-        response = await client.runs.fetch(run_id)
-        metadata = await fetch_run_metadata(client, run_id)
-        if output_format == "json":
-            click.echo(format_run_snapshot_json(response, metadata, event="snapshot"))
-        else:
-            format_benchmark_status(response, describe_run_spend(metadata))
-
-    call(show)
+    snapshot = call(lambda client: client.runs.snapshot(run_id))
+    if output_format == "json":
+        click.echo(snapshot.model_dump_json())
+    else:
+        format_benchmark_status(snapshot.run, describe_run_spend(snapshot.metadata), snapshot.metadata)

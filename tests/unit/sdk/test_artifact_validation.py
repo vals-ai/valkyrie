@@ -25,6 +25,7 @@ License-File: LICENSE
 Requires-Python: >=3.12
 Requires-Dist: filelock<4,>=3.20
 Requires-Dist: httpx<1,>=0.28.1
+Requires-Dist: pathspec<2,>=1.0.3
 Requires-Dist: pydantic<3,>=2
 Requires-Dist: pyyaml<7,>=6.0.3
 """
@@ -88,13 +89,13 @@ def test_sdk_package_configuration_matches_release_boundaries() -> None:
     assert (PACKAGE_ROOT / ".gitignore").read_text(encoding="utf-8") == ".ruff_cache/\n__pycache__/\ndist/\n"
 
 
-@pytest.mark.description("The CLI requires an SDK version of at least 0.20.0.")
-def test_cli_requires_sdk_benchmark_and_dataset_methods() -> None:
+@pytest.mark.description("The CLI requires an SDK version that installs datasets.")
+def test_cli_requires_sdk_dataset_install() -> None:
     with (ROOT / "pyproject.toml").open("rb") as root_file:
         dependencies = tomllib.load(root_file)["project"]["dependencies"]
     requirement = next(Requirement(value) for value in dependencies if value.startswith("valkyrie-sdk"))
-    assert not requirement.specifier.contains("0.19.1")
-    assert requirement.specifier.contains("0.20.0")
+    assert not requirement.specifier.contains("0.30.0")
+    assert requirement.specifier.contains("0.32.0")
 
 
 @pytest.mark.description("A correctly built wheel and sdist pass validation.")

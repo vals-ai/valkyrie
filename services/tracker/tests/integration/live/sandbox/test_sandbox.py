@@ -7,13 +7,14 @@ from typing import AsyncGenerator
 import pytest
 from benchmark_service import ImageSource, Resources, Sandbox, SandboxNotFoundError, SandboxProvider
 
-from tests.utils import random_task_id
+from tests.utils import random_task_id, unexpected_sandbox_record
 from tests.integration.seed_agent_artifacts import create_s3_client
 from tracker import sandbox as sandbox_module
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import S3ObjectStore, get_benchmark_contract_s3_key
 from tracker.runtime.artifacts import agent_bundle_key
-from tracker.database.models import AgentCausedExitReason, AgentContractRequest
+from tracker.types import AgentContractRequest
+from tracker.domain import AgentCausedExitReason
 from tracker.egress import combine_run_egress_policies
 from tracker.exceptions import AgentRunFailedError, OutputArtifactError, SandboxError
 from tracker.external_service_gateway import ExternalServiceDeadlineController
@@ -47,6 +48,7 @@ async def test_sandbox(
         test_resources,
         creation_semaphore,
         creation_state=SandboxCreationState(cleanup_pending=False),
+        record_sandbox=unexpected_sandbox_record,
     ) as sandbox:
         yield sandbox
 
@@ -250,6 +252,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             assert sandbox.name.startswith(random_sandbox_name)
             result = await sandbox.exec("echo 'test'")
@@ -477,6 +480,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             command = "timeout 15 sleep 70"
 
@@ -491,6 +495,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             command = "timeout 15 sleep 10"
 
@@ -527,6 +532,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             command = "echo 'STAGE_1' && sleep 1 && echo 'STAGE_2' && sleep 1 && echo 'STAGE_3'"
 
@@ -563,6 +569,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             ready = asyncio.Event()
 
@@ -608,6 +615,7 @@ class TestSandboxOperations:
             test_resources,
             creation_semaphore,
             creation_state=SandboxCreationState(cleanup_pending=False),
+            record_sandbox=unexpected_sandbox_record,
         ) as sandbox:
             with pytest.raises(SandboxError, match="exit code 1"):
                 await stream_command_output(sandbox, "false", on_output=lambda _: None)

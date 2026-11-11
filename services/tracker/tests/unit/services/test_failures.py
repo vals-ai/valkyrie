@@ -6,11 +6,10 @@ from benchmark_service.client import (
 )
 from websockets.exceptions import ConnectionClosedError
 
-from tracker.database.models import FailureCategory, FailurePhase
+from tracker.domain import FailureCategory, FailurePhase
 from tracker.exceptions import (
     AgentRunFailedError,
     EpisodeOrchestratorFailedError,
-    GenerationContainmentUnavailableError,
     OutputArtifactError,
     SandboxDNSResolutionError,
     SandboxError,
@@ -43,7 +42,6 @@ from tracker.services.failures import Disposition, decide, describe_failure, is_
         (SandboxError("exit code 1"), FailurePhase.SETUP, Disposition.TERMINAL),
         (AgentRunFailedError("agent exited 1"), FailurePhase.AGENT, Disposition.TERMINAL),
         (SandboxDNSResolutionError("gateway"), FailurePhase.AGENT, Disposition.RECREATE_SANDBOX),
-        (GenerationContainmentUnavailableError("probe failed"), FailurePhase.AGENT, Disposition.RECREATE_SANDBOX),
         (OutputArtifactError("missing"), FailurePhase.AGENT, Disposition.TERMINAL),
         (BenchmarkServiceError("bad request", status_code=400), FailurePhase.SETUP, Disposition.TERMINAL),
         (

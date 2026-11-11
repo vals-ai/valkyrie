@@ -58,6 +58,8 @@ Valkyrie fills these in `run_cmd`:
 | --- | --- |
 | `{problem_statement_path}` | Path of the file holding the task's problem statement. Required. |
 | `{task_id}` | The task's ID, such as `astropy__astropy-12907`. |
+| `{mcp_config_path}` | Path of a JSON file that lists the task's MCP servers under `mcpServers`, the format that Claude Code's `--mcp-config` option reads. A task without MCP servers gets an empty `mcpServers` object. |
+| `{skills_dir}` | Path of the task's skills folder, or of an empty folder when the task has none. |
 | `{model}` and other parameter names | The parameter's value |
 | `{slot_dir}`, `{container_name}` | See [`turns`](#turns). |
 
@@ -67,8 +69,10 @@ stays in the command as written.
 
 ## Parameters
 
-Parameters are values a run passes to the agent. `--model` sets the `model` parameter,
-declared under `defaults`. `-k NAME VALUE` sets parameters declared under `kwargs`.
+Parameters are values a run passes to the agent:
+
+- `--model` sets the `model` parameter, declared under `defaults`.
+- `-k NAME VALUE` sets parameters declared under `kwargs`.
 
 | Key | Required | Meaning |
 | --- | --- | --- |
@@ -144,9 +148,11 @@ sandbox, including any written during grading, so don't treat the path as privat
 | An object | `{path: artifacts/result.json, source: /logs/{task_id}/result.json}` | `source` |
 
 - `source` is an absolute path. It can include `{task_id}` and a glob under a directory,
-  such as `/logs/*.json`. A glob saves its first match in sorted order.
-- Every entry is required unless it sets `required: false`. A required artifact that is
-  missing or can't be saved fails the task. An optional one is skipped and logged.
+  such as `/logs/*.json`.
+- A glob saves its first match in sorted order.
+- Every entry is required unless it sets `required: false`.
+- A required artifact that is missing or can't be saved fails the task. An optional one is
+  skipped and logged.
 - A task can declare at most 10 artifacts, of at most 250 MiB each and 250 MiB together.
 - Entries are saved under `benchmarks/RUN_ID/TASK_ID/` at their `path`, where *`RUN_ID`* and
   *`TASK_ID`* are the run's and task's IDs.
@@ -163,6 +169,22 @@ When `run_cmd` exits with a nonzero code, the task fails with
   recognize other sensitive data, so don't write prompts or model output.
 - Exit code 137, when the operating system stops the agent, isn't an agent failure. The
   benchmark still grades the task.
+
+## Search costs
+
+An agent that calls a paid search API, such as Tavily or Exa, can report what each call cost.
+Valkyrie adds the cost to the run.
+
+- Append one JSON line per call to the file named by `VALKYRIE_SEARCH_COST_PATH`, such as
+  `{"provider": "tavily", "amount_usd": "0.016", "source_id": "REQUEST_ID"}`.
+- `provider` is lowercase, such as `tavily` or `exa`. `amount_usd` is a decimal from 0 to 100,
+  written as a string to keep its precision.
+- Set `source_id` to the provider's request ID when the response has one, as Tavily's does. A
+  call reported twice with the same ID is counted once.
+- Leave out `source_id` when the provider has no request ID, as with Exa. These calls are
+  added up per provider for the task attempt.
+- Valkyrie reads the file after `run_cmd` exits, even when it fails. Invalid lines are skipped
+  and logged, and a file larger than 1 MiB is dropped.
 
 The time an agent can spend on a task is set by the benchmark. See
 [Task time limits](/runs/time-limits).

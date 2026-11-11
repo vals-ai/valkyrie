@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID
@@ -11,7 +11,10 @@ from pydantic import BaseModel, PlainValidator
 
 from tracker.auth import get_current_org
 from tracker.database.models import Org
+from tracker.database.session import database_call
 from tracker.repositories.cost import DAYTONA_PROVIDER, CostRepositoryDependency
+from tracker.repositories.provider_secret import ProviderSecretRepositoryDependency
+from tracker.sandbox_cost import daytona_last_ends
 
 router = APIRouter(prefix="/costs")
 
@@ -260,6 +263,43 @@ def get_project_sandbox_costs(
     )
 
 
+class DaytonaUnmatchedResponse(BaseModel):
+    start: str
+    end: str
+    total_usd: float
+    unpriced_sandboxes: int
+
+
+@router.get(
+    "/daytona-unmatched",
+    response_model=DaytonaUnmatchedResponse,
+    description=(
+        "Sum Daytona usage in this organization's accounts from sandboxes no run recorded, "
+        "over the usage hours in [start, end), and count the listed sandboxes that had no price."
+    ),
+)
+def get_daytona_unmatched_costs(
+    repository: CostRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose usage hours are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
+    org: Org = Depends(get_current_org),
+) -> DaytonaUnmatchedResponse:
+    window_start, window_end = _window(start, end)
+    total_usd, unpriced_sandboxes = repository.unmatched_usage(org.id, window_start, window_end)
+    return DaytonaUnmatchedResponse(
+        start=start.isoformat(),
+        end=end.isoformat(),
+        total_usd=total_usd,
+        unpriced_sandboxes=unpriced_sandboxes,
+    )
+
+
 class SandboxRowKind(str, Enum):
     HOURLY = "hourly"
     LIFETIME = "lifetime"
@@ -355,5 +395,67 @@ def get_sandbox_cost_rows(
                 total_usd=sum(amounts.values()),
             )
             for day, amounts in sorted(days.items())
+        ],
+    )
+
+
+class UsageEndFill(BaseModel):
+    run_cost_id: UUID
+    source_id: str
+    amount_usd: float
+    placed_at: datetime
+    usage_end: datetime
+
+
+class UsageEndFillResponse(BaseModel):
+    start: datetime
+    end: datetime
+    applied: bool
+    rows: list[UsageEndFill]
+
+
+@router.post(
+    "/sandbox-usage-end",
+    response_model=UsageEndFillResponse,
+    include_in_schema=False,
+    description="Fill the missing `usage_end` of this organization's Daytona sandbox rows whose sandbox ended in [start, end), from Daytona's last usage time.",
+)
+async def fill_sandbox_usage_end(
+    repository: CostRepositoryDependency,
+    secrets: ProviderSecretRepositoryDependency,
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, of Daytona usage read."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which the Daytona read stops (excluded)."),
+    ],
+    apply: Annotated[bool, Query(description="Write the rows and save their IDs. Defaults to a dry run.")] = False,
+    org: Org = Depends(get_current_org),
+) -> UsageEndFillResponse:
+    window_start, window_end = _window(start, end)
+    secret_name = (await database_call(lambda: secrets.list_all(org.id))).get(DAYTONA_PROVIDER)
+    if secret_name is None:
+        raise HTTPException(status_code=409, detail=f"{org.name} has no Daytona secret.")
+    last_ends = await daytona_last_ends(org, secret_name, window_start, window_end)
+    rows = await database_call(lambda: repository.missing_usage_end_rows(org.id, DAYTONA_PROVIDER, list(last_ends)))
+    if apply:
+        usage_ends = {row.id: last_ends[row.source_id] for row in rows}
+        changed = set(await database_call(lambda: repository.backfill_usage_end(usage_ends, datetime.now(UTC))))
+        rows = [row for row in rows if row.id in changed]
+    return UsageEndFillResponse(
+        start=window_start,
+        end=window_end,
+        applied=apply,
+        rows=[
+            UsageEndFill(
+                run_cost_id=row.id,
+                source_id=row.source_id,
+                amount_usd=row.amount_usd,
+                placed_at=_as_utc(row.placed_at),
+                usage_end=last_ends[row.source_id],
+            )
+            for row in rows
         ],
     )

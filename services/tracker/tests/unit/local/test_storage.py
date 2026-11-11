@@ -160,3 +160,16 @@ async def test_batch_reads_keep_frozen_bytes_and_skip_missing_objects(tmp_path: 
 
     assert objects == [("runs/frozen.zip", original), ("agents/current.zip", b"replacement")]
     assert not list((tmp_path / "staging").iterdir())
+
+
+@pytest.mark.description("An object streams in chunks and a missing one raises.")
+async def test_an_object_streams_in_chunks_and_a_missing_one_raises(tmp_path: Path) -> None:
+    store = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+    await store.put_bytes("task.zip", b"y" * 2_500_000)
+
+    chunks = [chunk async for chunk in store.get_stream("task.zip")]
+
+    assert [len(chunk) for chunk in chunks] == [1_048_576, 1_048_576, 402_848]
+    assert b"".join(chunks) == b"y" * 2_500_000
+    with pytest.raises(FileNotFoundError):
+        _ = [chunk async for chunk in store.get_stream("missing.zip")]

@@ -16,6 +16,7 @@ from tracker.database.scoping import assert_org
 from tracker.logging import benchmark_id_var
 from tracker.local import config as local_config
 from tracker.runtime.services import RuntimeServices
+from tracker.types import OrgContext
 
 
 async def bind_benchmark_id(benchmark_id: UUID) -> UUID:
@@ -56,7 +57,7 @@ async def get_run_runtime(
 
     aws_runtime = resolve_run_aws_runtime(
         properties=arguments.properties,
-        org=org,
+        org=OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
     )
     return CloudRuntimeFactory.create_runtime(
         aws_runtime,
@@ -75,7 +76,7 @@ def get_agent_library_runtime(
         from tracker.local.runtime import LocalRuntimeFactory
 
         return LocalRuntimeFactory.create_runtime(local_config.resources, org.id)
-    aws_runtime = resolve_org_aws_runtime(org)
+    aws_runtime = resolve_org_aws_runtime(OrgContext(id=org.id, name=org.name, storage_key=org.storage_key))
 
     return CloudRuntimeFactory.create_runtime(aws_runtime)
 

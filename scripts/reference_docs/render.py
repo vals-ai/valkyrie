@@ -17,7 +17,6 @@ from .model import (
     CLI_ROOT,
     GENERATED_MARKER,
     GUIDE_LINKS,
-    READ_ONLY_COMMANDS,
     REDIRECTS,
     RESOURCE_CARDS,
     SDK_CLIENT,
@@ -236,8 +235,6 @@ def _example(command: CLICommandReference) -> str | None:
     example = command.example
     if command.path == ("run", "stop"):
         example = "valkyrie run stop $RUN_ID"
-    if command.path not in READ_ONLY_COMMANDS:
-        example = "# Example only, review before running\n" + example
     return _format_example(command, example)
 
 

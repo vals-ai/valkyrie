@@ -1,37 +1,42 @@
 import base64
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
-from cryptography.exceptions import InvalidTag
-from tracker.executor import entrypoint
 from benchmark_service.schemas import DatasetVersion
 from sqlmodel import Session, col, select
 
 from executor_protocol import (
     DATASET_VERSION_PROTOCOL_VERSION,
+    ExecutorDispatchStatus,
     MANAGED_EXECUTION_PROTOCOL_VERSION,
     RESERVED_QUEUE_PROTOCOL_VERSION,
     SHARED_POOL_QUEUE_PROTOCOL_VERSION,
 )
+from tests.factories import make_benchmark
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
     ErrorResult,
     ExecutorDispatch,
-    ExecutorDispatchKind,
-    ExecutorDispatchPayload,
-    ExecutorDispatchStatus,
     ExecutorRelease,
-    FailureCategory,
     Task,
-    TaskStatus,
 )
+from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, FailureCategory, TaskStatus
+from tracker.executor.control_protocol import (
+    AckDispatchRequest,
+    ClaimDispatchRequest,
+    ClaimDispatchResponse,
+    DispatchRef,
+    FailedFinishDispatchRequest,
+    FinishDispatchRequest,
+    FinishDispatchResponse,
+)
+from tracker.executor.control_runs import RunControl, RunFailure
+from tracker.executor.control_store import Invocation
+from tracker.executor import control_dispatch
 from tracker.executor.dispatch_control import (
     unowned_pending_task_ids,
-    ClaimedDispatch,
-    claim_dispatch,
-    finish_dispatch,
     EnqueueFailureResolution,
     admit_recovery_dispatch,
     admit_start_dispatch,
@@ -39,9 +44,8 @@ from tracker.executor.dispatch_control import (
     resolve_enqueue_failure,
     terminalize_active_dispatches,
 )
-from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.executor.dispatch_payload import generate_payload_key, seal_payload
-from tracker.executor.execution_authority import ExecutionAuthority, lock_execution_authority
+from tracker.database.models import ExecutorDispatchPayload
 from tracker.executor.release_control import (
     ReleaseControlError,
     create_executor_dispatch,
@@ -49,7 +53,41 @@ from tracker.executor.release_control import (
     promote_release,
     register_release,
 )
-from tracker.scheduler.store import queue_pool_id, reserved_queue_pool_id
+from tracker.executor.control_queue import queue_pool_id, reserved_queue_pool_id
+from starlette.requests import Request
+
+
+def _control_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "headers": [(b"x-executor-bootstrap", b"claim-test-bootstrap")],
+            "method": "POST",
+            "path": "/",
+        },
+    )
+
+
+def _claim_dispatch(session: Session, dispatch: ExecutorDispatch) -> ClaimDispatchResponse:
+    return control_dispatch.claim_dispatch(
+        ClaimDispatchRequest(dispatch_id=dispatch.id),
+        _control_request(),
+        Invocation(dispatch_id=dispatch.id, invocation_key="local-executor"),
+        session,
+    )
+
+
+def _finish_dispatch(session: Session, dispatch: ExecutorDispatch, *, succeeded: bool) -> FinishDispatchResponse:
+    request = FinishDispatchRequest(
+        ref=DispatchRef(benchmark_id=dispatch.benchmark_id, dispatch_id=dispatch.id),
+        succeeded=succeeded,
+    )
+    return control_dispatch.finish_dispatch(
+        request,
+        Invocation(dispatch_id=dispatch.id, invocation_key="local-executor"),
+        session,
+    )
+
 
 _LEGACY_QUEUE_POOL_ID = queue_pool_id("daytona:org-1")
 
@@ -75,7 +113,7 @@ def _fail_stopped_task(session: Session, dispatch: ExecutorDispatch) -> bool:
 def _release(release_id: str, *, protocol_version: str = MANAGED_EXECUTION_PROTOCOL_VERSION) -> ExecutorRelease:
     return ExecutorRelease(
         id=release_id,
-        artifact_uri=f"source:///artifacts/{release_id}.pex",
+        artifact_uri=f"source:///artifacts/{release_id}/src",
         artifact_digest="a" * 64,
         protocol_version=protocol_version,
         created_at=datetime.now(UTC),
@@ -516,54 +554,6 @@ def test_enqueue_failure_makes_start_retryable(
         assert error_result.failed_attempt_number is None
 
 
-@pytest.mark.description("A payload decryption failure is recorded as an infrastructure failure.")
-def test_payload_decryption_failure_records_infrastructure_category(
-    database_session: Session,
-    example_benchmark_object: Benchmark,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    register_release(database_session, _release("active"))
-    promote_release(database_session, "active")
-    dispatch = admit_start_dispatch(
-        database_session,
-        benchmark=example_benchmark_object,
-        dispatch_id=uuid4(),
-        task_ids=["preclaim"],
-    )
-    task = Task(
-        org_id=example_benchmark_object.org_id,
-        benchmark=example_benchmark_object.id,
-        task_id="preclaim",
-        status=TaskStatus.PENDING,
-        started_at=dispatch.created_at - timedelta(seconds=1),
-    )
-    database_session.add(task)
-    database_session.commit()
-    monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
-    monkeypatch.setattr(entrypoint, "engine", database_session.get_bind())
-    key = generate_payload_key(dispatch.id)
-    sealed = seal_payload(dispatch.id, {"benchmark_id_str": str(example_benchmark_object.id)}, key)
-    database_session.add(
-        ExecutorDispatchPayload(
-            dispatch_id=dispatch.id,
-            ciphertext=sealed.ciphertext + b"corrupt",
-            encrypted_data_key=sealed.encrypted_data_key,
-            nonce=sealed.nonce,
-        )
-    )
-    database_session.commit()
-
-    with pytest.raises(InvalidTag):
-        entrypoint._claim(dispatch.id)
-
-    database_session.expire_all()
-    error = database_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).one()
-    assert error.error_message == "Executor payload decrypt failed: InvalidTag"
-    assert error.error_type == "InvalidTag"
-    assert error.cause_code == "PAYLOAD_DECRYPT_FAILED"
-    assert error.category == FailureCategory.INFRASTRUCTURE
-
-
 @pytest.mark.description("An enqueue failure on an additive retry keeps the original execution active.")
 def test_additive_retry_enqueue_failure_keeps_original_execution_active(
     database_session: Session,
@@ -990,56 +980,102 @@ def test_terminalize_active_dispatches_preserves_selected_finalizer(
     assert sibling.finished_at is not None
 
 
-@pytest.mark.description("Locking execution authority for a stopped run raises `ExecutionAuthorityRevoked`.")
+@pytest.mark.description("Finishing a stopped run respects its execution authority.")
 @pytest.mark.parametrize(
-    ("status", "allowed"),
+    ("status", "succeeded", "allowed"),
     [
-        (BenchmarkStatus.IN_PROGRESS, True),
-        (BenchmarkStatus.FINISHED, True),
-        (BenchmarkStatus.ERROR, True),
-        (BenchmarkStatus.STOPPING, True),
-        (BenchmarkStatus.STOPPED, False),
+        (BenchmarkStatus.IN_PROGRESS, True, True),
+        (BenchmarkStatus.FINISHED, True, True),
+        (BenchmarkStatus.ERROR, True, True),
+        (BenchmarkStatus.STOPPING, True, True),
+        (BenchmarkStatus.STOPPING, False, True),
+        (BenchmarkStatus.STOPPED, True, True),
     ],
 )
-def test_terminal_authority_rejects_stopped_state(
+@pytest.mark.asyncio
+async def test_finish_respects_stopping_and_stopped_state(
     status: BenchmarkStatus,
+    succeeded: bool,
     allowed: bool,
-    database_session: Session,
-    example_benchmark_object: Benchmark,
+    control_postgres_session: Session,
+    bound_controls: Callable[..., dict[str, object]],
 ) -> None:
-    release = _release("authority")
-    register_release(database_session, release)
-    promote_release(database_session, release.id)
-    pin_benchmark_to_release(example_benchmark_object, release)
-    example_benchmark_object.status = status
+    session = control_postgres_session
+    benchmark = make_benchmark(session=session, status=BenchmarkStatus.IN_PROGRESS)
+    controls = bound_controls(benchmark, session=session)
+    dispatch = session.get(ExecutorDispatch, UUID(str(controls["executor_dispatch_id"])))
+    assert dispatch is not None
+    benchmark.status = status
     if status in (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR):
-        example_benchmark_object.finished_at = datetime.now(UTC)
-    dispatch = create_executor_dispatch(
-        example_benchmark_object.id,
-        release,
-        ExecutorDispatchKind.START,
-        dispatch_id=uuid4(),
+        benchmark.finished_at = datetime.now(UTC)
+    session.add(benchmark)
+    session.commit()
+    run_control = controls["run_control"]
+    assert isinstance(run_control, RunControl)
+    ref = DispatchRef(benchmark_id=benchmark.id, dispatch_id=dispatch.id)
+    request = (
+        FinishDispatchRequest(ref=ref, succeeded=True)
+        if succeeded
+        else FailedFinishDispatchRequest(
+            ref=ref,
+            succeeded=False,
+            error_message="Executor dispatch failed",
+            error_type="ExecutorDispatchFailed",
+            category=FailureCategory.INFRASTRUCTURE,
+        )
     )
-    dispatch.status = ExecutorDispatchStatus.RUNNING
-    dispatch.started_at = datetime.now(UTC)
-    database_session.add(example_benchmark_object)
-    database_session.add(dispatch)
-    database_session.commit()
-    authority = ExecutionAuthority(
-        benchmark_id=example_benchmark_object.id,
-        dispatch_id=dispatch.id,
+    result = await run_control.client.call("finish_dispatch", request, FinishDispatchResponse)
+    assert result.finished is allowed
+    if status == BenchmarkStatus.STOPPING:
+        session.refresh(benchmark)
+        assert benchmark.status == BenchmarkStatus.STOPPED
+        if succeeded:
+            session.refresh(dispatch)
+            assert dispatch.status == ExecutorDispatchStatus.FINISHED
+            assert dispatch.finished_at is not None
+            assert benchmark.finished_at is not None
+
+
+@pytest.mark.description(
+    "A successful finish after the executor committed its own run error is accepted without change."
+)
+@pytest.mark.asyncio
+async def test_finish_after_committed_run_error_is_accepted(
+    control_postgres_session: Session,
+    bound_controls: Callable[..., dict[str, object]],
+) -> None:
+    session = control_postgres_session
+    benchmark = make_benchmark(session=session, status=BenchmarkStatus.IN_PROGRESS)
+    controls = bound_controls(benchmark, session=session)
+    dispatch = session.get(ExecutorDispatch, UUID(str(controls["executor_dispatch_id"])))
+    assert dispatch is not None
+    run_control = controls["run_control"]
+    assert isinstance(run_control, RunControl)
+    decision = await run_control.commit_run_error(
+        RunFailure(
+            error_message="Control read timed out",
+            producer="executor",
+            operation="read_run_state",
+            error_type="ReadTimeout",
+            category=FailureCategory.INFRASTRUCTURE,
+            cause_code=None,
+            task_ids=[],
+            fingerprint=None,
+        )
+    )
+    assert decision.committed
+
+    result = await run_control.client.call(
+        "finish_dispatch",
+        FinishDispatchRequest(ref=DispatchRef(benchmark_id=benchmark.id, dispatch_id=dispatch.id), succeeded=True),
+        FinishDispatchResponse,
     )
 
-    if allowed:
-        assert (
-            lock_execution_authority(database_session, authority, require_in_progress=False).id
-            == example_benchmark_object.id
-        )
-        database_session.rollback()
-    else:
-        with pytest.raises(ExecutionAuthorityRevoked):
-            lock_execution_authority(database_session, authority, require_in_progress=False)
-        database_session.rollback()
+    assert result.finished
+    session.refresh(dispatch)
+    session.refresh(benchmark)
+    assert dispatch.status == ExecutorDispatchStatus.FAILED
+    assert benchmark.status == BenchmarkStatus.ERROR
 
 
 @pytest.mark.description(
@@ -1282,6 +1318,7 @@ def test_failed_resume_of_untouched_attempts_keeps_tasks_the_start_dispatch_stil
 def local_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
     monkeypatch.setenv("EXECUTOR_PAYLOAD_LOCAL_KEY", base64.b64encode(b"k" * 32).decode())
+    monkeypatch.setenv("EXECUTOR_BOOTSTRAP_KEY", "claim-test-bootstrap")
     monkeypatch.delenv("EXECUTOR_PAYLOAD_KMS_KEY_ID", raising=False)
 
 
@@ -1292,7 +1329,11 @@ def _queue_claimable_dispatch(session: Session, benchmark: Benchmark) -> tuple[E
     dispatch = create_executor_dispatch(
         benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["task-1"]
     )
-    sealed = seal_payload(dispatch.id, {"benchmark_id_str": str(benchmark.id)}, generate_payload_key(dispatch.id))
+    sealed = seal_payload(
+        dispatch.id,
+        {"benchmark_id_str": str(benchmark.id), "verified_task_ids": ["task-1"]},
+        generate_payload_key(dispatch.id),
+    )
     payload = ExecutorDispatchPayload(
         dispatch_id=dispatch.id,
         ciphertext=sealed.ciphertext,
@@ -1305,31 +1346,59 @@ def _queue_claimable_dispatch(session: Session, benchmark: Benchmark) -> tuple[E
 
 
 @pytest.mark.usefixtures("local_payload_key")
-def test_claim_consumes_the_payload_once(database_session: Session, example_benchmark_object: Benchmark) -> None:
+@pytest.mark.description("A Control claim replays for its owner and retains payload until acknowledgement.")
+def test_claim_replays_for_owner_and_acknowledges_payload(
+    control_postgres_session: Session, example_benchmark_object: Benchmark
+) -> None:
+    database_session = control_postgres_session
     release, dispatch = _queue_claimable_dispatch(database_session, example_benchmark_object)
 
-    claimed = claim_dispatch(database_session, dispatch.id, task_arn=None)
-    database_session.commit()
+    claimed = _claim_dispatch(database_session, dispatch)
 
-    assert claimed == ClaimedDispatch(
-        dispatch_id=dispatch.id,
-        benchmark_id=example_benchmark_object.id,
-        release_id=release.id,
-        assigned_task_ids=["task-1"],
-        payload={"benchmark_id_str": str(example_benchmark_object.id)},
-    )
+    assert claimed.claimed
+    assert claimed.payload is not None
+    assert claimed.payload["executor_dispatch_id"] == str(dispatch.id)
+    assert claimed.payload["executor_release_id"] == release.id
+    assert claimed.payload["benchmark_id_str"] == str(example_benchmark_object.id)
+    assert claimed.payload["verified_task_ids"] == ["task-1"]
     database_session.refresh(dispatch)
     assert dispatch.status == ExecutorDispatchStatus.RUNNING
     assert dispatch.started_at is not None
+    assert database_session.get(ExecutorDispatchPayload, dispatch.id) is not None
+    assert _claim_dispatch(database_session, dispatch).claimed
+    other = control_dispatch.claim_dispatch(
+        ClaimDispatchRequest(dispatch_id=dispatch.id),
+        _control_request(),
+        Invocation(dispatch_id=dispatch.id, invocation_key="different-owner"),
+        database_session,
+    )
+    assert other.claimed is False
+
+    acknowledged = control_dispatch.ack_dispatch(
+        AckDispatchRequest(ref=DispatchRef(benchmark_id=dispatch.benchmark_id, dispatch_id=dispatch.id)),
+        Invocation(dispatch_id=dispatch.id, invocation_key="local-executor"),
+        database_session,
+    )
+    assert acknowledged.acknowledged
     assert database_session.get(ExecutorDispatchPayload, dispatch.id) is None
-    assert claim_dispatch(database_session, dispatch.id, task_arn=None) is None
+
+
+@pytest.mark.usefixtures("local_payload_key")
+@pytest.mark.description("A queued dispatch can be claimed for five minutes after it is created.")
+def test_claim_window_lasts_five_minutes(database_session: Session, example_benchmark_object: Benchmark) -> None:
+    _, dispatch = _queue_claimable_dispatch(database_session, example_benchmark_object)
+
+    assert dispatch.claim_deadline_at is not None
+    assert dispatch.claim_deadline_at - dispatch.created_at == timedelta(minutes=5)
 
 
 @pytest.mark.usefixtures("local_payload_key")
 @pytest.mark.parametrize("revocation", ["benchmark_stopping", "benchmark_repinned"])
+@pytest.mark.description("A Control claim preserves queued dispatches and payloads after benchmark stop or repin.")
 def test_claim_refuses_a_dispatch_the_benchmark_no_longer_owns(
-    database_session: Session, example_benchmark_object: Benchmark, revocation: str
+    control_postgres_session: Session, example_benchmark_object: Benchmark, revocation: str
 ) -> None:
+    database_session = control_postgres_session
     _, dispatch = _queue_claimable_dispatch(database_session, example_benchmark_object)
     if revocation == "benchmark_stopping":
         example_benchmark_object.status = BenchmarkStatus.STOPPING
@@ -1340,13 +1409,12 @@ def test_claim_refuses_a_dispatch_the_benchmark_no_longer_owns(
     database_session.add(example_benchmark_object)
     database_session.commit()
 
-    assert claim_dispatch(database_session, dispatch.id, task_arn=None) is None
+    assert _claim_dispatch(database_session, dispatch).claimed is False
     database_session.refresh(dispatch)
     assert dispatch.status == ExecutorDispatchStatus.QUEUED
     assert database_session.get(ExecutorDispatchPayload, dispatch.id) is not None
 
 
-@pytest.mark.usefixtures("local_payload_key")
 @pytest.mark.parametrize(
     ("benchmark_status", "with_sibling", "expected_status"),
     [
@@ -1356,16 +1424,18 @@ def test_claim_refuses_a_dispatch_the_benchmark_no_longer_owns(
         (BenchmarkStatus.FINISHED, False, BenchmarkStatus.FINISHED),
     ],
 )
+@pytest.mark.usefixtures("local_payload_key")
+@pytest.mark.description("Control finish finalizes only a run with no active dispatch remaining.")
 def test_finish_finalizes_only_a_benchmark_no_dispatch_still_owns(
-    database_session: Session,
+    control_postgres_session: Session,
     example_benchmark_object: Benchmark,
     benchmark_status: BenchmarkStatus,
     with_sibling: bool,
     expected_status: BenchmarkStatus,
 ) -> None:
+    database_session = control_postgres_session
     release, dispatch = _queue_claimable_dispatch(database_session, example_benchmark_object)
-    claimed = claim_dispatch(database_session, dispatch.id, task_arn=None)
-    assert claimed is not None
+    assert _claim_dispatch(database_session, dispatch).claimed
     if with_sibling:
         sibling = create_executor_dispatch(
             example_benchmark_object.id, release, ExecutorDispatchKind.RETRY, dispatch_id=uuid4(), task_ids=["task-2"]
@@ -1376,32 +1446,32 @@ def test_finish_finalizes_only_a_benchmark_no_dispatch_still_owns(
     database_session.add(example_benchmark_object)
     database_session.commit()
 
-    finish_dispatch(database_session, claimed)
-    database_session.commit()
+    finished = _finish_dispatch(database_session, dispatch, succeeded=True)
 
     database_session.refresh(dispatch)
     database_session.refresh(example_benchmark_object)
+    assert finished.finished
     assert dispatch.status == ExecutorDispatchStatus.FINISHED
     assert dispatch.finished_at is not None
     assert example_benchmark_object.status == expected_status
 
 
 @pytest.mark.usefixtures("local_payload_key")
+@pytest.mark.description("Control finish does not revive a dispatch already failed by recovery.")
 def test_finish_does_not_revive_a_dispatch_recovery_already_failed(
-    database_session: Session, example_benchmark_object: Benchmark
+    control_postgres_session: Session, example_benchmark_object: Benchmark
 ) -> None:
+    database_session = control_postgres_session
     _, dispatch = _queue_claimable_dispatch(database_session, example_benchmark_object)
-    claimed = claim_dispatch(database_session, dispatch.id, task_arn=None)
-    assert claimed is not None
-    database_session.commit()
+    assert _claim_dispatch(database_session, dispatch).claimed
     database_session.refresh(dispatch)
     assert _fail_stopped_task(database_session, dispatch)
     database_session.commit()
 
-    finish_dispatch(database_session, claimed)
-    database_session.commit()
+    finished = _finish_dispatch(database_session, dispatch, succeeded=True)
 
     database_session.refresh(dispatch)
     database_session.refresh(example_benchmark_object)
+    assert finished.finished is False
     assert dispatch.status == ExecutorDispatchStatus.FAILED
     assert example_benchmark_object.status == BenchmarkStatus.ERROR

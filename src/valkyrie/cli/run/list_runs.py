@@ -12,7 +12,6 @@ from valkyrie.sdk.models import (
 from valkyrie.cli.client import call
 from valkyrie.cli.display import format_option, format_table, paginate_cli_pages, progress_percent, short_local_time
 from valkyrie.cli.run.progress import styled_status
-from valkyrie.cli.run.snapshot import format_run_list_json
 
 _MACHINE_PAGE_LIMIT = 500
 
@@ -116,7 +115,7 @@ def list_runs(
     if output_format == "json":
         machine_request = request.model_copy(update={"limit": _MACHINE_PAGE_LIMIT})
         runs = call(lambda client: _collect(client.runs.iter(machine_request)))
-        click.echo(format_run_list_json(runs))
+        click.echo(FetchBenchmarksResponse(benchmarks=runs).model_dump_json())
     else:
         paginate_benchmarks(request)
 

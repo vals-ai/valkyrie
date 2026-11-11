@@ -4,6 +4,7 @@ import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from email.utils import format_datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,18 +27,20 @@ import tracker.sandbox_cost as sandbox_cost
 from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
 from tracker.repositories.cost import CostRepository
+from tracker.search_cost import SearchCharge
 from tracker.aws.runtime import AWSResources
 from tracker.database.models import (
     Benchmark,
-    BenchmarkStatus,
-    LocalBenchmarkArguments,
     Org,
     OrgProviderSecret,
     RunCost,
     SandboxCostCursor,
+    SandboxUnmatchedUsage,
     SandboxRecord,
     Task,
 )
+from tracker.domain import BenchmarkStatus
+from tracker.executor.control_tasks import SandboxLink
 from tracker.local.resources import LocalResources
 from tracker.repositories.advisory_lock import PostgresAdvisoryLock
 from tracker.sandbox import SandboxCreationState, create_sandbox
@@ -52,13 +55,13 @@ from tracker.sandbox_cost import (
     USAGE_PAGE_SIZE,
     USAGE_SETTLE_LAG,
     AutomaticSandboxCost,
-    SandboxLink,
     HourReader,
     HourUsage,
     SandboxUsage,
     UsageOpener,
     sweep_sandbox_costs,
 )
+from tracker.types import LocalBenchmarkArguments
 
 NOW = datetime(2026, 10, 21, 18, tzinfo=UTC)
 START = NOW - timedelta(hours=6)
@@ -163,7 +166,9 @@ async def read_daytona_usage(org: Org, start: datetime, end: datetime) -> dict[s
     return {sandbox_id: found for sandbox_id, found in sandbox_cost.sum_usage(hours).items() if found is not None}
 
 
-async def _open_sandbox(sandbox_id: str, link: SandboxLink, *, fail: bool) -> None:
+async def _open_sandbox(
+    sandbox_id: str, link: SandboxLink, *, fail: bool, record: Callable[[SandboxLink, str], Awaitable[None]]
+) -> None:
     async with create_sandbox(
         provider=AsyncMock(),
         sandbox_name="task-1",
@@ -172,6 +177,7 @@ async def _open_sandbox(sandbox_id: str, link: SandboxLink, *, fail: bool) -> No
         creation_semaphore=asyncio.Semaphore(1),
         creation_state=SandboxCreationState(cleanup_pending=False),
         sandbox_link=link,
+        record_sandbox=record,
     ) as sandbox:
         assert sandbox.id == sandbox_id
         if fail:
@@ -193,9 +199,15 @@ class TestRecordSandbox:
         monkeypatch.setattr(sandbox_module, "_create_sandbox", fake_create)
         monkeypatch.setattr(sandbox_module, "delete_sandbox", AsyncMock(return_value=True))
 
+        async def record(link: SandboxLink, sandbox_id: str) -> None:
+            database_session.add(
+                SandboxRecord(provider=link.provider, sandbox_id=sandbox_id, benchmark_id=link.benchmark_id)
+            )
+            database_session.commit()
+
         with pytest.raises(RuntimeError, match="agent setup failed"):
-            await _open_sandbox("sandbox-attempt-1", _link(benchmark), fail=True)
-        await _open_sandbox("sandbox-attempt-2", _link(benchmark), fail=False)
+            await _open_sandbox("sandbox-attempt-1", _link(benchmark), fail=True, record=record)
+        await _open_sandbox("sandbox-attempt-2", _link(benchmark), fail=False, record=record)
 
         rows = database_session.exec(select(SandboxRecord).order_by(col(SandboxRecord.sandbox_id))).all()
 
@@ -214,9 +226,12 @@ class TestRecordSandbox:
 
         monkeypatch.setattr(sandbox_module, "_create_sandbox", fake_create)
         monkeypatch.setattr(sandbox_module, "delete_sandbox", delete)
-        monkeypatch.setattr(sandbox_cost, "engine", None)
 
-        await _open_sandbox("sandbox-1", _link(benchmark), fail=False)
+        async def fail_record(_link: SandboxLink, _sandbox_id: str) -> None:
+            raise RuntimeError("sandbox link write failed")
+
+        with pytest.raises(RuntimeError, match="sandbox link write failed"):
+            await _open_sandbox("sandbox-1", _link(benchmark), fail=False, record=fail_record)
 
         delete.assert_awaited_once()
         assert database_session.exec(select(SandboxRecord)).all() == []
@@ -246,9 +261,11 @@ class TestRecordSandbox:
 
         monkeypatch.setattr(sandbox_module, "_create_sandbox", fake_create)
         monkeypatch.setattr(sandbox_module, "delete_sandbox", delete)
-        monkeypatch.setattr(sandbox_module, "record_sandbox", blocked_write)
 
-        opening = asyncio.create_task(_open_sandbox("sandbox-1", _link(benchmark), fail=False))
+        async def record(_link: SandboxLink, _sandbox_id: str) -> None:
+            await asyncio.to_thread(blocked_write)
+
+        opening = asyncio.create_task(_open_sandbox("sandbox-1", _link(benchmark), fail=False, record=record))
         await asyncio.to_thread(write_started.wait, 5)
         opening.cancel()
         await asyncio.sleep(0.05)
@@ -364,6 +381,34 @@ class TestAddSandboxHourCost:
         rows = database_session.exec(select(RunCost.source_id)).all()
 
         assert rows == ["req-1", "req-1"]
+
+    @pytest.mark.description(
+        "A task attempt's search charges are saved once, even when the same report is saved again."
+    )
+    def test_search_costs_are_saved_once_per_source(self, database_session: Session) -> None:
+        benchmark, _ = _run(database_session, status=BenchmarkStatus.FINISHED)
+        charges = [
+            SearchCharge("tavily", Decimal("0.016"), "req-1"),
+            SearchCharge("exa", Decimal("0.007")),
+            SearchCharge("exa", Decimal("0.005")),
+        ]
+        repository = CostRepository(database_session)
+
+        saved = [
+            repository.add_search_costs(benchmark_id=benchmark.id, attempt_id="task-1:attempt-1", charges=charges)
+            for _ in range(2)
+        ]
+        database_session.commit()
+
+        rows = database_session.exec(
+            select(RunCost.cost_type, RunCost.provider, RunCost.source_id, RunCost.amount_usd)
+        ).all()
+        assert saved == [2, 0]
+        assert all(usage_end is not None for usage_end in database_session.exec(select(RunCost.usage_end)).all())
+        assert sorted(rows) == [
+            ("search", "exa", "task-1:attempt-1", pytest.approx(0.012)),
+            ("search", "tavily", "req-1", 0.016),
+        ]
 
 
 def _hour_rows(session: Session) -> dict[str, float]:
@@ -640,6 +685,41 @@ class TestHourlyCursor:
         assert written == 0
         assert _hour_rows(database_session) == {}
         assert _cursor(database_session) == START + timedelta(hours=1)
+
+
+@pytest.mark.description("The sweep keeps Daytona usage from sandboxes no run recorded, per account hour.")
+class TestUnmatchedUsage:
+    @pytest.mark.description("A listed sandbox with no run is summed into its hour and nothing is priced for it.")
+    async def test_an_unrecorded_sandbox_is_kept_as_unmatched_usage(self, database_session: Session) -> None:
+        _configure(database_session)
+        run, _ = _run(database_session, status=BenchmarkStatus.FINISHED, hours_ago=6)
+        _save_sandbox(database_session, run, "sb-run")
+        bind = database_session.get_bind()
+
+        async def read_hour(org: Org, secret: str, start: datetime, end: datetime) -> HourUsage:
+            if start != START:
+                return {}
+            return {
+                "sb-run": _usage("sb-run", 0.5, last_end=end),
+                "sb-other-1": _usage("sb-other-1", 0.25, last_end=end),
+                "sb-other-2": _usage("sb-other-2", 1.0, last_end=end),
+                "sb-other-unpriced": None,
+            }
+
+        await sweep_sandbox_costs(bind, now=NOW, open_usage=_opener(read_hour))
+
+        database_session.expire_all()
+        rows = database_session.exec(select(SandboxUnmatchedUsage)).all()
+        assert [(_as_utc(row.hour), row.amount_usd, row.sandboxes, row.unpriced_sandboxes) for row in rows] == [
+            (START, 1.25, 3, 1)
+        ]
+        assert set(_priced_per_sandbox(database_session)) == {"sb-run"}
+        repository = CostRepository(database_session)
+        assert repository.unmatched_usage(TEST_ORG_ID, START, START + timedelta(hours=1)) == (1.25, 1)
+        assert repository.unmatched_usage(TEST_ORG_ID, START + timedelta(hours=1), START + timedelta(hours=2)) == (
+            0.0,
+            0,
+        )
 
 
 @pytest.mark.description("The Daytona reader that the hourly sweep uses.")
@@ -1726,3 +1806,30 @@ class TestAutomaticSandboxCost:
         thread.stop()
 
         assert leader.acquires == 1
+
+
+@pytest.mark.description(
+    (
+        "Daytona's last usage time is kept only for sandboxes that ended inside the read window.\n"
+        "\n"
+        "Test cases:\n"
+        "- A sandbox ending before `end` keeps its last usage time.\n"
+        "- A sandbox whose usage runs to `end` is left for a later window.\n"
+        "- A listed sandbox with no price or no last usage time is left out."
+    )
+)
+async def test_daytona_last_ends_keeps_sandboxes_that_ended_in_the_window() -> None:
+    end = START + timedelta(hours=1)
+    usage: HourUsage = {
+        "sb-ended": _usage("sb-ended", 1.0, last_end=START + timedelta(minutes=20)),
+        "sb-running": _usage("sb-running", 1.0, last_end=end),
+        "sb-no-end": _usage("sb-no-end", 1.0, last_end=None),
+        "sb-unpriced": None,
+    }
+
+    async def read(_org: Org, _secret: str, _start: datetime, _end: datetime) -> HourUsage:
+        return usage
+
+    last_ends = await sandbox_cost.daytona_last_ends(Org(name="org"), SECRET_NAME, START, end, open_usage=_opener(read))
+
+    assert last_ends == {"sb-ended": START + timedelta(minutes=20)}
