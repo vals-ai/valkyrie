@@ -34,6 +34,7 @@ from tracker.executor.control_tasks import (
     BenchmarkState,
     DirectAdmissionResponse,
     NativeOutputRequest,
+    SandboxCostRequest,
     SandboxLinkRequest,
     TaskAccountingRequest,
     TaskBreakdownRequest,
@@ -539,6 +540,30 @@ def record_link(
     if body.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
     BenchmarkRepository(session).record_sandbox_link(body.provider, body.sandbox_id, body.benchmark_id)
+    session.commit()
+    return complete_response(session, TaskDecision(accepted=True))
+
+
+@router.post(
+    "/record_sandbox_cost",
+    response_model=TaskDecision,
+    description="Record the cost of a sandbox linked to an owned run.",
+)
+def record_cost(
+    body: SandboxCostRequest,
+    invocation: Invocation = Depends(authenticated_invocation),
+    session: Session = Depends(get_session),
+) -> TaskDecision:
+    benchmark = _owner(session, invocation, body.ref, live=False)
+    if body.benchmark_id != benchmark.id:
+        raise HTTPException(status_code=403)
+    CostRepository(session).add_sandbox_cost(
+        benchmark_id=body.benchmark_id,
+        provider=body.provider,
+        sandbox_id=body.sandbox_id,
+        amount_usd=body.amount_usd,
+        usage_end=body.usage_end,
+    )
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))
 

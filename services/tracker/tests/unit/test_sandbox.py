@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, Never, cast
 from unittest.mock import AsyncMock, Mock, call
+from uuid import uuid4
 
 import pytest
 from benchmark_service import (
@@ -67,6 +68,7 @@ from tracker.exceptions import (
     SandboxImageBuildError,
     SandboxSetupError,
 )
+from tracker.executor.control_tasks import SandboxLink
 from tracker.search_cost import SearchCharge
 from tracker.sandbox import (
     render_run_cmd,
@@ -4883,6 +4885,44 @@ class TestSandboxLifecycle:
             pass
 
         delete_mock.assert_awaited_once_with(mock_sandbox, provider, initiated_by="task_teardown")
+
+    @pytest.mark.description("A deleted task sandbox records the cost it prices itself at, if any.")
+    @pytest.mark.parametrize("amount", [0.04, None])
+    async def test_create_sandbox_records_sandbox_cost_after_teardown(
+        self, monkeypatch: pytest.MonkeyPatch, amount: float | None
+    ) -> None:
+        mock_sandbox = Mock(id="sb-1", cost_usd=Mock(return_value=amount))
+
+        async def mock_create_sandbox(*_args: Any, **_kwargs: Any) -> Mock:
+            return mock_sandbox
+
+        monkeypatch.setattr(sandbox_module, "_create_sandbox", mock_create_sandbox)
+        monkeypatch.setattr(sandbox_module, "delete_sandbox", AsyncMock(return_value=True))
+        monkeypatch.setattr(sandbox_module, "distribution", Mock())
+        monkeypatch.setattr(sandbox_module, "set_sandbox_context", Mock())
+        link = SandboxLink(benchmark_id=uuid4(), provider="priced")
+        record_cost = AsyncMock()
+
+        async with create_sandbox(
+            provider=Mock(),
+            sandbox_name="task-alias",
+            source=ImageSource(image="ghcr.io/vals/swebench:latest"),
+            resources=Resources(vcpu=0.25, memory=1, disk=5),
+            creation_semaphore=asyncio.Semaphore(1),
+            creation_state=SandboxCreationState(cleanup_pending=False),
+            sandbox_link=link,
+            record_sandbox=AsyncMock(),
+            record_sandbox_cost=record_cost,
+        ):
+            pass
+
+        if amount is None:
+            record_cost.assert_not_awaited()
+            return
+        record_cost.assert_awaited_once()
+        cost_link, sandbox_id, recorded, ended_at = record_cost.await_args.args
+        assert (cost_link, sandbox_id, recorded) == (link, "sb-1", amount)
+        mock_sandbox.cost_usd.assert_called_once_with(ended_at)
 
     @pytest.mark.description("Sandbox creation keeps its success when task teardown fails.")
     async def test_create_sandbox_preserves_success_when_task_teardown_fails(

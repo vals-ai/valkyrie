@@ -53,6 +53,7 @@ RETRYABLE_OPERATIONS = frozenset(
         "read_dataset_version",
         "read_run_state",
         "read_task",
+        "record_sandbox_cost",
         "record_sandbox_link",
         "revoke_egress_policy",
         "save_task_resume",

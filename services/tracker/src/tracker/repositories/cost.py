@@ -107,6 +107,14 @@ class MissingUsageEndRow(NamedTuple):
     placed_at: datetime
 
 
+class UnpricedSandbox(NamedTuple):
+    org_id: UUID
+    provider: str
+    secret_name: str
+    benchmark_id: UUID
+    sandbox_id: str
+
+
 class SandboxAccountUse(NamedTuple):
     org_id: UUID
     secret_name: str
@@ -388,6 +396,26 @@ class CostRepository:
         )
         return result.rowcount == 1
 
+    def add_sandbox_cost(
+        self, *, benchmark_id: UUID, provider: str, sandbox_id: str, amount_usd: float, usage_end: datetime
+    ) -> bool:
+        result = self._session.exec(
+            insert(RunCost)
+            .values(
+                benchmark_id=benchmark_id,
+                cost_type=SANDBOX_COST_TYPE,
+                source_id=sandbox_id,
+                provider=provider,
+                amount_usd=amount_usd,
+                usage_end=usage_end,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["provider", "source_id"],
+                index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+            )
+        )
+        return result.rowcount == 1
+
     def upsert_modal_run_cost(self, *, benchmark_id: UUID, amount_usd: float, usage_end: datetime) -> bool:
         result = self._session.exec(
             insert(RunCost)
@@ -521,6 +549,40 @@ class CostRepository:
             SandboxAccountUse(org_id=org_id, secret_name=name, last_finished_at=None if active_runs else last_end)
             for org_id, name, active_runs, last_end in rows
         ]
+
+    def unpriced_sandboxes(self, providers: Sequence[str], since: datetime) -> list[UnpricedSandbox]:
+        secret_name = type_coerce(col(Benchmark.arguments), JSON)["sandbox_provider_secret_name"].as_string()
+        priced = (
+            select(RunCost.id)
+            .where(
+                col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+                col(RunCost.provider) == col(SandboxRecord.provider),
+                col(RunCost.source_id) == col(SandboxRecord.sandbox_id),
+            )
+            .exists()
+        )
+        statement = (
+            cast(Any, select)(
+                col(Benchmark.org_id),
+                col(SandboxRecord.provider),
+                secret_name,
+                col(SandboxRecord.benchmark_id),
+                col(SandboxRecord.sandbox_id),
+            )
+            .join(Benchmark, col(Benchmark.id) == col(SandboxRecord.benchmark_id))
+            .where(
+                col(SandboxRecord.provider).in_(providers),
+                secret_name.is_not(None),
+                or_(
+                    col(Benchmark.status).not_in(FINISHED_BENCHMARK_STATUSES),
+                    col(Benchmark.finished_at) >= since,
+                    col(Benchmark.started_at) >= since,
+                ),
+                ~priced,
+            )
+            .order_by(col(SandboxRecord.benchmark_id), col(SandboxRecord.sandbox_id))
+        )
+        return [UnpricedSandbox(*row) for row in cast(Any, self._session.exec(statement)).all()]
 
     def usage_cursor(self, org_id: UUID, secret_name: str, start: datetime) -> datetime:
         self._session.exec(

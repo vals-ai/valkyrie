@@ -232,7 +232,9 @@ class TestQueuedTaskSource:
         lifecycle: list[tuple[str, bool]] = []
         provider = Mock()
         provider_context_entries: list[DaytonaProviderConfig] = []
-        mock_sandbox = SimpleNamespace(id="mock-sandbox-id", name="mock-sandbox-name", state="started", labels={})
+        mock_sandbox = SimpleNamespace(
+            id="mock-sandbox-id", name="mock-sandbox-name", state="started", labels={}, cost_usd=lambda _ended_at: None
+        )
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             return task_response

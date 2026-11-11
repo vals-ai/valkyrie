@@ -14,6 +14,7 @@ from asyncio import Semaphore
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator, Literal, Never, assert_never
@@ -232,6 +233,18 @@ def audit_sandbox_delete(
     )
 
 
+async def _record_cost(
+    sandbox: Sandbox,
+    link: SandboxLink | None,
+    record_sandbox_cost: Callable[[SandboxLink, str, float, datetime], Awaitable[None]] | None,
+) -> None:
+    if link is None or record_sandbox_cost is None:
+        return
+    ended_at = datetime.now(UTC)
+    if (amount := sandbox.cost_usd(ended_at)) is not None:
+        await record_sandbox_cost(link, sandbox.id, amount, ended_at)
+
+
 async def delete_sandbox(
     sandbox: Sandbox,
     provider: SandboxProvider,
@@ -409,6 +422,7 @@ async def create_sandbox(
     unique_name: bool = True,
     sandbox_link: SandboxLink | None = None,
     record_sandbox: Callable[[SandboxLink, str], Awaitable[None]],
+    record_sandbox_cost: Callable[[SandboxLink, str, float, datetime], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[Sandbox, Any]:
     if unique_name:
         sandbox_name = f"{sandbox_name}_{uuid.uuid4().hex[:6]}"
@@ -503,6 +517,7 @@ async def create_sandbox(
             try:
                 if await delete_sandbox(sandbox, provider, initiated_by="task_teardown"):
                     creation_state.cleanup_pending = False
+                    await _record_cost(sandbox, sandbox_link, record_sandbox_cost)
             except ProviderSandboxError:
                 pass
 

@@ -187,6 +187,15 @@ class SandboxLinkRequest(BaseModel):
     sandbox_id: str
 
 
+class SandboxCostRequest(BaseModel):
+    ref: DispatchRef
+    benchmark_id: UUID
+    provider: str
+    sandbox_id: str
+    amount_usd: float
+    usage_end: datetime
+
+
 class EgressGrantRequest(BaseModel):
     ref: DispatchRef
     task_row_id: UUID
@@ -317,6 +326,27 @@ class TaskControl:
         except Exception:
             logger.exception(
                 "Failed to save run sandbox", extra={"sandbox_id": sandbox_id, "benchmark_id": str(link.benchmark_id)}
+            )
+
+    async def record_sandbox_cost(
+        self, link: SandboxLink, sandbox_id: str, amount_usd: float, usage_end: datetime
+    ) -> None:
+        try:
+            await self.client.call(
+                "record_sandbox_cost",
+                SandboxCostRequest(
+                    ref=self.ref,
+                    benchmark_id=link.benchmark_id,
+                    provider=link.provider,
+                    sandbox_id=sandbox_id,
+                    amount_usd=amount_usd,
+                    usage_end=usage_end,
+                ),
+                TaskDecision,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to save sandbox cost", extra={"sandbox_id": sandbox_id, "benchmark_id": str(link.benchmark_id)}
             )
 
     async def grant_egress_policy(self, proxy: RunEgressProxy, attempt: RunAttempt) -> None:

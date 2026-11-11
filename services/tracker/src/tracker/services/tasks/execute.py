@@ -1346,6 +1346,7 @@ async def _process_task_attempt(
                     unique_name=queue_context is None,
                     sandbox_link=SandboxLink(benchmark_id=benchmark_id, provider=sandbox_provider_config.type),
                     record_sandbox=control.record_sandbox,
+                    record_sandbox_cost=control.record_sandbox_cost,
                 ) as sandbox:
                     try:
                         yield sandbox

@@ -379,7 +379,7 @@ class DatasetTaskService:
                         outer,
                         provider,
                         on_message,
-                        on_sandbox_created if sandbox_provider and sandbox_provider.type == "daytona" else None,
+                        on_sandbox_created,
                         folder=f"{STEPS_DIR}/{step.name}/artifacts",
                         reset_tests=True,
                         layers=step_layers(config, step, task_dir),
@@ -433,7 +433,7 @@ class DatasetTaskService:
                 outer,
                 provider,
                 on_message,
-                on_sandbox_created if sandbox_provider and sandbox_provider.type == "daytona" else None,
+                on_sandbox_created,
             )
 
     async def _grade(

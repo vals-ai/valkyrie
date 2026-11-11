@@ -14,6 +14,7 @@ from benchmark_service import (
     SandboxCreateRequest,
     SandboxError,
 )
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider, notify_sandbox_created
 from benchmark_service.schemas import SandboxCreatedData
 from benchmark_service.sandbox.types import SandboxSource
 
@@ -36,8 +37,11 @@ AGENT_SOURCE = ImageSource(image="agent:1")
 
 
 class FakeProvider:
-    def __init__(self, sandboxes: Sequence[FakeSandbox | SandboxError]) -> None:
+    def __init__(
+        self, sandboxes: Sequence[FakeSandbox | SandboxError], announces: AnnouncedSandboxProvider | None = "daytona"
+    ) -> None:
         self.to_create = list(sandboxes)
+        self.announces: AnnouncedSandboxProvider | None = announces
         self.requests: list[SandboxCreateRequest] = []
         self.deleted: list[str] = []
 
@@ -48,6 +52,8 @@ class FakeProvider:
         created = self.to_create.pop(0)
         if isinstance(created, SandboxError):
             raise created
+        if self.announces is not None:
+            await notify_sandbox_created(self.announces, created.id)
         return created
 
     async def delete_sandbox(self, instance_id: str) -> None:
@@ -339,6 +345,20 @@ class TestGradeSeparately:
             await grade(TaskConfig.parse("[verifier]\nenvironment_mode = 'separate'"), provider, tests_dir)
 
         assert len(provider.requests) == 1
+
+    @pytest.mark.description("Only a verifier its provider announces is reported, under the provider's own name.")
+    @pytest.mark.parametrize("announces", ["daytona_v2", None])
+    async def test_the_provider_names_the_verifier_it_announces(
+        self, tests_dir: Path, announces: AnnouncedSandboxProvider | None
+    ) -> None:
+        provider = FakeProvider([verifier_sandbox()], announces=announces)
+        created: list[SandboxCreatedData] = []
+        config = TaskConfig.parse("[verifier]\ntimeout_sec = 600\n[verifier.environment]\ndocker_image = 'grader:1'")
+
+        await grade(config, provider, tests_dir, created=created)
+
+        expected = [] if announces is None else [SandboxCreatedData(provider=announces, sandbox_id="verifier-1")]
+        assert created == expected
 
     @pytest.mark.description("The sandbox is deleted even if announcing it fails.")
     async def test_the_sandbox_is_deleted_even_if_announcing_it_fails(self, tests_dir: Path) -> None:

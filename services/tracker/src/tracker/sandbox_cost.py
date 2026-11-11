@@ -27,6 +27,7 @@ from sqlmodel import Session
 from tracker.database.models import Org
 from tracker.database.session import database_call, engine
 from tracker.logging import get_logger
+from tracker.services.sandboxes.costs import sweep_priced_sandbox_costs
 from tracker.modal_cost import sweep_modal_costs
 from tracker.repositories.cost import CostRepository, SandboxUsage
 from tracker.repositories.organization import OrganizationRepository
@@ -502,7 +503,11 @@ async def sweep_sandbox_costs_as_leader(
             logger.debug("Sandbox cost sweep skipped because another worker leads")
             return None
         logger.info("Sandbox cost sweep leadership acquired", extra={"pid": os.getpid()})
-    return await sweep_modal_costs(bind, now=now) + await sweep_sandbox_costs(bind, now=now)
+    return (
+        await sweep_modal_costs(bind, now=now)
+        + await sweep_sandbox_costs(bind, now=now)
+        + await sweep_priced_sandbox_costs(bind, now=now)
+    )
 
 
 def run_sandbox_cost_loop(stop_event: Event, *, interval_seconds: float = _SWEEP_INTERVAL_SECONDS) -> None:

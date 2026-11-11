@@ -264,7 +264,7 @@ class OrgContext(BaseModel):
 BenchmarkName = Annotated[str, AfterValidator(validate_benchmark_name)]
 ServiceUrl = Annotated[str, AfterValidator(validate_service_url_syntax)]
 ServiceHeaderName = Annotated[str, AfterValidator(validate_service_header_name)]
-ProviderName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
+ProviderName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 SecretReference = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_+=.@/-]{1,512}$")]
 
 

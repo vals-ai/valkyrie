@@ -7,7 +7,8 @@ import re
 import shlex
 import tarfile
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -22,6 +23,7 @@ from benchmark_service import (
     SandboxError,
     SandboxProvider,
 )
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_created_scope
 from benchmark_service.sandbox.types import SandboxSource
 from benchmark_service.schemas import SandboxCreatedData
 
@@ -138,6 +140,20 @@ def verifier_runs_compose(config: TaskConfig, task_dir: Path) -> bool:
 def _sandbox_name(task_id: str) -> str:
     prefix = re.sub(r"[^a-z0-9-]", "-", task_id.lower())[:NAME_PREFIX_LENGTH].strip("-") or "task"
     return f"{prefix}-verifier-{uuid4().hex[:12]}"
+
+
+@contextmanager
+def _collect_announcements(enabled: bool) -> Iterator[list[SandboxCreatedData]]:
+    announced: list[SandboxCreatedData] = []
+    if not enabled:
+        yield announced
+        return
+
+    async def announce(provider: AnnouncedSandboxProvider, sandbox_id: str) -> None:
+        announced.append(SandboxCreatedData(provider=provider, sandbox_id=sandbox_id))
+
+    with sandbox_created_scope(announce):
+        yield announced
 
 
 async def _create_sandbox(
@@ -301,10 +317,12 @@ async def grade_separately(
     if on_message is not None:
         on_message(f"Starting a separate verifier for {task_id}")
     labels = {**(services[MAIN_SERVICE].labels or {}), "valkyrie-role": "verifier"}
-    verifier = await _create_sandbox(provider, task_id, config, source, sandbox_env, labels)
+    with _collect_announcements(on_created is not None) as announced:
+        verifier = await _create_sandbox(provider, task_id, config, source, sandbox_env, labels)
     try:
         if on_created is not None:
-            on_created(SandboxCreatedData(provider="daytona", sandbox_id=verifier.id))
+            for created in announced:
+                on_created(created)
         if isinstance(source, ComposeSource) and environment.compose is not None:
             await start_compose_runtime(verifier, source, environment.compose, sandbox_env)
         policy = stage_egress(config.verifier, config.verifier.environment or config.environment)

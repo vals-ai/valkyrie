@@ -109,6 +109,14 @@ def test_an_organization_only_sees_its_own_mappings(store: MagicMock, database_s
     assert _client.delete("/sandbox-providers/modal").status_code == 404
 
 
+@pytest.mark.description("A provider name with an underscore, such as `daytona_v2`, maps like any other.")
+def test_underscored_provider_names_map(store: MagicMock) -> None:
+    _stored(store, "v2secret")
+
+    assert _client.put("/sandbox-providers/daytona_v2", json={"secret_name": "v2secret"}).status_code == 200
+    assert _client.get("/sandbox-providers").json() == {"providers": {"daytona_v2": "v2secret"}}
+
+
 @pytest.mark.description("An unknown provider or invalid secret name returns 422 and saves no mapping.")
 @pytest.mark.parametrize(
     ("provider", "body"),
