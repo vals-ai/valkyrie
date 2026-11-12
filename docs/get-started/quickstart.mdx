@@ -1,128 +1,81 @@
 ---
 title: "Quickstart"
-description: "Install the CLI, connect Daytona, and run a test agent on one SWE-bench task."
+description: "Install Claude Code from the public registry and run one Terminal-Bench task on Modal."
 ---
 
-In this tutorial you run a small test agent on one SWE-bench task with Vals AI's hosted
-Valkyrie, and read the result.
-
-The test agent reads the task and changes nothing, so the run scores 0. That's expected,
-since the goal is to see each step of a run work.
+Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie.
 
 You need:
 
 - Python 3.12, [uv](https://docs.astral.sh/uv/), and Git.
 - A Vals AI account. To get one, send an email to [contact@vals.ai](mailto:contact@vals.ai).
-- A [Daytona](https://app.daytona.io) account, where your tasks' sandboxes run.
+- A [Modal](https://modal.com) account for task sandboxes.
+- An [Anthropic API key](https://platform.claude.com/settings/keys) for Claude Code.
 
-## Install the CLI
+<a id="install-the-cli" style={{ display: "block", scrollMarginTop: "12rem" }} />
 
-```bash
-uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false \
-  --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
-```
-
-This installs the Valkyrie CLI as `valkyrie`, with the short alias `valk`. To check it,
-run `valkyrie --help`, which lists the commands. To remove it once you're done, run:
+## 1. Install the CLI
 
 ```bash
-uv tool uninstall valkyrie-cli
+uv tool install valkyrie-cli
 ```
 
-## Sign in
+<a id="sign-in" style={{ display: "block", scrollMarginTop: "12rem" }} />
+
+## 2. Sign in
 
 ```bash
 valkyrie login
 ```
 
-The CLI prints a link and a code, and your browser opens the link. Confirm the code and
-sign in. The output ends with your account and your organization, similar to the following:
+## 3. Connect Modal
 
-```text
-Logged in to https://benchmark-tracker.vals.ai as you@example.com.
-* acme
-```
+Follow [Set up Modal](/get-started/sandbox-providers#set-up-modal) to save your token and
+connect your workspace to Valkyrie.
 
-If the CLI says that you aren't in an organization yet, ask Vals AI to add you, and then
-run `valkyrie login` again.
+## 4. Install Claude Code
 
-## Connect Daytona
-
-[Create a Daytona API key](https://app.daytona.io/dashboard/keys) with access to sandboxes
-and snapshots. Save it in a file named `daytona.json`:
-
-```json daytona.json
-{
-  "DAYTONA_API_KEY": "API_KEY",
-  "DAYTONA_API_URL": "https://app.daytona.io/api",
-  "DAYTONA_TARGET": "us"
-}
-```
-
-Replace *`API_KEY`* with your Daytona API key. Then store the file as a secret of your
-organization:
+Install the [Claude Code example](https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0)
+from the public agent registry:
 
 ```bash
-valkyrie secret set daytona < daytona.json
+valkyrie agent install \
+  https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
 ```
 
-The output is similar to the following:
+- The CLI confirms that `claude_code-v1.0.0` is installed in your organization's library.
 
-```text
-✓ Secret 'daytona' saved.
-Use this reference as the secret name: daytona
-```
-
-Point the `daytona` provider at that secret, using the reference that the output showed:
+Store your Anthropic API key at the hidden prompt:
 
 ```bash
-valkyrie provider set daytona daytona
+valkyrie secret set anthropic-api-key
 ```
 
-The CLI confirms with `Provider daytona now uses the secret daytona.`
-
-## Create a test agent
-
-An agent is a directory with a `contract.yaml` that says how to run it. Create one whose
-agent prints the task's problem statement and does nothing else:
+## 5. Install a Harbor dataset
 
 ```bash
-mkdir hello-agent
-
-cat > hello-agent/contract.yaml << 'EOF'
-name: hello-agent
-install_cmd: ""
-run_cmd: cat "{problem_statement_path}"
-EOF
+valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
 ```
 
-## Upload the agent
+- The CLI downloads the tasks from Harbor and publishes them as `tb/tb2` in your
+  organization, creating the benchmark and dataset if needed.
+
+<a id="run-one-task" style={{ display: "block", scrollMarginTop: "12rem" }} />
+
+## 6. Run one task
 
 ```bash
-valkyrie agent push ./hello-agent
+valkyrie run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
+  --model anthropic/claude-sonnet-4-6 --provider modal \
+  -s ANTHROPIC_API_KEY anthropic-api-key --slice 0:1 --concurrency 1 --connect
 ```
 
-The CLI confirms with `✓ Agent 'hello-agent' pushed successfully!` The agent is now in
-your organization's library as `hello-agent`.
+- Valkyrie creates a Modal sandbox, runs Claude Code on one task, and grades the result.
+- The CLI prints a **Run ID** and streams progress until the run finishes.
 
-## Run one task
+<a id="read-the-result" style={{ display: "block", scrollMarginTop: "12rem" }} />
 
-```bash
-valkyrie run start --agent hello-agent --benchmark swebench --slice 0:1 --connect
-```
-
-The run goes in your organization's `default` project. If your organization requires a
-project, the Tracker refuses the start and says so; see
-[Put the run in a project](/runs/start#put-the-run-in-a-project).
-
-Valkyrie creates a sandbox in your Daytona account, sets up the first SWE-bench task in it,
-runs the agent, and grades the result.
-
-- The output starts with a summary of the benchmark and the agent, followed by a **Run ID**
-  line.
-- Progress updates follow. They stream until the run finishes, after a few minutes.
-
-## Read the result
+## 7. Read the result
 
 ```bash
 valkyrie run results RUN_ID
@@ -130,14 +83,12 @@ valkyrie run results RUN_ID
 
 Replace *`RUN_ID`* with the ID from the **Run ID** line.
 
-- The CLI confirms with `Results saved to 'results-RUN_ID.json'`.
-- In that file, `final_evaluation.final_score` is `0.0`, because the test agent didn't fix
-  the task.
-
-You've run an agent on a benchmark task, from sandbox to score.
+- The CLI prints the saved results file's path.
+- Open that JSON file to inspect the task's result and score.
 
 ## Next steps
 
 - [Package an agent](/agents/package-an-agent) to run your own agent
-- [Start a run](/runs/start) on a whole dataset, with your model and concurrency
+- [Publish a dataset](/benchmarks/datasets) to evaluate tasks you build
+- [Start a run](/runs/start) on more tasks, with your model and concurrency
 - [Monitor runs](/runs/monitor) to follow progress and find failed tasks
