@@ -479,6 +479,10 @@ TRACKER_ONLY_FIELDS: dict[type[BaseModel], set[str]] = {
 
 SDK_OPTIONAL_FIELDS: dict[type[BaseModel], set[str]] = {StartBenchmarkRequest: {"sandbox_provider"}}
 
+SDK_OMITTED_EMPTY_FIELDS: dict[type[BaseModel], dict[str, set[str]]] = {
+    FinalViewResponse: {"benchmark_arguments": {"agent_attempts"}},
+}
+
 
 def load_fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -517,7 +521,8 @@ def test_sdk_and_tracker_accept_canonical_fixture(
     assert isinstance(sdk_value, sdk_model)
     tracker_only = TRACKER_ONLY_FIELDS.get(tracker_model, set())
     assert tracker_value.model_dump(mode="json", warnings=False, exclude=tracker_only) == payload
-    assert sdk_value.model_dump(mode="json") == payload
+    sdk_omitted = SDK_OMITTED_EMPTY_FIELDS.get(tracker_model, {})
+    assert sdk_value.model_dump(mode="json", exclude=sdk_omitted) == payload
 
 
 @pytest.mark.description("Matching SDK and Tracker wire models have the same fields with the same defaults.")

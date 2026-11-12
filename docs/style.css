@@ -528,3 +528,16 @@ img.nav-logo {
 td > code:only-child {
   white-space: nowrap;
 }
+
+/* Mintlify's banner is site-wide. Show it only in the Benchmark services tab, whose tab link
+   points at its first page. Mintlify forces the banner on with !important in Tailwind's
+   components layer, so this rule sits in the earlier base layer to take precedence. */
+@layer base {
+  html:not(:has(.nav-tabs-item[data-active][href="/benchmarks/convert-a-benchmark"])) #banner {
+    display: none !important;
+  }
+}
+
+html:not(:has(.nav-tabs-item[data-active][href="/benchmarks/convert-a-benchmark"])) {
+  --banner-height: 0px !important;
+}

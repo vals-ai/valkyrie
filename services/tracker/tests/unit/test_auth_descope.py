@@ -15,7 +15,6 @@ from fastapi import HTTPException
 from jwt import InvalidAudienceError, InvalidSignatureError
 from requests.exceptions import ReadTimeout
 from sqlmodel import Session, select
-from tenacity import wait_none
 
 import tracker.auth as auth_module
 from tracker.auth import (
@@ -84,11 +83,6 @@ def descope_access_key_response(
         "keyId": key_id,
         "sessionToken": session_token,
     }
-
-
-def disable_auth_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    exchange_access_key = getattr(auth_module, "_exchange_access_key")
-    monkeypatch.setattr(exchange_access_key.retry, "wait", wait_none())
 
 
 _RUN_KEY_CLAIM_PLACEMENTS = [
@@ -274,8 +268,7 @@ class TestDescopeIdentityResolution:
             "- The second exchange succeeds without a real retry delay."
         )
     )
-    def test_access_key_retries_read_timeout(self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-        disable_auth_retry_wait(monkeypatch)
+    def test_access_key_retries_read_timeout(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.side_effect = [
             ReadTimeout("HTTPSConnectionPool(host='api.descope.com', port=443): Read timed out. (read timeout=60)"),
             descope_access_key_response(),
@@ -295,10 +288,7 @@ class TestDescopeIdentityResolution:
             "- The client receives a safe 503 response after immediate test retries."
         )
     )
-    def test_access_key_returns_503_when_retries_exhausted(
-        self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        disable_auth_retry_wait(monkeypatch)
+    def test_access_key_returns_503_when_retries_exhausted(self, mock_descope: MagicMock) -> None:
         mock_descope.exchange_access_key.side_effect = ReadTimeout(
             "HTTPSConnectionPool(host='api.descope.com', port=443): Read timed out. (read timeout=60)"
         )

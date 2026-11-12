@@ -9,6 +9,7 @@ from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceErr
 from benchmark_service.schemas import VerifyTaskIdsResponse
 from fastapi.testclient import TestClient
 from httpx._models import Response
+from pydantic import BaseModel
 from sqlmodel import Session, col, func, select, update
 from sqlalchemy import text
 
@@ -43,7 +44,7 @@ from tracker.executor.control_tasks import (
     TaskSearchCostsRequest,
 )
 from tracker.executor.control_protocol import AttemptRef, PhaseRef
-from tracker.executor.control_runs import RunControl
+from tracker.executor.control_runs import CommitFinalScoreRequest, RunControl
 from tracker.executor.release_control import promote_release
 
 from tracker.types import FetchBenchmarksRequest, RunExecutionRequest, StartBenchmarkRequest
@@ -88,6 +89,11 @@ def example_benchmark_object(contract: AgentContractRequest, database_session: S
     benchmark.executor_artifact_digest = release.artifact_digest
     benchmark.executor_protocol_version = release.protocol_version
     return benchmark
+
+
+class _WirePublicationClaim(BaseModel):
+    committed: bool
+    final_view: dict[str, Any]
 
 
 @pytest.mark.description("Benchmark state transitions, task rows, and finalization.")
@@ -774,6 +780,51 @@ class TestRunState:
         assert task.status == TaskStatus.IN_PROGRESS
         assert task.finished_at is None
         assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).all() == []
+
+    @pytest.mark.parametrize("with_attempts", [False, True])
+    @pytest.mark.description(
+        "A committed final view sends `agent_attempts` only when the run has attempts."
+        " Executor releases that predate attempt history can parse runs without them."
+    )
+    async def test_commit_final_score_omits_empty_agent_attempts(
+        self,
+        with_attempts: bool,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+    ) -> None:
+        benchmark = make_benchmark(contract=contract, concurrency=1)
+        if with_attempts:
+            benchmark.arguments.agent_attempts = [
+                AgentExecutionAttempt(effective_configuration={}, task_ids=["task_0"])
+            ]
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+        run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
+        await run_control.read_run_state(["task_0"], create_missing_tasks=True)
+        control_postgres_session.exec(
+            update(Task)
+            .where(col(Task.benchmark) == benchmark.id)
+            .values(status=TaskStatus.FINISHED, finished_at=datetime.now(ZoneInfo("UTC")))
+        )
+        task = control_postgres_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+        control_postgres_session.add(EvaluationResult(org_id=TEST_ORG_ID, task=task.id, result={"score": 1.0}))
+        control_postgres_session.commit()
+        decision = await run_control.prepare_finalization()
+        assert decision.kind == "score" and decision.inputs is not None
+        claim = await run_control.client.call(
+            "commit_final_score",
+            CommitFinalScoreRequest(
+                ref=run_control.ref,
+                phase=decision.inputs.phase,
+                fingerprint=decision.inputs.fingerprint,
+                final_score=1.0,
+                metadata={},
+            ),
+            _WirePublicationClaim,
+        )
+        assert claim.committed
+        assert ("agent_attempts" in claim.final_view["benchmark_arguments"]) is with_attempts
 
     @pytest.mark.description("Finalization defers pending work, scores completed work, and stops interrupted runs.")
     async def test_finalize_benchmark_status(

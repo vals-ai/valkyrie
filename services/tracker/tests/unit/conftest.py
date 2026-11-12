@@ -18,6 +18,7 @@ from benchmark_service.schemas import (
 import pytest
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
+from tenacity import wait_none
 
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tests.unit.services.task_execution_support import (
@@ -26,6 +27,8 @@ from tests.unit.services.task_execution_support import (
     make_retrieve_task_response,
 )
 from tests.utils import TEST_ORG_ID, add_sqlite_btrim, inline_database_calls_in
+import tracker.auth as auth_module
+from tracker import sandbox as sandbox_module
 from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
 from tracker.database.models import (
     ExecutorAdmission,
@@ -211,6 +214,16 @@ def mock_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def mock_lambda_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("main.dry_run_lambda", AsyncMock())
+
+
+@pytest.fixture(autouse=True)
+def no_retry_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    for retried in (
+        getattr(auth_module, "_exchange_access_key"),
+        getattr(sandbox_module, "upload_agent_artifacts"),
+        getattr(sandbox_module, "_run_egress_operation"),
+    ):
+        monkeypatch.setattr(retried.retry, "wait", wait_none())
 
 
 @pytest.fixture(autouse=True)

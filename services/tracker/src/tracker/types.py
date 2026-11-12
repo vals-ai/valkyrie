@@ -192,7 +192,7 @@ class _BenchmarkArguments(BaseModel):
     model_config = {"extra": "forbid"}
 
     contract: AgentContractRequest
-    agent_attempts: list[AgentExecutionAttempt] = Field(default_factory=list)
+    agent_attempts: list[AgentExecutionAttempt] = Field(default_factory=list, exclude_if=lambda attempts: not attempts)
     concurrency: int
     priority: int | None = Field(default=None, exclude=True, strict=True, ge=0, le=4)
     queue_pool_id: str | None = Field(default=None, exclude=True)

@@ -40,7 +40,6 @@ from benchmark_service import (
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
 from benchmark_service.sandbox.created import notify_sandbox_created
-from tenacity import wait_none
 
 from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.external_service_gateway import (
@@ -5372,7 +5371,6 @@ class TestUploadAgentArtifacts:
         retryable: bool,
     ) -> None:
         store = _mock_object_store()
-        monkeypatch.setattr(upload_agent_artifacts.retry, "wait", wait_none())
         mock_sandbox = AsyncMock()
         mock_sandbox.name = "test-sandbox"
 
@@ -5461,14 +5459,12 @@ class TestEgressPolicy:
     )
     async def test_apply_egress_policy_maps_provider_errors(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         provider_error: Exception,
         expected_error: type[SandboxError],
         message: str,
         attempts: int,
         transient: bool,
     ) -> None:
-        monkeypatch.setattr(_run_egress_operation.retry, "wait", wait_none())
         sandbox = Mock()
         sandbox.modify_egress_rules = AsyncMock(side_effect=provider_error)
 

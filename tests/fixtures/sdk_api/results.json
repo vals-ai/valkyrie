@@ -42,7 +42,6 @@
       "sandbox_provider_secret_name": "ModalSecret",
       "dataset_version": null,
       "monitoring": null,
-      "agent_attempts": [],
       "monitoring_rules": null
     },
     "tasks_stopped": 0,

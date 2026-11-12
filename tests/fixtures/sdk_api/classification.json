@@ -55,8 +55,7 @@
       "lambda_function": null,
       "dataset": null,
       "sandbox_provider": "daytona",
-      "sandbox_provider_secret_name": "test-daytona-secret",
-      "agent_attempts": []
+      "sandbox_provider_secret_name": "test-daytona-secret"
     },
     "tasks_stopped": null,
     "final_evaluation": null,

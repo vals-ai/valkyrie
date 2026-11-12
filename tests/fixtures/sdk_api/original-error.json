@@ -58,8 +58,7 @@
       "sandbox_provider": "daytona",
       "sandbox_provider_secret_name": "test-daytona-secret",
       "environment": "aws",
-      "properties": null,
-      "agent_attempts": []
+      "properties": null
     },
     "tasks_stopped": null,
     "final_evaluation": null,

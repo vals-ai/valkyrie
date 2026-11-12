@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from itertools import batched
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, NamedTuple, cast
 from uuid import UUID
@@ -32,6 +33,7 @@ SANDBOX_COST_TYPE = "sandbox"
 SEARCH_COST_TYPE = "search"
 _HOUR = timedelta(hours=1)
 _LAST_MOMENT_OF_HOUR = _HOUR - timedelta(microseconds=1)
+_SANDBOX_HOUR_COST_BATCH = 1000
 
 
 def sandbox_hour_source_id(sandbox_id: str, hour: datetime) -> str:
@@ -412,24 +414,33 @@ class CostRepository:
             .on_conflict_do_nothing(index_elements=["provider", "sandbox_id"])
         )
 
-    def add_sandbox_hour_cost(self, *, benchmark_id: UUID, provider: str, hour: datetime, usage: SandboxUsage) -> bool:
+    def add_sandbox_hour_costs(
+        self, *, provider: str, hour: datetime, usages: Sequence[tuple[UUID, SandboxUsage]]
+    ) -> int:
         last_moment = hour + _LAST_MOMENT_OF_HOUR
-        result = self._session.exec(
-            insert(RunCost)
-            .values(
-                benchmark_id=benchmark_id,
-                cost_type=SANDBOX_COST_TYPE,
-                source_id=sandbox_hour_source_id(usage.sandbox_id, hour),
-                provider=provider,
-                amount_usd=usage.total_price,
-                usage_end=min(usage.last_end, last_moment) if usage.last_end else last_moment,
+        rows = [
+            {
+                "benchmark_id": benchmark_id,
+                "cost_type": SANDBOX_COST_TYPE,
+                "source_id": sandbox_hour_source_id(usage.sandbox_id, hour),
+                "provider": provider,
+                "amount_usd": usage.total_price,
+                "usage_end": min(usage.last_end, last_moment) if usage.last_end else last_moment,
+            }
+            for benchmark_id, usage in usages
+        ]
+        written = 0
+        for batch in batched(rows, _SANDBOX_HOUR_COST_BATCH):
+            result = self._session.exec(
+                insert(RunCost)
+                .values(list(batch))
+                .on_conflict_do_nothing(
+                    index_elements=["provider", "source_id"],
+                    index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+                )
             )
-            .on_conflict_do_nothing(
-                index_elements=["provider", "source_id"],
-                index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
-            )
-        )
-        return result.rowcount == 1
+            written += result.rowcount
+        return written
 
     def add_sandbox_cost(
         self, *, benchmark_id: UUID, provider: str, sandbox_id: str, amount_usd: float, usage_end: datetime

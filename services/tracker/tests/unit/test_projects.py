@@ -1,7 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,7 +20,10 @@ import tracker.auth as tracker_auth
 from tracker.api.projects import reject_archived_project
 from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
 from tracker.aws.tags import ORG_ID_TAG
-from tracker.exceptions import ProjectNameTakenError
+from tracker.aws.secrets import SecretsManagerStore
+from tracker.clients.projects import ProjectServiceClient
+from tracker.exceptions import ProjectNameTakenError, SecretNotFoundError
+import tracker.repositories.project as project_repository
 from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
     Benchmark,
@@ -58,10 +61,20 @@ class GatewayAPI:
         self.requests: list[dict[str, Any]] = []
         self.collections: list[dict[str, Any]] = []
         self.paths: list[str] = []
+        self.unpublished_checks = 0
+        self.registry_unreachable = False
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.paths.append(path)
+        if path == "/registry":
+            assert request.headers["authorization"] == "Bearer project-gateway-key"
+            if self.registry_unreachable:
+                raise httpx.ConnectTimeout("registry timed out", request=request)
+            if self.unpublished_checks:
+                self.unpublished_checks -= 1
+                return httpx.Response(401, json={"detail": "Invalid managed key"})
+            return httpx.Response(200, json={"models": {}})
         assert request.headers["authorization"] == "Bearer machine-test-key"
         if path == "/admin/managed-auth/machine/requests":
             assert request.method == "POST"
@@ -75,7 +88,8 @@ class GatewayAPI:
             )
         if path == f"/admin/managed-auth/machine/keys/{self.key_id}":
             assert request.method == "GET"
-            return httpx.Response(200, json={"id": str(self.key_id), "revision": 3, "status": "pending_collection"})
+            status = "active" if self.collections else "pending_collection"
+            return httpx.Response(200, json={"id": str(self.key_id), "revision": 3, "status": status})
         if path == f"/admin/managed-auth/machine/keys/{self.key_id}/collect":
             assert request.method == "POST"
             self.collections.append(json.loads(request.content))
@@ -102,6 +116,45 @@ def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
         ),
     )
     return gateway
+
+
+async def _collect_with_unpublished_checks(monkeypatch: MonkeyPatch, gateway_api: GatewayAPI, checks: int) -> UUID:
+    from tracker import project_gateway
+
+    monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_POLL_SECONDS", 0)
+    gateway_api.unpublished_checks = checks
+    project = MagicMock(handle="blog", gateway_request_id=gateway_api.request_id)
+    return await project_gateway._collect_project_gateway_key(  # pyright: ignore[reportPrivateUsage]
+        project, MagicMock(id=TEST_ORG_ID), MagicMock(put=AsyncMock())
+    )
+
+
+@pytest.mark.description("Run start waits until the Gateway accepts a newly collected project key.")
+async def test_a_collected_project_key_is_returned_once_the_gateway_accepts_it(
+    monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
+) -> None:
+    assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 2) == gateway_api.key_id
+    assert gateway_api.paths.count("/registry") == 3
+
+
+@pytest.mark.description("Run start stops waiting for a new project key at the deadline and starts anyway.")
+async def test_a_collected_project_key_the_gateway_never_accepts_stops_waiting_at_the_deadline(
+    monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
+) -> None:
+    from tracker import project_gateway
+
+    monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_TIMEOUT_SECONDS", 0)
+    assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 3) == gateway_api.key_id
+    assert gateway_api.paths.count("/registry") == 1
+
+
+@pytest.mark.description("Run start keeps a newly collected project key when the Gateway registry check times out.")
+async def test_a_collected_project_key_is_returned_when_the_gateway_registry_check_times_out(
+    monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
+) -> None:
+    gateway_api.registry_unreachable = True
+    assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 0) == gateway_api.key_id
+    assert gateway_api.paths.count("/registry") == 1
 
 
 @pytest.fixture
@@ -963,6 +1016,58 @@ def test_provision_keeps_supplied_keys_then_automatic_selects_one_project_gatewa
         secrets = payload["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"]
         assert secrets == expected_secrets
         assert "project-gateway-key" not in str(payload)
+
+
+@pytest.mark.usefixtures("active_executor_release")
+@pytest.mark.description(
+    "A start whose project service write fails after the Gateway key collect gets 503, and the next start reuses the stored key without collecting again."
+)
+def test_start_after_a_failed_project_service_write_reuses_the_collected_gateway_key(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+    vals_org: Org,
+) -> None:
+    stored: dict[str, str] = {}
+
+    async def put_secret(_self: SecretsManagerStore, name: str, value: str, *, tags: dict[str, str]) -> None:
+        stored[name] = value
+
+    async def get_secret(_self: SecretsManagerStore, name: str) -> Any:
+        if name not in stored:
+            raise SecretNotFoundError(name)
+        return json.loads(stored[name])
+
+    monkeypatch.setattr(SecretsManagerStore, "put", put_secret)
+    monkeypatch.setattr(SecretsManagerStore, "get", get_secret)
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    created = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert created.status_code == 200, created.text
+    service = {"down": True}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503 if service["down"] else 200, request=request)
+
+    writer = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(project_repository, "project_service_writer", lambda: writer)
+    request = _start_request(contract, "blog")
+
+    refused = client.post("/start-benchmark", json=request)
+    assert refused.status_code == 503, refused.text
+    (project,) = database_session.exec(select(Project)).all()
+    assert project.gateway_key_id is None
+    assert gateway_api.collections == [{"expected_revision": 3}]
+
+    service["down"] = False
+    response = client.post("/start-benchmark", json=request)
+
+    assert response.status_code == 200, response.text
+    assert gateway_api.collections == [{"expected_revision": 3}]
+    database_session.refresh(project)
+    assert project.gateway_key_id == gateway_api.key_id
+    assert len(mock_launcher.queued_calls) == 1
 
 
 @pytest.mark.usefixtures("active_executor_release")

@@ -286,17 +286,15 @@ class TestAddSandboxHourCost:
         hour = START
         costs = CostRepository(database_session)
 
-        costs.add_sandbox_hour_cost(
-            benchmark_id=benchmark.id,
+        costs.add_sandbox_hour_costs(
             provider="daytona",
             hour=hour,
-            usage=_usage("sb-1", 1, last_end=hour + timedelta(minutes=20)),
+            usages=[(benchmark.id, _usage("sb-1", 1, last_end=hour + timedelta(minutes=20)))],
         )
-        costs.add_sandbox_hour_cost(
-            benchmark_id=benchmark.id,
+        costs.add_sandbox_hour_costs(
             provider="daytona",
             hour=hour + timedelta(hours=1),
-            usage=_usage("sb-1", 1, last_end=None),
+            usages=[(benchmark.id, _usage("sb-1", 1, last_end=None))],
         )
         database_session.commit()
 
@@ -322,11 +320,10 @@ class TestAddSandboxHourCost:
         benchmark, _ = _run(database_session, status=BenchmarkStatus.FINISHED)
         costs = CostRepository(database_session)
         october_end = datetime(2026, 11, 1, tzinfo=UTC)
-        costs.add_sandbox_hour_cost(
-            benchmark_id=benchmark.id,
+        costs.add_sandbox_hour_costs(
             provider="daytona",
             hour=october_end - timedelta(hours=1),
-            usage=_usage("sb-1", 0.5, last_end=last_end),
+            usages=[(benchmark.id, _usage("sb-1", 0.5, last_end=last_end))],
         )
         database_session.commit()
 
@@ -343,15 +340,13 @@ class TestAddSandboxHourCost:
         costs = CostRepository(database_session)
 
         written = [
-            costs.add_sandbox_hour_cost(
-                benchmark_id=benchmark.id, provider="daytona", hour=hour, usage=_usage("sb-1", 0.5)
-            )
+            costs.add_sandbox_hour_costs(provider="daytona", hour=hour, usages=[(benchmark.id, _usage("sb-1", 0.5))])
             for _ in range(2)
             for hour in _hours(START, 3)
         ]
         database_session.commit()
 
-        assert written == [True] * 3 + [False] * 3
+        assert written == [1] * 3 + [0] * 3
         rows = database_session.exec(select(RunCost.source_id, RunCost.amount_usd)).all()
         assert sorted(rows) == [(f"sb-1:{hour.isoformat()}", 0.5) for hour in _hours(START, 3)]
 

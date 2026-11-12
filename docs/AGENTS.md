@@ -13,6 +13,13 @@ people outside Vals AI.
 
 ## Readers and page types
 
+The site has three tabs:
+
+- **CLI:** every group below except Benchmark services and the Python SDK groups.
+- **Python SDK:** the Python SDK guides and reference.
+- **Benchmark services:** the legacy benchmark service guides. Point new benchmarks to
+  Datasets instead.
+
 Each navigation group has one reader. Each page is one [Diátaxis](https://diataxis.fr) type
 and doesn't mix in another: a tutorial, a how-to guide, reference, or an explanation.
 
@@ -21,7 +28,8 @@ and doesn't mix in another: a tutorial, a how-to guide, reference, or an explana
 | Get started | Someone new to Valkyrie | The introduction, the quickstart tutorial, and setup guides |
 | Agents | People packaging an agent | How-to guides, and the contract reference |
 | Runs | People running benchmarks from the CLI | How-to guides, and one explanation of time limits |
-| Benchmarks | People building or connecting a benchmark service | How-to guides |
+| Datasets | People publishing benchmark tasks | How-to guides |
+| Benchmark services | People building or connecting a legacy benchmark service | How-to guides |
 | Integrations | People processing finished runs in AWS Lambda | How-to guides |
 | Python SDK | Developers driving Valkyrie from Python | How-to guides |
 | CLI reference, Python SDK reference | Anyone looking up an option or a field | Generated reference |

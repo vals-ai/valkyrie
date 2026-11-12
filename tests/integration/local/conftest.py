@@ -1,14 +1,16 @@
 from collections.abc import Generator
 from functools import partial
+from pathlib import Path
 from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
 import pytest
 from click.testing import CliRunner
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from sqlalchemy import event
-from sqlmodel import Session, SQLModel, StaticPool, create_engine
+from sqlalchemy import Engine
+from sqlmodel import Session, SQLModel, create_engine
 
 from services.tracker import main as tracker_main
 from services.tracker.tests.utils import add_sqlite_btrim
@@ -40,43 +42,52 @@ def cli_runner() -> CliRunner:
 
 
 @pytest.fixture
-def database_session() -> Generator[Session, None, None]:
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+def database_engine(tmp_path: Path) -> Generator[Engine, None, None]:
+    engine = create_engine(f"sqlite:///{tmp_path / 'tracker.db'}", connect_args={"check_same_thread": False})
     event.listen(engine, "connect", add_sqlite_btrim)
     SQLModel.metadata.create_all(engine)
 
     try:
-        with Session(engine, expire_on_commit=False) as session:
-            release = ExecutorRelease(
-                id="cli-test-release",
-                artifact_uri="source:///cli-test-release",
-                artifact_digest="a" * 64,
-                protocol_version=SUPPORTED_PROTOCOL_VERSION,
-                status=ExecutorReleaseStatus.ACTIVE,
-            )
-            session.add_all([Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME, storage_key="test-bucket"), release])
-            session.flush()
-            session.add(ExecutorAdmission(release_id=release.id))
-            session.commit()
-            yield session
+        yield engine
     finally:
-        SQLModel.metadata.drop_all(engine)
         engine.dispose()
 
 
 @pytest.fixture
+def database_session(database_engine: Engine) -> Generator[Session, None, None]:
+    with Session(database_engine, expire_on_commit=False) as session:
+        release = ExecutorRelease(
+            id="cli-test-release",
+            artifact_uri="source:///cli-test-release",
+            artifact_digest="a" * 64,
+            protocol_version=SUPPORTED_PROTOCOL_VERSION,
+            status=ExecutorReleaseStatus.ACTIVE,
+        )
+        session.add_all([Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME, storage_key="test-bucket"), release])
+        session.flush()
+        session.add(ExecutorAdmission(release_id=release.id))
+        session.commit()
+        yield session
+
+
+@pytest.fixture
 def local_tracker_app(
+    database_engine: Engine,
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[FastAPI, None, None]:
 
     def get_test_session() -> Generator[Session, None, None]:
-        yield database_session
+        with Session(database_engine, expire_on_commit=False) as session:
+            yield session
 
-    org = database_session.get(Org, TEST_ORG_ID)
-    assert org is not None
+    def get_test_org(session: Session = Depends(get_session)) -> Org:
+        org = session.get(Org, TEST_ORG_ID)
+        assert org is not None
+        return org
+
     tracker_main.app.dependency_overrides[get_session] = get_test_session
-    tracker_main.app.dependency_overrides[get_current_org] = lambda: org
+    tracker_main.app.dependency_overrides[get_current_org] = get_test_org
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_REGION", "us-east-1")
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_S3_BUCKET", "test-bucket")
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_GROUP", "test-log-group")

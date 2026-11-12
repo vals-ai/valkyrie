@@ -3,6 +3,10 @@
   "theme": "mint",
   "name": "Valkyrie",
   "description": "Run scalable, reproducible evaluations for AI agents.",
+  "banner": {
+    "content": "Benchmark services are legacy. The recommended way to run your own benchmark through Valkyrie is to publish its tasks as a [dataset](/benchmarks/datasets).",
+    "type": "warning"
+  },
   "colors": {
     "primary": "#386B46",
     "light": "#6FD09F",
@@ -43,74 +47,97 @@
     "options": ["copy", "view", "chatgpt", "claude", "cursor", "vscode"]
   },
   "navigation": {
-    "groups": [
+    "tabs": [
       {
-        "group": "Get started",
-        "pages": [
-          "introduction/what-is-valkyrie",
-          "get-started/quickstart",
-          "get-started/configuration",
-          "get-started/sandbox-providers"
+        "tab": "CLI",
+        "icon": "terminal",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "introduction/what-is-valkyrie",
+              "get-started/quickstart",
+              "get-started/configuration",
+              "get-started/sandbox-providers"
+            ]
+          },
+          {
+            "group": "Agents",
+            "pages": [
+              "agents/package-an-agent",
+              "agents/manage-agents",
+              "agents/agent-contract"
+            ]
+          },
+          {
+            "group": "Runs",
+            "pages": [
+              "runs/start",
+              "runs/monitor",
+              "runs/manage",
+              "runs/results-and-outputs",
+              "runs/time-limits"
+            ]
+          },
+          {
+            "group": "Datasets",
+            "pages": [
+              "benchmarks/datasets"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/post-run-lambda",
+              "integrations/docent"
+            ]
+          },
+          {
+            "group": "CLI reference",
+            "pages": {
+              "$ref": "reference/cli/navigation.json"
+            }
+          },
+          {
+            "group": "Self-hosting",
+            "pages": [
+              "self-hosting/local-tracker"
+            ]
+          }
         ]
       },
       {
-        "group": "Agents",
-        "pages": [
-          "agents/package-an-agent",
-          "agents/manage-agents",
-          "agents/agent-contract"
+        "tab": "Python SDK",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk/quickstart",
+              "sdk/runs",
+              "sdk/resources"
+            ]
+          },
+          {
+            "group": "Python SDK reference",
+            "pages": {
+              "$ref": "reference/sdk/navigation.json"
+            }
+          }
         ]
       },
       {
-        "group": "Runs",
-        "pages": [
-          "runs/start",
-          "runs/monitor",
-          "runs/manage",
-          "runs/results-and-outputs",
-          "runs/time-limits"
-        ]
-      },
-      {
-        "group": "Benchmarks",
-        "pages": [
-          "benchmarks/convert-a-benchmark",
-          "benchmarks/custom-services",
-          "benchmarks/datasets",
-          "benchmarks/authentication"
-        ]
-      },
-      {
-        "group": "Integrations",
-        "pages": [
-          "integrations/post-run-lambda",
-          "integrations/docent"
-        ]
-      },
-      {
-        "group": "Python SDK",
-        "pages": [
-          "sdk/quickstart",
-          "sdk/runs",
-          "sdk/resources"
-        ]
-      },
-      {
-        "group": "CLI reference",
-        "pages": {
-          "$ref": "reference/cli/navigation.json"
-        }
-      },
-      {
-        "group": "Python SDK reference",
-        "pages": {
-          "$ref": "reference/sdk/navigation.json"
-        }
-      },
-      {
-        "group": "Self-hosting",
-        "pages": [
-          "self-hosting/local-tracker"
+        "tab": "Benchmark services",
+        "icon": "server",
+        "groups": [
+          {
+            "group": "Benchmark services",
+            "pages": [
+              "benchmarks/convert-a-benchmark",
+              "benchmarks/custom-services",
+              "benchmarks/authentication"
+            ]
+          }
         ]
       }
     ]

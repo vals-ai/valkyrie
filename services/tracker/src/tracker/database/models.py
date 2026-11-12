@@ -98,8 +98,6 @@ class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
         excluded_fields = {"priority", "queue_pool_id", "selected_project_gateway_secret_ref"}
         if value.dataset_version is None:
             excluded_fields.add("dataset_version")
-        if not value.agent_attempts:
-            excluded_fields.add("agent_attempts")
         serialized = value.model_dump(mode="json", exclude=excluded_fields)
         if value.priority is not None:
             serialized["priority"] = value.priority

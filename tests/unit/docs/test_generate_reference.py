@@ -509,9 +509,12 @@ class TestGeneratedFiles:
         assert {Path(page).with_suffix(".mdx") for page in pages} == set(mdx)
 
         config = json.loads((_DOCS_ROOT / "docs.json").read_text(encoding="utf-8"))
-        groups = {group["group"]: group["pages"] for group in config["navigation"]["groups"]}
-        assert groups["CLI reference"] == {"$ref": cli_path.as_posix()}
-        assert groups["Python SDK reference"] == {"$ref": sdk_path.as_posix()}
+        tabs = {
+            tab["tab"]: {group["group"]: group["pages"] for group in tab["groups"]}
+            for tab in config["navigation"]["tabs"]
+        }
+        assert tabs["CLI"]["CLI reference"] == {"$ref": cli_path.as_posix()}
+        assert tabs["Python SDK"]["Python SDK reference"] == {"$ref": sdk_path.as_posix()}
 
     @pytest.mark.description(
         "`docs.json` loads redirects from the generated file, and each retired route points to an existing page."

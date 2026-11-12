@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import time
 from decimal import Decimal
 from uuid import UUID
 
@@ -18,6 +20,7 @@ from tracker.config import (
     project_gateway_keys_mode,
 )
 from tracker.database.models import Org, Project
+from tracker.exceptions import SecretNotFoundError
 from tracker.repositories.project import ProjectRepository
 from tracker.local import config as local_config
 from tracker.local.resources import reads_secrets_file
@@ -25,6 +28,10 @@ from tracker.secret_access import GATEWAY_SECRET_NAME_PREFIX, tenant_secret_pref
 
 
 _GATEWAY_PATH = "admin/managed-auth/machine"
+_KEY_PUBLICATION_TIMEOUT_SECONDS = 90
+_KEY_PUBLICATION_POLL_SECONDS = 5
+
+logger = logging.getLogger(__name__)
 
 
 def automatic_project_gateway(org: Org) -> bool:
@@ -73,6 +80,14 @@ def _gateway_secret_reference(org: Org, key_id: UUID) -> str:
     return f"{tenant_secret_prefix(org.id)}{GATEWAY_SECRET_NAME_PREFIX}{key_id}"
 
 
+async def _has_secret(secret_store: SecretsManagerStore, name: str) -> bool:
+    try:
+        _ = await secret_store.get(name)
+    except SecretNotFoundError:
+        return False
+    return True
+
+
 async def _collect_project_gateway_key(project: Project, org: Org, secret_store: SecretsManagerStore) -> UUID:
     request_id = project.gateway_request_id
     async with _gateway_client() as client:
@@ -88,6 +103,8 @@ async def _collect_project_gateway_key(project: Project, org: Org, secret_store:
         response = await client.get(f"{_GATEWAY_PATH}/keys/{key_id}")
         response.raise_for_status()
         key = response.json()
+        if key["status"] == "active" and await _has_secret(secret_store, _gateway_secret_reference(org, key_id)):
+            return key_id
         response = await client.post(
             f"{_GATEWAY_PATH}/keys/{key_id}/collect",
             json={"expected_revision": key["revision"]},
@@ -95,13 +112,28 @@ async def _collect_project_gateway_key(project: Project, org: Org, secret_store:
         response.raise_for_status()
         secret = response.json()["secret"]
 
-    url, _ = project_gateway_configuration()
-    await secret_store.put(
-        _gateway_secret_reference(org, key_id),
-        json.dumps({"MODEL_GATEWAY_URL": url, "MODEL_GATEWAY_API_KEY": secret}),
-        tags={ORG_ID_TAG: str(org.id)},
-    )
+        url, _ = project_gateway_configuration()
+        await secret_store.put(
+            _gateway_secret_reference(org, key_id),
+            json.dumps({"MODEL_GATEWAY_URL": url, "MODEL_GATEWAY_API_KEY": secret}),
+            tags={ORG_ID_TAG: str(org.id)},
+        )
+        await _wait_for_gateway_to_accept(client, secret, project)
     return key_id
+
+
+async def _wait_for_gateway_to_accept(client: httpx.AsyncClient, secret: str, project: Project) -> None:
+    deadline = time.monotonic() + _KEY_PUBLICATION_TIMEOUT_SECONDS
+    try:
+        while (await client.get("registry", headers={"Authorization": f"Bearer {secret}"})).status_code == 401:
+            if time.monotonic() >= deadline:
+                logger.warning("Gateway still rejects the new key for project %s; starting anyway", project.handle)
+                return
+            await asyncio.sleep(_KEY_PUBLICATION_POLL_SECONDS)
+    except httpx.TransportError:
+        logger.warning(
+            "Could not reach the Gateway to check the new key for project %s; starting anyway", project.handle
+        )
 
 
 def _prepare_project_gateway_key(

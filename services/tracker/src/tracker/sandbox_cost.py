@@ -356,7 +356,7 @@ class _CursorSweep:
     def _write_and_advance(self, account: UsageAccount, hour: datetime, plan: _HourPlan) -> bool:
         with Session(self.bind) as session:
             costs = CostRepository(session)
-            written = self._write(costs, hour, plan.priced)
+            written = costs.add_sandbox_hour_costs(provider=DAYTONA_PROVIDER, hour=hour, usages=plan.priced)
             if plan.unmatched:
                 costs.record_unmatched_usage(account.org_id, account.secret_name, hour, plan.unmatched)
             if not costs.advance_usage_cursor(account.org_id, account.secret_name, hour, hour + USAGE_SLICE_WIDTH):
@@ -390,12 +390,6 @@ class _CursorSweep:
             usage = await self.readers[account](hour, hour + USAGE_SLICE_WIDTH)
         self.hours_read += 1
         return usage
-
-    def _write(self, costs: CostRepository, hour: datetime, priced: list[tuple[UUID, SandboxUsage]]) -> int:
-        return sum(
-            costs.add_sandbox_hour_cost(benchmark_id=benchmark_id, provider=DAYTONA_PROVIDER, hour=hour, usage=usage)
-            for benchmark_id, usage in priced
-        )
 
 
 async def sweep_sandbox_costs(
