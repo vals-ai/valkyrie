@@ -7,6 +7,8 @@ from typing import Any
 import click
 from valkyrie.sdk import (
     AgentContract,
+    AgentContractRequest,
+    AgentReleaseSelection,
     RunMonitoring,
     StartBenchmarkResponse,
     ValkyrieAPIError,
@@ -178,6 +180,8 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
     required=True,
     help="Published agent name or local agent path (e.g., claude_code or ./claude_code), or oracle to run each task's solution.",
 )
+@click.option("--agent-release", default=None, help="Saved agent version. Valkyrie verifies and records its checksum.")
+@click.option("--agent-sha256", default=None, help="Optional expected SHA-256 of the saved agent ZIP.")
 @click.option(
     "--model",
     type=str,
@@ -309,6 +313,8 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
 )
 def start(
     agent: str,
+    agent_release: str | None,
+    agent_sha256: str | None,
     model: str | None,
     benchmark: str | None,
     concurrency: int,
@@ -344,6 +350,15 @@ def start(
         raise click.UsageError("--monitor cannot be used with a pushed dataset or a folder")
     formatted_task_ids = resolve_task_ids(task_ids, task_ids_file)
     agent_dir = _local_agent_dir(agent)
+    if agent_sha256 and not agent_release:
+        raise click.UsageError("--agent-sha256 requires --agent-release")
+    if agent_release and agent_dir is not None:
+        raise click.UsageError("Exact releases require a published agent name")
+    selection = (
+        AgentReleaseSelection(reference=agent_release, archive_sha256=agent_sha256, overrides=dict(kwargs))
+        if agent_release
+        else None
+    )
     if reference is None and benchmark is None:
         raise click.UsageError("Missing option '--benchmark'.")
     shared_options: dict[str, Any] = {
@@ -355,17 +370,18 @@ def start(
         "label": label,
         "lambda_function": lambda_function,
         "provider": provider,
-        "agent_kwargs": dict(kwargs),
+        "agent_kwargs": {} if selection else dict(kwargs),
         "secrets": dict(secrets),
         "project": project,
     }
 
     async def begin(client: ValkyrieClient, agent_name: str) -> StartBenchmarkResponse:
+        selected_agent = AgentContractRequest(name=agent_name, agent_release=selection) if selection else agent_name
         if reference is not None:
-            return await client.datasets.start_run(agent_name, reference, benchmark=benchmark, **shared_options)
+            return await client.datasets.start_run(selected_agent, reference, benchmark=benchmark, **shared_options)
         assert benchmark is not None
         return await client.runs.start(
-            agent_name,
+            selected_agent,
             benchmark,
             dataset=dataset,
             dataset_version=dataset_version,

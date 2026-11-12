@@ -3,13 +3,15 @@ from itertools import count
 from typing import Annotated, Literal
 from uuid import UUID
 
+import httpx
 from fastapi import Depends
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, func, select
 
+from tracker.clients.projects import project_service_reader, project_service_writer
 from tracker.database.session import get_session
-from tracker.database.models import Project, RunProject, SpendType
-from tracker.exceptions import ProjectHandleTakenError, ProjectNameTakenError
+from tracker.database.models import Benchmark, Org, Project, RunProject, SpendType
+from tracker.exceptions import ProjectHandleTakenError, ProjectNameTakenError, ProjectServiceUnavailableError
 
 
 DEFAULT_PROJECT_HANDLE = "default"
@@ -26,13 +28,31 @@ def _default_names() -> Iterator[str]:
 class ProjectRepository:
     def __init__(self, session: Session = Depends(get_session)) -> None:
         self._session = session
+        self._writer = project_service_writer()
+        self._reader = project_service_reader()
+
+    def _commit(self, org_id: UUID) -> None:
+        if self._writer is not None:
+            try:
+                self._session.flush()
+                _ = self._session.exec(
+                    select(Org.id).where(col(Org.id) == org_id).with_for_update(key_share=True)
+                ).one()
+                for row in list(self._session.identity_map.values()):
+                    if isinstance(row, Project):
+                        self._session.expire(row)
+                self._writer.replace(org_id, self._rows(org_id, include_archived=True))
+            except httpx.HTTPError as error:
+                self._session.rollback()
+                raise ProjectServiceUnavailableError() from error
+        self._session.commit()
 
     def create(self, project: Project) -> Project:
         org_id, name, handle = project.org_id, project.name, project.handle
         self._reject_taken_name(org_id, name, project.id)
         self._session.add(project)
         try:
-            self._session.commit()
+            self._commit(project.org_id)
         except IntegrityError as error:
             self._session.rollback()
             self._reject_taken_name(org_id, name, project.id)
@@ -45,7 +65,7 @@ class ProjectRepository:
             return existing
         self._session.add(project)
         try:
-            self._session.commit()
+            self._commit(project.org_id)
         except IntegrityError:
             self._session.rollback()
             existing = self.get(project.org_id, project.handle)
@@ -76,7 +96,7 @@ class ProjectRepository:
         self._reject_taken_name(org_id, name, project_id)
         self._session.add(project)
         try:
-            self._session.commit()
+            self._commit(project.org_id)
         except IntegrityError:
             self._session.rollback()
             self._reject_taken_name(org_id, name, project_id)
@@ -97,7 +117,7 @@ class ProjectRepository:
 
     def save(self, project: Project) -> Project:
         self._session.add(project)
-        self._session.commit()
+        self._commit(project.org_id)
         return project
 
     def delete(self, project: Project) -> bool:
@@ -105,7 +125,7 @@ class ProjectRepository:
             return False
         self._session.delete(project)
         try:
-            self._session.commit()
+            self._commit(project.org_id)
         except IntegrityError:
             self._session.rollback()
             return False
@@ -123,9 +143,36 @@ class ProjectRepository:
         query = select(Project).where(col(Project.org_id) == org_id, col(Project.id) == project_id)
         if lock is not None:
             query = query.with_for_update(read=lock == "share")
-        return self._session.exec(query).first()
+        if self._reader is None:
+            return self._session.exec(query).first()
+        if lock is not None:
+            _ = self._session.exec(query).first()
+        return self._reader.get(org_id, project_id)
+
+    def set_gateway_key(self, project: Project, key_id: UUID) -> UUID:
+        if self._reader is not None:
+            key_id = self._reader.set_gateway_key(project.org_id, project.id, key_id)
+        row = self._session.exec(select(Project).where(col(Project.id) == project.id)).one()
+        row.gateway_key_id = key_id
+        _ = self.save(row)
+        return key_id
+
+    def find(self, org_id: UUID, handle: str) -> Project | None:
+        if self._reader is None:
+            return self.get(org_id, handle, "share")
+        rows = self._reader.list_rows(org_id, include_archived=True)
+        return next((self._reader.get(org_id, row.id) for row in rows if row.handle == handle), None)
 
     def get_for_run(self, benchmark_id: UUID) -> Project | None:
+        if self._reader is not None:
+            link = self._session.exec(
+                select(Benchmark.org_id, RunProject.project_id)
+                .join(Benchmark, col(Benchmark.id) == col(RunProject.benchmark_id))
+                .where(col(RunProject.benchmark_id) == benchmark_id)
+                .order_by(col(RunProject.id).desc())
+                .limit(1)
+            ).first()
+            return None if link is None else self._reader.get(*link)
         return self._session.exec(
             select(Project)
             .join(RunProject, col(RunProject.project_id) == col(Project.id))
@@ -134,13 +181,27 @@ class ProjectRepository:
             .limit(1)
         ).first()
 
-    def lock(self, project_id: UUID) -> Project:
+    def get_for_link(self, org_id: UUID, project_id: UUID) -> Project:
+        if self._reader is not None:
+            project = self._reader.get(org_id, project_id)
+            if project is None:
+                raise LookupError(f"Project {project_id} is not in the project service")
+            return project
         return self._session.exec(select(Project).where(col(Project.id) == project_id).with_for_update(read=True)).one()
 
     def list_all(self, org_id: UUID, include_archived: bool = False) -> list[Project]:
+        if self._reader is not None:
+            return self._reader.list_rows(org_id, include_archived)
+        return self._rows(org_id, include_archived)
+
+    def _rows(self, org_id: UUID, include_archived: bool) -> list[Project]:
         query = select(Project).where(col(Project.org_id) == org_id).order_by(col(Project.handle))
         if not include_archived:
             query = query.where(col(Project.archived_at).is_(None))
+        return list(self._session.exec(query).all())
+
+    def list_every(self) -> list[Project]:
+        query = select(Project).order_by(col(Project.org_id), col(Project.handle))
         return list(self._session.exec(query).all())
 
 

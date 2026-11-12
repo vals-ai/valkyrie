@@ -42,7 +42,8 @@
         "egress_allowlist": [],
         "secrets": {},
         "kwargs": {},
-        "inference_settings_attested": false
+        "inference_settings_attested": false,
+        "agent_release": null
       },
       "concurrency": 1,
       "environment": "aws",
@@ -54,7 +55,8 @@
       "lambda_function": null,
       "dataset": null,
       "sandbox_provider": "daytona",
-      "sandbox_provider_secret_name": "test-daytona-secret"
+      "sandbox_provider_secret_name": "test-daytona-secret",
+      "agent_attempts": []
     },
     "tasks_stopped": null,
     "final_evaluation": null,

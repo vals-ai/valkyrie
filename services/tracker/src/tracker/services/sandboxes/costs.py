@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from uuid import UUID
 
@@ -22,6 +22,10 @@ logger = get_logger(__name__)
 SWEEP_LOOKBACK = timedelta(days=7)
 
 ProviderOpener = Callable[[Org, str, str], AbstractAsyncContextManager[SandboxProvider]]
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 @asynccontextmanager
@@ -46,9 +50,15 @@ def _load(
         return pending, orgs
 
 
+def _mark_seen(bind: Engine | Connection, row: UnpricedSandbox, seen_at: datetime) -> None:
+    with Session(bind) as session:
+        CostRepository(session).mark_sandbox_seen(row.provider, row.sandbox_id, seen_at)
+        session.commit()
+
+
 def _write(bind: Engine | Connection, row: UnpricedSandbox, amount: float, ended_at: datetime) -> bool:
     with Session(bind) as session:
-        written = CostRepository(session).add_sandbox_cost(
+        written = CostRepository(session).price_sandbox_up_to(
             benchmark_id=row.benchmark_id,
             provider=row.provider,
             sandbox_id=row.sandbox_id,
@@ -60,7 +70,7 @@ def _write(bind: Engine | Connection, row: UnpricedSandbox, amount: float, ended
 
 
 async def _price_account(
-    bind: Engine | Connection, provider: SandboxProvider, rows: list[UnpricedSandbox], now: datetime
+    bind: Engine | Connection, provider: SandboxProvider, rows: list[UnpricedSandbox], clock: Callable[[], datetime]
 ) -> int:
     written = 0
     for row in rows:
@@ -72,9 +82,18 @@ async def _price_account(
             )
             continue
         if not sandbox.has_ended:
+            await database_call(lambda row=row, seen_at=clock(): _mark_seen(bind, row, seen_at))
             continue
-        amount = sandbox.cost_usd(now)
-        if amount is not None and await database_call(lambda row=row, amount=amount: _write(bind, row, amount, now)):
+        if (ended_at := row.last_seen_at) is None:
+            logger.warning(
+                "Ended sandbox was never seen alive", extra={"provider": row.provider, "sandbox_id": row.sandbox_id}
+            )
+            continue
+        ended_at = ended_at if ended_at.tzinfo is not None else ended_at.replace(tzinfo=UTC)
+        amount = sandbox.cost_usd(ended_at)
+        if amount is not None and await database_call(
+            lambda row=row, amount=amount, ended_at=ended_at: _write(bind, row, amount, ended_at)
+        ):
             written += 1
     return written
 
@@ -89,6 +108,7 @@ async def sweep_priced_sandbox_costs(
     now: datetime,
     providers: Sequence[str] | None = None,
     open_provider: ProviderOpener = open_sandbox_provider,
+    clock: Callable[[], datetime] = _now,
 ) -> int:
     providers = priced_provider_types() if providers is None else providers
     try:
@@ -103,7 +123,7 @@ async def sweep_priced_sandbox_costs(
             continue
         try:
             async with open_provider(org, provider_type, secret_name) as provider:
-                written += await _price_account(bind, provider, rows, now)
+                written += await _price_account(bind, provider, rows, clock)
         except Exception as error:
             logger.warning(
                 "Sandbox costs unavailable",

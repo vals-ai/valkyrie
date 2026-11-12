@@ -1,0 +1,76 @@
+---
+title: "Publish a dataset"
+description: "Publish task folders as a versioned dataset in your benchmark, tag versions, and run agents on them."
+---
+
+A dataset holds tasks your organization publishes to Valkyrie, with no benchmark service to run.
+Each push makes an immutable version.
+
+## Lay out the task folders
+
+- Put each task in its own folder, named by its task ID, under one parent folder.
+- A task folder holds `task.toml`, `instruction.md`, and `tests/test.sh`. It can also hold
+  `environment/` and `solution/`.
+- A `metric.py` in the parent folder computes the dataset's score from the task rewards.
+- A `dataset.toml` in the parent folder pins the exact tasks and their digests, and its version
+  becomes a tag.
+
+## Push a folder
+
+```bash
+valkyrie dataset push my-benchmark/my-dataset ./tasks --tag v1
+```
+
+- The benchmark and the dataset are created when they don't exist yet.
+- Only tasks the dataset doesn't store yet are uploaded. Pushing an unchanged folder makes no
+  new version.
+- Every version gets the `latest` tag, plus each `--tag`.
+
+## Install from Harbor, GitHub, or Hugging Face
+
+```bash
+valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
+```
+
+`--location github` and `--location hugging_face` take a repository as `owner/name` or its URL.
+
+<Note>
+  `--location harbor` needs `uv` or the `harbor` CLI on your `PATH`.
+</Note>
+
+## Tag versions
+
+```bash
+valkyrie dataset versions my-benchmark/my-dataset
+
+valkyrie dataset tag my-benchmark/my-dataset@2 stable
+
+valkyrie dataset untag my-benchmark/my-dataset v1
+```
+
+- `latest` always moves. Another tag on a different version moves only with `--force`.
+- `untag` removes a tag. `latest` can't be removed.
+
+## Run an agent on a dataset
+
+```bash
+valkyrie run start --agent my-agent --dataset my-benchmark/my-dataset@stable
+```
+
+- After `@`, pass a revision number, a tag, or a digest. Without it, the run uses `latest`.
+- `--slice`, `--task-ids`, and `--concurrency` work as in [Start a run](/runs/start).
+
+## Inspect tasks
+
+```bash
+valkyrie dataset task list my-benchmark/my-dataset@2
+
+valkyrie dataset task download my-benchmark/my-dataset@2 hello
+```
+
+The download is saved as `TASK_ID.zip` unless you pass `--output`.
+
+## Reference
+
+- [`valkyrie dataset`](/reference/cli/dataset)
+- [`client.datasets`](/reference/sdk/datasets) and [`client.datasets.versions`](/reference/sdk/datasets-versions)

@@ -117,8 +117,8 @@ def _prepare_project_gateway_key(
                     status_code=409,
                     detail=f"Project '{project.handle}' has no Gateway key request; configure its Gateway binding before starting a run",
                 )
-            project.gateway_key_id = asyncio.run(_collect_project_gateway_key(project, org, secret_store))
-            ProjectRepository(session).save(project)
+            collected = asyncio.run(_collect_project_gateway_key(project, org, secret_store))
+            project.gateway_key_id = ProjectRepository(session).set_gateway_key(project, collected)
         reference = _gateway_secret_reference(org, project.gateway_key_id)
         return {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}
 

@@ -5515,6 +5515,13 @@
           "contract": {
             "$ref": "#/components/schemas/AgentContractRequest-Output"
           },
+          "agent_attempts": {
+            "items": {
+              "$ref": "#/components/schemas/AgentExecutionAttempt"
+            },
+            "type": "array",
+            "title": "Agent Attempts"
+          },
           "concurrency": {
             "type": "integer",
             "title": "Concurrency"
@@ -5843,6 +5850,16 @@
             "type": "boolean",
             "title": "Inference Settings Attested",
             "default": false
+          },
+          "agent_release": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentReleaseSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -5965,6 +5982,16 @@
             "type": "boolean",
             "title": "Inference Settings Attested",
             "default": false
+          },
+          "agent_release": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentReleaseSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -6019,6 +6046,147 @@
           "name"
         ],
         "title": "AgentEntry"
+      },
+      "AgentExecutionAttempt": {
+        "properties": {
+          "dispatch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatch Id"
+          },
+          "successor_dispatch_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Successor Dispatch Ids"
+          },
+          "agent_release": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Release"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "effective_configuration": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Effective Configuration"
+          },
+          "task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Task Ids"
+          },
+          "retained_outputs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Outputs"
+          },
+          "results": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Results"
+          },
+          "final_evaluation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Evaluation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "effective_configuration",
+          "task_ids"
+        ],
+        "title": "AgentExecutionAttempt"
+      },
+      "AgentReleaseSelection": {
+        "properties": {
+          "reference": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Reference"
+          },
+          "archive_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archive Sha256"
+          },
+          "prescribed_configuration": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Prescribed Configuration"
+          },
+          "overrides": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Overrides"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "reference"
+        ],
+        "title": "AgentReleaseSelection"
       },
       "AgentTurns": {
         "properties": {
@@ -6717,6 +6885,16 @@
       },
       "Body_retry_or_resume_benchmark": {
         "properties": {
+          "agent_release": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentReleaseSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "task_ids": {
             "items": {
               "type": "string"
@@ -8023,6 +8201,13 @@
         "properties": {
           "contract": {
             "$ref": "#/components/schemas/AgentContractRequest-Output"
+          },
+          "agent_attempts": {
+            "items": {
+              "$ref": "#/components/schemas/AgentExecutionAttempt"
+            },
+            "type": "array",
+            "title": "Agent Attempts"
           },
           "concurrency": {
             "type": "integer",
@@ -10764,6 +10949,18 @@
               }
             ],
             "title": "Dataset Version"
+          },
+          "admission_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admission Id"
           },
           "dataset_ref": {
             "anyOf": [

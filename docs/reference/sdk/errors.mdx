@@ -23,7 +23,7 @@ Catch `ValkyrieSDKError` to handle every SDK-defined failure, or catch a specifi
 The Valkyrie API returned a non-success response.
 
 ```python
-ValkyrieAPIError(status_code: int, detail: Any)
+ValkyrieAPIError(status_code: int, detail: Any, headers: httpx.Headers | None = None)
 ```
 
 ## `ValkyrieConfigError`

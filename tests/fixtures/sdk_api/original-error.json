@@ -44,7 +44,8 @@
         "allow_provider_tools": false,
         "secrets": {},
         "kwargs": {},
-        "inference_settings_attested": false
+        "inference_settings_attested": false,
+        "agent_release": null
       },
       "concurrency": 1,
       "task_ids": [
@@ -57,7 +58,8 @@
       "sandbox_provider": "daytona",
       "sandbox_provider_secret_name": "test-daytona-secret",
       "environment": "aws",
-      "properties": null
+      "properties": null,
+      "agent_attempts": []
     },
     "tasks_stopped": null,
     "final_evaluation": null,

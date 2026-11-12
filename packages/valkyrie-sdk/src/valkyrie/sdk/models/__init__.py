@@ -13,6 +13,7 @@ from valkyrie.sdk.models.account import (
 from valkyrie.sdk.models.agents import (
     AgentContract,
     AgentContractRequest,
+    AgentReleaseSelection,
     AgentDownloadURLResponse,
     AgentEntry,
     AgentsResponse,
@@ -151,6 +152,7 @@ __all__ = [
     "LocalResources",
     "AgentContract",
     "AgentContractRequest",
+    "AgentReleaseSelection",
     "AgentDownloadURLResponse",
     "AgentEntry",
     "AgentsResponse",

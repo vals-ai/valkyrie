@@ -11,6 +11,7 @@ from pydantic import BaseModel, BeforeValidator, Field
 
 from valkyrie.sdk.models._base import ResponseModel
 from valkyrie.sdk.models._generated.runs import (
+    AgentExecutionAttempt,
     AnalyzeBenchmarkRequest,
     AverageTaskBreakdown,
     AWSBenchmarkArguments,
@@ -47,6 +48,7 @@ from valkyrie.sdk.models._validation import default_environment
 
 __all__ = [
     "AWSBenchmarkArguments",
+    "AgentExecutionAttempt",
     "AnalyzeBenchmarkRequest",
     "AnalyzeEvent",
     "AverageTaskBreakdown",

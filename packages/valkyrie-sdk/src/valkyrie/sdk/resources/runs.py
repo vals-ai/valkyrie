@@ -8,13 +8,14 @@ import tempfile
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from valkyrie.sdk._sse import error_detail, server_sent_events
 from valkyrie.sdk._transfer import finish_before_cancelling
 from valkyrie.sdk.errors import ValkyrieInputError, ValkyrieSDKError, ValkyrieRunError, ValkyrieStreamError
 from valkyrie.sdk.models import (
     AgentContractRequest,
+    AgentReleaseSelection,
     AnalyzeBenchmarkRequest,
     AnalyzeEvent,
     BenchmarkTableRow,
@@ -62,6 +63,8 @@ class RunsResource:
         benchmark: str,
         *,
         model: str | None = None,
+        agent_release: AgentReleaseSelection | None = None,
+        admission_id: UUID | None = None,
         concurrency: int = 5,
         priority: int | None = None,
         task_ids: Sequence[str] | None = None,
@@ -85,7 +88,11 @@ class RunsResource:
 
         contract = normalize_contract(agent, model=model, agent_kwargs=agent_kwargs, secrets=secrets)
 
+        if agent_release is not None:
+            contract.agent_release = agent_release
+
         payload = StartBenchmarkRequest(
+            admission_id=(admission_id or uuid4()) if contract.agent_release else admission_id,
             contract=contract,
             benchmark_name=benchmark,
             concurrency=concurrency,
@@ -410,6 +417,7 @@ class RunsResource:
         service_headers: Mapping[str, str] | None = None,
         from_scratch: bool = False,
         update_agent: bool = False,
+        agent_release: AgentReleaseSelection | None = None,
         benchmark_url: str | None = None,
         lambda_function: str | None = None,
     ) -> RetryOrResumeBenchmarkResponse:
@@ -423,6 +431,7 @@ class RunsResource:
             service_headers=service_headers,
             from_scratch=from_scratch,
             update_agent=update_agent,
+            agent_release=agent_release,
             benchmark_url=benchmark_url,
             lambda_function=lambda_function,
         )
@@ -437,6 +446,7 @@ class RunsResource:
         service_headers: Mapping[str, str] | None = None,
         from_scratch: bool = False,
         update_agent: bool = False,
+        agent_release: AgentReleaseSelection | None = None,
         benchmark_url: str | None = None,
         lambda_function: str | None = None,
     ) -> RetryOrResumeBenchmarkResponse:
@@ -450,6 +460,7 @@ class RunsResource:
             service_headers=service_headers,
             from_scratch=from_scratch,
             update_agent=update_agent,
+            agent_release=agent_release,
             benchmark_url=benchmark_url,
             lambda_function=lambda_function,
         )
@@ -488,6 +499,7 @@ class RunsResource:
         service_headers: Mapping[str, str] | None,
         from_scratch: bool,
         update_agent: bool,
+        agent_release: AgentReleaseSelection | None,
         benchmark_url: str | None,
         lambda_function: str | None,
     ) -> RetryOrResumeBenchmarkResponse:
@@ -507,6 +519,8 @@ class RunsResource:
             "service_headers": dict(service_headers or {}),
             "secrets": dict(secrets or {}),
         }
+        if agent_release is not None:
+            body["agent_release"] = agent_release.model_dump(mode="json")
         optional = {"benchmark_url": benchmark_url, "lambda_function": lambda_function}
         body |= {key: value for key, value in optional.items() if value is not None}
 

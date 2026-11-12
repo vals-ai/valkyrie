@@ -537,6 +537,19 @@ async def test_api_and_transport_failures_use_sdk_exceptions(make_client) -> Non
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "invalid API key"
 
+    def rate_limited(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, json={"detail": "too many runs"}, headers={"Retry-After": "60", "X-RateLimit-Limit": "10"}
+        )
+
+    client = make_client(rate_limited)
+    async with client:
+        with pytest.raises(ValkyrieAPIError) as exc_info:
+            await client.runs.fetch(uuid4())
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.headers["retry-after"] == "60"
+    assert exc_info.value.headers["x-ratelimit-limit"] == "10"
+
     def text_error(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(502, text="upstream unavailable")
 

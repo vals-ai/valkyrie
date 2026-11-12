@@ -1,4 +1,5 @@
 import socket
+from datetime import UTC, datetime, timedelta
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -7,16 +8,17 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
-from benchmark_service import DockerProviderConfig, ImageSource, Resources
+from benchmark_service import DockerProviderConfig, ImageSource, Resources, SandboxCreatedData
 from benchmark_service.schemas import EgressPolicy, RetrieveTaskResponse
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from tests.unit.services.task_execution_support import (
+    FixedClock,
     create_task_environment,
     finalize_agent_generation,
     run_process_task,
 )
-from tracker.database.models import ErrorResult, TaskBreakdown
+from tracker.database.models import ErrorResult, SandboxRecord, TaskBreakdown
 from tracker.domain import FailureCategory, TaskStatus
 from tracker.types import AgentContractRequest
 from tracker.services.failures import FailurePhase
@@ -228,6 +230,43 @@ class TestSteps:
         assert result is not None
         assert result["rewards"] == {"reward": 0.75}
         assert [step["name"] for step in result["metadata"]["steps"]] == ["one", "two"]
+
+    @pytest.mark.description(
+        "A verifier sandbox announced while grading one step is last seen when that grading ends, not after later steps."
+    )
+    async def test_a_steps_verifier_sandbox_is_last_seen_when_its_grading_ends(
+        self,
+        stepped: StepStarter,
+        contract: AgentContractRequest,
+        database_session: Session,
+        bound_controls: Any,
+        runtime_services: RuntimeServices,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run = stepped(_response("one", "two"), [_grade(1.0), _grade(0.5)])
+        started = datetime(2026, 11, 11, 12, tzinfo=UTC)
+        clock = FixedClock.at(started, monkeypatch)
+        grade_step = DatasetTaskService.grade_step
+
+        async def announce_while_grading(
+            service: DatasetTaskService, task_id: str, instance_id: str, step_name: str, **kwargs: Any
+        ) -> StepOutcome:
+            if step_name == "one":
+                kwargs["on_sandbox_created"](SandboxCreatedData(provider="daytona", sandbox_id="verifier-one"))
+                clock.moment = started + timedelta(minutes=5)
+            else:
+                clock.moment = started + timedelta(hours=1)
+            return await grade_step(service, task_id, instance_id, step_name, **kwargs)
+
+        monkeypatch.setattr(DatasetTaskService, "grade_step", announce_while_grading)
+
+        await _run(run, contract, database_session, runtime_services, bound_controls)
+
+        database_session.expire_all()
+        last_seen_at = database_session.exec(
+            select(SandboxRecord.last_seen_at).where(col(SandboxRecord.sandbox_id) == "verifier-one")
+        ).one()
+        assert last_seen_at == started + timedelta(minutes=5)
 
     @pytest.mark.description("The oracle runs each steps solution with its env in place of an installed agent.")
     async def test_the_oracle_runs_each_steps_solution_with_its_env_in_place_of_an_installed_agent(

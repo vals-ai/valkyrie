@@ -47,7 +47,7 @@ def reject_missing_project(org: Org, project: str | None) -> None:
 
 
 def find_project(repository: ProjectRepository, org_id: UUID, handle: str) -> Project:
-    project = repository.get(org_id, handle, "share")
+    project = repository.find(org_id, handle)
     if project is not None:
         return reject_archived_project(project)
     handles = ", ".join(row.handle for row in repository.list_all(org_id)) or "none"

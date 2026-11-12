@@ -23,6 +23,8 @@ This prints the run's details, then its progress until the run finishes.
 - Press **Control+C** to stop watching. The run keeps going.
 - Without `--connect`, `run fetch` prints one snapshot. `--format json` prints the SDK's
   `RunSnapshot`: the run and its launch metadata.
+- CLI snapshots omit saved agent configuration and agent secret references. Use the SDK to read
+  the full launch metadata when you need it.
 
 A run ends as `FINISHED`, `ERROR`, or `STOPPED`. The command exits with 0 whichever way the
 run ends, so check the status rather than the exit code.

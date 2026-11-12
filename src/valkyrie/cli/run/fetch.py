@@ -3,7 +3,7 @@ from uuid import UUID
 import click
 
 from valkyrie.cli.client import call
-from valkyrie.cli.run.progress import follow_run_status, format_benchmark_status
+from valkyrie.cli.run.progress import follow_run_status, format_benchmark_status, format_run_snapshot_json
 from valkyrie.cli.project import describe_run_spend
 from valkyrie.cli.display import format_option
 
@@ -35,6 +35,6 @@ def fetch(run_id: UUID, connect: bool, output_format: str):
 
     snapshot = call(lambda client: client.runs.snapshot(run_id))
     if output_format == "json":
-        click.echo(snapshot.model_dump_json())
+        click.echo(format_run_snapshot_json(snapshot))
     else:
         format_benchmark_status(snapshot.run, describe_run_spend(snapshot.metadata), snapshot.metadata)

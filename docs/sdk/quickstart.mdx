@@ -59,6 +59,15 @@ except ValkyrieSDKError as exc:
     print(exc)
 ```
 
+When starting, retrying, resuming, or regrading a run hits your organization's run limit,
+`exc.status_code` is `429` and `exc.headers` has these values:
+
+| Header | Value |
+| --- | --- |
+| `Retry-After` | Seconds to wait before trying again: `60` |
+| `X-RateLimit-Limit` | How many runs your organization can have going at once, for example `10` |
+| `X-RateLimit-Remaining` | How many more runs you can start now: `0` |
+
 The [errors reference](/reference/sdk/errors) lists every exception.
 
 ## Run the example scripts

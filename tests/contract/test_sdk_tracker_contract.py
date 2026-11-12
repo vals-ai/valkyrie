@@ -21,7 +21,7 @@ from tracker.api.organizations import (
     OrganizationResponse,
     OrganizationsResponse,
 )
-from tracker.database.models import FinalEvaluation
+from tracker.types import FinalEvaluation
 from tracker.types import (
     AWSBenchmarkArguments,
     LocalBenchmarkArguments,
@@ -679,7 +679,12 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
     retry_schema_ref = retry["requestBody"]["content"]["application/json"]["schema"]["$ref"]
     retry_schema = schema["components"]["schemas"][retry_schema_ref.rsplit("/", 1)[-1]]
     retry_fixture = load_fixture("retry_resume.json")
-    assert set(retry_schema["properties"]) == {*retry_fixture["body"], "benchmark_url", "lambda_function"}
+    assert set(retry_schema["properties"]) == {
+        *retry_fixture["body"],
+        "benchmark_url",
+        "lambda_function",
+        "agent_release",
+    }
     retry_properties = retry_schema["properties"]
     assert {
         name: (retry_properties[name]["type"], retry_properties[name]["default"])

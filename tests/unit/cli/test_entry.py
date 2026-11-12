@@ -105,16 +105,14 @@ def test_lazy_help_matches_imported_commands(group: LazyGroup) -> None:
 
 
 @pytest.mark.description(
-    "Hidden commands such as `dataset` can be called but are not listed, and unknown names resolve to nothing."
+    "Hidden commands such as `benchmark create` can be called but are not listed, and unknown names resolve to nothing."
 )
 def test_hidden_commands_resolve_but_are_not_listed() -> None:
-    ctx = click.Context(cli_main.cli)
+    ctx = click.Context(benchmark)
 
-    dataset = cli_main.cli.get_command(ctx, "dataset")
-
-    assert dataset is not None
-    assert "dataset" not in cli_main.cli.list_commands(ctx)
-    assert cli_main.cli.get_command(ctx, "no-such-command") is None
+    assert benchmark.get_command(ctx, "create") is not None
+    assert "create" not in benchmark.list_commands(ctx)
+    assert benchmark.get_command(ctx, "no-such-command") is None
 
 
 @pytest.mark.description("Imports every command, in a subprocess because this test process has already imported them.")

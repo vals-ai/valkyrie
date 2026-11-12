@@ -39,6 +39,7 @@ from benchmark_service import (
 )
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox.created import notify_sandbox_created
 from tenacity import wait_none
 
 from tracker.runtime.task_logs import TaskLogBuffer
@@ -4765,6 +4766,37 @@ class TestSandboxLifecycle:
         assert increments == [("valkyrie.sandbox.create.errors", {"error_class": metric_class})]
         assert [call.kwargs["extra"]["event"] for call in warning_log.call_args_list] == ["sandbox.create.failed"]
 
+    @pytest.mark.description(
+        "A sandbox the provider announces before its start fails is still recorded for the run under the announced provider."
+    )
+    async def test_announced_sandbox_is_recorded_when_its_start_fails(self) -> None:
+        benchmark_id = uuid4()
+        record_sandbox = AsyncMock()
+        provider = AsyncMock()
+
+        async def create_then_fail(_request: Any) -> Never:
+            await notify_sandbox_created("daytona_v2", "sbx-never-started")
+            raise ProviderSandboxError("Daytona v2 sandbox sbx-never-started did not start: deleted")
+
+        provider.create_sandbox.side_effect = create_then_fail
+
+        with pytest.raises(SandboxSetupError, match="did not start"):
+            async with create_sandbox(
+                provider=provider,
+                sandbox_name="task-alias",
+                source=ImageSource(image="ghcr.io/vals/swebench:latest"),
+                resources=Resources(vcpu=2, memory=4, disk=5),
+                creation_semaphore=asyncio.Semaphore(1),
+                creation_state=SandboxCreationState(cleanup_pending=False),
+                sandbox_link=SandboxLink(benchmark_id=benchmark_id, provider="configured"),
+                record_sandbox=record_sandbox,
+            ):
+                pass
+
+        record_sandbox.assert_awaited_once_with(
+            SandboxLink(benchmark_id=benchmark_id, provider="daytona_v2"), "sbx-never-started"
+        )
+
     @pytest.mark.description("A failed image build is not retried and carries the end of its log once.")
     async def test_a_failed_image_build_is_not_retried_and_carries_the_end_of_its_log_once(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5957,7 +5989,7 @@ async def test_upload_agent_artifacts_wraps_only_sandbox_errors(raised: Exceptio
 
     with pytest.raises(expected) as error:
         await sandbox_module.upload_agent_artifacts(
-            cast(Any, sandbox), cast(Any, SimpleNamespace(name="agent")), "run-1", cast(Any, object_store)
+            cast(Any, sandbox), AgentContractRequest(name="agent"), "run-1", cast(Any, object_store)
         )
 
     assert type(error.value) is expected

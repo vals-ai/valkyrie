@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import PurePosixPath
 from types import TracebackType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -144,6 +144,13 @@ from tracker.services.failures import (
 )
 from tracker.services.tasks.steps import StepRun, run_steps
 from tracker.clients.benchmark_service import run_benchmark_service_websocket
+
+
+_Streamed = TypeVar("_Streamed")
+
+
+def sighting_time() -> datetime:
+    return datetime.now(UTC)
 
 
 logger = get_logger(__name__)
@@ -811,9 +818,9 @@ async def _process_task_attempt(
     sandbox_writes: set[asyncio.Future[None]] = set()
     sandbox_write_order = asyncio.Lock()
 
-    async def save_announced_sandbox(link: SandboxLink, sandbox_id: str) -> None:
+    async def save_announced_sandbox(link: SandboxLink, sandbox_id: str, seen_at: datetime) -> None:
         async with sandbox_write_order:
-            await control.record_sandbox(link, sandbox_id)
+            await control.record_sandbox(link, sandbox_id, seen_at)
 
     async def drain_sandbox_writes() -> None:
         if not sandbox_writes:
@@ -828,11 +835,26 @@ async def _process_task_attempt(
         if cancelled:
             raise asyncio.CancelledError
 
-    def on_sandbox_created(created: SandboxCreatedData) -> None:
-        link = SandboxLink(benchmark_id=benchmark_id, provider=created.provider)
-        write = asyncio.ensure_future(save_announced_sandbox(link, created.sandbox_id))
+    def save_sighting(link: SandboxLink, sandbox_id: str, seen_at: datetime) -> None:
+        write = asyncio.ensure_future(save_announced_sandbox(link, sandbox_id, seen_at))
         sandbox_writes.add(write)
         write.add_done_callback(sandbox_writes.discard)
+
+    streamed_sandboxes: list[tuple[SandboxLink, str]] = []
+
+    def on_sandbox_created(created: SandboxCreatedData) -> None:
+        link = SandboxLink(benchmark_id=benchmark_id, provider=created.provider)
+        streamed_sandboxes.append((link, created.sandbox_id))
+        save_sighting(link, created.sandbox_id, sighting_time())
+
+    async def until_stream_ends(stream: Awaitable[_Streamed]) -> _Streamed:
+        try:
+            return await stream
+        finally:
+            ended_at = sighting_time()
+            for link, sandbox_id in streamed_sandboxes:
+                save_sighting(link, sandbox_id, ended_at)
+            streamed_sandboxes.clear()
 
     identity = {
         "benchmark_name": benchmark_name,
@@ -918,17 +940,19 @@ async def _process_task_attempt(
     async def resume_evaluation_with_wall(state: dict[str, Any]) -> Any:
         async with enforce_wall_deadline(task_row.credited_wall_deadline_at), resumed_child_egress() as grants:
             async with grading_credentials(None) as grading_token:
-                result = await run_benchmark_service_websocket(
-                    benchmark_service.resume_evaluation(
-                        task_row.task_id,
-                        eval_resume_state=state,
-                        on_message=task_logs.write_line,
-                        on_eval_resume_state=on_eval_resume_state,
-                        on_sandbox_created=on_sandbox_created,
-                        dataset=start_benchmark_request.dataset,
-                        sandbox_provider=sandbox_provider_config,
-                        child_egress=grants,
-                        grading_token=grading_token,
+                result = await until_stream_ends(
+                    run_benchmark_service_websocket(
+                        benchmark_service.resume_evaluation(
+                            task_row.task_id,
+                            eval_resume_state=state,
+                            on_message=task_logs.write_line,
+                            on_eval_resume_state=on_eval_resume_state,
+                            on_sandbox_created=on_sandbox_created,
+                            dataset=start_benchmark_request.dataset,
+                            sandbox_provider=sandbox_provider_config,
+                            child_egress=grants,
+                            grading_token=grading_token,
+                        )
                     )
                 )
             if task_row.credited_wall_deadline_at is not None:
@@ -1688,6 +1712,7 @@ async def _process_task_attempt(
                             generate=generate_step,
                             persist_accounting=persist_generation_accounting_summary,
                             on_sandbox_created=on_sandbox_created,
+                            until_stream_ends=until_stream_ends,
                             set_phase=set_phase,
                             redact=lambda text: redact_error(text) if redact_error is not None else text,
                             restrict_egress=None if unrestricted_docker else restrict_egress,
@@ -1734,17 +1759,19 @@ async def _process_task_attempt(
                         await apply_egress_policy(sandbox, task_data.egress.evaluation)
                     task_logs.last_log_time = time.monotonic()
                     async with grading_credentials(resolved_secrets) as grading_token:
-                        evaluation_result = await run_benchmark_service_websocket(
-                            benchmark_service.evaluate_instance(
-                                task_row.task_id,
-                                sandbox.id,
-                                on_message=task_logs.write_line,
-                                on_eval_resume_state=on_eval_resume_state,
-                                on_sandbox_created=on_sandbox_created,
-                                dataset=start_benchmark_request.dataset,
-                                sandbox_provider=sandbox_provider_config,
-                                child_egress=child_egress,
-                                grading_token=grading_token,
+                        evaluation_result = await until_stream_ends(
+                            run_benchmark_service_websocket(
+                                benchmark_service.evaluate_instance(
+                                    task_row.task_id,
+                                    sandbox.id,
+                                    on_message=task_logs.write_line,
+                                    on_eval_resume_state=on_eval_resume_state,
+                                    on_sandbox_created=on_sandbox_created,
+                                    dataset=start_benchmark_request.dataset,
+                                    sandbox_provider=sandbox_provider_config,
+                                    child_egress=child_egress,
+                                    grading_token=grading_token,
+                                )
                             )
                         )
                     evaluation_run_duration = time.perf_counter() - evaluation_start_time

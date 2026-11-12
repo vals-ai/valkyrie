@@ -405,16 +405,29 @@ def _dataset_invoke(*arguments: str) -> Result:
 
 
 @pytest.mark.description("A hosted dataset run is named for the datasets benchmark.")
-def test_a_hosted_dataset_run_is_named_for_the_datasets_benchmark(tracker: MockTracker) -> None:
+@pytest.mark.parametrize("exact_release", [False, True])
+@pytest.mark.parametrize("explicit_digest", [False, True])
+def test_a_hosted_dataset_run_is_named_for_the_datasets_benchmark(
+    tracker: MockTracker, exact_release: bool, explicit_digest: bool
+) -> None:
     tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
 
-    result = _dataset_invoke("--dataset", "swe-bench/verified", "--task-ids", "task-a")
+    release_flags = ("--agent-release", "release-1") if exact_release else ()
+    if exact_release and explicit_digest:
+        release_flags += ("--agent-sha256", "a" * 64)
+    result = _dataset_invoke("--dataset", "swe-bench/verified", "--task-ids", "task-a", *release_flags)
 
     assert result.exit_code == 0, result.output
     (body,) = _start_bodies(tracker)
     assert body["benchmark_name"] == "swe-bench"
     assert body["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": "latest"}
     assert body["task_ids"] == ["task-a"]
+    if exact_release:
+        assert body["contract"]["agent_release"]["reference"] == "release-1"
+        if explicit_digest:
+            assert body["contract"]["agent_release"]["archive_sha256"] == "a" * 64
+        else:
+            assert "archive_sha256" not in body["contract"]["agent_release"]
     assert "dataset" not in body and "dataset_version" not in body
     assert body["service_headers"] == {}
     assert "Dataset:" in result.output and "verified" in result.output

@@ -28,6 +28,16 @@ class BundlerError(Exception):
     pass
 
 
+class RunLimitExceededError(Exception):
+    def __init__(self, limit: int, active: int) -> None:
+        super().__init__(
+            f"Your organization has {active} active runs and may run at most {limit} at once. "
+            "Stop a run or wait for one to finish, then try again."
+        )
+        self.limit = limit
+        self.active = active
+
+
 class ContractValidationError(ValueError):
     FORMATTERS: dict[str, str] = {
         "missing": "'{field}' is required but was not provided",
@@ -139,6 +149,11 @@ class SecretNotFoundError(SecretsError):
 class ProjectHandleTakenError(TrackerServiceError):
     def __init__(self, handle: str) -> None:
         super().__init__(f"Project '{handle}' already exists")
+
+
+class ProjectServiceUnavailableError(Exception):
+    def __init__(self) -> None:
+        super().__init__("The project service did not take this project change, so Tracker did not save it")
 
 
 class ProjectNameTakenError(TrackerServiceError):

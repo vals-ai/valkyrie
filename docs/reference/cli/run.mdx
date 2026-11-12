@@ -574,6 +574,8 @@ Resume a run's stopped tasks by its ID.
 valkyrie run resume \
   <RUN_ID> \
   [--retry] \
+  [--agent-release <TEXT>] \
+  [--agent-sha256 <TEXT>] \
   [--concurrency <INTEGER>] \
   [--task-ids <TEXT>] \
   [--task-ids-file <TEXT>] \
@@ -604,6 +606,16 @@ valkyrie run resume \
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--retry"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
   <p className="mb-0 mt-1">{"Retry tasks with the status error."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Saved replacement agent version."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-sha256"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Optional expected SHA-256 of the replacement ZIP."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -667,6 +679,8 @@ Retry a run's errored tasks by its ID.
 ```bash Syntax
 valkyrie run retry \
   <RUN_ID> \
+  [--agent-release <TEXT>] \
+  [--agent-sha256 <TEXT>] \
   [--concurrency <INTEGER>] \
   [--task-ids <TEXT>] \
   [--task-ids-file <TEXT>] \
@@ -694,6 +708,16 @@ valkyrie run retry \
 </div>
 
 **Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Saved replacement agent version."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-sha256"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Optional expected SHA-256 of the replacement ZIP."}</p>
+</div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--concurrency"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"integer"}</code> · default: <code>{"None"}</code> · constraints: {">= 1"}</span></div>
@@ -802,6 +826,8 @@ Start a run of an agent on a benchmark.
 ```bash Syntax
 valkyrie run start \
   --agent <TEXT> \
+  [--agent-release <TEXT>] \
+  [--agent-sha256 <TEXT>] \
   [--model <TEXT>] \
   [--benchmark <TEXT>] \
   [--concurrency <INTEGER>] \
@@ -837,6 +863,16 @@ valkyrie run start \
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
   <p className="mb-0 mt-1">{"Published agent name or local agent path (e.g., claude_code or ./claude_code), or oracle to run each task's solution."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Saved agent version. Valkyrie verifies and records its checksum."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--agent-sha256"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Optional expected SHA-256 of the saved agent ZIP."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

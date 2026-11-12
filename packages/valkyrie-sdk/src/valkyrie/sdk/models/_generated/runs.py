@@ -1,9 +1,9 @@
 from __future__ import annotations
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 from valkyrie.sdk.models._base import ResponseModel, UTCDateTime
 from enum import Enum
 from uuid import UUID
-from typing import Annotated, Any, Literal
 from valkyrie.sdk.models._validation import (
     FinalEvaluationBase,
     StartBenchmarkRequestBase,
@@ -11,6 +11,20 @@ from valkyrie.sdk.models._validation import (
 )
 from . import agents, config, datasets as datasets_1, projects
 from datetime import datetime
+
+
+class AgentExecutionAttempt(BaseModel):
+    """The agent version and configuration used for one execution attempt."""
+
+    dispatch_id: str | None = None
+    successor_dispatch_ids: list[str] = []
+    agent_release: dict[str, Any] | None = None
+    model: str | None = None
+    effective_configuration: dict[str, str]
+    task_ids: list[str]
+    retained_outputs: str | None = None
+    results: dict[str, Any] | None = None
+    final_evaluation: dict[str, Any] | None = None
 
 
 class AnalyzeBenchmarkRequest(BaseModel):
@@ -232,6 +246,7 @@ class AWSBenchmarkArguments(ResponseModel):
     """Stored arguments for an AWS run."""
 
     contract: agents.AgentContractRequest
+    agent_attempts: Annotated[list[AgentExecutionAttempt], Field(validate_default=True)] = []
     concurrency: int
     task_ids: list[str] | None = None
     slice_str: str | None = None
@@ -250,6 +265,7 @@ class LocalBenchmarkArguments(ResponseModel):
     """Stored arguments for a local run."""
 
     contract: agents.AgentContractRequest
+    agent_attempts: Annotated[list[AgentExecutionAttempt], Field(validate_default=True)] = []
     concurrency: int
     task_ids: list[str] | None = None
     slice_str: str | None = None
@@ -283,6 +299,7 @@ class StartBenchmarkRequest(StartBenchmarkRequestBase):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset_version: Annotated[str | None, Field(max_length=1024, min_length=1)] = None
+    admission_id: UUID | None = None
     dataset_ref: Annotated[
         datasets_1.HostedDataset | datasets_1.LocalDataset | None,
         Field(discriminator="kind"),

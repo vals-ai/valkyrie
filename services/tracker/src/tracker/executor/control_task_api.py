@@ -539,7 +539,9 @@ def record_link(
     benchmark = _owner(session, invocation, body.ref, live=False)
     if body.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
-    BenchmarkRepository(session).record_sandbox_link(body.provider, body.sandbox_id, body.benchmark_id)
+    BenchmarkRepository(session).record_sandbox_link(
+        body.provider, body.sandbox_id, body.benchmark_id, body.seen_at or datetime.now(UTC)
+    )
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))
 

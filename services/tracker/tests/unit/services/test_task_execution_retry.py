@@ -1661,13 +1661,28 @@ class TestTaskExecutionRetry:
         )
         task_row.status = TaskStatus.EVALUATING
         task_row.eval_resume_state = {"artifact_prefix": "s3://bucket/run"}
-        task_row.credited_wall_deadline_at = datetime.now(UTC) + timedelta(seconds=0.5)
+        deadline_at = datetime.now(UTC) + timedelta(seconds=60)
+        task_row.credited_wall_deadline_at = deadline_at
         control_postgres_session.add(task_row)
         control_postgres_session.commit()
         started = asyncio.Event()
+        wall_timeouts: list[tuple[asyncio.Timeout, float]] = []
+        real_timeout_at = asyncio.timeout_at
+
+        def record_timeout_at(when: float | None) -> asyncio.Timeout:
+            assert when is not None
+            timeout = real_timeout_at(when)
+            wall_timeouts.append((timeout, when))
+            return timeout
+
+        monkeypatch.setattr(asyncio, "timeout_at", record_timeout_at)
 
         async def stalled_resume(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             started.set()
+            resume_wall, resume_when = wall_timeouts[-1]
+            loop_now = asyncio.get_running_loop().time()
+            assert abs(resume_when - (loop_now + (deadline_at - datetime.now(UTC)).total_seconds())) <= 0.05
+            resume_wall.reschedule(loop_now)
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 

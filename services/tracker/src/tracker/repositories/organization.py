@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import Depends
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from tracker.database.models import Org
 from tracker.database.session import get_session
@@ -15,6 +15,9 @@ class OrganizationRepository:
 
     def get(self, org_id: UUID) -> Org | None:
         return self._session.get(Org, org_id)
+
+    def list_ids(self) -> list[UUID]:
+        return list(self._session.exec(select(Org.id).order_by(col(Org.id))).all())
 
     def get_by_name(self, name: str) -> Org | None:
         return self._session.exec(select(Org).where(Org.name == name)).first()

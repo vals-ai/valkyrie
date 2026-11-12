@@ -36,6 +36,9 @@ valkyrie run start --agent my-agent --benchmark terminal-bench \
   --dataset terminal-bench-2.1
 ```
 
+To run a dataset your organization published, pass `BENCHMARK/DATASET[@VERSION]` to
+`--dataset`. See [Publish a dataset](/benchmarks/datasets).
+
 Run a slice of the dataset for a cheap first try:
 
 ```bash
@@ -203,3 +206,10 @@ Each run uses its own concurrency, so `--count 3 --concurrency 20` can run 60 ta
   `This user cannot start or retry benchmarks`, starting runs is turned off for your
   account.
   - You can still read and stop runs. Ask Vals AI to turn it back on.
+- By default, an organization can have 10 runs going at once. Runs that are stopping
+  count toward it.
+  - Ask Vals AI if you need a higher limit.
+  - At the limit, starting, retrying, resuming, or regrading a run fails with HTTP 429, and the CLI
+    prints how many runs are active and the limit.
+  - Stop a run or wait for one to finish, then try again.
+  - To read the limit from Python code, see [Handle errors](/sdk/quickstart#handle-errors).

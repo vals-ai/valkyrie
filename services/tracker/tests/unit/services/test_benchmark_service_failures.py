@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 import re
 import json
 from pathlib import Path
@@ -42,6 +43,7 @@ import tracker.services.tasks.execute as utils_module
 from tests.unit.services import task_execution_support
 from tests.unit.services.task_execution_support import (
     TEST_ORG,
+    FixedClock,
     create_task_environment,
     finalize_agent_generation,
     make_retrieve_task_response,
@@ -346,6 +348,37 @@ class TestBenchmarkServiceFailures:
             select(SandboxRecord).where(col(SandboxRecord.sandbox_id) == "verifier-1")
         ).all()
         assert [(row.provider, row.benchmark_id) for row in rows] == [("daytona", benchmark_id)]
+
+    @pytest.mark.usefixtures("process_benchmark_env")
+    async def test_announced_sandbox_is_last_seen_when_its_evaluate_stream_ends(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        announced_at = datetime(2026, 11, 11, 12, tzinfo=UTC)
+        stream_end = announced_at + timedelta(minutes=14)
+        clock = FixedClock.at(announced_at, monkeypatch)
+
+        async def _mock_evaluate_instance(*_args: Any, on_sandbox_created: Any, **_kwargs: Any) -> dict[str, Any]:
+            on_sandbox_created(SandboxCreatedData(provider="daytona", sandbox_id="verifier-short"))
+            clock.moment = stream_end
+            return {"status": "success", "score": 1.0}
+
+        monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", _mock_evaluate_instance)
+
+        await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
+
+        control_postgres_session.expire_all()
+        last_seen_at = control_postgres_session.exec(
+            select(SandboxRecord.last_seen_at).where(col(SandboxRecord.sandbox_id) == "verifier-short")
+        ).one()
+        assert last_seen_at == stream_end
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_cancelled_attempt_still_saves_every_pending_announced_sandbox(

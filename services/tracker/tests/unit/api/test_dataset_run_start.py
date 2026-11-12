@@ -249,14 +249,18 @@ class TestDatasetRunRequest:
         queued = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]
         assert queued["contract"]["run_cmd"] == ORACLE_CONTRACT.run_cmd
 
-    @pytest.mark.description("An oracle run needs a dataset.")
-    def test_an_oracle_run_needs_a_dataset(self) -> None:
+    @pytest.mark.description("An oracle run requires a dataset and cannot replace its built-in agent with a release.")
+    @pytest.mark.parametrize("exact_release", [False, True])
+    def test_an_oracle_run_needs_a_dataset(self, exact_release: bool) -> None:
         body = StartBenchmarkRequest(contract=AgentContractRequest(name="oracle"), benchmark_name="swebench")
+        payload = body.model_dump(mode="json")
+        if exact_release:
+            payload["contract"]["agent_release"] = {"reference": "release-1", "archive_sha256": "a" * 64}
 
-        response = _client.post("/start-benchmark", json=body.model_dump(mode="json"))
+        response = _client.post("/start-benchmark", json=payload)
 
         assert response.status_code == 400
-        assert "runs only on a dataset" in response.text
+        assert ("cannot select an agent release" if exact_release else "runs only on a dataset") in response.text
 
     @pytest.mark.description("An ordinary run still needs a hostname for its benchmark.")
     @pytest.mark.parametrize("name", ["Bad Name", "a.b", "a" * 65])

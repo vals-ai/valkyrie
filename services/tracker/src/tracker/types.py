@@ -95,6 +95,14 @@ class AgentTurns(BaseModel):
     container_name: str | None = None
 
 
+class AgentReleaseSelection(BaseModel):
+    model_config = {"extra": "forbid", "frozen": True}
+    reference: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    archive_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    prescribed_configuration: dict[str, str] = Field(default_factory=dict)
+    overrides: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentContractRequest(BaseModel):
     name: str
     model: str | None = None
@@ -109,6 +117,7 @@ class AgentContractRequest(BaseModel):
     secrets: dict[str, str] = {}
     kwargs: dict[str, str] = {}
     inference_settings_attested: bool = False
+    agent_release: AgentReleaseSelection | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -167,10 +176,23 @@ class RunMonitoringRules(BaseModel):
     allowed_hosts: list[str] = []
 
 
+class AgentExecutionAttempt(BaseModel):
+    dispatch_id: str | None = None
+    successor_dispatch_ids: list[str] = Field(default_factory=list)
+    agent_release: dict[str, Any] | None = None
+    model: str | None = None
+    effective_configuration: dict[str, str]
+    task_ids: list[str]
+    retained_outputs: str | None = None
+    results: dict[str, Any] | None = None
+    final_evaluation: dict[str, Any] | None = None
+
+
 class _BenchmarkArguments(BaseModel):
     model_config = {"extra": "forbid"}
 
     contract: AgentContractRequest
+    agent_attempts: list[AgentExecutionAttempt] = Field(default_factory=list)
     concurrency: int
     priority: int | None = Field(default=None, exclude=True, strict=True, ge=0, le=4)
     queue_pool_id: str | None = Field(default=None, exclude=True)
@@ -609,6 +631,7 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset_version: str | None = Field(default=None, min_length=1, max_length=1024)
+    admission_id: UUID | None = None
     dataset_ref: DatasetRef | None = None
     sandbox_provider: str = "daytona"
     sandbox_provider_secret_name: str | None = None

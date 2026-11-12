@@ -10,6 +10,7 @@ from benchmark_service.schemas import VerifyTaskIdsResponse
 from fastapi.testclient import TestClient
 from httpx._models import Response
 from sqlmodel import Session, col, func, select, update
+from sqlalchemy import text
 
 from main import app
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
@@ -26,7 +27,7 @@ from tracker.database.models import (
     Org,
     Task,
 )
-from tracker.types import AgentContractRequest
+from tracker.types import AgentContractRequest, AgentExecutionAttempt, AgentReleaseSelection
 from tracker.database.models import BenchmarkDefinition, Dataset, RunCost
 from tracker.search_cost import SearchCharge
 from decimal import Decimal
@@ -482,10 +483,21 @@ class TestRunState:
     @pytest.mark.description(
         "Run state creates missing pending task rows once and returns all tasks on subsequent reads."
     )
+    @pytest.mark.parametrize("exact_release", [False, True])
     async def test_read_run_state_creates_missing_task_rows(
-        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        exact_release: bool,
     ) -> None:
         benchmark = make_benchmark(contract=contract, concurrency=5)
+        if exact_release:
+            selection = AgentReleaseSelection(reference="A1", archive_sha256="a" * 64)
+            benchmark.arguments.contract.agent_release = selection
+            benchmark.arguments.agent_attempts = [
+                AgentExecutionAttempt(agent_release=selection.model_dump(), effective_configuration={}, task_ids=[])
+            ]
         control_postgres_session.add(benchmark)
         control_postgres_session.commit()
         run_control = cast(RunControl, bound_controls(benchmark, session=control_postgres_session)["run_control"])
@@ -494,6 +506,13 @@ class TestRunState:
         snapshot = await run_control.read_run_state(task_ids, create_missing_tasks=True)
         assert {task.ref.task_id: task.status for task in snapshot.tasks} == dict.fromkeys(task_ids, TaskStatus.PENDING)
         assert snapshot.authority_current
+        stored = control_postgres_session.execute(
+            text("SELECT arguments FROM benchmark WHERE id = :id"), {"id": benchmark.id}
+        ).scalar_one()
+        assert ("agent_attempts" in stored) is exact_release
+        assert ("agent_attempts" in snapshot.arguments) is exact_release
+        if exact_release:
+            assert snapshot.arguments["agent_attempts"][0]["agent_release"]["reference"] == "A1"
 
         repeated = await run_control.read_run_state(task_ids, create_missing_tasks=True)
         assert [(task.ref.task_id, task.ref.task_row_id) for task in repeated.tasks] == [

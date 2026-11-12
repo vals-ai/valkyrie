@@ -45,6 +45,19 @@ MODELS: dict[str, ModelOverlay] = {
         "module": "account",
         "doc": "Your login's email, its organizations, and the organizations that invited it.",
     },
+    "AgentReleaseSelection": {
+        "module": "agents",
+        "doc": "A saved agent version and its configuration.",
+        "fields": {"prescribed_configuration": {"default": {}}, "overrides": {"default": {}}},
+        "base": REQUEST,
+        "config": {"extra": '"forbid"', "frozen": "True"},
+    },
+    "AgentExecutionAttempt": {
+        "module": "runs",
+        "doc": "The agent version and configuration used for one execution attempt.",
+        "fields": {"successor_dispatch_ids": {"default": []}},
+        "base": REQUEST,
+    },
     "AgentContractRequest": {
         "module": "agents",
         "schema": "AgentContractRequest-Input",
@@ -224,7 +237,11 @@ MODELS: dict[str, ModelOverlay] = {
     },
     "ProjectsResponse": {"module": "projects", "doc": "The organization's projects, by handle."},
     "SpendType": {"module": "projects", "doc": "Why a run spends money."},
-    "AWSBenchmarkArguments": {"module": "runs", "doc": "Stored arguments for an AWS run."},
+    "AWSBenchmarkArguments": {
+        "module": "runs",
+        "doc": "Stored arguments for an AWS run.",
+        "fields": {"agent_attempts": {"default": []}},
+    },
     "AnalyzeBenchmarkRequest": {
         "module": "runs",
         "doc": "Wire payload used to trigger Docent analysis for a run.",
@@ -261,7 +278,11 @@ MODELS: dict[str, ModelOverlay] = {
         "doc": "Inline final results for a benchmark run.",
         "base": "valkyrie.sdk.models._validation.StoredArgumentsBase",
     },
-    "LocalBenchmarkArguments": {"module": "runs", "doc": "Stored arguments for a local run."},
+    "LocalBenchmarkArguments": {
+        "module": "runs",
+        "doc": "Stored arguments for a local run.",
+        "fields": {"agent_attempts": {"default": []}},
+    },
     "Order": {"module": "runs", "doc": "Sort order for run listings."},
     "RescoreBenchmarkResponse": {
         "module": "runs",

@@ -4,7 +4,7 @@ import pytest
 
 from tracker import config
 from tracker.runtime.secrets import secret_display_name
-from tracker.secret_access import resolve_secret_name, validate_secret_names
+from tracker.secret_access import resolve_secret_name, secret_name_candidates, validate_secret_names
 
 _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
 _OTHER_ORG_ID = UUID("00000000-0000-0000-0000-000000000002")
@@ -178,3 +178,24 @@ def test_shared_tenants_cannot_name_another_orgs_gateway_key() -> None:
         )
 
     assert str(error.value) == f"Secret '{key}' does not exist"
+
+
+@pytest.mark.description(
+    "A shared tenant looks up its own tenant secret before the shared one, and other orgs only read their own."
+)
+@pytest.mark.parametrize(
+    ("org_name", "auth_required", "name", "candidates"),
+    [
+        ("internal.example", True, "TOKEN", [f"valkyrie/tenants/{_ORG_ID}/TOKEN", "TOKEN"]),
+        ("internal.example", True, f"valkyrie/tenants/{_ORG_ID}/TOKEN", [f"valkyrie/tenants/{_ORG_ID}/TOKEN"]),
+        ("acme.example", True, "TOKEN", [f"valkyrie/tenants/{_ORG_ID}/TOKEN"]),
+        ("acme.example", False, "TOKEN", ["TOKEN"]),
+    ],
+    ids=["shared-tenant", "shared-tenant-full-reference", "customer", "self-hosted"],
+)
+def test_secret_name_candidates_put_the_run_org_first(
+    monkeypatch: pytest.MonkeyPatch, org_name: str, auth_required: bool, name: str, candidates: list[str]
+) -> None:
+    monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "internal.example")
+
+    assert secret_name_candidates(name, org_id=_ORG_ID, org_name=org_name, auth_required=auth_required) == candidates

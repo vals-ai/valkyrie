@@ -1,5 +1,6 @@
 import asyncio
 from asyncio import Semaphore
+from datetime import datetime
 from collections.abc import Awaitable, Callable, Generator
 from typing import Any, cast
 from uuid import UUID
@@ -29,6 +30,17 @@ from tracker.services.benchmarks import start_benchmark_request_to_benchmark
 
 TEST_ORG = Org(id=TEST_ORG_ID, name="default")
 _TEST_STARTER = RequestIdentity(org=TEST_ORG)
+
+
+class FixedClock:
+    def __init__(self, moment: datetime) -> None:
+        self.moment = moment
+
+    @classmethod
+    def at(cls, moment: datetime, monkeypatch: pytest.MonkeyPatch) -> "FixedClock":
+        clock = cls(moment)
+        monkeypatch.setattr("tracker.services.tasks.execute.sighting_time", lambda: clock.moment)
+        return clock
 
 
 @pytest.fixture

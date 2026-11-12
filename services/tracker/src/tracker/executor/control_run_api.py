@@ -168,7 +168,9 @@ def read_run_state(body: ReadRunStateRequest, request: Request, session: Session
         benchmark_name=benchmark.name,
         custom_benchmark_service=benchmark.custom_benchmark_service,
         benchmark_service_woken=wake_recorded(session, benchmark.name),
-        arguments=benchmark.arguments.model_dump(mode="json"),
+        arguments=benchmark.arguments.model_dump(
+            mode="json", exclude={"agent_attempts"} if not benchmark.arguments.agent_attempts else set()
+        ),
     )
     session.commit()
     return complete_response(session, snapshot)

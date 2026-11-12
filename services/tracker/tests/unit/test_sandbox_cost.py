@@ -582,6 +582,25 @@ class TestHourlyCursor:
         )
         assert _hour_rows(database_session) == {f"sb-1:{hour.isoformat()}": 0.5 for hour in _hours(START, 4)}
 
+    @pytest.mark.description("A tenant's Daytona mapping by secret name reads the same account its runs read.")
+    async def test_a_tenant_mapping_by_name_reads_the_account_its_runs_read(
+        self, monkeypatch: pytest.MonkeyPatch, database_session: Session
+    ) -> None:
+        monkeypatch.setattr(sandbox_cost, "AUTH_REQUIRED", True)
+        reference = f"valkyrie/tenants/{TEST_ORG_ID}/daytona"
+        _configure(database_session, secret="daytona")
+        run, _ = _run(database_session, status=BenchmarkStatus.IN_PROGRESS, secret=reference)
+        _save_sandbox(database_session, run, "sb-1")
+        reads: list[tuple[str, datetime]] = []
+
+        async def read_hour(org: Org, secret: str, start: datetime, end: datetime) -> HourUsage:
+            reads.append((secret, start))
+            return {"sb-1": _usage("sb-1", 0.5, last_end=end)}
+
+        await sweep_sandbox_costs(database_session.get_bind(), now=NOW, open_usage=_opener(read_hour))
+
+        assert reads == [(reference, hour) for hour in _hours(START, 4)]
+
     @pytest.mark.description(
         "A deleted Daytona secret is read through the hour after its last run finished, and then no longer."
     )

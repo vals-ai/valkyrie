@@ -35,6 +35,7 @@ from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.config import AUTH_REQUIRED
 from tracker.repositories.advisory_lock import PostgresAdvisoryLock, sandbox_cost_sweep_lock
 from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
+from tracker.secret_access import resolve_secret_name
 
 logger = get_logger(__name__)
 
@@ -426,16 +427,23 @@ def _load_accounts_and_cursors(
     last_hours: dict[UsageAccount, datetime] = {}
     with Session(bind, expire_on_commit=False) as session:
         costs = CostRepository(session)
+        orgs = OrganizationRepository(session)
         configured = {
-            UsageAccount(org_id=secret.org_id, secret_name=secret.secret_name)
+            UsageAccount(
+                org_id=org.id,
+                secret_name=resolve_secret_name(
+                    secret.secret_name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED
+                ),
+            )
             for secret in ProviderSecretRepository(session).for_provider(DAYTONA_PROVIDER)
+            if (org := orgs.get(secret.org_id)) is not None
         }
         last_used: dict[UsageAccount, datetime | None] = {
             UsageAccount(org_id=use.org_id, secret_name=use.secret_name): use.last_finished_at
             for use in costs.sandbox_accounts_in_use(DAYTONA_PROVIDER, ACCOUNTING_START)
         }
         for account in configured | last_used.keys():
-            if (org := OrganizationRepository(session).get(account.org_id)) is None:
+            if (org := orgs.get(account.org_id)) is None:
                 continue
             last_finished_at = None if account in configured else last_used[account]
             last_hour = (

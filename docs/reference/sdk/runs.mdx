@@ -17,6 +17,8 @@ async def start(
     benchmark: str,
     *,
     model: str | None = None,
+    agent_release: AgentReleaseSelection | None = None,
+    admission_id: UUID | None = None,
     concurrency: int = 5,
     priority: int | None = None,
     task_ids: Sequence[str] | None = None,
@@ -47,6 +49,14 @@ async def start(
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"model"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · str | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"agent_release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <a href="/reference/sdk/models/agents#agent-release-selection"><code>AgentReleaseSelection</code></a> | None · default: <code>{"None"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"admission_id"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · UUID | None · default: <code>{"None"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -649,6 +659,7 @@ async def resume(
     service_headers: Mapping[str, str] | None = None,
     from_scratch: bool = False,
     update_agent: bool = False,
+    agent_release: AgentReleaseSelection | None = None,
     benchmark_url: str | None = None,
     lambda_function: str | None = None,
 ) -> RetryOrResumeBenchmarkResponse
@@ -682,6 +693,10 @@ async def resume(
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"update_agent"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"agent_release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <a href="/reference/sdk/models/agents#agent-release-selection"><code>AgentReleaseSelection</code></a> | None · default: <code>{"None"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -712,6 +727,7 @@ async def retry(
     service_headers: Mapping[str, str] | None = None,
     from_scratch: bool = False,
     update_agent: bool = False,
+    agent_release: AgentReleaseSelection | None = None,
     benchmark_url: str | None = None,
     lambda_function: str | None = None,
 ) -> RetryOrResumeBenchmarkResponse
@@ -745,6 +761,10 @@ async def retry(
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"update_agent"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"agent_release"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <a href="/reference/sdk/models/agents#agent-release-selection"><code>AgentReleaseSelection</code></a> | None · default: <code>{"None"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

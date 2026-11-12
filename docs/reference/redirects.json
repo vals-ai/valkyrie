@@ -216,6 +216,58 @@
     "destination": "/reference/cli/benchmark#service-list"
   },
   {
+    "source": "/reference/cli/dataset/create",
+    "destination": "/reference/cli/dataset#create"
+  },
+  {
+    "source": "/reference/cli/dataset/list",
+    "destination": "/reference/cli/dataset#list"
+  },
+  {
+    "source": "/reference/cli/dataset/show",
+    "destination": "/reference/cli/dataset#show"
+  },
+  {
+    "source": "/reference/cli/dataset/update",
+    "destination": "/reference/cli/dataset#update"
+  },
+  {
+    "source": "/reference/cli/dataset/remove",
+    "destination": "/reference/cli/dataset#remove"
+  },
+  {
+    "source": "/reference/cli/dataset/restore",
+    "destination": "/reference/cli/dataset#restore"
+  },
+  {
+    "source": "/reference/cli/dataset/push",
+    "destination": "/reference/cli/dataset#push"
+  },
+  {
+    "source": "/reference/cli/dataset/install",
+    "destination": "/reference/cli/dataset#install"
+  },
+  {
+    "source": "/reference/cli/dataset/versions",
+    "destination": "/reference/cli/dataset#versions"
+  },
+  {
+    "source": "/reference/cli/dataset/tag",
+    "destination": "/reference/cli/dataset#tag"
+  },
+  {
+    "source": "/reference/cli/dataset/untag",
+    "destination": "/reference/cli/dataset#untag"
+  },
+  {
+    "source": "/reference/cli/dataset/task/list",
+    "destination": "/reference/cli/dataset#task-list"
+  },
+  {
+    "source": "/reference/cli/dataset/task/download",
+    "destination": "/reference/cli/dataset#task-download"
+  },
+  {
     "source": "/reference/cli/queue/status",
     "destination": "/reference/cli/queue#status"
   },
@@ -730,6 +782,10 @@
   {
     "source": "/reference/sdk/models/agents/agent-contract-request",
     "destination": "/reference/sdk/models/agents#agent-contract-request"
+  },
+  {
+    "source": "/reference/sdk/models/agents/agent-release-selection",
+    "destination": "/reference/sdk/models/agents#agent-release-selection"
   },
   {
     "source": "/reference/sdk/models/agents/agent-download-url-response",

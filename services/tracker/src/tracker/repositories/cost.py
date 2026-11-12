@@ -5,13 +5,14 @@ from uuid import UUID
 
 from dataclasses import dataclass
 
-from sqlalchemy import JSON, and_, case, extract, func, or_, type_coerce, update
+from sqlalchemy import JSON, ColumnElement, and_, case, extract, func, or_, type_coerce, update
 from sqlalchemy.dialects.postgresql import insert
 from fastapi import Depends
 from sqlmodel import Session, col, select
 
 from tracker.database.session import get_session
 from tracker.search_cost import SearchCharge, attempt_totals
+from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
     FINISHED_BENCHMARK_STATUSES,
     Benchmark,
@@ -113,6 +114,7 @@ class UnpricedSandbox(NamedTuple):
     secret_name: str
     benchmark_id: UUID
     sandbox_id: str
+    last_seen_at: datetime | None
 
 
 class SandboxAccountUse(NamedTuple):
@@ -132,12 +134,32 @@ _EPOCH_DAY = date(1970, 1, 1)
 _SECONDS_PER_DAY = 86400
 
 
+def _labels(projects: dict[UUID, Project], project_id: UUID | None) -> tuple[Any, ...]:
+    project = None if project_id is None else projects.get(project_id)
+    if project is None:
+        return (None, None, None, None, None)
+    return (project.handle, project.name, project.spend_type, project.subcategory, project.customer)
+
+
 def _placed_at() -> Any:
     return func.coalesce(col(RunCost.usage_end), col(Benchmark.finished_at), col(Benchmark.started_at))
 
 
 def _is_hourly_source() -> Any:
     return col(RunCost.source_id).contains(":")
+
+
+def later_of(current: ColumnElement[Any], candidate: Any) -> ColumnElement[Any]:
+    return case((or_(current.is_(None), current < candidate), candidate), else_=current)
+
+
+def _run_last_active_at() -> ColumnElement[datetime | None]:
+    last_task_at = (
+        select(func.max(func.coalesce(col(Task.finished_at), col(Task.started_at))))
+        .where(col(Task.benchmark) == col(Benchmark.id))
+        .scalar_subquery()
+    )
+    return func.coalesce(col(Benchmark.finished_at), last_task_at, col(Benchmark.started_at))
 
 
 class CostRepository:
@@ -152,6 +174,9 @@ class CostRepository:
                 )
             )
         )
+
+    def _projects(self, org_id: UUID) -> dict[UUID, Project]:
+        return {project.id: project for project in ProjectRepository(self._session).list_all(org_id, True)}
 
     def _current_projects(self, org_id: UUID, *filters: Any) -> Any:
         ranked = (
@@ -209,15 +234,10 @@ class CostRepository:
             cast(Any, select)(
                 col(Benchmark.id).label("run_id"),
                 col(Benchmark.started_at).label("started_at"),
-                col(Project.handle).label("handle"),
-                col(Project.name).label("name"),
-                col(Project.spend_type).label("spend_type"),
-                col(Project.subcategory).label("subcategory"),
-                col(Project.customer).label("customer"),
+                current.c.project_id.label("project_id"),
             )
             .select_from(Benchmark)
             .outerjoin(current, current.c.benchmark_id == col(Benchmark.id))
-            .outerjoin(Project, (col(Project.id) == current.c.project_id) & (col(Project.org_id) == org_id))
             .where(Benchmark.org_id == org_id)
             .where(or_(alive_in_window, col(Benchmark.id).in_(runs_with_costs)))
             .order_by(col(Benchmark.started_at), col(Benchmark.id))
@@ -228,22 +248,25 @@ class CostRepository:
                 col(RunCost.provider).label("provider"),
                 col(RunCost.amount_usd).label("amount_usd"),
                 placed_at.label("placed_at"),
-                col(Project.handle).label("handle"),
-                col(Project.name).label("name"),
-                col(Project.spend_type).label("spend_type"),
-                col(Project.subcategory).label("subcategory"),
-                col(Project.customer).label("customer"),
+                current.c.project_id.label("project_id"),
             )
             .join(Benchmark, col(Benchmark.id) == col(RunCost.benchmark_id))
             .outerjoin(current, current.c.benchmark_id == col(Benchmark.id))
-            .outerjoin(Project, (col(Project.id) == current.c.project_id) & (col(Project.org_id) == org_id))
             .where(Benchmark.org_id == org_id)
             .where(placed_at >= start)
             .where(placed_at < end)
         )
+        projects = self._projects(org_id)
+        runs = cast(Any, self._session.exec(runs_statement)).all()
+        costs = cast(Any, self._session.exec(costs_statement)).all()
         return (
-            cast(Sequence[RunProjectRow], cast(Any, self._session.exec(runs_statement)).all()),
-            cast(Sequence[PlacedCostRow], cast(Any, self._session.exec(costs_statement)).all()),
+            [RunProjectRow(row.run_id, row.started_at, *_labels(projects, row.project_id)) for row in runs],
+            [
+                PlacedCostRow(
+                    row.run_id, row.provider, row.amount_usd, row.placed_at, *_labels(projects, row.project_id)
+                )
+                for row in costs
+            ],
         )
 
     def _placed_sandbox_costs(self, statement: Any, org_id: UUID, provider: str, start: datetime, end: datetime) -> Any:
@@ -270,7 +293,7 @@ class CostRepository:
                     col(RunCost.amount_usd).label("amount_usd"),
                     col(RunCost.usage_end).label("usage_end"),
                     col(RunCost.benchmark_id).label("run_id"),
-                    col(Project.handle).label("handle"),
+                    current.c.project_id.label("project_id"),
                 ),
                 org_id,
                 provider,
@@ -278,12 +301,23 @@ class CostRepository:
                 end,
             )
             .outerjoin(current, current.c.benchmark_id == col(Benchmark.id))
-            .outerjoin(Project, (col(Project.id) == current.c.project_id) & (col(Project.org_id) == org_id))
             .order_by(placed_at, col(RunCost.id))
             .limit(limit)
             .offset(offset)
         )
-        return cast(Sequence[SandboxCostRow], cast(Any, self._session.exec(statement)).all())
+        projects = self._projects(org_id)
+        return [
+            SandboxCostRow(
+                row.source_id,
+                row.hourly,
+                row.placed_at,
+                row.amount_usd,
+                row.usage_end,
+                row.run_id,
+                _labels(projects, row.project_id)[0],
+            )
+            for row in cast(Any, self._session.exec(statement)).all()
+        ]
 
     def sandbox_day_totals(
         self, org_id: UUID, provider: str, start: datetime, end: datetime
@@ -324,18 +358,19 @@ class CostRepository:
         current = self._current_projects(org_id, col(Benchmark.started_at) >= start, col(Benchmark.started_at) < end)
         statement = (
             cast(Any, select)(
-                col(Project.id).label("project_id"),
+                current.c.project_id.label("project_id"),
                 col(RunCost.provider).label("provider"),
                 func.sum(col(RunCost.amount_usd)).label("total_usd"),
             )
             .select_from(current)
-            .join(Project, (col(Project.id) == current.c.project_id) & (col(Project.org_id) == org_id))
             .join(RunCost, col(RunCost.benchmark_id) == current.c.benchmark_id)
             .where(col(RunCost.cost_type) == SANDBOX_COST_TYPE)
-            .group_by(col(Project.id), col(RunCost.provider))
-            .order_by(col(Project.id), col(RunCost.provider))
+            .group_by(current.c.project_id, col(RunCost.provider))
+            .order_by(current.c.project_id, col(RunCost.provider))
         )
-        return cast(Sequence[ProjectSandboxTotalRow], cast(Any, self._session.exec(statement)).all())
+        projects = self._projects(org_id)
+        rows = cast(Sequence[ProjectSandboxTotalRow], cast(Any, self._session.exec(statement)).all())
+        return [ProjectSandboxTotalRow(*row) for row in rows if row.project_id in projects]
 
     def missing_usage_end_rows(self, org_id: UUID, provider: str, source_ids: list[str]) -> list[MissingUsageEndRow]:
         if not source_ids:
@@ -412,6 +447,27 @@ class CostRepository:
             .on_conflict_do_nothing(
                 index_elements=["provider", "source_id"],
                 index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+            )
+        )
+        return result.rowcount == 1
+
+    def price_sandbox_up_to(
+        self, *, benchmark_id: UUID, provider: str, sandbox_id: str, amount_usd: float, usage_end: datetime
+    ) -> bool:
+        statement = insert(RunCost).values(
+            benchmark_id=benchmark_id,
+            cost_type=SANDBOX_COST_TYPE,
+            source_id=sandbox_id,
+            provider=provider,
+            amount_usd=amount_usd,
+            usage_end=usage_end,
+        )
+        result = self._session.exec(
+            statement.on_conflict_do_update(
+                index_elements=["provider", "source_id"],
+                index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+                set_={"amount_usd": statement.excluded.amount_usd, "usage_end": statement.excluded.usage_end},
+                where=col(RunCost.usage_end) < statement.excluded.usage_end,
             )
         )
         return result.rowcount == 1
@@ -523,12 +579,7 @@ class CostRepository:
     def sandbox_accounts_in_use(self, provider: str, since: datetime) -> list[SandboxAccountUse]:
         secret_name = type_coerce(col(Benchmark.arguments), JSON)["sandbox_provider_secret_name"].as_string()
         active = col(Benchmark.status).not_in(FINISHED_BENCHMARK_STATUSES)
-        last_task_at = (
-            select(func.max(func.coalesce(col(Task.finished_at), col(Task.started_at))))
-            .where(col(Task.benchmark) == col(Benchmark.id))
-            .scalar_subquery()
-        )
-        ended_at = func.coalesce(col(Benchmark.finished_at), last_task_at, col(Benchmark.started_at))
+        ended_at = _run_last_active_at()
         has_sandbox = (
             select(SandboxRecord.sandbox_id)
             .where(col(SandboxRecord.provider) == provider, col(SandboxRecord.benchmark_id) == col(Benchmark.id))
@@ -558,6 +609,9 @@ class CostRepository:
                 col(RunCost.cost_type) == SANDBOX_COST_TYPE,
                 col(RunCost.provider) == col(SandboxRecord.provider),
                 col(RunCost.source_id) == col(SandboxRecord.sandbox_id),
+                or_(
+                    col(SandboxRecord.last_seen_at).is_(None), col(RunCost.usage_end) >= col(SandboxRecord.last_seen_at)
+                ),
             )
             .exists()
         )
@@ -568,6 +622,7 @@ class CostRepository:
                 secret_name,
                 col(SandboxRecord.benchmark_id),
                 col(SandboxRecord.sandbox_id),
+                func.coalesce(col(SandboxRecord.last_seen_at), _run_last_active_at()),
             )
             .join(Benchmark, col(Benchmark.id) == col(SandboxRecord.benchmark_id))
             .where(
@@ -583,6 +638,13 @@ class CostRepository:
             .order_by(col(SandboxRecord.benchmark_id), col(SandboxRecord.sandbox_id))
         )
         return [UnpricedSandbox(*row) for row in cast(Any, self._session.exec(statement)).all()]
+
+    def mark_sandbox_seen(self, provider: str, sandbox_id: str, seen_at: datetime) -> None:
+        self._session.exec(
+            update(SandboxRecord)
+            .where(col(SandboxRecord.provider) == provider, col(SandboxRecord.sandbox_id) == sandbox_id)
+            .values(last_seen_at=later_of(col(SandboxRecord.last_seen_at), seen_at))
+        )
 
     def usage_cursor(self, org_id: UUID, secret_name: str, start: datetime) -> datetime:
         self._session.exec(

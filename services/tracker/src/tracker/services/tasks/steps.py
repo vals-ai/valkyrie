@@ -44,6 +44,7 @@ class StepRun:
     generate: StepGeneration
     persist_accounting: AccountingSink
     on_sandbox_created: Callable[[SandboxCreatedData], None]
+    until_stream_ends: Callable[[Awaitable[StepOutcome]], Awaitable[StepOutcome]]
     set_phase: Callable[[FailurePhase], None]
     redact: Callable[[str], str]
     restrict_egress: Callable[[EgressPolicy], Awaitable[None]] | None
@@ -125,14 +126,16 @@ async def run_steps(run: StepRun, controller: ExternalServiceDeadlineController)
         if run.restrict_egress is not None:
             await run.restrict_egress(step.egress_evaluation)
         run.task_logs.last_log_time = time.monotonic()
-        outcome = await run_benchmark_service_websocket(
-            run.service.grade_step(
-                run.task_id,
-                run.sandbox_id,
-                step.name,
-                on_message=log_output,
-                on_sandbox_created=run.on_sandbox_created,
-                sandbox_provider=run.sandbox_provider,
+        outcome = await run.until_stream_ends(
+            run_benchmark_service_websocket(
+                run.service.grade_step(
+                    run.task_id,
+                    run.sandbox_id,
+                    step.name,
+                    on_message=log_output,
+                    on_sandbox_created=run.on_sandbox_created,
+                    sandbox_provider=run.sandbox_provider,
+                )
             )
         )
         result.evaluation_time += time.perf_counter() - evaluation_started

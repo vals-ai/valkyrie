@@ -1,4 +1,6 @@
 import io
+from hashlib import sha256
+from collections.abc import AsyncIterator
 import json
 import zipfile
 from pathlib import Path
@@ -9,6 +11,8 @@ from uuid import UUID
 import pytest
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.schemas import VerifyTaskIdsResponse
+from botocore.exceptions import ClientError
+from tracker.exceptions import S3Error
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -19,6 +23,8 @@ from main import app
 from tests.conftest import TEST_ORG_ID
 from tracker import config
 from tracker.auth import RequestIdentity, get_current_runner, get_current_starter
+from tracker.types import AgentContractRequest, AgentReleaseSelection, RunMonitoringRules
+from tracker.database.models import FinalEvaluation
 from tracker.database.models import (
     Benchmark,
     ExecutorDispatch,
@@ -26,16 +32,17 @@ from tracker.database.models import (
     ExecutorRelease,
     Org,
     Project,
+    RunProject,
     Task,
     UserBenchmarkService,
 )
-from tracker.types import AgentContractRequest, RunMonitoringRules
+from tracker.domain import SpendType
 from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.executor.release_control import promote_release
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
-from tracker.runtime.storage import ObjectStore
+from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
 from tracker.types import StartBenchmarkRequest
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
@@ -149,11 +156,15 @@ def test_managed_start_and_resume_emit_credential_free_v3(
     reset_to_in_progress = Mock(return_value=["task-2"])
     monkeypatch.setattr("main.reset_to_in_progress_status", reset_to_in_progress)
 
+    contract.model = None
+    contract.kwargs["model"] = "recorded-model"
+
     response = client.post("/start-benchmark", json=_start_request(contract).model_dump(mode="json"))
 
     assert response.status_code == 200
     benchmark = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert benchmark is not None
+    assert benchmark.arguments.agent_attempts == []
     assert len(payloads) == 1
     assert set(payloads[0]) == _MANAGED_ENVELOPE_KEYS
     start_context = payloads[0]["execution_context_json"]
@@ -626,6 +637,186 @@ def test_managed_resume_payload_failure_rolls_back_recovery_state(
         ).all()
     } == original_dispatch_ids
     assert payloads == []
+
+
+@pytest.mark.description("Retries keep the selected agent version and explicit updates preserve earlier attempts.")
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("protected_gateway", [False, True])
+def test_exact_agent_selection_survives_alias_and_explicit_update(
+    legacy: bool,
+    protected_gateway: bool,
+    database_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    _configure_managed_runtime(monkeypatch)
+    _promote_test_release(database_session)
+    payloads = _capture_dispatch_payloads(monkeypatch, database_session)
+    archives: dict[str, bytes] = {}
+    selections: list[AgentReleaseSelection] = []
+    for reference in ("A1", "A2"):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "example/contract.yaml",
+                f"name: example\ninstall_cmd: echo setup\nrun_cmd: echo {reference} {{problem_statement_path}}\nkwargs:\n  budget:\n    type: int\n    required: false\n    default: 1\n"
+                + (
+                    "secrets:\n  MODEL_GATEWAY_URL: changed-url\n  MODEL_GATEWAY_API_KEY: changed-key\n"
+                    if protected_gateway and reference == "A2"
+                    else ""
+                ),
+            )
+        content = buffer.getvalue()
+        selection = AgentReleaseSelection(
+            reference=reference,
+            archive_sha256=sha256(content).hexdigest(),
+            prescribed_configuration={"budget": "2"},
+            overrides={"budget": "5"},
+        )
+        selections.append(selection)
+        archives[f"agent-releases/example/{reference}/{selection.archive_sha256}.zip"] = content
+        archives[f"agent-releases/example/{reference}/release.json"] = json.dumps(
+            {"schema_version": 1, "agent": "example", "archive": "example.zip", "sha256": selection.archive_sha256}
+        ).encode()
+
+    async def get_bytes(_self: object, key: str) -> bytes:
+        if "/denied/" in key:
+            raise S3Error("Failed to download from S3") from ClientError(
+                {"Error": {"Code": "AccessDenied"}}, "GetObject"
+            )
+        if key not in archives:
+            raise S3Error("Failed to download from S3") from ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return archives[key]
+
+    async def objects(_self: object, _prefix: str) -> AsyncIterator[StoredObject]:
+        for key, content in tuple(archives.items()):
+            if key.startswith(_prefix):
+                yield StoredObject(key=key, size=len(content))
+
+    async def copy_object(_self: object, source_key: str, destination_key: str) -> StoredObjectCopy:
+        archives[destination_key] = archives[source_key]
+        return StoredObjectCopy(deletion_token=None)
+
+    async def verify_task_ids(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
+        archives["agents/example.zip"] = archives[f"agent-releases/example/A2/{selections[1].archive_sha256}.zip"]
+        return VerifyTaskIdsResponse(task_ids=["task-1"])
+
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.get_bytes", get_bytes)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.list_objects", objects)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.copy", copy_object)
+    monkeypatch.setattr(main.SchedulerRepository, "try_task_evaluation_transaction_lock", lambda *_args: True)
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+    request = _start_request(AgentContractRequest(name="example", agent_release=selections[0]))
+    request.admission_id = UUID("11111111-1111-4111-8111-111111111111")
+    missing_request = request.model_copy(
+        update={
+            "contract": request.contract.model_copy(
+                update={"agent_release": selections[0].model_copy(update={"reference": "missing"})}
+            )
+        }
+    )
+    missing = client.post("/start-benchmark", json=missing_request.model_dump(mode="json"))
+    assert missing.status_code == 404
+    assert database_session.exec(select(ExecutorDispatch)).all() == []
+    denied_request = request.model_copy(
+        update={
+            "contract": request.contract.model_copy(
+                update={"agent_release": selections[0].model_copy(update={"reference": "denied"})}
+            )
+        }
+    )
+    denied = client.post("/start-benchmark", json=denied_request.model_dump(mode="json"))
+    assert denied.status_code == 403
+    key = f"agent-releases/example/A1/{selections[0].archive_sha256}.zip"
+    original = archives[key]
+    archives[key] = b"corrupt"
+    corrupted = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+    assert corrupted.status_code == 400
+    assert database_session.exec(select(ExecutorDispatch)).all() == []
+    archives[key] = original
+
+    response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+    assert response.status_code == 200, response.text
+    benchmark_id = UUID(response.json()["benchmark_id"])
+    repeated = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+    assert repeated.status_code == 409, repeated.text
+    assert repeated.json()["detail"]["benchmark_id"] == str(benchmark_id)
+    assert len(payloads) == 1
+    if protected_gateway:
+        project = Project(
+            org_id=TEST_ORG_ID, handle="exact-release", name="Exact release", spend_type=SpendType.INTERNAL
+        )
+        database_session.add(project)
+        database_session.flush()
+        database_session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id))
+        database_session.commit()
+        monkeypatch.setattr(main, "selects_project_gateway_key", lambda _org: True)
+    archives[f"benchmarks/{benchmark_id}/task-1/output.txt"] = b"A1 output"
+    task = database_session.exec(select(Task).where(Task.benchmark == benchmark_id)).one()
+    task.eval_resume_state = {"cursor": "A1-evaluation"}
+    database_session.add(task)
+    if legacy:
+        benchmark = database_session.get(Benchmark, benchmark_id)
+        assert benchmark is not None
+        contract = benchmark.arguments.contract.model_copy(
+            update={"agent_release": None, "kwargs": {"budget": "3", "model": "recorded-model"}}
+        )
+        benchmark.arguments = benchmark.arguments.model_copy(update={"contract": contract, "agent_attempts": []})
+        database_session.add(benchmark)
+        database_session.add(FinalEvaluation(org_id=benchmark.org_id, benchmark=benchmark_id, final_score=0.5))
+        database_session.commit()
+    database_session.commit()
+    for replacement in (selections[1],) if legacy else (None, selections[1]):
+        database_session.expire_all()
+        benchmark = database_session.get(Benchmark, benchmark_id)
+        assert benchmark is not None
+        assert benchmark.arguments.contract.run_cmd == "echo A1 {problem_statement_path}"
+        _stop_benchmark(benchmark, database_session)
+        body: dict[str, Any] = {"task_ids": ["task-1"]}
+        if replacement is not None:
+            body["agent_release"] = replacement.model_dump(mode="json")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_id}",
+            params={
+                "retry": "true",
+                "update_agent": str(replacement is not None).lower(),
+                "retry_mode": "from_scratch" if replacement else "auto",
+            },
+            json=body,
+        )
+        assert response.status_code == 200, response.text
+        database_session.expire_all()
+        recovered_task = database_session.exec(select(Task).where(Task.benchmark == benchmark_id)).one()
+        assert recovered_task.eval_resume_state == (None if replacement else {"cursor": "A1-evaluation"})
+
+    database_session.expire_all()
+    benchmark = database_session.get(Benchmark, benchmark_id)
+    assert benchmark is not None
+    assert benchmark.arguments.contract.run_cmd == "echo A2 {problem_statement_path}"
+    if protected_gateway:
+        assert "MODEL_GATEWAY_URL" not in benchmark.arguments.contract.secrets
+        assert "MODEL_GATEWAY_API_KEY" not in benchmark.arguments.contract.secrets
+    assert [a.agent_release["reference"] for a in benchmark.arguments.agent_attempts if a.agent_release] == (
+        ["A2"] if legacy else ["A1", "A1", "A2"]
+    )
+    assert len(payloads) == (2 if legacy else 3)
+
+    metadata = client.get(f"/fetch-benchmark-metadata/{benchmark_id}")
+    assert metadata.status_code == 200
+    attempts = metadata.json()["benchmark_arguments"]["agent_attempts"]
+    if legacy:
+        assert attempts[0]["agent_release"] is None
+        assert attempts[0]["model"] == "recorded-model"
+        assert attempts[0]["effective_configuration"] == {"budget": "3"}
+        assert attempts[0]["final_evaluation"]["final_score"] == 0.5
+    else:
+        assert [attempt["agent_release"]["reference"] for attempt in attempts] == ["A1", "A1", "A2"]
+    assert attempts[0]["retained_outputs"] is not None
+
+    archives[f"benchmarks/{benchmark_id}/task-1/output.txt"] = b"A2 output"
+    assert archives[attempts[0]["retained_outputs"] + "task-1/output.txt"] == b"A1 output"
+    if not legacy:
+        assert [attempt["effective_configuration"] for attempt in attempts] == [{"budget": "5"}] * 3
 
 
 class _MonitoringClient:

@@ -12,7 +12,7 @@ import time
 import uuid
 from asyncio import Semaphore
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -42,6 +42,7 @@ from benchmark_service import (
     Resources as TrackerResources,
 )
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_created_scope
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
 from opentelemetry import trace
 from tenacity import (
@@ -406,6 +407,18 @@ async def _create_sandbox(
     return sandbox
 
 
+def _record_announced(
+    link: SandboxLink | None, record_sandbox: Callable[[SandboxLink, str], Awaitable[None]]
+) -> AbstractContextManager[None]:
+    if link is None:
+        return nullcontext()
+
+    async def announce(provider: AnnouncedSandboxProvider, sandbox_id: str) -> None:
+        await record_sandbox(SandboxLink(benchmark_id=link.benchmark_id, provider=provider), sandbox_id)
+
+    return sandbox_created_scope(announce)
+
+
 @asynccontextmanager
 async def create_sandbox(
     provider: SandboxProvider,
@@ -438,18 +451,19 @@ async def create_sandbox(
         async with creation_semaphore:
             start = time.monotonic()
             creation_state.cleanup_pending = True
-            creation_task = asyncio.create_task(
-                _create_sandbox(
-                    provider,
-                    sandbox_name,
-                    source,
-                    resources,
-                    labels=labels,
-                    env_vars=env_vars,
-                    volumes=volumes,
-                    sandbox_secrets=sandbox_secrets,
+            with _record_announced(sandbox_link, record_sandbox):
+                creation_task = asyncio.create_task(
+                    _create_sandbox(
+                        provider,
+                        sandbox_name,
+                        source,
+                        resources,
+                        labels=labels,
+                        env_vars=env_vars,
+                        volumes=volumes,
+                        sandbox_secrets=sandbox_secrets,
+                    )
                 )
-            )
             try:
                 sandbox = await asyncio.shield(creation_task)
             except asyncio.CancelledError:
@@ -538,6 +552,15 @@ async def upload_agent_artifacts(
     object_store: ObjectStore,
 ) -> None:
     logger.info("Uploading contract %s to sandbox %s", contract.name, sandbox.name)
+
+    if contract.agent_release is not None:
+        from tracker.agent.releases import retained_agent_key, validate_archive
+        from tracker.local.artifacts import upload_local_agent_artifacts
+
+        content = await object_store.get_bytes(retained_agent_key(contract.name, contract.agent_release))
+        validate_archive(content, contract.agent_release)
+        await upload_local_agent_artifacts(sandbox, content)
+        return
 
     contract_s3_key = benchmark_agent_bundle_key(benchmark_id, contract.name)
     presigned_url = await object_store.temporary_download_url(

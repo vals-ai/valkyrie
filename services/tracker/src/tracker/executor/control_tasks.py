@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -185,6 +185,7 @@ class SandboxLinkRequest(BaseModel):
     benchmark_id: UUID
     provider: str
     sandbox_id: str
+    seen_at: datetime | None = None
 
 
 class SandboxCostRequest(BaseModel):
@@ -314,12 +315,16 @@ class TaskControl:
     async def clear_native_output(self, request: NativeOutputRequest) -> None:
         await self.client.call("clear_native_output", request, TaskDecision)
 
-    async def record_sandbox(self, link: SandboxLink, sandbox_id: str) -> None:
+    async def record_sandbox(self, link: SandboxLink, sandbox_id: str, seen_at: datetime | None = None) -> None:
         try:
             await self.client.call(
                 "record_sandbox_link",
                 SandboxLinkRequest(
-                    ref=self.ref, benchmark_id=link.benchmark_id, provider=link.provider, sandbox_id=sandbox_id
+                    ref=self.ref,
+                    benchmark_id=link.benchmark_id,
+                    provider=link.provider,
+                    sandbox_id=sandbox_id,
+                    seen_at=seen_at or datetime.now(UTC),
                 ),
                 TaskDecision,
             )

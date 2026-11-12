@@ -12,10 +12,12 @@ from valkyrie.sdk.models import (
     BenchmarkStatus,
     FetchBenchmarkMetadataResponse,
     ProjectResponse,
-    RunSnapshot,
+    AgentReleaseSelection,
     SpendType,
     TaskStatus,
 )
+
+from valkyrie.sdk.models.runs import AgentExecutionAttempt
 
 from valkyrie.cli.run.fetch import fetch
 from valkyrie.cli.run.progress import stream_benchmark_status
@@ -46,23 +48,51 @@ def _records(output: str) -> list[dict[str, object]]:
     return [json.loads(line) for line in output.splitlines()]
 
 
-@pytest.mark.description("JSON fetch prints the SDK `RunSnapshot`, with regrade fields and launch metadata.")
-def test_fetch_json_prints_the_sdk_run_snapshot(tracker: MockTracker, cli_runner: CliRunner) -> None:
+@pytest.mark.description("JSON snapshots retain release identities and regrade fields but omit saved configuration.")
+@pytest.mark.parametrize("output_format", ["json", "jsonl"])
+def test_fetch_json_prints_the_sdk_run_snapshot(
+    tracker: MockTracker, cli_runner: CliRunner, output_format: str
+) -> None:
     regraded_from = UUID(int=7)
     run = make_fetch_response(_RUN_ID).model_copy(
         update={"regraded_from_run_id": regraded_from, "regrade_skipped_task_ids": ["task-9"]}
     )
     metadata = _tagged_metadata()
-    serve_run(tracker, run, metadata=metadata)
+    release = AgentReleaseSelection(
+        reference="release-1",
+        archive_sha256="a" * 64,
+        prescribed_configuration={"endpoint": "https://user:private-value@example.test"},
+        overrides={"payload": "private-value"},
+    )
+    metadata.benchmark_arguments.contract.agent_release = release
+    metadata.benchmark_arguments.contract.kwargs["payload"] = "private-value"
+    metadata.benchmark_arguments.agent_attempts = [
+        AgentExecutionAttempt(
+            dispatch_id="dispatch-1",
+            agent_release=release.model_dump(),
+            effective_configuration={"payload": "private-value"},
+            task_ids=["task-1"],
+            results={"output": "private-value"},
+            final_evaluation={"output": "private-value"},
+        )
+    ]
+    serve_run(tracker, run, metadata=metadata, stream=run_stream(run))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
+    args = [str(_RUN_ID), "--format", output_format]
+    if output_format == "jsonl":
+        args.append("--connect")
+    result = cli_runner.invoke(fetch, args)
 
     assert result.exit_code == 0, result.output
-    assert len(result.output.splitlines()) == 1
-    payload = json.loads(result.output)
-    assert payload == RunSnapshot(run=run, metadata=metadata).model_dump(mode="json")
+    payload = json.loads(result.output.splitlines()[0])
+    assert set(payload) == {"run", "metadata"}
     assert payload["run"]["regraded_from_run_id"] == str(regraded_from)
-    assert payload["metadata"]["benchmark_arguments"]["contract"]["model"] == "openai/gpt-5"
+    arguments = payload["metadata"]["benchmark_arguments"]
+    assert arguments["contract"]["model"] == "openai/gpt-5"
+    assert arguments["contract"]["agent_release"] == {"reference": "release-1", "archive_sha256": "a" * 64}
+    assert arguments["agent_attempts"][0]["agent_release"] == arguments["contract"]["agent_release"]
+    assert "private-value" not in result.output
+    assert "effective_configuration" not in result.output
 
 
 @pytest.mark.description("Non-finite scores print as null, and unavailable metadata prints as null instead of failing.")

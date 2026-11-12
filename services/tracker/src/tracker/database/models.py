@@ -98,6 +98,8 @@ class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
         excluded_fields = {"priority", "queue_pool_id", "selected_project_gateway_secret_ref"}
         if value.dataset_version is None:
             excluded_fields.add("dataset_version")
+        if not value.agent_attempts:
+            excluded_fields.add("agent_attempts")
         serialized = value.model_dump(mode="json", exclude=excluded_fields)
         if value.priority is not None:
             serialized["priority"] = value.priority
@@ -221,6 +223,7 @@ class SandboxRecord(SQLModel, table=True):
     provider: str = Field(primary_key=True)
     sandbox_id: str = Field(primary_key=True)
     benchmark_id: UUID = Field(foreign_key="benchmark.id")
+    last_seen_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
 class RunCost(SQLModel, table=True):

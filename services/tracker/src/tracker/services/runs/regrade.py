@@ -6,7 +6,8 @@ from typing import Any
 from benchmark_service.schemas import DatasetVersion
 
 from tracker.auth import RequestIdentity
-from tracker.database.models import Benchmark, ErrorResult, Task, TaskStatus
+from tracker.database.models import Benchmark, ErrorResult, Task
+from tracker.domain import TaskStatus
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ def regrade_run(
                 "concurrency": source.arguments.concurrency if concurrency is None else concurrency,
                 "lambda_function": None,
                 "regraded_from_run_id": source.id,
+                "agent_attempts": [],
                 "regrade_skipped_task_ids": tasks.skipped_task_ids,
             }
         ),

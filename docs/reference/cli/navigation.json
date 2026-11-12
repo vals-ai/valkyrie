@@ -3,6 +3,7 @@
   "reference/cli/run",
   "reference/cli/agent",
   "reference/cli/benchmark",
+  "reference/cli/dataset",
   "reference/cli/queue",
   "reference/cli/project",
   "reference/cli/secret",

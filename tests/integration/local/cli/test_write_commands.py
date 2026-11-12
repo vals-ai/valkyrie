@@ -1,6 +1,18 @@
 import pytest
 
 import json
+import base64
+import hashlib
+import io
+import zipfile
+from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock
+
+from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.schemas import HealthCheckResponse, VerifyTaskIdsResponse, VersionResponse
+from services.tracker import main as tracker_main
+from tracker.database.models import Org, OrgProviderSecret
+from tracker.runtime.storage import StoredObject
 from pathlib import Path
 
 
@@ -307,3 +319,152 @@ def test_cli_downloads_run_artifacts_through_tracker(
     result = cli_runner.invoke(cli, ["run", "output", str(running.id), "task", "-o", str(destination)])
     assert result.exit_code == 0, result.output
     assert (destination / "task/result.txt").read_text() == "result"
+
+
+@pytest.mark.description("The CLI starts and retries a run with the same saved agent version.")
+@pytest.mark.parametrize("explicit_digest", [False, True])
+def test_cli_selects_and_retries_exact_agent(
+    explicit_digest: bool,
+    cli_runner: CliRunner,
+    database_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    org = database_session.exec(select(Org)).one()
+    database_session.add(OrgProviderSecret(org_id=org.id, provider="daytona", secret_name="provider-secret"))
+    database_session.commit()
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "local")
+    monkeypatch.setenv("EXECUTOR_PAYLOAD_LOCAL_KEY", base64.b64encode(b"k" * 32).decode())
+    monkeypatch.delenv("EXECUTOR_PAYLOAD_KMS_KEY_ID", raising=False)
+    monkeypatch.setattr(tracker_main, "launch_dispatch", AsyncMock())
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "health_check", AsyncMock(return_value=HealthCheckResponse(status="ok"))
+    )
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "version", AsyncMock(return_value=VersionResponse(framework_version="test"))
+    )
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "verify_task_ids", AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["one"]))
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "exact/contract.yaml",
+            "name: exact\ninstall_cmd: echo setup\nrun_cmd: echo {problem_statement_path}\nkwargs:\n  budget:\n    type: int\n    required: false\n    default: 1\n",
+        )
+    content = buffer.getvalue()
+    digest = hashlib.sha256(content).hexdigest()
+    objects = {
+        f"agent-releases/exact/A1/{digest}.zip": content,
+        "agent-releases/exact/A1/release.json": json.dumps(
+            {"schema_version": 1, "agent": "exact", "archive": "exact.zip", "sha256": digest}
+        ).encode(),
+    }
+
+    async def get_bytes(_store: object, key: str) -> bytes:
+        return objects[key]
+
+    async def put_bytes(_store: object, key: str, content: bytes) -> None:
+        objects[key] = content
+
+    async def exists(_store: object, key: str) -> bool:
+        return key in objects
+
+    async def list_objects(_store: object, _prefix: str) -> AsyncIterator[StoredObject]:
+        for item in tuple[StoredObject, ...]():
+            yield item
+
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.get_bytes", get_bytes)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.put_bytes", put_bytes)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.exists", exists)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.list_objects", list_objects)
+    project = cli_runner.invoke(
+        cli,
+        [
+            "project",
+            "create",
+            "exact-project",
+            "--name",
+            "Exact",
+            "--spend-type",
+            "development",
+            "--subcategory",
+            "new_benchmark_generation",
+        ],
+    )
+    assert project.exit_code == 0, project.output
+
+    started = cli_runner.invoke(
+        cli,
+        [
+            "run",
+            "start",
+            "--agent",
+            "exact",
+            "--agent-release",
+            "A1",
+            *(["--agent-sha256", digest] if explicit_digest else []),
+            "--benchmark",
+            "swebench",
+            "--project",
+            "exact-project",
+            "--kwarg",
+            "budget",
+            "5",
+        ],
+    )
+    assert started.exit_code == 0, started.output
+    benchmark = database_session.exec(select(Benchmark)).one()
+    assert benchmark.arguments.contract.agent_release is not None
+    assert benchmark.arguments.contract.agent_release.reference == "A1"
+    assert benchmark.arguments.contract.agent_release.archive_sha256 == digest
+    assert benchmark.arguments.contract.kwargs["budget"] == "5"
+    benchmark.status = BenchmarkStatus.STOPPED
+    task = database_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+    task.status = TaskStatus.STOPPED
+    database_session.add_all([benchmark, task])
+    database_session.commit()
+
+    receipt = objects["agent-releases/exact/A1/release.json"]
+    objects["agent-releases/exact/A1/release.json"] = receipt.replace(digest.encode(), b"0" * 64)
+    retried = cli_runner.invoke(cli, ["run", "retry", str(benchmark.id)])
+    assert retried.exit_code == 0, retried.output
+    inspected = cli_runner.invoke(cli, ["run", "fetch", str(benchmark.id), "--format", "json"])
+    assert inspected.exit_code == 0, inspected.output
+    snapshot = json.loads(inspected.output)["metadata"]["benchmark_arguments"]
+    assert snapshot["contract"]["agent_release"]["reference"] == "A1"
+    assert [attempt["agent_release"]["reference"] for attempt in snapshot["agent_attempts"]] == ["A1", "A1"]
+    assert "effective_configuration" not in inspected.output
+    assert "budget" not in inspected.output
+
+    database_session.expire_all()
+    benchmark = database_session.get(Benchmark, benchmark.id)
+    assert benchmark is not None
+    benchmark.status = BenchmarkStatus.STOPPED
+    task = database_session.exec(select(Task).where(Task.benchmark == benchmark.id)).one()
+    task.status = TaskStatus.STOPPED
+    database_session.add_all([benchmark, task])
+    database_session.commit()
+    objects[f"agent-releases/exact/A2/{digest}.zip"] = content
+    objects["agent-releases/exact/A2/release.json"] = receipt
+
+    updated = cli_runner.invoke(
+        cli,
+        [
+            "run",
+            "retry",
+            str(benchmark.id),
+            "--agent-release",
+            "A2",
+            *(["--agent-sha256", digest] if explicit_digest else []),
+            "--update-agent",
+            "--from-scratch",
+        ],
+    )
+
+    assert updated.exit_code == 0, updated.output
+    database_session.expire_all()
+    benchmark = database_session.get(Benchmark, benchmark.id)
+    assert benchmark is not None and benchmark.arguments.contract.agent_release is not None
+    assert benchmark.arguments.contract.agent_release.reference == "A2"
+    assert benchmark.arguments.contract.agent_release.archive_sha256 == digest
+    assert benchmark.arguments.contract.kwargs["budget"] == "1"

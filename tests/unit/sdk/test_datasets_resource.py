@@ -6,6 +6,7 @@ import json
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
@@ -13,6 +14,8 @@ import pytest
 from valkyrie.sdk import ValkyrieAPIError, ValkyrieClient, ValkyrieRunError
 from valkyrie.sdk.errors import ValkyrieDatasetPushError
 from valkyrie.sdk.models import (
+    AgentContractRequest,
+    AgentReleaseSelection,
     BenchmarkDefinitionResponse,
     BenchmarkDefinitionsResponse,
     DatasetResponse,
@@ -787,8 +790,12 @@ _STARTED = {
 
 
 @pytest.mark.description("Start run sends the dataset and names the run after its benchmark.")
+@pytest.mark.parametrize("exact_release", [False, True])
+@pytest.mark.parametrize("admission_id", [None, UUID("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")])
 async def test_start_run_sends_the_dataset_and_names_the_run_after_its_benchmark(
     make_client: Callable[..., ValkyrieClient],
+    exact_release: bool,
+    admission_id: UUID | None,
 ) -> None:
     bodies: list[dict[str, object]] = []
 
@@ -798,14 +805,24 @@ async def test_start_run_sends_the_dataset_and_names_the_run_after_its_benchmark
 
     async with make_client(handler) as client:
         await client.datasets.start_run(
-            "agent",
+            AgentContractRequest(
+                name="agent",
+                agent_release=AgentReleaseSelection(reference="R1", archive_sha256="a" * 64) if exact_release else None,
+            ),
             HostedDataset(benchmark="swe-bench", dataset="verified"),
+            admission_id=admission_id,
             concurrency=2,
             task_ids=["task-a"],
             provider="docker",
         )
 
     (body,) = bodies
+    if admission_id is not None:
+        assert body["admission_id"] == str(admission_id)
+    elif exact_release:
+        assert UUID(body["admission_id"]).version == 4
+    else:
+        assert body.get("admission_id") is None
     assert body["benchmark_name"] == "swe-bench"
     assert body["dataset_ref"] == {"kind": "hosted", "benchmark": "swe-bench", "dataset": "verified", "ref": "latest"}
     assert (body["concurrency"], body["task_ids"], body["sandbox_provider"]) == (2, ["task-a"], "docker")

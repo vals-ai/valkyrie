@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, col, select
 
 import main as main_module
+import tracker.services.runs.limits as run_limits_module
 from tests.factories import make_error_result
 from tests.utils import TEST_ORG_ID
 from tracker.api import dependencies as run_dependencies
@@ -27,17 +28,17 @@ from tracker.database.models import (
     ExecutorAdmission,
     ExecutorDispatch,
     ExecutorDispatchPayload,
-    FinalEvaluation,
     ExecutorRelease,
     ErrorResult,
     Org,
     Project,
     RunProject,
-    SpendType,
     Task,
-    TaskStatus,
 )
+from tracker.database.models import FinalEvaluation
+from tracker.domain import SpendType, TaskStatus
 from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus
+from tracker.services.runs.limits import OrgRunLimitsCache
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import SecretsError
@@ -501,6 +502,7 @@ def test_regrade_copies_saved_states_into_a_new_run(
     )
     assert (run.arguments.dataset, run.arguments.lambda_function) == ("target-dataset", None)
     assert run.arguments.contract == source.arguments.contract
+    assert source.arguments.agent_attempts == run.arguments.agent_attempts == []
     assert (source.arguments.concurrency, run.arguments.concurrency) == (5, 8)
     assert run.arguments.sandbox_provider == source.arguments.sandbox_provider
     dispatch = control_postgres_session.exec(
@@ -526,6 +528,32 @@ def test_regrade_copies_saved_states_into_a_new_run(
     metadata = local_tracker.get(f"/fetch-benchmark-metadata/{run.id}").json()
     for payload in (fetched, metadata):
         assert (payload["regraded_from_run_id"], payload["regrade_skipped_task_ids"]) == (str(source.id), ["task-3"])
+
+
+@pytest.mark.description("Regrade returns 429 and creates no run when the org's run limit is reached.")
+def test_regrade_at_run_limit_is_refused(
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
+    limits = OrgRunLimitsCache(read=lambda: json.dumps({"default": 0}))
+    limits.refresh()
+    monkeypatch.setattr(run_limits_module, "run_limits", limits)
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+    runs_before = len(control_postgres_session.exec(select(Benchmark)).all())
+
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+
+    assert response.status_code == 429, response.text
+    assert (response.headers["Retry-After"], response.headers["X-RateLimit-Limit"]) == ("60", "0")
+    control_postgres_session.expire_all()
+    assert len(control_postgres_session.exec(select(Benchmark)).all()) == runs_before
 
 
 @pytest.mark.description(

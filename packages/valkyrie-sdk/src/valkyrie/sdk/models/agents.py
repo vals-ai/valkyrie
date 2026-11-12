@@ -11,6 +11,7 @@ from valkyrie.sdk.agent_bundle import validate_agent_name
 from valkyrie.sdk.errors import ValkyrieContractError
 from valkyrie.sdk.models._generated.agents import (
     AgentContractRequest,
+    AgentReleaseSelection,
     AgentDownloadURLResponse,
     AgentEntry,
     AgentsResponse,
@@ -27,6 +28,7 @@ __all__ = [
     "MAX_OUTPUT_ARTIFACT_COUNT",
     "AgentContract",
     "AgentContractRequest",
+    "AgentReleaseSelection",
     "AgentDownloadURLResponse",
     "AgentEntry",
     "AgentTurns",

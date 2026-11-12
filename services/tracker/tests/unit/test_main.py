@@ -52,14 +52,13 @@ from tracker.database.models import (
     RunAccessKey,
     ErrorResult,
     EvaluationResult,
-    FinalEvaluation,
     Org,
     OrgProviderSecret,
     Task,
-    TaskBreakdown,
     UserBenchmarkService,
     UserDefaultProvider,
 )
+from tracker.database.models import FinalEvaluation, TaskBreakdown
 from executor_protocol import ExecutorDispatchStatus
 from tracker.types import LocalBenchmarkArguments, AgentContractRequest, AWSBenchmarkArguments
 from tracker.domain import (
@@ -1391,7 +1390,7 @@ class TestTrackerAPI:
         benchmark_row = database_session.get(Benchmark, UUID(json_response["benchmark_id"]))
         assert benchmark_row
 
-        assert benchmark_row.arguments == AWSBenchmarkArguments(
+        assert benchmark_row.arguments.model_copy(update={"agent_attempts": []}) == AWSBenchmarkArguments(
             properties=AWSResources(
                 region="us-east-1",
                 s3_bucket="test-bucket",
@@ -1939,6 +1938,7 @@ class TestTrackerAPI:
         assert fake_access_keys.deleted == ["K1"]
         assert database_session.exec(select(RunAccessKey)).all() == []
 
+    @pytest.mark.description("Login starts need descope management.")
     @pytest.mark.usefixtures("without_descope_management")
     async def test_login_starts_need_descope_management(
         self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session
@@ -3586,6 +3586,43 @@ class TestTrackerAPI:
             task_file = tar.extractfile("task_1/output.txt")
             assert task_file is not None
             assert task_file.read() == b"output contents"
+
+    @pytest.mark.description("Current output downloads exclude saved outputs from earlier attempts.")
+    async def test_fetch_run_outputs_excludes_retained_attempts(
+        self,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        example_benchmark_object: Benchmark,
+    ) -> None:
+        database_session.add(example_benchmark_object)
+        database_session.commit()
+        root = f"benchmarks/{example_benchmark_object.id}/"
+        objects = {
+            f"{root}task-1/output.txt": b"A2",
+            f"{root}agent-attempts/previous/task-1/output.txt": b"A1",
+        }
+
+        async def list_objects(_store: object, prefix: str) -> AsyncIterator[StoredObject]:
+            for key, content in objects.items():
+                if key.startswith(prefix):
+                    yield StoredObject(key=key, size=len(content))
+
+        async def get_many(_store: object, keys: AsyncIterator[str]) -> AsyncIterator[tuple[str, bytes]]:
+            async for key in keys:
+                yield key, objects[key]
+
+        monkeypatch.setattr(main_module.S3ObjectStore, "list_objects", list_objects)
+        monkeypatch.setattr(main_module.S3ObjectStore, "get_many", get_many)
+
+        response = client.get(f"/fetch-run-outputs/{example_benchmark_object.id}")
+
+        assert response.status_code == 200
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tar:
+            assert tar.getnames() == ["task-1/output.txt"]
+            output = tar.extractfile("task-1/output.txt")
+            assert output is not None
+            assert output.read() == b"A2"
+        assert objects[f"{root}agent-attempts/previous/task-1/output.txt"] == b"A1"
 
     @pytest.mark.description("Never copy unsafe S3 key suffixes into a downloaded tar.")
     async def test_fetch_run_outputs_omits_unsafe_tar_members(

@@ -27,7 +27,7 @@ from valkyrie.cli.resource import (
 )
 
 
-@click.group(help="Create, list, show, update, push, install and remove the datasets that belong to your benchmarks.")
+@click.group(help="Publish, version and manage the datasets in your benchmarks.")
 def dataset() -> None:
     pass
 
@@ -36,7 +36,7 @@ def dataset() -> None:
     name="create",
     help=(
         "Create a dataset in a benchmark.\n\n"
-        "BENCHMARK is a benchmark you created with `valkyrie benchmark create`. NAME is lowercase letters and "
+        "BENCHMARK must already exist. `valkyrie dataset push` creates a missing one. NAME is lowercase letters and "
         "digits with single '.', '_' or '-' separators, such as verified.\n\n"
         "Example:\n"
         '    valkyrie dataset create swe-bench verified --description "Human-verified issues"'

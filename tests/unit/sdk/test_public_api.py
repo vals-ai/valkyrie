@@ -36,6 +36,7 @@ EXPECTED_ALL = [
     "RunArtifactDownloadResponse",
     "AgentContract",
     "AgentContractRequest",
+    "AgentReleaseSelection",
     "AgentDownloadURLResponse",
     "AgentEntry",
     "AgentsResponse",
@@ -124,7 +125,7 @@ EXPECTED_SIGNATURES = {
     LoginSession.load: "tracker_url",
     LoginSession.forget: "tracker_url",
     RunsResource.start: (
-        "self, agent, benchmark, *, model=None, concurrency=5, priority=None, task_ids=None, "
+        "self, agent, benchmark, *, model=None, agent_release=None, admission_id=None, concurrency=5, priority=None, task_ids=None, "
         "slice_str=None, dataset=None, dataset_version=None, "
         "label=None, lambda_function=None, provider=None, agent_kwargs=None, secrets=None, service_headers=None, "
         "ignore_custom_services=False, project=None, monitoring=None"
@@ -143,11 +144,11 @@ EXPECTED_SIGNATURES = {
     RunsResource.stop: "self, run_id, *, force=False, task_ids=None",
     RunsResource.resume: (
         "self, run_id, *, concurrency=None, task_ids=None, secrets=None, service_headers=None, from_scratch=False, "
-        "update_agent=False, benchmark_url=None, lambda_function=None"
+        "update_agent=False, agent_release=None, benchmark_url=None, lambda_function=None"
     ),
     RunsResource.retry: (
         "self, run_id, *, concurrency=None, task_ids=None, secrets=None, service_headers=None, from_scratch=False, "
-        "update_agent=False, benchmark_url=None, lambda_function=None"
+        "update_agent=False, agent_release=None, benchmark_url=None, lambda_function=None"
     ),
     RunsResource.regrade: "self, run_id, *, dataset, dataset_version=None, concurrency=None, service_headers=None",
     RunsResource.events: "self, run_id",

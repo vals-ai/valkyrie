@@ -10,11 +10,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, PlainValidator
 
 from tracker.auth import get_current_org
+from tracker.config import AUTH_REQUIRED
 from tracker.database.models import Org
 from tracker.database.session import database_call
 from tracker.repositories.cost import DAYTONA_PROVIDER, CostRepositoryDependency
 from tracker.repositories.provider_secret import ProviderSecretRepositoryDependency
 from tracker.sandbox_cost import daytona_last_ends
+from tracker.secret_access import resolve_secret_name
 
 router = APIRouter(prefix="/costs")
 
@@ -438,7 +440,8 @@ async def fill_sandbox_usage_end(
     secret_name = (await database_call(lambda: secrets.list_all(org.id))).get(DAYTONA_PROVIDER)
     if secret_name is None:
         raise HTTPException(status_code=409, detail=f"{org.name} has no Daytona secret.")
-    last_ends = await daytona_last_ends(org, secret_name, window_start, window_end)
+    reference = resolve_secret_name(secret_name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
+    last_ends = await daytona_last_ends(org, reference, window_start, window_end)
     rows = await database_call(lambda: repository.missing_usage_end_rows(org.id, DAYTONA_PROVIDER, list(last_ends)))
     if apply:
         usage_ends = {row.id: last_ends[row.source_id] for row in rows}

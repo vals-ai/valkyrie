@@ -1,5 +1,12 @@
+from types import SimpleNamespace
+from typing import Any, cast
+from uuid import UUID
+
 import pytest
 
+from tracker import config
+from tracker.services.runs import start
+from tracker.types import OrgContext
 from tracker.services.datasets.env import SecretReader, resolve_env, secret_reader
 from tracker.exceptions import SecretNotFoundError, SecretsError
 from tracker.runtime.secrets import SecretValue
@@ -67,23 +74,68 @@ class TestSecretReader:
     @pytest.mark.description("The stored name is looked up and json secrets are read by variable.")
     async def test_the_stored_name_is_looked_up_and_json_secrets_are_read_by_variable(self) -> None:
         store = StubStore({"tenant/TOKEN": "plain", "tenant/DB": {"DB": "pg", "OTHER": "x"}})
-        read = secret_reader(store, lambda name: f"tenant/{name}")
+        read = secret_reader(store, lambda name: [f"tenant/{name}"])
 
         assert await read("TOKEN") == "plain"
         assert await read("DB") == "pg"
 
     @pytest.mark.description("A name the run may not use reads as missing.")
     async def test_a_name_the_run_may_not_use_reads_as_missing(self) -> None:
-        def stored_name(name: str) -> str:
+        def stored_name(name: str) -> list[str]:
             raise ValueError(f"Secret '{name}' does not exist")
 
         read = secret_reader(StubStore({"TOKEN": "plain"}), stored_name)
 
         assert await read("TOKEN") is None
 
+    @pytest.mark.description("Stored names are tried in order and the first secret found is read.")
+    async def test_stored_names_are_tried_in_order(self) -> None:
+        store = StubStore({"tenant/TOKEN": "mine", "TOKEN": "shared", "SHARED": "fallback"})
+        read = secret_reader(store, lambda name: [f"tenant/{name}", name])
+
+        assert await read("TOKEN") == "mine"
+        assert await read("SHARED") == "fallback"
+
     @pytest.mark.description("An unknown secret or json key reads as missing.")
     async def test_an_unknown_secret_or_json_key_reads_as_missing(self) -> None:
-        read = secret_reader(StubStore({"JSON": {"OTHER": "x"}}), lambda name: name)
+        read = secret_reader(StubStore({"JSON": {"OTHER": "x"}}), lambda name: [name])
 
         assert await read("NOPE") is None
         assert await read("JSON") is None
+
+    @pytest.mark.description("A json secret without the variable falls through to the next stored name.")
+    async def test_a_json_secret_without_the_variable_falls_through(self) -> None:
+        store = StubStore({"tenant/TOKEN": {"OTHER": "x"}, "TOKEN": "shared"})
+        read = secret_reader(store, lambda name: [f"tenant/{name}", name])
+
+        assert await read("TOKEN") == "shared"
+
+
+@pytest.mark.description(
+    "A run reads dataset secrets from its own tenant first and shared tenants fall back to the shared name."
+)
+@pytest.mark.parametrize(
+    ("org_name", "values", "expected"),
+    [
+        (
+            "internal.example",
+            {"valkyrie/tenants/00000000-0000-0000-0000-000000000001/TOKEN": "mine", "TOKEN": "shared"},
+            "mine",
+        ),
+        ("internal.example", {"TOKEN": "shared"}, "shared"),
+        ("acme.example", {"TOKEN": "shared"}, None),
+    ],
+    ids=["shared-tenant-own-secret", "shared-tenant-fallback", "customer-never-reads-shared"],
+)
+async def test_run_secret_reader_tries_the_run_org_first(
+    monkeypatch: pytest.MonkeyPatch, org_name: str, values: dict[str, SecretValue], expected: str | None
+) -> None:
+    monkeypatch.setattr(start, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "internal.example")
+    org = OrgContext(id=UUID("00000000-0000-0000-0000-000000000001"), name=org_name, storage_key=None)
+    request = cast(Any, SimpleNamespace(properties=None))
+    runtime = cast(Any, SimpleNamespace(secrets=StubStore(values)))
+
+    read = start._task_secret_reader(request, runtime, org)
+
+    assert await read("TOKEN") == expected

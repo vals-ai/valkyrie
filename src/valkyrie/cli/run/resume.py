@@ -3,13 +3,15 @@ from typing import Any
 from uuid import UUID
 
 import click
-from valkyrie.sdk import ValkyrieClient
+from valkyrie.sdk import AgentReleaseSelection, ValkyrieClient
 
 from valkyrie.cli.client import call
 from valkyrie.cli.run.progress import echo_next_steps, follow_run_status
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
 _RESTART_OPTIONS: tuple[Callable[[Callable[..., Any]], Callable[..., Any]], ...] = (
+    click.option("--agent-release", default=None, help="Saved replacement agent version."),
+    click.option("--agent-sha256", default=None, help="Optional expected SHA-256 of the replacement ZIP."),
     click.option(
         "--concurrency",
         type=click.IntRange(min=1),
@@ -100,12 +102,19 @@ def _restart(
     secrets: tuple[tuple[str, str], ...],
     headers: tuple[tuple[str, str], ...],
     update_agent: bool,
+    agent_release: str | None,
+    agent_sha256: str | None,
     from_scratch: bool,
     benchmark_url: str | None,
     lambda_function: str | None,
     connect: bool,
 ) -> None:
     retry_task_ids = resolve_task_ids(task_ids, task_ids_file)
+    if agent_sha256 and not agent_release:
+        raise click.UsageError("--agent-sha256 requires --agent-release")
+    if agent_release and not (update_agent and from_scratch):
+        raise click.UsageError("An exact agent update requires --update-agent --from-scratch")
+    selection = AgentReleaseSelection(reference=agent_release, archive_sha256=agent_sha256) if agent_release else None
 
     async def restart(client: ValkyrieClient) -> None:
         await (client.runs.retry if retry else client.runs.resume)(
@@ -116,6 +125,7 @@ def _restart(
             service_headers=dict(headers),
             from_scratch=from_scratch,
             update_agent=update_agent,
+            agent_release=selection,
             benchmark_url=benchmark_url,
             lambda_function=lambda_function,
         )

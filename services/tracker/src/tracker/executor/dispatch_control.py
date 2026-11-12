@@ -8,6 +8,7 @@ from sqlmodel import Session
 
 from executor_protocol import (
     DATASET_VERSION_PROTOCOL_VERSION,
+    EXACT_AGENT_PROTOCOL_VERSION,
     DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS,
     ExecutorDispatchStatus,
     MANAGED_EXECUTION_PROTOCOL_VERSION,
@@ -54,20 +55,27 @@ def _require_managed_execution_release(release: ExecutorRelease) -> None:
         DATASET_VERSION_PROTOCOL_VERSION,
         RESERVED_QUEUE_PROTOCOL_VERSION,
         SHARED_POOL_QUEUE_PROTOCOL_VERSION,
+        EXACT_AGENT_PROTOCOL_VERSION,
     }:
         raise ReleaseControlError("Activate an executor release that supports managed runs")
 
 
 def _require_shared_pool_release(release: ExecutorRelease) -> None:
-    if release.protocol_version != SHARED_POOL_QUEUE_PROTOCOL_VERSION:
+    if release.protocol_version not in {SHARED_POOL_QUEUE_PROTOCOL_VERSION, EXACT_AGENT_PROTOCOL_VERSION}:
         raise ReleaseControlError("Activate an executor release that supports shared pool admission")
 
 
 def _require_compatible_release(benchmark: Benchmark, release: ExecutorRelease) -> None:
+    if (
+        benchmark.arguments.contract.agent_release is not None
+        and release.protocol_version != EXACT_AGENT_PROTOCOL_VERSION
+    ):
+        raise ReleaseControlError("Activate an executor release that supports exact agent selections")
     if benchmark.arguments.dataset_version is not None and release.protocol_version not in {
         DATASET_VERSION_PROTOCOL_VERSION,
         RESERVED_QUEUE_PROTOCOL_VERSION,
         SHARED_POOL_QUEUE_PROTOCOL_VERSION,
+        EXACT_AGENT_PROTOCOL_VERSION,
     }:
         raise ReleaseControlError("Activate an executor release that supports pinned dataset versions")
     if benchmark.arguments.environment == "aws":

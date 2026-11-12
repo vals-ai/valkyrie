@@ -25,7 +25,8 @@
         "allow_provider_tools": false,
         "secrets": {},
         "kwargs": {},
-        "inference_settings_attested": false
+        "inference_settings_attested": false,
+        "agent_release": null
       },
       "concurrency": 2,
       "environment": "aws",
@@ -41,6 +42,7 @@
       "sandbox_provider_secret_name": "ModalSecret",
       "dataset_version": null,
       "monitoring": null,
+      "agent_attempts": [],
       "monitoring_rules": null
     },
     "tasks_stopped": 0,

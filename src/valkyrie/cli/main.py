@@ -28,6 +28,7 @@ class _ValkyrieCLI(LazyGroup):
             "valkyrie.cli.benchmark:benchmark",
             "Export the task IDs in a benchmark dataset, and save benchmark services.",
         ),
+        "dataset": ("valkyrie.cli.dataset:dataset", "Publish, version and manage the datasets in your benchmarks."),
         "queue": ("valkyrie.cli.queue:queue", "Inspect your organization's sandbox scheduler."),
         "project": ("valkyrie.cli.project:project", "Manage the projects runs are started in."),
         "secret": ("valkyrie.cli.secret:secret", "Store secrets that your runs reference."),
@@ -48,7 +49,6 @@ class _ValkyrieCLI(LazyGroup):
         "org": ("valkyrie.cli.org:org", "Create, join and switch organizations, and manage their members."),
         "ui": ("valkyrie.cli.ui:ui", "Browse runs, tasks and logs in a terminal UI."),
     },
-    hidden_commands={"dataset": "valkyrie.cli.dataset:dataset"},
     help="Run agents against benchmarks and manage their runs.",
 )
 def cli():

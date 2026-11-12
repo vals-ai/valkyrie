@@ -242,7 +242,9 @@ async def test_cleanup_treats_not_found_as_complete_and_continues_after_item_fai
 def test_lambda_handler_fails_for_each_unsuccessful_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
     failure_outcome = "invalid_metadata"
 
-    async def fake_run_cleanup(_secret_name: str, _provider_type: str, _context: object) -> Counter[str]:
+    async def fake_run_cleanup(
+        _secret_name: str, _provider_type: str, _context: object, **_kwargs: object
+    ) -> Counter[str]:
         return Counter({failure_outcome: 1})
 
     monkeypatch.setenv("SANDBOX_CLEANUP_SECRET_NAME", "cleanup-secret")
@@ -311,3 +313,62 @@ def test_lambda_handler_preserves_shutdown_margin_around_config_loading(monkeypa
     with pytest.raises(TimeoutError):
         cleanup_module.lambda_handler({}, FakeLambdaContext(60_001))
     assert load_calls == 1
+
+
+@pytest.mark.description("The cleanup Lambda sweeps every configured provider and secret pair, even after one fails.")
+def test_lambda_handler_sweeps_each_configured_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    shares: list[int] = []
+
+    async def fake_run_cleanup(
+        secret_name: str, provider_type: str, _context: object, *, remaining_targets: int
+    ) -> Counter[str]:
+        calls.append((provider_type, secret_name))
+        shares.append(remaining_targets)
+        if provider_type == "first":
+            raise RuntimeError("first provider unavailable")
+        return Counter({"deleted": 2})
+
+    monkeypatch.setenv("SANDBOX_CLEANUP_PROVIDER", "first, Second")
+    monkeypatch.setenv("SANDBOX_CLEANUP_SECRET_NAME", "first-secret, second-secret")
+    monkeypatch.setattr(cleanup_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(cleanup_module, "run_cleanup", fake_run_cleanup)
+
+    with pytest.raises(RuntimeError, match="first provider unavailable"):
+        cleanup_module.lambda_handler({}, FakeLambdaContext(840_000))
+    assert calls == [("first", "first-secret"), ("second", "second-secret")]
+    assert shares == [2, 1]
+
+    monkeypatch.setenv("SANDBOX_CLEANUP_PROVIDER", "second,third")
+    calls.clear()
+    result = cleanup_module.lambda_handler({}, FakeLambdaContext(840_000))
+    assert calls == [("second", "first-secret"), ("third", "second-secret")]
+    assert result["providers"] == ["second", "third"]
+    assert result["deleted"] == 4
+
+
+@pytest.mark.description("The cleanup Lambda rejects provider and secret lists of different lengths.")
+def test_lambda_handler_rejects_unpaired_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SANDBOX_CLEANUP_PROVIDER", "first,second")
+    monkeypatch.setenv("SANDBOX_CLEANUP_SECRET_NAME", "only-secret")
+    monkeypatch.setattr(cleanup_module, "configure_logging", lambda: None)
+
+    with pytest.raises(RuntimeError, match="same number of entries"):
+        cleanup_module.lambda_handler({}, FakeLambdaContext(840_000))
+
+
+@pytest.mark.description("Each provider sweep gets only its share of the time left, so later providers still run.")
+async def test_run_cleanup_splits_remaining_time_across_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cleanup_module, "AWS_DEPLOYMENT_REGION", "us-east-1")
+
+    async def hang(*_args: object, **_kwargs: object) -> SandboxProviderConfig:
+        await asyncio.Event().wait()
+        raise AssertionError("Secret retrieval should time out")
+
+    monkeypatch.setattr(cleanup_module, "fetch_sandbox_provider_config", hang)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TimeoutError):
+        await run_cleanup("cleanup-secret", "daytona", FakeLambdaContext(62_000), remaining_targets=4)
+    assert loop.time() - started < 1

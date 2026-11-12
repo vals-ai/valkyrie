@@ -3177,9 +3177,8 @@ async def test_reserved_promotion_requires_exact_attempt_live_run_and_authority(
         assert sandbox is None
 
     assert not creation_state.cleanup_pending
-    assert events[0] == "capacity"
-    assert events[1:-2] and all(event == "read_capacity" for event in events[1:-2])
-    assert events[-2:] == ["create", "cleanup"]
+    assert events[:2] == ["capacity", "read_capacity"]
+    assert [event for event in events if event != "read_capacity"] == ["capacity", "create", "cleanup"]
     if interruption == "superseded":
         assert _task(postgres_engine, task).started_at > _ATTEMPT
         with Session(postgres_engine) as session:

@@ -45,7 +45,7 @@ from tracker.clients.dataset_tasks import dataset_service
 from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.local.secrets import SecretsFile
 from tracker.runtime.artifacts import task_artifact_key
-from tracker.secret_access import resolve_secret_name, validate_secret_names
+from tracker.secret_access import secret_name_candidates, validate_secret_names
 from tracker.services.failures import classify_failure
 from tracker.services.tasks.error_summary import summarize_task_errors
 from tracker.services.tasks.execute import ResizableLimiter, TaskMonitor, TrackedTask, process_task
@@ -66,14 +66,14 @@ def _artifact_sink(runtime: RuntimeServices, benchmark_id: UUID) -> ArtifactSink
 def _task_secret_reader(request: RunExecutionRequest, runtime: RuntimeServices, org: OrgContext) -> SecretReader:
     properties = request.properties
     if isinstance(properties, LocalResources) and reads_secrets_file(properties) and properties.secrets_file:
-        return secret_reader(SecretsFile(properties.secrets_file), lambda name: name)
+        return secret_reader(SecretsFile(properties.secrets_file), lambda name: [name])
 
-    def stored_name(name: str) -> str:
-        stored = resolve_secret_name(name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
-        validate_secret_names([stored], org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
-        return stored
+    def stored_names(name: str) -> list[str]:
+        candidates = secret_name_candidates(name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
+        validate_secret_names(candidates, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
+        return candidates
 
-    return secret_reader(runtime.secrets, stored_name)
+    return secret_reader(runtime.secrets, stored_names)
 
 
 @dataclass(frozen=True)

@@ -41,6 +41,12 @@ def resolve_secret_name(name: str, *, org_id: UUID, org_name: str, auth_required
     return f"{tenant_secret_prefix(org_id)}{name}"
 
 
+def secret_name_candidates(name: str, *, org_id: UUID, org_name: str, auth_required: bool) -> list[str]:
+    if auth_required and may_use_shared_secrets(org_name) and not name.startswith(TENANT_SECRET_ROOT):
+        return [f"{tenant_secret_prefix(org_id)}{name}", name]
+    return [resolve_secret_name(name, org_id=org_id, org_name=org_name, auth_required=auth_required)]
+
+
 def validate_secret_names(names: Iterable[str], *, org_id: UUID, org_name: str, auth_required: bool) -> None:
     if not auth_required:
         return

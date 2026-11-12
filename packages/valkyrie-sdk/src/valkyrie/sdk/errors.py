@@ -34,20 +34,24 @@ class ValkyrieTransportError(ValkyrieSDKError):
 class ValkyrieAPIError(ValkyrieSDKError):
     """The Valkyrie API returned a non-success response."""
 
-    def __init__(self, status_code: int, detail: Any):
+    def __init__(self, status_code: int, detail: Any, headers: httpx.Headers | None = None):
         self.status_code = status_code
         self.detail = detail
+        self.headers = httpx.Headers(headers)
         super().__init__(f"Valkyrie API request failed ({status_code}): {detail}")
 
     @classmethod
     def from_response(cls, response: httpx.Response) -> "ValkyrieAPIError":
-        """Build one from a read non-success response, using its JSON `detail` or body as the detail."""
+        """Build one from a read non-success response, using its JSON `detail` or body as the detail.
+
+        `headers` keeps the response headers, such as `Retry-After` and `X-RateLimit-Limit` on a 429.
+        """
         try:
             body: Any = response.json()
         except ValueError:
             body = response.text
         detail = body.get("detail", body) if isinstance(body, dict) else body
-        return cls(response.status_code, detail)
+        return cls(response.status_code, detail, response.headers)
 
 
 class ValkyrieDatasetPushError(ValkyrieSDKError):

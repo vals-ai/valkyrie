@@ -15,13 +15,8 @@ from executor_protocol import (
     SHARED_POOL_QUEUE_PROTOCOL_VERSION,
 )
 from tests.factories import make_benchmark
-from tracker.database.models import (
-    Benchmark,
-    ErrorResult,
-    ExecutorDispatch,
-    ExecutorRelease,
-    Task,
-)
+from tracker.types import AgentReleaseSelection
+from tracker.database.models import Benchmark, ErrorResult, ExecutorDispatch, ExecutorRelease, Task
 from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, FailureCategory, TaskStatus
 from tracker.executor.control_protocol import (
     AckDispatchRequest,
@@ -1475,3 +1470,41 @@ def test_finish_does_not_revive_a_dispatch_recovery_already_failed(
     assert finished.finished is False
     assert dispatch.status == ExecutorDispatchStatus.FAILED
     assert example_benchmark_object.status == BenchmarkStatus.ERROR
+
+
+@pytest.mark.description("Exact agent requires capable executor.")
+@pytest.mark.parametrize("protocol_version", ["3", "4", "5", "6", "7"])
+@pytest.mark.parametrize("recovery", [False, True])
+def test_exact_agent_requires_capable_executor(
+    protocol_version: str,
+    recovery: bool,
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+) -> None:
+    release = _release("selected", protocol_version=protocol_version)
+    register_release(database_session, release)
+    promote_release(database_session, release.id)
+    database_session.commit()
+    contract = example_benchmark_object.arguments.contract.model_copy(
+        update={"agent_release": AgentReleaseSelection(reference="A1", archive_sha256="a" * 64)}
+    )
+    example_benchmark_object.arguments = example_benchmark_object.arguments.model_copy(update={"contract": contract})
+    dispatch_id = uuid4()
+
+    def admit() -> ExecutorDispatch:
+        if recovery:
+            return admit_recovery_dispatch(
+                database_session,
+                benchmark=example_benchmark_object,
+                pre_action_status=BenchmarkStatus.STOPPED,
+                dispatch_id=dispatch_id,
+                kind=ExecutorDispatchKind.RETRY,
+            )
+        return admit_start_dispatch(database_session, benchmark=example_benchmark_object, dispatch_id=dispatch_id)
+
+    if protocol_version == "7":
+        assert admit().executor_protocol_version == "7"
+    else:
+        with pytest.raises(ReleaseControlError, match="supports exact agent selections"):
+            admit()
+        assert database_session.get(ExecutorDispatch, dispatch_id) is None

@@ -18,6 +18,7 @@ _BENCHMARK_SERVICE_BASE_URL: str | None = os.environ.get("BENCHMARK_SERVICE_BASE
 BENCHMARK_CATALOG_URL = os.environ.get("BENCHMARK_CATALOG_URL", "").rstrip("/")
 PASSKEY_ORGS = frozenset(name.strip() for name in os.environ.get("TRACKER_PASSKEY_ORGS", "").split(",") if name.strip())
 GATEWAY_KEY_ORGS = frozenset({"vals.ai", *PASSKEY_ORGS})
+ORG_RUN_LIMITS_PARAMETER = os.environ.get("ORG_RUN_LIMITS_PARAMETER") or None
 
 
 class ProjectGatewayKeysMode(str, Enum):
@@ -99,6 +100,22 @@ def project_gateway_configuration() -> tuple[str, str]:
     if not url or not machine_api_key:
         raise ValueError("MODEL_GATEWAY_URL and MODEL_GATEWAY_MACHINE_API_KEY must be nonempty")
     return url, machine_api_key
+
+
+def project_service_configuration() -> tuple[str, str]:
+    url = os.environ["PROJECT_SERVICE_URL"]
+    token = os.environ["PROJECT_SERVICE_TOKEN"]
+    if not url or not token:
+        raise ValueError("PROJECT_SERVICE_URL and PROJECT_SERVICE_TOKEN must be nonempty")
+    return url, token
+
+
+def project_service_writes() -> bool:
+    return os.environ.get("PROJECT_SERVICE_WRITES") == "true"
+
+
+def project_service_reads() -> bool:
+    return os.environ.get("PROJECT_SERVICE_READS") == "true"
 
 
 RUN_ACCESS_KEY_TTL_SECONDS = _positive_int_setting("RUN_ACCESS_KEY_TTL_SECONDS", 14 * 24 * 3600)

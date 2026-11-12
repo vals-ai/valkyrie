@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -155,15 +156,19 @@ def _version_path(benchmark: str, dataset: str, ref: str) -> str:
 
 
 class DatasetVersionsResource:
+    """List, tag, and download the published versions of a dataset."""
+
     def __init__(self, client: ValkyrieClient) -> None:
         self._sdk = client
 
     async def list(self, benchmark: str, dataset: str) -> DatasetVersionsResponse:
+        """List the versions of a dataset, newest first, with the tags on each."""
         return await self._sdk.request_model(
             "GET", f"{_dataset_path(benchmark, dataset)}/versions", DatasetVersionsResponse
         )
 
     async def get(self, benchmark: str, dataset: str, ref: str = "latest") -> DatasetVersionDetailResponse:
+        """Get one version of a dataset by revision number, tag, or digest."""
         return await self._sdk.request_model(
             "GET", _version_path(benchmark, dataset, ref), DatasetVersionDetailResponse
         )
@@ -184,6 +189,7 @@ class DatasetVersionsResource:
     async def get_task(
         self, benchmark: str, dataset: str, task_id: str, ref: str = "latest"
     ) -> DatasetTaskDownloadResponse:
+        """Get one task of a dataset version, with a temporary link to download its archive."""
         return await self._sdk.request_model(
             "GET",
             f"{_version_path(benchmark, dataset, ref)}/tasks/{_valid_task_id(task_id)}",
@@ -193,6 +199,7 @@ class DatasetVersionsResource:
     async def tag(
         self, benchmark: str, dataset: str, tag: str, ref: str, force: bool = False
     ) -> DatasetVersionResponse:
+        """Point a tag at the version ``ref`` names. ``latest`` always moves. Another tag moves only when ``force`` is true."""
         return await self._sdk.request_model(
             "PUT",
             f"{_dataset_path(benchmark, dataset)}/tags/{quote(tag, safe='')}",
@@ -201,6 +208,7 @@ class DatasetVersionsResource:
         )
 
     async def untag(self, benchmark: str, dataset: str, tag: str) -> DatasetVersionResponse:
+        """Remove a tag from a dataset. The latest tag can't be removed."""
         return await self._sdk.request_model(
             "DELETE", f"{_dataset_path(benchmark, dataset)}/tags/{quote(tag, safe='')}", DatasetVersionResponse
         )
@@ -240,7 +248,7 @@ class DatasetVersionsResource:
 
 
 class DatasetsResource:
-    """Create and manage the datasets that belong to a benchmark; tasks manages their contents."""
+    """Create, publish, and manage the datasets that belong to a benchmark; versions holds what was published."""
 
     def __init__(self, client: ValkyrieClient) -> None:
         self._sdk = client
@@ -496,6 +504,7 @@ class DatasetsResource:
         dataset: DatasetRef,
         *,
         benchmark: str | None = None,
+        admission_id: UUID | None = None,
         model: str | None = None,
         concurrency: int = 5,
         priority: int | None = None,
@@ -516,8 +525,10 @@ class DatasetsResource:
             name = dataset.benchmark
         else:
             name = benchmark or folder_run_name(dataset.path)
+        contract = normalize_contract(agent, model=model, agent_kwargs=agent_kwargs, secrets=secrets)
         payload = StartBenchmarkRequest(
-            contract=normalize_contract(agent, model=model, agent_kwargs=agent_kwargs, secrets=secrets),
+            contract=contract,
+            admission_id=(admission_id or uuid4()) if contract.agent_release else admission_id,
             benchmark_name=name,
             concurrency=concurrency,
             priority=priority,

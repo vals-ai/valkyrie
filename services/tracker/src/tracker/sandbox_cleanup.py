@@ -142,10 +142,12 @@ async def cleanup_old_sandboxes(
     return outcomes
 
 
-async def run_cleanup(secret_name: str, provider_type: str, context: LambdaContext) -> Counter[str]:
+async def run_cleanup(
+    secret_name: str, provider_type: str, context: LambdaContext, *, remaining_targets: int = 1
+) -> Counter[str]:
     if AWS_DEPLOYMENT_REGION is None:
         raise RuntimeError("Sandbox cleanup requires AWS_DEPLOYMENT_REGION")
-    async with asyncio.timeout(_remaining_cleanup_seconds(context)):
+    async with asyncio.timeout(_remaining_cleanup_seconds(context) / remaining_targets):
         secret_store = SecretsManagerStore(AWSClientProvider(AWS_DEPLOYMENT_REGION))
         try:
             provider_config = await fetch_sandbox_provider_config(secret_name, secret_store, provider_type)
@@ -163,25 +165,56 @@ def _remaining_cleanup_seconds(context: LambdaContext) -> float:
     return timeout_seconds
 
 
+def cleanup_targets() -> list[tuple[str, str]]:
+    providers = [name.strip().casefold() for name in os.environ.get("SANDBOX_CLEANUP_PROVIDER", "daytona").split(",")]
+    secrets = [name.strip() for name in os.environ.get("SANDBOX_CLEANUP_SECRET_NAME", "").split(",")]
+    if not all(providers):
+        raise RuntimeError("SANDBOX_CLEANUP_PROVIDER must not be empty")
+    if not all(secrets):
+        raise RuntimeError("SANDBOX_CLEANUP_SECRET_NAME must not be empty")
+    if len(providers) != len(secrets):
+        raise RuntimeError(
+            "SANDBOX_CLEANUP_PROVIDER and SANDBOX_CLEANUP_SECRET_NAME must list the same number of entries"
+        )
+    return list(zip(providers, secrets, strict=True))
+
+
 def lambda_handler(_event: object, context: LambdaContext) -> dict[str, object]:
     configure_logging()
 
-    provider_type = os.environ.get("SANDBOX_CLEANUP_PROVIDER", "daytona").strip().casefold()
-    if not provider_type:
-        raise RuntimeError("SANDBOX_CLEANUP_PROVIDER must not be empty")
-    secret_name = os.environ.get("SANDBOX_CLEANUP_SECRET_NAME", "").strip()
-    if not secret_name:
-        raise RuntimeError("SANDBOX_CLEANUP_SECRET_NAME must not be empty")
+    targets = cleanup_targets()
+    totals: Counter[str] = Counter()
+    errors: list[Exception] = []
+    for index, (provider_type, secret_name) in enumerate(targets):
+        try:
+            outcomes = asyncio.run(
+                run_cleanup(secret_name, provider_type, context, remaining_targets=len(targets) - index)
+            )
+        except Exception as exc:
+            errors.append(exc)
+            logger.error(
+                "Sandbox cleanup sweep failed",
+                extra={"provider": provider_type, "error_type": type(exc).__name__},
+            )
+            continue
+        logger.info(
+            "Sandbox cleanup sweep complete",
+            extra={
+                "provider": provider_type,
+                "scanned": sum(outcomes.values()),
+                **{outcome: outcomes[outcome] for outcome in _OUTCOMES},
+            },
+        )
+        totals.update(outcomes)
 
-    outcomes = asyncio.run(run_cleanup(secret_name, provider_type, context))
+    if errors:
+        raise errors[0]
     fields: dict[str, object] = {
-        "provider": provider_type,
-        "scanned": sum(outcomes.values()),
-        **{outcome: outcomes[outcome] for outcome in _OUTCOMES},
+        "providers": [provider_type for provider_type, _ in targets],
+        "scanned": sum(totals.values()),
+        **{outcome: totals[outcome] for outcome in _OUTCOMES},
     }
-    logger.info("Sandbox cleanup sweep complete", extra=fields)
-
-    failures = sum(outcomes[outcome] for outcome in _FAILURE_OUTCOMES)
+    failures = sum(totals[outcome] for outcome in _FAILURE_OUTCOMES)
     if failures:
         raise RuntimeError(f"Sandbox cleanup did not fully succeed: failures={failures}")
     return fields

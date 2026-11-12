@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 from collections.abc import AsyncGenerator
 from datetime import timedelta
@@ -14,6 +15,7 @@ from sqlmodel import Session, select
 
 import main as main_module
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
+from tests.factories import make_benchmark
 from tests.unit.services.task_execution_support import MockLauncher
 from tests.utils import TEST_ORG_ID
 from tracker.auth import get_current_org
@@ -28,6 +30,8 @@ from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, TaskStatus
 from tracker.executor.release_control import promote_release
 from tracker.logging import benchmark_id_var
 from tracker.repositories.executor_release import ExecutorReleaseRepository
+import tracker.services.runs.limits as run_limits_module
+from tracker.services.runs.limits import OrgRunLimitsCache
 from tracker import config
 from tracker.types import StartBenchmarkRequest
 
@@ -478,3 +482,102 @@ async def test_recovery_rechecks_verified_state_before_mutating_or_dispatching(
                     row.model_dump(mode="json") for row in checked.exec(select(ExecutorDispatch)).all()
                 ] == expected_dispatches
                 assert mock_launcher.queued_calls == []
+
+
+def _limit_runs(monkeypatch: pytest.MonkeyPatch, limits: dict[str, Any]) -> None:
+    cache = OrgRunLimitsCache(read=lambda: json.dumps(limits))
+    cache.refresh()
+    monkeypatch.setattr(run_limits_module, "run_limits", cache)
+
+
+@pytest.mark.description(
+    "Start and resume return 429 with rate-limit headers when the org's active runs reach its limit."
+)
+@pytest.mark.parametrize("operation", ["retry", "start"])
+@pytest.mark.parametrize(
+    ("other_status", "expected_status"),
+    [
+        (BenchmarkStatus.IN_PROGRESS, 429),
+        (BenchmarkStatus.STOPPING, 429),
+        (BenchmarkStatus.FINISHED, 200),
+    ],
+)
+async def test_run_limit_rejects_admission_at_capacity(
+    operation: str,
+    other_status: BenchmarkStatus,
+    expected_status: int,
+    recovery_run: tuple[Benchmark, Task],
+    database_session: Session,
+    observed_sessions: list[tuple[Session, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    mock_launcher: MockLauncher,
+) -> None:
+    benchmark, _ = recovery_run
+    database_session.add(make_benchmark(status=other_status))
+    database_session.commit()
+    _limit_runs(monkeypatch, {"default": 1})
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "verify_task_ids", AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["task_0"]))
+    )
+    url, body = {
+        "retry": (f"/retry-or-resume-benchmark/{benchmark.id}", {}),
+        "start": ("/start-benchmark", _start_body(benchmark)),
+    }[operation]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app), base_url="http://test") as client:
+        response = await client.post(url, json=body)
+
+    assert response.status_code == expected_status, response.text
+    database_session.refresh(benchmark)
+    if expected_status == 429:
+        assert response.headers["Retry-After"] == "60"
+        assert response.headers["X-RateLimit-Limit"] == "1"
+        assert response.headers["X-RateLimit-Remaining"] == "0"
+        assert "1 active runs and may run at most 1" in response.json()["detail"]
+        assert mock_launcher.queued_calls == []
+        assert benchmark.status == BenchmarkStatus.STOPPED
+        assert len(database_session.exec(select(Benchmark)).all()) == 2
+    else:
+        assert len(mock_launcher.queued_calls) == 1
+
+
+@pytest.mark.description("Retrying a run that is already active succeeds while the org is over its limit.")
+async def test_run_limit_allows_recovery_of_active_run(
+    recovery_run: tuple[Benchmark, Task],
+    database_session: Session,
+    observed_sessions: list[tuple[Session, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    mock_launcher: MockLauncher,
+) -> None:
+    benchmark, _ = recovery_run
+    benchmark.status = BenchmarkStatus.IN_PROGRESS
+    database_session.add_all([benchmark, make_benchmark(status=BenchmarkStatus.IN_PROGRESS)])
+    database_session.commit()
+    _limit_runs(monkeypatch, {"default": 1})
+    monkeypatch.setattr(
+        BenchmarkServiceClient, "verify_task_ids", AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["task_0"]))
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app), base_url="http://test") as client:
+        response = await client.post(f"/retry-or-resume-benchmark/{benchmark.id}", json={})
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.description("An exempt org starts past the default run limit.")
+async def test_run_limit_skips_exempt_org(
+    recovery_run: tuple[Benchmark, Task],
+    database_session: Session,
+    observed_sessions: list[tuple[Session, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    mock_launcher: MockLauncher,
+) -> None:
+    benchmark, _ = recovery_run
+    database_session.add(make_benchmark(status=BenchmarkStatus.IN_PROGRESS))
+    database_session.commit()
+    org = database_session.get(Org, TEST_ORG_ID)
+    assert org is not None
+    _limit_runs(monkeypatch, {"default": 1, "exempt": [org.name]})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app), base_url="http://test") as client:
+        response = await client.post("/start-benchmark", json=_start_body(benchmark))
+
+    assert response.status_code == 200, response.text
+    assert len(mock_launcher.queued_calls) == 1

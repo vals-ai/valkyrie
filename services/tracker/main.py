@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import json
 from datetime import UTC, datetime
 from typing import Annotated, Any, TypeVar, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import httpx
 import logfire
@@ -99,6 +99,7 @@ from tracker.runtime.artifacts import (
 from tracker.runtime.secrets import resolve_secrets
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.storage import ObjectStore, StoredObjectCopy
+from tracker.agent.releases import resolve_agent_release
 from tracker.agent.schemas import AgentConfig, validate_agent_name
 from tracker.config import (
     AUTH_REQUIRED,
@@ -108,6 +109,7 @@ from tracker.config import (
     classify_benchmark_service_destination,
     create_benchmark_service_url,
 )
+from tracker.types import AgentContractRequest, AgentReleaseSelection, AgentExecutionAttempt
 from tracker.database.models import (
     Benchmark,
     Dataset,
@@ -134,6 +136,7 @@ from tracker.services.datasets.oracle import ORACLE_AGENT, ORACLE_CONTRACT
 from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDataset
 from tracker.services.datasets.scoring import scorer_for
 from tracker.clients.dataset_tasks import TaskSelectionError, dataset_service
+from tracker.clients.projects import project_service_reader
 from tracker.services.datasets.version_ref import parse_version_ref
 from tracker.services.datasets.versions import UnresolvedDatasetError, dataset_tasks
 from tracker.docent_analysis import (
@@ -143,9 +146,12 @@ from tracker.exceptions import (
     AmbiguousDigestError,
     InvalidSandboxConfigurationError,
     LambdaError,
+    ProjectServiceUnavailableError,
+    RunLimitExceededError,
     SecretNotFoundError,
     TrackerServiceError,
 )
+from tracker.clients.projects import project_service_writer
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.local.runtime import LocalRuntimeFactory
@@ -173,7 +179,6 @@ from tracker.outbound_security import (
 )
 from tracker.executor.control_queue import queue_pool_id
 from tracker.types import (
-    AgentContractRequest,
     AnalyzeBenchmarkRequest,
     AWSRuntimeResponse,
     FetchBenchmarkMetadataResponse,
@@ -224,6 +229,7 @@ from tracker.services.failures import is_rejected_request
 from tracker.services.final_views import create_final_view, final_view_s3_key, upload_final_view
 from tracker.api.storage_errors import storage_errors
 from tracker.services.runs.attempts import record_prior_attempts
+from tracker.services.runs.limits import RUN_LIMIT_RETRY_AFTER_SECONDS, AutomaticRunLimitsRefresh, ensure_run_capacity
 from tracker.services.runs.regrade import RegradeTasks, regrade_run, regrade_task_rows, regrade_tasks
 from tracker.services.runs.retry import (
     RetryState,
@@ -251,11 +257,15 @@ def _operation_id(route: APIRoute) -> str:
 
 @asynccontextmanager
 async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    _ = project_service_reader()
+    _ = project_service_writer()
     retirement = AutomaticReleaseRetirement()
     dispatch_recovery = AutomaticDispatchRecovery()
     sandbox_cost = AutomaticSandboxCost()
     scheduler = SharedPoolScheduler()
     service_capacity = ServiceCapacityScheduler()
+    run_limits_refresh = AutomaticRunLimitsRefresh()
+    run_limits_refresh.start()
     retirement.start()
     dispatch_recovery.start()
     sandbox_cost.start()
@@ -269,6 +279,7 @@ async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         sandbox_cost.stop()
         dispatch_recovery.stop()
         retirement.stop()
+        run_limits_refresh.stop()
 
 
 app = FastAPI(generate_unique_id_function=_operation_id, redirect_slashes=False, lifespan=tracker_lifespan)
@@ -334,6 +345,22 @@ def _persist_dispatch_payload(
     telemetry_context: ExecutorTelemetryContext,
     payload_key: PayloadKey,
 ) -> None:
+    benchmark = BenchmarkRepository(session).get_by_id(dispatch.benchmark_id)
+    if benchmark is None:
+        raise RuntimeError("Dispatch requires a durable benchmark selection")
+    contract = benchmark.arguments.contract
+    if contract.agent_release is not None:
+        attempt = AgentExecutionAttempt(
+            dispatch_id=str(dispatch.id),
+            agent_release=contract.agent_release.model_dump(mode="json"),
+            model=contract.model or contract.kwargs.get("model"),
+            effective_configuration={key: value for key, value in contract.kwargs.items() if key != "model"},
+            task_ids=list(dispatch.assigned_task_ids or []),
+        )
+        benchmark.arguments = benchmark.arguments.model_copy(
+            update={"agent_attempts": [*benchmark.arguments.agent_attempts, attempt]}
+        )
+        BenchmarkRepository(session).save(benchmark)
     sealed = seal_payload(dispatch.id, {**payload, "telemetry_context_json": telemetry_context}, payload_key)
     BenchmarkRepository(session).save(
         ExecutorDispatchPayload(
@@ -499,6 +526,11 @@ async def tracker_service_error_handler(request: Request, exc: TrackerServiceErr
     logger.error("Tracker service operation failed on %s %s: %s", request.method, request.url.path, exc, exc_info=exc)
     sentry_sdk.capture_exception(exc)
     return JSONResponse(status_code=500, content={"detail": "Tracker service operation failed"})
+
+
+@app.exception_handler(ProjectServiceUnavailableError)
+async def project_service_unavailable_handler(_request: Request, exc: ProjectServiceUnavailableError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(BenchmarkServiceUnauthenticatedError)
@@ -668,6 +700,25 @@ def _validate_start_release(bind: Engine | Connection) -> None:
         validate_managed_execution_release(session)
 
 
+def _ensure_run_capacity(session: Session, org_id: UUID, run_id: UUID) -> None:
+    try:
+        ensure_run_capacity(session, org_id, run_id)
+    except RunLimitExceededError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={
+                "Retry-After": str(RUN_LIMIT_RETRY_AFTER_SECONDS),
+                "X-RateLimit-Limit": str(exc.limit),
+                "X-RateLimit-Remaining": "0",
+            },
+        ) from exc
+
+
+class RepeatedAdmissionError(Exception):
+    pass
+
+
 def _commit_start(
     bind: Engine | Connection,
     benchmark_json: str,
@@ -694,11 +745,16 @@ def _commit_start(
             }
         )
         try:
-            if project_id is not None:
-                reject_archived_project(ProjectRepository(session).lock(project_id))
             repository = BenchmarkRepository(session)
+            if request.admission_id is not None:
+                lock_executor_admission(session)
+                if repository.get_by_id(benchmark.id) is not None:
+                    raise RepeatedAdmissionError(str(benchmark.id))
+            if project_id is not None:
+                reject_archived_project(ProjectRepository(session).get_for_link(benchmark.org_id, project_id))
             repository.add_tasks(benchmark.org_id, benchmark.id, task_ids)
             dispatch = admit_start_dispatch(session, benchmark=benchmark, dispatch_id=dispatch_id, task_ids=task_ids)
+            _ensure_run_capacity(session, benchmark.org_id, benchmark.id)
             payload = _process_benchmark_kwargs(benchmark, request, task_ids)
             _persist_dispatch_payload(session, dispatch, payload, telemetry_context, payload_key)
             repository.save(*(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark.id) for key in issued_keys))
@@ -858,6 +914,8 @@ async def start_benchmark(
     session: Session = Depends(get_session),
     run_starter: RequestIdentity = Depends(get_current_runner),
 ) -> StartBenchmarkResponse:
+    if request.admission_id is not None and request.contract.agent_release is None:
+        raise HTTPException(status_code=400, detail="admission_id requires an exact agent release")
     settings = await asyncio.to_thread(user_run_settings, RunSettingsRepository(session), run_starter)
     request.use_settings(
         settings, await asyncio.to_thread(ProviderSecretRepository(session).list_all, run_starter.org.id)
@@ -872,11 +930,17 @@ async def start_benchmark(
     reject_missing_project(run_starter.org, request.project)
     oracle = request.contract.name == ORACLE_AGENT
     if oracle:
+        if request.contract.agent_release is not None:
+            raise HTTPException(status_code=400, detail="The oracle agent cannot select an agent release")
         if request.dataset_ref is None:
             raise HTTPException(status_code=400, detail="The oracle agent runs only on a dataset")
         request = request.model_copy(update={"contract": ORACLE_CONTRACT})
     projects = ProjectRepository(session)
-    named_project = find_project(projects, run_starter.org.id, request.project) if request.project is not None else None
+    named_project = (
+        await asyncio.to_thread(find_project, projects, run_starter.org.id, request.project)
+        if request.project is not None
+        else None
+    )
     project = named_project or projects.get_or_create_default(run_starter.org.id, run_starter.email)
     selected_project_gateway_root = False
 
@@ -1016,8 +1080,19 @@ async def start_benchmark(
                 detail="Queue priority requires a sandbox provider configured for admission",
             )
 
+    if request.contract.agent_release is not None:
+        with storage_errors("Retained agent release"):
+            request = request.model_copy(
+                update={"contract": await resolve_agent_release(object_store, request.contract)}
+            )
+        if aws_runtime is not None:
+            validate_managed_execution_request(request)
+        if not reads_secrets_file(request.properties):
+            request = _authorize_secret_names(request, run_starter.org)
+
     if (
-        aws_runtime is not None
+        request.contract.agent_release is None
+        and aws_runtime is not None
         and not oracle
         and not await object_store.exists(agent_bundle_key(request.contract.name))
     ):
@@ -1026,7 +1101,7 @@ async def start_benchmark(
             detail=f"Agent '{request.contract.name}' is not in your organization's agent library. Push it first.",
         )
 
-    if not request.contract.install_cmd and not request.contract.run_cmd:
+    if request.contract.agent_release is None and not request.contract.install_cmd and not request.contract.run_cmd:
         request = request.model_copy(update={"contract": await _resolve_contract_from_s3(request, object_store)})
         if aws_runtime is not None:
             try:
@@ -1052,10 +1127,12 @@ async def start_benchmark(
         run_starter,
         queue_pool_id=resolved_queue_pool_id,
     )
+    if request.admission_id is not None:
+        benchmark_row.id = uuid5(run_starter.org.id, str(request.admission_id))
     dispatch_id = uuid4()
     created_agent_copy: StoredObjectCopy | None = None
     try:
-        if not oracle:
+        if request.contract.agent_release is None and not oracle:
             created_agent_copy = await copy_agent_to_benchmark(
                 object_store,
                 str(benchmark_row.id),
@@ -1083,12 +1160,20 @@ async def start_benchmark(
             update={"dataset_ref": execution_request.dataset_ref}
         )
         executor_dispatch = ExecutorDispatch.model_validate(json.loads(result.dispatch_json))
+    except RepeatedAdmissionError as error:
+        raise HTTPException(
+            status_code=409, detail={"message": "Admission already exists", "benchmark_id": str(error)}
+        ) from error
     except Exception as error:
         cancellation_after_failure: asyncio.CancelledError | None = None
         exc = error
         if isinstance(exc, _TaskFailedAfterCancellation):
             cancellation_after_failure = exc.cancellation
             exc = exc.task_error
+        if isinstance(exc, RepeatedAdmissionError):
+            raise HTTPException(
+                status_code=409, detail={"message": "Admission already exists", "benchmark_id": str(exc)}
+            ) from exc
         if isinstance(exc, _StartAdmissionRollbackError):
             assert exc.__cause__ is not None
             exc = exc.__cause__
@@ -1903,6 +1988,11 @@ class RecoveryPreparation:
     sandbox_provider: str
     properties: AWSResources | LocalResources | None = None
     resolved_properties: AWSResources | None = None
+    contract: AgentContractRequest | None = None
+    replacement_contract: AgentContractRequest | None = None
+    artifact_store: ObjectStore | None = None
+    prepared_status: BenchmarkStatus | None = None
+    retained_outputs: str | None = None
 
 
 def _prepare_recovery(
@@ -1956,6 +2046,8 @@ def _prepare_recovery(
             benchmark.arguments.contract.name,
             benchmark.arguments.sandbox_provider,
             benchmark.arguments.properties,
+            contract=benchmark.arguments.contract,
+            prepared_status=benchmark.status,
         )
 
 
@@ -2074,6 +2166,7 @@ async def retry_or_resume_benchmark(
     retry: bool = Query(default=False),
     retry_mode: RetryMode = Query(default=RetryMode.AUTO),
     update_agent: bool = False,
+    agent_release: Annotated[AgentReleaseSelection | None, Body()] = None,
     concurrency: int | None = Query(default=None),
     task_ids: list[str] = Body(default=[]),
     service_headers: dict[str, str] = Body(default={}),
@@ -2088,8 +2181,9 @@ async def retry_or_resume_benchmark(
         validate_service_headers(service_headers)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    project = ProjectRepository(session).get_for_run(
-        assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org).id
+    project = await asyncio.to_thread(
+        ProjectRepository(session).get_for_run,
+        assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org).id,
     )
     if project is not None:
         reject_archived_project(project)
@@ -2134,6 +2228,36 @@ async def retry_or_resume_benchmark(
                 await dry_run_lambda(aws_runtime.clients, lambda_function)
             except LambdaError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if agent_release is not None or (
+        preparation.contract is not None and preparation.contract.agent_release is not None
+    ):
+        recovery_store = _recovery_objects(preparation, aws_runtime, org_id)
+        preparation = replace(preparation, artifact_store=recovery_store)
+        if agent_release is None:
+            from tracker.agent.releases import retained_agent_key, validate_archive
+
+            assert preparation.contract is not None and preparation.contract.agent_release is not None
+            with storage_errors("Retained agent release"):
+                content = await recovery_store.get_bytes(
+                    retained_agent_key(preparation.contract.name, preparation.contract.agent_release)
+                )
+                validate_archive(content, preparation.contract.agent_release)
+
+    if agent_release is not None:
+        if not update_agent or retry_mode != RetryMode.FROM_SCRATCH:
+            raise HTTPException(
+                status_code=400, detail="An exact agent update requires update_agent and from-scratch recovery"
+            )
+        if preparation.contract is None:
+            raise HTTPException(status_code=409, detail="Run has no recorded contract")
+        assert preparation.artifact_store is not None
+        candidate = preparation.contract.model_copy(update={"agent_release": agent_release, "kwargs": {}})
+        with storage_errors("Retained agent release"):
+            replacement = await resolve_agent_release(preparation.artifact_store, candidate)
+        preparation = replace(preparation, replacement_contract=replacement)
+    elif update_agent and preparation.contract is not None and preparation.contract.agent_release is not None:
+        raise HTTPException(status_code=400, detail="Versioned runs require an explicit replacement agent release")
+
     effective_headers = service_headers
     if preparation.dataset_ref is None:
         destination = classify_benchmark_service_destination(preparation.benchmark_name, preparation.service_url)
@@ -2172,7 +2296,7 @@ async def retry_or_resume_benchmark(
     if update_agent or prior_attempts:
         run_store = _recovery_objects(preparation, aws_runtime, org_id)
     library_store: ObjectStore | None = None
-    if update_agent:
+    if update_agent and agent_release is None:
         assert run_store is not None
         library_store = run_store
         if not await library_store.exists(agent_bundle_key(preparation.agent_name)):
@@ -2180,6 +2304,14 @@ async def retry_or_resume_benchmark(
                 status_code=404,
                 detail=f"Agent {preparation.agent_name!r} was not found. Push the agent before using --update-agent.",
             )
+    if preparation.artifact_store is not None:
+        if preparation.prepared_status == BenchmarkStatus.IN_PROGRESS:
+            raise HTTPException(status_code=409, detail="Stop a versioned run before admitting recovery")
+        from tracker.agent.releases import preserve_attempt_outputs
+
+        retained_outputs = await preserve_attempt_outputs(preparation.artifact_store, str(benchmark_id), str(uuid4()))
+        preparation = replace(preparation, retained_outputs=retained_outputs)
+
     recorded_attempts: list[str] = []
     if prior_attempts:
         assert run_store is not None
@@ -2293,11 +2425,12 @@ def _commit_regrade(
             if _regrade_source(session, org, source_id, for_update=True).tasks != tasks:
                 raise HTTPException(status_code=409, detail="Source run changed during regrade; retry the request.")
             dispatch = admit_start_dispatch(session, benchmark=run, dispatch_id=dispatch_id, task_ids=tasks.task_ids)
+            _ensure_run_capacity(session, run.org_id, run.id)
             repository = BenchmarkRepository(session)
             repository.add_tasks_with_errors(*regrade_task_rows(run, tasks, dispatch.created_at))
             project = ProjectRepository(session).get_for_run(source_id)
             if project is not None:
-                reject_archived_project(ProjectRepository(session).lock(project.id))
+                reject_archived_project(ProjectRepository(session).get_for_link(project.org_id, project.id))
                 repository.save(
                     RunProject(benchmark_id=run.id, project_id=project.id, created_by_email=run.started_by_email)
                 )
@@ -2466,7 +2599,7 @@ def _apply_recovery(
     benchmark_row = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
     current_project = ProjectRepository(session).get_for_run(benchmark_row.id)
     if current_project is not None:
-        reject_archived_project(ProjectRepository(session).lock(current_project.id))
+        reject_archived_project(ProjectRepository(session).get_for_link(current_project.org_id, current_project.id))
     if selects_project_gateway_key(org) and not reads_secrets_file(benchmark_row.arguments.properties):
         if current_project is not None:
             secrets = {
@@ -2568,6 +2701,8 @@ def _apply_recovery(
                 detail=f"Run {benchmark_id} is in the {benchmark_row.status.value} state. Cannot continue a run that is stopping.",
             )
         pre_action_status = benchmark_row.status
+        if pre_action_status != BenchmarkStatus.IN_PROGRESS:
+            _ensure_run_capacity(session, org.id, benchmark_row.id)
 
         try:
             current_state = prepare_retry_state(
@@ -2583,7 +2718,11 @@ def _apply_recovery(
             raise HTTPException(
                 status_code=409, detail="Run changed during task verification; retry the request."
             ) from exc
-        if current_state != preparation.state:
+        if current_state != preparation.state or (
+            preparation.contract is not None
+            and benchmark_row.arguments.contract.model_dump(exclude={"secrets"})
+            != preparation.contract.model_dump(exclude={"secrets"})
+        ):
             raise HTTPException(status_code=409, detail="Run changed during task verification; retry the request.")
         if queued_running_recovery and pre_action_status == BenchmarkStatus.IN_PROGRESS:
             scheduler_rows = BenchmarkRepository(session).lock_tasks(
@@ -2606,6 +2745,10 @@ def _apply_recovery(
             prospective_request = benchmark_row.managed_start_benchmark_request(
                 service_headers=service_headers,
             )
+            if preparation.replacement_contract is not None:
+                prospective_request = prospective_request.model_copy(
+                    update={"contract": preparation.replacement_contract}
+                )
             if secrets:
                 prospective_contract = prospective_request.contract.model_copy(
                     update={"secrets": {**prospective_request.contract.secrets, **secrets}}
@@ -2616,7 +2759,61 @@ def _apply_recovery(
                     validate_managed_execution_request(prospective_request)
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
-            _ = _authorize_secret_names(prospective_request, org)
+            authorized_request = _authorize_secret_names(prospective_request, org)
+            if preparation.replacement_contract is not None:
+                preparation = replace(preparation, replacement_contract=authorized_request.contract)
+
+        if preparation.artifact_store is not None:
+            if pre_action_status == BenchmarkStatus.IN_PROGRESS:
+                raise HTTPException(status_code=409, detail="Stop a versioned run before admitting recovery")
+            if preparation.retained_outputs is None:
+                raise RuntimeError("Recovery requires retained prior outputs")
+            attempts = list(benchmark_row.arguments.agent_attempts)
+            if not attempts:
+                previous_contract = benchmark_row.arguments.contract
+                attempts.append(
+                    AgentExecutionAttempt(
+                        agent_release=None,
+                        model=previous_contract.model or previous_contract.kwargs.get("model"),
+                        effective_configuration={
+                            key: value for key, value in previous_contract.kwargs.items() if key != "model"
+                        },
+                        task_ids=list(BenchmarkRepository(session).task_ids(org.id, benchmark_id)),
+                    )
+                )
+            if attempts:
+                attempts[-1] = attempts[-1].model_copy(
+                    update={
+                        "retained_outputs": preparation.retained_outputs,
+                        "results": benchmark_row.fetch_evaluation_results(session),
+                        "final_evaluation": benchmark_row.final_evaluation.model_dump(mode="json")
+                        if benchmark_row.final_evaluation is not None
+                        else None,
+                    }
+                )
+                benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"agent_attempts": attempts})
+
+        if preparation.replacement_contract is not None:
+            all_task_ids = BenchmarkRepository(session).task_ids(org.id, benchmark_id)
+            if set(verified_task_ids) != all_task_ids:
+                raise HTTPException(
+                    status_code=400, detail="An agent update requires from-scratch recovery of every task"
+                )
+            if pre_action_status == BenchmarkStatus.IN_PROGRESS:
+                raise HTTPException(status_code=409, detail=_UPDATE_AGENT_IN_PROGRESS)
+            replacement_contract = preparation.replacement_contract
+            if (
+                current_project is not None
+                and selects_project_gateway_key(org)
+                and not reads_secrets_file(benchmark_row.arguments.properties)
+            ):
+                replacement_secrets = dict(replacement_contract.secrets)
+                for name in ("MODEL_GATEWAY_URL", "MODEL_GATEWAY_API_KEY"):
+                    replacement_secrets.pop(name, None)
+                    if name in benchmark_row.arguments.contract.secrets:
+                        replacement_secrets[name] = benchmark_row.arguments.contract.secrets[name]
+                replacement_contract = replacement_contract.model_copy(update={"secrets": replacement_secrets})
+            benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"contract": replacement_contract})
 
         if recovery_task_ids is not None or retry_mode == RetryMode.AUTO:
             evaluation_candidates = BenchmarkRepository(session).lock_tasks(
@@ -2846,6 +3043,8 @@ async def _output_keys(
     prefixes = [f"{benchmark_prefix}{task_id}/" for task_id in task_ids] if task_ids else [benchmark_prefix]
     for prefix in prefixes:
         async for stored_object in object_store.list_objects(prefix):
+            if stored_object.key.startswith(f"{benchmark_prefix}agent-attempts/"):
+                continue
             if _safe_output_tar_member(stored_object.key, benchmark_prefix) is None:
                 logger.warning("Skipping unsafe output archive member for benchmark %s", benchmark_id)
                 continue

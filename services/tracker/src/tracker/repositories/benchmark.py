@@ -12,6 +12,7 @@ from sqlmodel import Session, SQLModel, asc, col, desc, func, or_, select, updat
 from sqlmodel.sql.expression import Select, SelectOfScalar
 
 from tracker.database.session import get_session
+from tracker.repositories.cost import later_of
 from tracker.database.models import (
     AgentCausedExitReason,
     TaskBreakdown,
@@ -202,6 +203,15 @@ class BenchmarkRepository:
                 .order_by(col(Benchmark.started_at))
             ).all()
         )
+
+    def count_active(self, org_id: UUID, *, excluding: UUID) -> int:
+        return self._session.exec(
+            select(func.count())
+            .select_from(Benchmark)
+            .where(col(Benchmark.org_id) == org_id)
+            .where(col(Benchmark.status).in_([BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING]))
+            .where(col(Benchmark.id) != excluding)
+        ).one()
 
     def task_state_counts(self, benchmark_ids: Sequence[UUID]) -> dict[UUID, dict[TaskStatus, int]]:
         rows = self._session.exec(
@@ -403,11 +413,16 @@ class BenchmarkRepository:
             select(Task).where(col(Task.benchmark) == benchmark_id, col(Task.task_id).in_(task_ids))
         ).all()
 
-    def record_sandbox_link(self, provider: str, sandbox_id: str, benchmark_id: UUID) -> None:
+    def record_sandbox_link(self, provider: str, sandbox_id: str, benchmark_id: UUID, seen_at: datetime) -> None:
+        statement = insert(SandboxRecord).values(
+            provider=provider, sandbox_id=sandbox_id, benchmark_id=benchmark_id, last_seen_at=seen_at
+        )
         self._session.exec(
-            insert(SandboxRecord)
-            .values(provider=provider, sandbox_id=sandbox_id, benchmark_id=benchmark_id)
-            .on_conflict_do_nothing(index_elements=["provider", "sandbox_id"])
+            statement.on_conflict_do_update(
+                index_elements=["provider", "sandbox_id"],
+                set_={"last_seen_at": later_of(col(SandboxRecord.last_seen_at), statement.excluded.last_seen_at)},
+                where=col(SandboxRecord.benchmark_id) == statement.excluded.benchmark_id,
+            )
         )
 
     def task_ids(self, org_id: UUID, benchmark_id: UUID, task_ids: Sequence[str] | None = None) -> set[str]:

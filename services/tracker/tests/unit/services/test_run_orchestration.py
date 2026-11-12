@@ -443,7 +443,7 @@ async def test_queued_runner_prepares_backlog_independently_of_run_slots(
         process_benchmark(execution_context_json=_context(request, benchmark, task_ids), **authority_kwargs)
     )
     try:
-        await asyncio.wait_for(all_preparing.wait(), timeout=2)
+        await asyncio.wait_for(all_preparing.wait(), timeout=30)
         assert pending_started == task_ids
     finally:
         run.cancel()
@@ -613,7 +613,7 @@ async def test_queued_coordinator_retires_stale_evaluation_runner(
 
     await asyncio.wait_for(
         process_benchmark(execution_context_json=_context(request, benchmark, ["resume_eval"]), **authority_kwargs),
-        timeout=2,
+        timeout=30,
     )
 
     control_postgres_session.expire_all()

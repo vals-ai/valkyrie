@@ -12,6 +12,7 @@ from valkyrie.sdk.models import (
     FetchBenchmarkMetadataResponse,
     FetchBenchmarkResponse,
     TaskStatus,
+    RunSnapshot,
 )
 
 from valkyrie.cli.client import call
@@ -146,6 +147,14 @@ def format_run_identity(
         version = arguments.dataset_version
         rows += [
             ("Agent:", arguments.contract.name),
+            (
+                "Agent release:",
+                arguments.contract.agent_release.reference if arguments.contract.agent_release else "unversioned",
+            ),
+            (
+                "Agent SHA-256:",
+                arguments.contract.agent_release.archive_sha256 if arguments.contract.agent_release else "-",
+            ),
             ("Model:", arguments.contract.model or "-"),
             ("Dataset:", arguments.dataset or "default"),
             ("Dataset version:", version.label or version.id if version else "not pinned"),
@@ -254,7 +263,7 @@ async def stream_benchmark_status(
 
 
 async def _stream_jsonl(client: ValkyrieClient, benchmark_id: UUID, on_interrupt: Callable[[], None]) -> None:
-    click.echo((await client.runs.snapshot(benchmark_id)).model_dump_json())
+    click.echo(format_run_snapshot_json(await client.runs.snapshot(benchmark_id)))
     try:
         async for event in client.runs.events(benchmark_id):
             click.echo(event.model_dump_json())
@@ -288,3 +297,27 @@ def follow_run_status(
     except KeyboardInterrupt:
         if not interrupted:
             raise
+
+
+def format_run_snapshot_json(snapshot: RunSnapshot) -> str:
+    return snapshot.model_dump_json(
+        exclude={
+            "metadata": {
+                "benchmark_arguments": {
+                    "contract": {
+                        "kwargs": True,
+                        "secrets": True,
+                        "agent_release": {"prescribed_configuration", "overrides"},
+                    },
+                    "agent_attempts": {
+                        "__all__": {
+                            "effective_configuration": True,
+                            "agent_release": {"prescribed_configuration", "overrides"},
+                            "results": True,
+                            "final_evaluation": True,
+                        }
+                    },
+                }
+            }
+        }
+    )

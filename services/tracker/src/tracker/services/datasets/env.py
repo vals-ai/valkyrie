@@ -9,15 +9,23 @@ TEMPLATE = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
 SecretReader = Callable[[str], Awaitable[str | None]]
 
 
-def secret_reader(store: SecretStore, stored_name: Callable[[str], str]) -> SecretReader:
+def secret_reader(store: SecretStore, stored_names: Callable[[str], list[str]]) -> SecretReader:
     async def read(name: str) -> str | None:
         try:
-            value = await store.get(stored_name(name))
-        except (SecretNotFoundError, ValueError):
+            candidates = stored_names(name)
+        except ValueError:
             return None
-        if isinstance(value, dict):
-            return str(value[name]) if name in value else None
-        return str(value)
+        for stored in candidates:
+            try:
+                value = await store.get(stored)
+            except SecretNotFoundError:
+                continue
+            if isinstance(value, dict):
+                if name in value:
+                    return str(value[name])
+                continue
+            return str(value)
+        return None
 
     return read
 

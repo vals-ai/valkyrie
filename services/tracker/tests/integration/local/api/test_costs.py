@@ -1289,6 +1289,30 @@ class TestFillSandboxUsageEnd:
         assert [row.amount_usd for row in rows.values()] == [2.0, 3.0, 4.0, 5.0]
         assert reads[0][0] == "DaytonaSecret"
 
+    @pytest.mark.description("A tenant's Daytona mapping by secret name is read under its tenant path.")
+    def test_a_tenant_mapping_by_name_is_read_under_its_tenant_path(
+        self, client: TestClient, database_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        database_session.add(OrgProviderSecret(org_id=TEST_ORG_ID, provider="daytona", secret_name="daytona"))
+        database_session.commit()
+        reads: list[str] = []
+
+        async def last_ends(_org: Org, secret_name: str, _start: datetime, _end: datetime) -> dict[str, datetime]:
+            reads.append(secret_name)
+            return {}
+
+        monkeypatch.setattr(costs_api, "daytona_last_ends", last_ends)
+        monkeypatch.setattr(costs_api, "AUTH_REQUIRED", True)
+
+        response = client.post(
+            "/costs/sandbox-usage-end",
+            params={"start": "2026-10-20", "end": "2026-10-21"},
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 200
+        assert reads == [f"valkyrie/tenants/{TEST_ORG_ID}/daytona"]
+
     @pytest.mark.description("An organization without a Daytona secret gets a 409.")
     def test_an_org_without_a_daytona_secret_gets_409(self, client: TestClient) -> None:
         response = client.post(
