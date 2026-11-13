@@ -35,6 +35,7 @@ from tracker.services.datasets.grading import ARTIFACTS_DIR, OPEN_LOG_DIRS, VERI
 from tracker.services.datasets.retrieve_task import sandbox_resources, stage_egress
 from tracker.services.datasets.steps import step_layers, step_verifier
 from tracker.sandbox import apply_egress_policy, runtime_sandbox
+from tracker.egress import select_policy
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +318,11 @@ async def grade_separately(
     if on_message is not None:
         on_message(f"Starting a separate verifier for {task_id}")
     labels = {**(services[MAIN_SERVICE].labels or {}), "valkyrie-role": "verifier"}
+    policy = select_policy(
+        stage_egress(config.verifier, config.verifier.environment or config.environment),
+        "evaluation",
+        phase="separate_verifier",
+    )
     with _collect_announcements(on_created is not None) as announced:
         verifier = await _create_sandbox(provider, task_id, config, source, sandbox_env, labels)
     try:
@@ -325,7 +331,6 @@ async def grade_separately(
                 on_created(created)
         if isinstance(source, ComposeSource) and environment.compose is not None:
             await start_compose_runtime(verifier, source, environment.compose, sandbox_env)
-        policy = stage_egress(config.verifier, config.verifier.environment or config.environment)
         if policy != "*" and (policy or isinstance(source, ComposeSource)):
             await apply_egress_policy(verifier, policy)
         grader = runtime_sandbox(verifier, source)

@@ -474,8 +474,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.72.7"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.7#ac7e798accc467de31f3c267501c9327f5f4049e" }
+version = "0.73.0"
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.73.0#81b873b5c319b1d2f3da4fc17988ca8ceb7b1a1e" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -2391,7 +2391,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.42.20" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.72.7" },
+    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.73.0" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
@@ -2420,6 +2420,7 @@ dev = [
     { name = "pytest-alembic", specifier = ">=0.12.1" },
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "pytest-timeout", specifier = "==2.3.1" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff" },
     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.10.0" },
@@ -2637,7 +2638,7 @@ dev = [
 
 [[package]]
 name = "valkyrie-sdk"
-version = "0.34.0"
+version = "0.35.0"
 source = { editable = "packages/valkyrie-sdk" }
 dependencies = [
     { name = "filelock" },

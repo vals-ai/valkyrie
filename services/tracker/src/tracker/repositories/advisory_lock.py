@@ -72,11 +72,13 @@ class PostgresAdvisoryLock:
         acquire_task = asyncio.create_task(asyncio.to_thread(self._try_acquire))
         try:
             return await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
-            acquired = await acquire_task
-            if acquired:
-                await asyncio.to_thread(self._release)
-            raise
+        except asyncio.CancelledError as cancellation:
+            try:
+                acquired = await acquire_task
+                if acquired:
+                    await asyncio.to_thread(self._release)
+            finally:
+                raise cancellation
 
     async def still_held(self) -> bool:
         if self._connection is None:

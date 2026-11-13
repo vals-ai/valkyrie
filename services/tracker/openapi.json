@@ -5830,6 +5830,11 @@
             "title": "Allow Provider Tools",
             "default": false
           },
+          "isolate_agent_uid": {
+            "type": "boolean",
+            "title": "Isolate Agent Uid",
+            "default": false
+          },
           "secrets": {
             "additionalProperties": {
               "type": "string"
@@ -5960,6 +5965,11 @@
           "allow_provider_tools": {
             "type": "boolean",
             "title": "Allow Provider Tools",
+            "default": false
+          },
+          "isolate_agent_uid": {
+            "type": "boolean",
+            "title": "Isolate Agent Uid",
             "default": false
           },
           "secrets": {

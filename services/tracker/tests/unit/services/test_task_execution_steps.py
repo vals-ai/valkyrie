@@ -1,4 +1,5 @@
 import socket
+import logging
 from datetime import UTC, datetime, timedelta
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
@@ -47,7 +48,7 @@ def _grade(reward: float, stopped: str | None = None) -> StepOutcome:
 def _response(
     *names: str,
     strategy: MultiStepRewardStrategy = MultiStepRewardStrategy.MEAN,
-    egress_run: EgressPolicy = "*",
+    egress_run: EgressPolicy | None = "*",
     egress_evaluation: EgressPolicy = "*",
     env: dict[str, str] | None = None,
 ) -> RetrieveTaskResponse:
@@ -213,6 +214,51 @@ async def _run(
 @pytest.mark.description("Each step is prepared, run by the agent and graded before the next begins.")
 @pytest.mark.usefixtures("process_benchmark_env")
 class TestSteps:
+    @pytest.mark.description("Step policy events identify the step and phase even when local Docker skips enforcement.")
+    @pytest.mark.parametrize("local_docker", [False, True])
+    async def test_step_policy_events(
+        self,
+        stepped: StepStarter,
+        contract: AgentContractRequest,
+        database_session: Session,
+        bound_controls: Any,
+        runtime_services: RuntimeServices,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        local_docker: bool,
+    ) -> None:
+        if local_docker:
+            monkeypatch.setattr(
+                runtime_services, "get_sandbox_provider_config", AsyncMock(return_value=DockerProviderConfig())
+            )
+        applied = AsyncMock()
+        monkeypatch.setattr("tracker.services.tasks.execute.apply_egress_policy", applied)
+        monkeypatch.setattr("tracker.runtime.run_egress.apply_egress_policy", applied)
+        contract = contract.model_copy(update={"egress_allowlist": ["contract.example"]})
+        run = stepped(_response("one", "two", egress_run=None), [_grade(1.0), _grade(0.5)])
+        logger = logging.getLogger("tracker.egress")
+        logger.addHandler(caplog.handler)
+        try:
+            await _run(run, contract, database_session, runtime_services, bound_controls)
+        finally:
+            logger.removeHandler(caplog.handler)
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "task.egress.policy" and getattr(record, "stage") == "step"
+        ]
+        expected = [(step, phase) for step in ("one", "two") for phase in ("setup", "evaluation")]
+        assert [(getattr(record, "step"), getattr(record, "phase")) for record in records] == expected
+        assert all(
+            getattr(record, "attempt_id") and getattr(record, "org_id") and getattr(record, "benchmark_id")
+            for record in records
+        )
+        runs = [record for record in caplog.records if getattr(record, "stage", None) == "run"]
+        assert len(runs) == 2
+        assert all(getattr(record, "implicit_allow_all") for record in runs)
+        assert bool(applied.await_count) is not local_docker
+        assert all(call.args[1] == "*" for call in applied.await_args_list)
+
     @pytest.mark.description("Every step is prepared run and graded in turn and the rewards are averaged.")
     async def test_every_step_is_prepared_run_and_graded_in_turn_and_the_rewards_are_averaged(
         self,

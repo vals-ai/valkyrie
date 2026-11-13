@@ -47,7 +47,7 @@ class StepRun:
     until_stream_ends: Callable[[Awaitable[StepOutcome]], Awaitable[StepOutcome]]
     set_phase: Callable[[FailurePhase], None]
     redact: Callable[[str], str]
-    restrict_egress: Callable[[EgressPolicy], Awaitable[None]] | None
+    restrict_egress: Callable[[EgressPolicy | None, str, str], Awaitable[None]] | None
 
 
 @dataclass
@@ -70,7 +70,7 @@ async def run_steps(run: StepRun, controller: ExternalServiceDeadlineController)
 
     for index, step in enumerate(run.task.steps):
         if run.restrict_egress is not None:
-            await run.restrict_egress(run.task.egress.setup_task)
+            await run.restrict_egress(run.task.egress.setup_task, step.name, "setup")
         run.set_phase(FailurePhase.SETUP if index == 0 else FailurePhase.EVALUATION)
         run.task_logs.last_log_time = time.monotonic()
         try:
@@ -124,7 +124,7 @@ async def run_steps(run: StepRun, controller: ExternalServiceDeadlineController)
             },
         )
         if run.restrict_egress is not None:
-            await run.restrict_egress(step.egress_evaluation)
+            await run.restrict_egress(step.egress_evaluation, step.name, "evaluation")
         run.task_logs.last_log_time = time.monotonic()
         outcome = await run.until_stream_ends(
             run_benchmark_service_websocket(

@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 import re
 import json
+import logging
 from pathlib import Path
 import socket
 import shlex
@@ -85,6 +86,52 @@ def _context(request: Any, benchmark_id: Any, task_ids: list[str]) -> dict[str, 
 
 @pytest.mark.description("Benchmark service disconnect, validation, and task error handling.")
 class TestBenchmarkServiceFailures:
+    @pytest.mark.description("Attempts record implicit allow-all before enforcement, including when enforcement fails.")
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize(
+        ("policy", "error"),
+        [
+            (None, None),
+            ("*", None),
+            ([], None),
+            (["packages.example.com"], None),
+            (None, RuntimeError("Egress failed")),
+        ],
+    )
+    async def test_attempt_records_implicit_egress(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        caplog: pytest.LogCaptureFixture,
+        policy: Any,
+        error: Exception | None,
+    ) -> None:
+        contract = contract.model_copy(update={"install_egress": policy})
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        applied = AsyncMock(side_effect=error)
+        monkeypatch.setattr(utils_module, "apply_egress_policy", applied)
+        logging.getLogger("tracker.egress").addHandler(caplog.handler)
+        try:
+            result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+        finally:
+            logging.getLogger("tracker.egress").removeHandler(caplog.handler)
+
+        assert result == {"task_0": None if error is not None else {"status": "success", "score": 1.0}}
+        records = [record for record in caplog.records if getattr(record, "event", None) == "task.egress.policy"]
+        install = next(record for record in records if getattr(record, "stage") == "install")
+        assert getattr(install, "implicit_allow_all") is (policy is None)
+        assert json.loads(JsonFormatter().format(install))["implicit_allow_all"] is (policy is None)
+        assert getattr(install, "attempt_id") == utils_module.task_attempt_id(task_row.id, task_row.started_at)
+        assert getattr(install, "benchmark_id") == str(benchmark_id)
+        assert getattr(install, "org_id") == str(task_row.org_id)
+        assert applied.await_args_list[0].args[1] == ("*" if policy is None else policy)
+        assert all(getattr(record, "implicit_allow_all") for record in records if record is not install)
+
     def _latest_task_error_result(self, database_session: Session, task_row: Task) -> ErrorResult:
         return database_session.exec(
             select(ErrorResult)

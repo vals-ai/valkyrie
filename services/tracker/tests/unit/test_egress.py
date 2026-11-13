@@ -1,11 +1,13 @@
 import pytest
+import json
 from pydantic import ValidationError
 
 from tracker.types import AgentContractRequest
-from tracker.egress import EgressPolicy, combine_run_egress_policies
+from tracker.egress import EgressPolicy, combine_run_egress_policies, select_policy
 
 
-@pytest.mark.description("Run egress policies combine into one policy.")
+@pytest.mark.description("Effective run policies match dev while undeclared folder policies remain implicit.")
+@pytest.mark.parametrize("task_folder", [False, True])
 @pytest.mark.parametrize(
     ("benchmark_policy", "legacy_agent_allowlist", "expected"),
     [
@@ -27,8 +29,13 @@ def test_combine_run_egress_policies(
     benchmark_policy: EgressPolicy | None,
     legacy_agent_allowlist: list[str],
     expected: EgressPolicy,
+    task_folder: bool,
 ) -> None:
-    assert combine_run_egress_policies(benchmark_policy, legacy_agent_allowlist) == expected
+    if task_folder and benchmark_policy is None:
+        expected = "*"
+    policy = combine_run_egress_policies(benchmark_policy, legacy_agent_allowlist, default_allow_all=task_folder)
+    assert json.dumps(select_policy(policy, "run")) == json.dumps(expected)
+    assert (policy is None) is (benchmark_policy is None and (task_folder or not legacy_agent_allowlist))
 
 
 @pytest.mark.description("An agent contract with the obsolete egress field is rejected.")
@@ -42,7 +49,7 @@ def test_agent_contract_rejects_obsolete_egress(egress: object) -> None:
 @pytest.mark.parametrize(
     ("install_egress", "expected"),
     [
-        (None, "*"),
+        (None, None),
         ("*", "*"),
         ([], []),
         (["packages.example.com"], ["packages.example.com"]),
@@ -50,8 +57,8 @@ def test_agent_contract_rejects_obsolete_egress(egress: object) -> None:
 )
 def test_agent_install_egress_policy(
     install_egress: EgressPolicy | None,
-    expected: EgressPolicy,
+    expected: EgressPolicy | None,
 ) -> None:
     contract = AgentContractRequest(name="agent", install_egress=install_egress)
 
-    assert contract.install_egress_policy == expected
+    assert contract.install_egress == expected

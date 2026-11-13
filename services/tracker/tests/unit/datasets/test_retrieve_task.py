@@ -158,11 +158,13 @@ class TestWorkingDirectory:
 
 @pytest.mark.description("Each stage's egress policy, falling back to the environment's.")
 class TestNetworkRules:
-    @pytest.mark.description("Public everywhere by default.")
-    def test_public_everywhere_by_default(self, tmp_path: Path) -> None:
-        egress = mapped(tmp_path).egress
+    @pytest.mark.description("Missing stage policies stay distinct from explicit public access.")
+    @pytest.mark.parametrize("network", ["", '\nnetwork_mode = "public"'])
+    def test_missing_stage_policies_stay_distinct(self, tmp_path: Path, network: str) -> None:
+        egress = mapped(tmp_path, '[environment]\ndocker_image = "x"' + network).egress
 
-        assert (egress.setup_task, egress.run, egress.evaluation) == ("*", "*", "*")
+        expected = "*" if network else None
+        assert (egress.setup_task, egress.run, egress.evaluation) == (expected, expected, expected)
 
     @pytest.mark.description("Stages inherit the environment unless they set their own.")
     def test_stages_inherit_the_environment_unless_they_set_their_own(self, tmp_path: Path) -> None:
@@ -194,7 +196,7 @@ class TestNetworkRules:
         egress = mapped(tmp_path, toml).egress
 
         assert (egress.setup_task, egress.run, egress.evaluation) == (
-            "*",
+            None,
             ["pypi.org", "files.pythonhosted.org"],
             ["api.openai.com"],
         )

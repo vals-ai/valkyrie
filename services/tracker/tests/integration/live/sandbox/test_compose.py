@@ -255,7 +255,7 @@ async def test_compose_sandbox_methods_use_daytona_outer_from_retrieve_task(
     )
 
     agent_sandbox = runtime_sandbox(outer_sandbox, task_data.source)
-    await apply_egress_policy(agent_sandbox, contract.install_egress_policy)
+    await apply_egress_policy(agent_sandbox, "*" if contract.install_egress is None else contract.install_egress)
     await install_agent_dependencies(
         agent_sandbox, contract, logs.append, log_line=lambda text: logs.append(text + "\n")
     )

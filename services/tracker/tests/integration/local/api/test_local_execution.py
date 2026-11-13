@@ -15,10 +15,13 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, col, select
 
 import main as main_module
+import tracker.repositories.project as project_repository_module
 import tracker.services.runs.limits as run_limits_module
 from tests.factories import make_error_result
 from tests.utils import TEST_ORG_ID
 from tracker.api import dependencies as run_dependencies
+from tracker.clients.projects import ProjectServiceClient
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSResources
@@ -528,6 +531,55 @@ def test_regrade_copies_saved_states_into_a_new_run(
     metadata = local_tracker.get(f"/fetch-benchmark-metadata/{run.id}").json()
     for payload in (fetched, metadata):
         assert (payload["regraded_from_run_id"], payload["regrade_skipped_task_ids"]) == (str(source.id), ["task-3"])
+
+
+@pytest.mark.description(
+    "With reads on, a regrade reads its project from the service before it takes the run admission lock."
+)
+def test_regrade_reads_the_project_service_before_the_admission_lock(
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
+    project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
+    control_postgres_session.add(project)
+    control_postgres_session.flush()
+    control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
+    control_postgres_session.commit()
+    row = project.model_dump(mode="json", exclude={"org_id"})
+    events: list[str] = []
+
+    def answer(_request: httpx.Request) -> httpx.Response:
+        events.append("service")
+        return httpx.Response(200, json=row)
+
+    service = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(answer)))
+    monkeypatch.setattr(project_repository_module, "project_service_reader", lambda: service)
+    admission = ExecutorReleaseRepository.admission
+
+    def locked_admission(self: ExecutorReleaseRepository, *, for_update: bool = False) -> ExecutorAdmission | None:
+        if for_update:
+            events.append("lock")
+        return admission(self, for_update=for_update)
+
+    monkeypatch.setattr(ExecutorReleaseRepository, "admission", locked_admission)
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+
+    response = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+
+    assert response.status_code == 200, response.text
+    assert "service" in events and "lock" in events, events
+    assert "service" not in events[events.index("lock") :], events
+    links = control_postgres_session.exec(
+        select(RunProject).where(RunProject.benchmark_id == UUID(response.json()["benchmark_id"]))
+    ).all()
+    assert [link.project_id for link in links] == [project.id]
 
 
 @pytest.mark.description("Regrade returns 429 and creates no run when the org's run limit is reached.")

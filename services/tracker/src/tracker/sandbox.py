@@ -174,13 +174,16 @@ class _StageOutput:
             self.pending = ""
 
 
-async def _provision_stage(sandbox: Sandbox) -> bytes:
+async def _provision_stage(sandbox: Sandbox, *, isolate_agent_uid: bool = False) -> bytes:
     key = os.urandom(32)
     result = await _exec(sandbox, f"mkdir -m 700 {_STAGE_DIR} && mkdir -m 700 {_STAGE_DIR}/ack")
     if result.exit_code != 0:
         raise SandboxError("Could not provision stage control directory")
     await sandbox.upload_file(f"{_STAGE_DIR}/key", key.hex().encode())
-    result = await _exec(sandbox, f"chmod 600 {_STAGE_DIR}/key")
+    permissions = f"chmod 600 {_STAGE_DIR}/key"
+    if isolate_agent_uid:
+        permissions = f"chown root:root {_STAGE_DIR} {_STAGE_DIR}/ack {_STAGE_DIR}/key && {permissions}"
+    result = await _exec(sandbox, permissions)
     if result.exit_code != 0:
         raise SandboxError("Could not restrict stage signing key")
     return key
@@ -2012,6 +2015,8 @@ async def run_agent(
     skills_dir: str | None = None,
     on_search_costs: Callable[[list[SearchCharge]], Awaitable[None]] | None = None,
 ) -> tuple[AgentCausedExitReason | None, float]:
+    if contract.isolate_agent_uid and (user is not None or plan.episode is None):
+        raise InvalidSandboxConfigurationError("UID isolation requires an episode without agent.user")
     log_line(
         f"Running episode orchestrator for {contract.name}"
         if plan.episode is not None
@@ -2040,7 +2045,7 @@ async def run_agent(
     if user is not None:
         setup += f"; mkdir -p {shlex.quote(_STATUS_DIR)} && chmod 1777 {shlex.quote(_STATUS_DIR)}"
     await _exec(sandbox, setup)
-    stage_key = await _provision_stage(sandbox) if plan.staged else None
+    stage_key = await _provision_stage(sandbox, isolate_agent_uid=contract.isolate_agent_uid) if plan.staged else None
     if plan.episode is not None:
         turns = contract.turns
         await sandbox.upload_file(
@@ -2055,6 +2060,7 @@ async def run_agent(
                     "final_output": contract.final_output,
                     "parallel_agents": plan.episode.parallel_agents,
                     "slots_root": "/workspace/.valkyrie/slots",
+                    "isolate_agent_uid": contract.isolate_agent_uid,
                 }
             ).encode(),
         )

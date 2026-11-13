@@ -98,7 +98,7 @@ from tracker.exceptions import (
     SandboxSetupError,
     TrackerServiceError,
 )
-from tracker.egress import combine_run_egress_policies
+from tracker.egress import combine_run_egress_policies, policy_context, select_policy
 from tracker.egress_proxy.resolve import validate_proxy_entries
 from tracker.egress_proxy.run_stage import EgressProxy
 from tracker.egress_proxy.settings import EGRESS_PROXY
@@ -1234,17 +1234,21 @@ async def _process_task_attempt(
         grading_spec = None if task_data.eval_sandbox is None else resolve_grading_spec(task_data)
         unrestricted_docker = sandbox_provider_config.type == "docker"
         run_egress_policy = combine_run_egress_policies(
-            task_data.egress.run, start_benchmark_request.contract.egress_allowlist
+            task_data.egress.run,
+            start_benchmark_request.contract.egress_allowlist,
+            default_allow_all=isinstance(task_data, TaskFolderResponse),
         )
+        setup_egress = task_data.egress.setup_task
+        evaluation_egress = task_data.egress.evaluation
         folder = task_data if isinstance(task_data, TaskFolderResponse) else None
         steps = folder.steps if folder is not None else []
         if unrestricted_docker and any(
-            policy != "*"
+            policy is not None and policy != "*"
             for policy in (
-                start_benchmark_request.contract.install_egress_policy,
-                task_data.egress.setup_task,
+                start_benchmark_request.contract.install_egress,
+                setup_egress,
                 run_egress_policy,
-                task_data.egress.evaluation,
+                evaluation_egress,
                 *(step.egress_run for step in steps),
                 *(step.egress_evaluation for step in steps),
             )
@@ -1262,7 +1266,7 @@ async def _process_task_attempt(
                 )
             egress_proxy = EgressProxy(EGRESS_PROXY, control)
             if task_data.egress.run_through_proxy:
-                validate_proxy_entries(run_egress_policy, task_data.egress.run_inspect)
+                validate_proxy_entries(run_egress_policy or [], task_data.egress.run_inspect)
                 stage_egress = egress_proxy
             for profile in task_data.egress.children.values():
                 validate_proxy_entries(profile.egress, profile.inspect)
@@ -1272,6 +1276,19 @@ async def _process_task_attempt(
         plan = GenerationPlan.from_task(task_data)
 
         attempt_id = task_attempt_id(task_row.id, attempt_started_at)
+
+        egress_context = {
+            "benchmark_id": str(benchmark_id),
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "org_id": str(org.id),
+        }
+
+        def stage_policy(
+            policy: EgressPolicy | None, stage: str, step: str | None = None, phase: str | None = None
+        ) -> EgressPolicy:
+            return select_policy(policy, stage, step, phase, context=egress_context)
+
         labels = {
             "Benchmark": start_benchmark_request.benchmark_name,
             "Id": str(benchmark_id),
@@ -1340,7 +1357,7 @@ async def _process_task_attempt(
                         companion_models=contract.kwargs.get("companion_models"),
                         identity=identity,
                         org_name=org.name,
-                        egress=run_egress_policy,
+                        egress=stage_policy(run_egress_policy, "gateway"),
                         allow_provider_tools=contract.allow_provider_tools,
                         rotation=token_rotation,
                     )
@@ -1381,6 +1398,8 @@ async def _process_task_attempt(
                             wall_timeout.reschedule(None)
 
         async with AsyncExitStack() as sandbox_stack:
+            token = policy_context.set(egress_context)
+            sandbox_stack.callback(policy_context.reset, token)
             if queue_context is None:
                 sandbox = await sandbox_stack.enter_async_context(sandbox_context())
             else:
@@ -1469,11 +1488,9 @@ async def _process_task_attempt(
                 async def install_agent() -> None:
                     if oracle:
                         return
+                    install_policy = stage_policy(start_benchmark_request.contract.install_egress, "install")
                     if not unrestricted_docker:
-                        await apply_egress_policy(
-                            agent_sandbox,
-                            start_benchmark_request.contract.install_egress_policy,
-                        )
+                        await apply_egress_policy(agent_sandbox, install_policy)
                     try:
                         await install_agent_dependencies(
                             agent_sandbox,
@@ -1494,8 +1511,9 @@ async def _process_task_attempt(
                 if not install_after_setup:
                     await install_agent()
 
+                setup_policy = stage_policy(setup_egress, "setup")
                 if not unrestricted_docker:
-                    await apply_egress_policy(sandbox, task_data.egress.setup_task)
+                    await apply_egress_policy(sandbox, setup_policy)
 
                 def run_attempt() -> RunAttempt:
                     assert task_row.credited_wall_deadline_at is not None
@@ -1548,7 +1566,7 @@ async def _process_task_attempt(
                 async def run_generation(
                     run_plan: GenerationPlan,
                     run_controller: ExternalServiceDeadlineController,
-                    run_egress: EgressPolicy,
+                    run_egress: EgressPolicy | None,
                     run_user: str | None,
                     output_key: str | None,
                     *,
@@ -1559,6 +1577,7 @@ async def _process_task_attempt(
                     ] = persist_generation_accounting_summary,
                 ) -> tuple[AgentCausedExitReason | None, float]:
                     nonlocal agent_attempt_started, phase, redact_error
+                    run_egress = stage_policy(run_egress, "run", step_name, "run" if step_name else None)
                     run_access = RunStageAccess()
                     if not unrestricted_docker:
                         run_access = await sandbox_stack.enter_async_context(
@@ -1686,7 +1705,9 @@ async def _process_task_attempt(
                             replace(plan, allowance_seconds=step.agent_timeout),
                             step_controller,
                             combine_run_egress_policies(
-                                step.egress_run, start_benchmark_request.contract.egress_allowlist
+                                step.egress_run,
+                                start_benchmark_request.contract.egress_allowlist,
+                                default_allow_all=True,
                             ),
                             step.agent_user,
                             step_output_key(step),
@@ -1699,8 +1720,10 @@ async def _process_task_attempt(
                         nonlocal phase
                         phase = next_phase
 
-                    async def restrict_egress(policy: EgressPolicy) -> None:
-                        await apply_egress_policy(sandbox, policy)
+                    async def restrict_egress(policy: EgressPolicy | None, step: str, phase: str) -> None:
+                        selected = stage_policy(policy, "step", step, phase)
+                        if not unrestricted_docker:
+                            await apply_egress_policy(sandbox, selected)
 
                     stepped = await run_steps(
                         StepRun(
@@ -1718,7 +1741,7 @@ async def _process_task_attempt(
                             until_stream_ends=until_stream_ends,
                             set_phase=set_phase,
                             redact=lambda text: redact_error(text) if redact_error is not None else text,
-                            restrict_egress=None if unrestricted_docker else restrict_egress,
+                            restrict_egress=restrict_egress,
                         ),
                         deadline_controller,  # noqa: F821
                     )
@@ -1758,8 +1781,9 @@ async def _process_task_attempt(
                     logger.info(
                         "Evaluating agent %s in sandbox %s", start_benchmark_request.contract.name, sandbox.name
                     )
+                    evaluation_policy = stage_policy(evaluation_egress, "evaluation")
                     if not unrestricted_docker:
-                        await apply_egress_policy(sandbox, task_data.egress.evaluation)
+                        await apply_egress_policy(sandbox, evaluation_policy)
                     task_logs.last_log_time = time.monotonic()
                     grading_releases: list[asyncio.Task[None]] = []
 

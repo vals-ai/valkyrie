@@ -23,6 +23,7 @@
         "egress_allowlist": [],
         "install_egress": null,
         "allow_provider_tools": false,
+        "isolate_agent_uid": false,
         "secrets": {},
         "kwargs": {},
         "inference_settings_attested": false,

@@ -1,7 +1,9 @@
 import io
+import logging
 import os
 import tarfile
 from collections.abc import Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,6 +22,7 @@ from benchmark_service.sandbox.types import SandboxSource
 
 from tests.unit.datasets.support import FakeSandbox, OuterSandbox, ShellSandbox
 from tracker.services.datasets import artifacts, separate_verifier
+from tracker import egress
 from tracker.services.datasets.artifacts import SkippedArtifact, StagedArtifact, stage_artifacts
 from tracker.services.datasets.compose import ComposeRuntime
 from tracker.services.datasets.config import ArtifactConfig, TaskConfig
@@ -34,6 +37,31 @@ from tracker.services.datasets.separate_verifier import (
 )
 
 AGENT_SOURCE = ImageSource(image="agent:1")
+
+
+@pytest.mark.description("Separate verifier policy events retain attempt context for implicit and explicit policies.")
+@pytest.mark.parametrize("network", ["", "network_mode = 'public'", "network_mode = 'no-network'"])
+async def test_separate_verifier_policy_event(
+    tests_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, network: str
+) -> None:
+    context = {"attempt_id": "attempt-1", "benchmark_id": "run-1", "task_id": "task-1", "org_id": "org-1"}
+    monkeypatch.setattr(egress, "policy_context", ContextVar("test_policy_context", default=context), raising=False)
+    logger = logging.getLogger("tracker.egress")
+    logger.addHandler(caplog.handler)
+    try:
+        await grade(
+            TaskConfig.parse(f"[verifier]\nenvironment_mode = 'separate'\n{network}"),
+            FakeProvider([verifier_sandbox()]),
+            tests_dir,
+        )
+    finally:
+        logger.removeHandler(caplog.handler)
+    records = [record for record in caplog.records if getattr(record, "event", None) == "task.egress.policy"]
+    assert len(records) == 1
+    assert getattr(records[0], "stage") == "evaluation"
+    assert getattr(records[0], "phase") == "separate_verifier"
+    assert getattr(records[0], "implicit_allow_all") is (network == "")
+    assert all(getattr(records[0], key) == value for key, value in context.items())
 
 
 class FakeProvider:

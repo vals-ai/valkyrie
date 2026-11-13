@@ -39,8 +39,8 @@ class StepPlan(BaseModel):
     name: str
     agent_timeout: float | None = None
     agent_user: str | None = None
-    egress_run: EgressPolicy
-    egress_evaluation: EgressPolicy
+    egress_run: EgressPolicy | None
+    egress_evaluation: EgressPolicy | None
 
 
 class TaskFolderResponse(RetrieveTaskResponse):
@@ -71,9 +71,11 @@ def dockerfile_workdir(dockerfile: Path) -> str | None:
     return workdir
 
 
-def stage_egress(stage: NetworkSettings, environment: EnvironmentConfig) -> EgressPolicy:
+def stage_egress(stage: NetworkSettings, environment: EnvironmentConfig) -> EgressPolicy | None:
     settings = stage if stage.network_mode is not None else environment
     match settings.network_mode:
+        case None:
+            return None
         case NetworkMode.NO_NETWORK:
             return []
         case NetworkMode.ALLOWLIST:

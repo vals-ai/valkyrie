@@ -66,6 +66,7 @@ class AgentContractRequest(AgentContractRequestBase):
     egress_allowlist: list[str] = []
     install_egress: Literal["*"] | list[str] | None = None
     allow_provider_tools: bool = False
+    isolate_agent_uid: bool = False
     secrets: dict[str, str] = {}
     kwargs: dict[str, str] = {}
     inference_settings_attested: bool = False

@@ -276,7 +276,7 @@ class AgentConfig(NetworkSettings):
 
 
 class EnvironmentConfig(NetworkSettings):
-    network_mode: NetworkMode | None = NetworkMode.PUBLIC
+    network_mode: NetworkMode | None = None
     build_timeout_sec: float = 600.0
     docker_image: str | None = None
     os: TaskOS = TaskOS.LINUX

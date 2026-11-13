@@ -163,6 +163,10 @@ class ProjectRepository:
         rows = self._reader.list_rows(org_id, include_archived=True)
         return next((self._reader.get(org_id, row.id) for row in rows if row.handle == handle), None)
 
+    @property
+    def reads_from_service(self) -> bool:
+        return self._reader is not None
+
     def get_for_run(self, benchmark_id: UUID) -> Project | None:
         if self._reader is not None:
             link = self._session.exec(

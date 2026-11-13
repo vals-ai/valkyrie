@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from benchmark_service import ResourceCapacity, SandboxCapacity, SandboxCapacityDomain, SandboxError
+from sqlalchemy.engine import Connection
 
 from tests.factories import make_benchmark
 from tracker.database.models import Org
@@ -14,6 +15,35 @@ from tracker.executor.control_queue import queue_pool_id, reserved_queue_pool_id
 from tracker.local.resources import LocalResources
 from tracker.scheduler import coordinator
 from tracker.types import LocalBenchmarkArguments, OrgContext
+
+
+@pytest.mark.description(
+    "Scheduler shutdown completes on its first cancellation when an in-flight lock acquisition fails."
+)
+async def test_shutdown_preserves_cancellation_when_lock_acquisition_fails() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def connect() -> Connection:
+        entered.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("database unavailable")
+
+    scheduler = coordinator.SharedPoolScheduler(Mock(connect=Mock(side_effect=connect)))
+    stopping: asyncio.Task[None] | None = None
+    scheduler.start()
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        stopping = asyncio.create_task(scheduler.stop())
+        asyncio.get_running_loop().call_soon(release.set)
+        await asyncio.wait_for(asyncio.shield(stopping), timeout=5)
+
+        assert stopping.done()
+    finally:
+        release.set()
+        await scheduler.stop()
+        if stopping is not None:
+            await stopping
 
 
 @pytest.mark.description("The pool provider uses the run's saved runtime.")

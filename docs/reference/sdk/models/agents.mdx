@@ -14,7 +14,7 @@ Represents an agent's `contract.yaml`, which says how to install and run the age
 Use `from_directory()` to load and check one before publishing, and `validate_kwargs()` to check a
 run's `-k` values. Tracker checks the published contract again when a run starts.
 
-Agents model · 13 fields
+Agents model · 14 fields
 
 **Fields**
 
@@ -44,6 +44,10 @@ Agents model · 13 fields
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"allow_provider_tools"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"isolate_agent_uid"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -78,7 +82,7 @@ Agents model · 13 fields
 
 Agent definition submitted when starting a run.
 
-Agents model · 14 fields
+Agents model · 15 fields
 
 **Fields**
 
@@ -120,6 +124,10 @@ Agents model · 14 fields
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"allow_provider_tools"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"isolate_agent_uid"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · bool · default: <code>{"False"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

@@ -299,6 +299,17 @@ class TestRunCmdValidation:
 
 @pytest.mark.description("End-to-end: YAML file -> AgentContractRequest with kwargs resolved.")
 class TestParseYamlContract:
+    @pytest.mark.description("Agent UID isolation is opt-in and survives YAML contract parsing.")
+    @pytest.mark.parametrize("isolated", [False, True])
+    def test_agent_uid_isolation(self, tmp_path: Path, isolated: bool) -> None:
+        path = tmp_path / "agent.yaml"
+        field = "\nisolate_agent_uid: true" if isolated else ""
+        path.write_text('name: agent\ninstall_cmd: "true"\nrun_cmd: "cat {problem_statement_path}"' + field)
+
+        result = _parse_yaml_contract(path, AgentConfig())
+
+        assert result.isolate_agent_uid is isolated
+
     def _write_yaml(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "contract.yaml"
         p.write_text(dedent(content))
@@ -424,7 +435,6 @@ class TestParseYamlContract:
         result = _parse_yaml_contract(path, AgentConfig())
 
         assert result.install_egress == ["https://packages.example.com"]
-        assert result.install_egress_policy == ["https://packages.example.com"]
         assert result.egress_allowlist == []
 
     @pytest.mark.description("Legacy egress settings get defaults and map to the allowlist.")
@@ -440,7 +450,6 @@ class TestParseYamlContract:
         unrestricted_result = _parse_yaml_contract(unrestricted, AgentConfig())
 
         assert unrestricted_result.install_egress is None
-        assert unrestricted_result.install_egress_policy == "*"
         assert unrestricted_result.egress_allowlist == []
 
         unrestricted.write_text(
@@ -456,7 +465,7 @@ class TestParseYamlContract:
         )
         legacy_result = _parse_yaml_contract(unrestricted, AgentConfig())
 
-        assert legacy_result.install_egress_policy == "*"
+        assert legacy_result.install_egress is None
         assert legacy_result.egress_allowlist == ["https://api.openai.com"]
 
     @pytest.mark.description("Install egress can sit alongside a legacy run allowlist.")
@@ -477,7 +486,6 @@ class TestParseYamlContract:
         result = _parse_yaml_contract(path, AgentConfig())
 
         assert result.install_egress == ["https://packages.example.com"]
-        assert result.install_egress_policy == ["https://packages.example.com"]
         assert result.egress_allowlist == ["https://api.openai.com"]
 
     @pytest.mark.description("The obsolete agent egress field is rejected.")

@@ -114,6 +114,7 @@ class AgentContractRequest(BaseModel):
     egress_allowlist: list[str] = []
     install_egress: EgressPolicy | None = None
     allow_provider_tools: bool = False
+    isolate_agent_uid: bool = False
     secrets: dict[str, str] = {}
     kwargs: dict[str, str] = {}
     inference_settings_attested: bool = False
@@ -125,10 +126,6 @@ class AgentContractRequest(BaseModel):
         if isinstance(value, dict) and "egress" in value:
             raise ValueError("'egress' is no longer supported; use 'install_egress'")
         return value
-
-    @property
-    def install_egress_policy(self) -> EgressPolicy:
-        return self.install_egress if self.install_egress is not None else "*"
 
     @field_validator("output_artifacts")
     @classmethod

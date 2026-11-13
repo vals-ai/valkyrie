@@ -81,6 +81,7 @@ def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> Agen
             egress_allowlist=agent_contract.egress_allowlist,
             install_egress=agent_contract.install_egress,
             allow_provider_tools=agent_contract.allow_provider_tools,
+            isolate_agent_uid=agent_contract.isolate_agent_uid,
             secrets=agent_contract.secrets,
         )
     except ContractValidationError:

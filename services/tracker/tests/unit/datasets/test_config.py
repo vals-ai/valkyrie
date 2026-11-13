@@ -78,7 +78,7 @@ class TestTaskConfig:
         assert config.schema_version == "1.4"
         assert (config.agent.timeout_sec, config.verifier.timeout_sec) == (600, 60)
         assert (config.environment.cpus, config.environment.memory_mb, config.environment.workdir) == (1, 2048, "/app")
-        assert config.environment.network_mode == NetworkMode.PUBLIC
+        assert config.environment.network_mode is None
         assert config.environment.build_timeout_sec == 600
         assert config.agent.network_mode is None
         assert config.environment.os == TaskOS.LINUX
@@ -127,7 +127,7 @@ class TestTaskConfig:
         assert config.agent.network_mode == NetworkMode.ALLOWLIST
         assert config.agent.allowed_hosts == ["pypi.org", "files.pythonhosted.org"]
         assert config.verifier.allowed_hosts == ["api.openai.com"]
-        assert config.environment.network_mode == NetworkMode.PUBLIC
+        assert config.environment.network_mode is None
 
     @pytest.mark.description("Hosts are lowercased and stripped.")
     def test_hosts_are_lowercased_and_stripped(self) -> None:

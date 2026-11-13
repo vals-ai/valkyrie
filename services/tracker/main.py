@@ -117,6 +117,7 @@ from tracker.database.models import (
     ExecutorDispatch,
     ExecutorDispatchPayload,
     Org,
+    Project,
     RunAccessKey,
     RunProject,
 )
@@ -746,12 +747,16 @@ def _commit_start(
         )
         try:
             repository = BenchmarkRepository(session)
+            projects = ProjectRepository(session)
+            linked = None
+            if project_id is not None and projects.reads_from_service:
+                linked = projects.get_for_link(benchmark.org_id, project_id)
             if request.admission_id is not None:
                 lock_executor_admission(session)
                 if repository.get_by_id(benchmark.id) is not None:
                     raise RepeatedAdmissionError(str(benchmark.id))
             if project_id is not None:
-                reject_archived_project(ProjectRepository(session).get_for_link(benchmark.org_id, project_id))
+                reject_archived_project(linked or projects.get_for_link(benchmark.org_id, project_id))
             repository.add_tasks(benchmark.org_id, benchmark.id, task_ids)
             dispatch = admit_start_dispatch(session, benchmark=benchmark, dispatch_id=dispatch_id, task_ids=task_ids)
             _ensure_run_capacity(session, benchmark.org_id, benchmark.id)
@@ -2422,15 +2427,17 @@ def _commit_regrade(
             update={"regraded_from_run_id": source_id, "regrade_skipped_task_ids": tasks.skipped_task_ids}
         )
         try:
+            projects = ProjectRepository(session)
+            project = _linked_project(projects, source_id) if projects.reads_from_service else None
             if _regrade_source(session, org, source_id, for_update=True).tasks != tasks:
                 raise HTTPException(status_code=409, detail="Source run changed during regrade; retry the request.")
             dispatch = admit_start_dispatch(session, benchmark=run, dispatch_id=dispatch_id, task_ids=tasks.task_ids)
             _ensure_run_capacity(session, run.org_id, run.id)
             repository = BenchmarkRepository(session)
             repository.add_tasks_with_errors(*regrade_task_rows(run, tasks, dispatch.created_at))
-            project = ProjectRepository(session).get_for_run(source_id)
+            if not projects.reads_from_service:
+                project = _linked_project(projects, source_id)
             if project is not None:
-                reject_archived_project(ProjectRepository(session).get_for_link(project.org_id, project.id))
                 repository.save(
                     RunProject(benchmark_id=run.id, project_id=project.id, created_by_email=run.started_by_email)
                 )
@@ -2576,6 +2583,13 @@ async def regrade_benchmark(
     )
 
 
+def _linked_project(projects: ProjectRepository, run_id: UUID) -> Project | None:
+    project = projects.get_for_run(run_id)
+    if project is not None:
+        reject_archived_project(projects.get_for_link(project.org_id, project.id))
+    return project
+
+
 def _apply_recovery(
     benchmark_id: UUID,
     issued_keys: Sequence[IssuedRunKey],
@@ -2595,11 +2609,12 @@ def _apply_recovery(
     *,
     update_agent: bool = False,
 ) -> AdmissionResult | None:
+    projects = ProjectRepository(session)
+    current_project = _linked_project(projects, benchmark_id) if projects.reads_from_service else None
     get_executor_admission(session, for_update=True)
     benchmark_row = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
-    current_project = ProjectRepository(session).get_for_run(benchmark_row.id)
-    if current_project is not None:
-        reject_archived_project(ProjectRepository(session).get_for_link(current_project.org_id, current_project.id))
+    if not projects.reads_from_service:
+        current_project = _linked_project(projects, benchmark_row.id)
     if selects_project_gateway_key(org) and not reads_secrets_file(benchmark_row.arguments.properties):
         if current_project is not None:
             secrets = {

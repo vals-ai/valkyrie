@@ -24,6 +24,7 @@ from tracker.aws.secrets import SecretsManagerStore
 from tracker.clients.projects import ProjectServiceClient
 from tracker.exceptions import ProjectNameTakenError, SecretNotFoundError
 import tracker.repositories.project as project_repository
+from tracker.repositories.executor_release import ExecutorReleaseRepository
 from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
     Benchmark,
@@ -37,7 +38,7 @@ from tracker.database.models import (
     SpendType,
     Task,
 )
-from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
+from tracker.types import AWSBenchmarkArguments, AgentContractRequest, RunExecutionRequest, StartBenchmarkRequest
 
 pytestmark = pytest.mark.usefixtures("mapped_providers")
 
@@ -1551,6 +1552,103 @@ def test_retry_or_resume_of_a_run_in_an_archived_project_is_refused_without_chan
     database_session.expire_all()
     stored = database_session.get(Benchmark, benchmark.id)
     assert stored is not None and stored.status == BenchmarkStatus.STOPPED
+
+
+def _record_service_calls_and_admission_locks(monkeypatch: MonkeyPatch, project: Project) -> list[str]:
+    events: list[str] = []
+    row = project.model_dump(mode="json", exclude={"org_id"})
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        events.append("service")
+        if request.url.path.endswith("/projects"):
+            return httpx.Response(200, json={"projects": [row]})
+        return httpx.Response(200, json=row)
+
+    reader = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(project_repository, "project_service_reader", lambda: reader, raising=False)
+    admission = ExecutorReleaseRepository.admission
+
+    def locked_admission(self: ExecutorReleaseRepository, *, for_update: bool = False) -> Any:
+        if for_update:
+            events.append("lock")
+        return admission(self, for_update=for_update)
+
+    monkeypatch.setattr(ExecutorReleaseRepository, "admission", locked_admission)
+    return events
+
+
+def _no_service_call_under_the_lock(events: list[str]) -> bool:
+    return "service" in events and "lock" in events and "service" not in events[events.index("lock") :]
+
+
+@pytest.mark.usefixtures("active_executor_release")
+@pytest.mark.description(
+    "With reads on, a retry or resume reads its project from the service inside recovery before it takes the run admission lock."
+)
+@pytest.mark.parametrize("query", ["", "?retry=true"])
+def test_retry_or_resume_reads_the_project_service_before_the_admission_lock(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    router_bench: Project,
+    query: str,
+) -> None:
+    benchmark = _saved_run(database_session, contract)
+    benchmark.status = BenchmarkStatus.STOPPED
+    benchmark.arguments = benchmark.arguments.model_copy(update={"sandbox_provider_secret_name": "provider-secret"})
+    database_session.add(benchmark)
+    database_session.add(RunProject(benchmark_id=benchmark.id, project_id=router_bench.id))
+    database_session.commit()
+    monkeypatch.setattr(main_module, "reset_to_in_progress_status", lambda *_args, **_kwargs: ["task_0"])
+    events = _record_service_calls_and_admission_locks(monkeypatch, router_bench)
+    apply_recovery = main_module._apply_recovery
+
+    def recorded_recovery(*args: Any, **kwargs: Any) -> Any:
+        events.append("recovery")
+        return apply_recovery(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "_apply_recovery", recorded_recovery)
+
+    response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}{query}")
+
+    assert response.status_code == 200, response.text
+    assert _no_service_call_under_the_lock(events[events.index("recovery") :]), events
+
+
+@pytest.mark.usefixtures("active_executor_release")
+@pytest.mark.description(
+    "With reads on, an admitted start reads its project from the service before it takes the run admission lock."
+)
+def test_admitted_start_reads_the_project_service_before_the_admission_lock(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    router_bench: Project,
+) -> None:
+    events = _record_service_calls_and_admission_locks(monkeypatch, router_bench)
+    request = RunExecutionRequest.model_validate(_start_request(contract, None) | {"admission_id": str(uuid4())})
+    benchmark = Benchmark(
+        org_id=TEST_ORG_ID, name="swebench", arguments=AWSBenchmarkArguments(contract=contract, concurrency=1)
+    )
+
+    _ = main_module._commit_start(
+        database_session.get_bind(),
+        benchmark.model_dump_json(),
+        request.model_copy(update={"priority": 0}),
+        uuid4(),
+        ["task_0"],
+        None,
+        {"request_id": "admitted-start", "trace_headers": {}},
+        (),
+        project_id=router_bench.id,
+        selected_project_gateway_root=False,
+    )
+
+    assert _no_service_call_under_the_lock(events), events
+    database_session.expire_all()
+    link = database_session.exec(select(RunProject).where(RunProject.benchmark_id == benchmark.id)).one()
+    assert link.project_id == router_bench.id
 
 
 def _archive_in_the_background(database_session: Session, project: Project) -> None:

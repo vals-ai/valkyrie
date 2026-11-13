@@ -859,6 +859,61 @@ def _controlled_contract() -> AgentContractRequest:
 
 @pytest.mark.description("Agent execution, output collection, and runtime command construction.")
 class TestRunAgent:
+    @pytest.mark.description("Opted-in episodes protect the signing key and tell CBS to isolate slot commands.")
+    @pytest.mark.parametrize("isolated", [False, True])
+    async def test_agent_uid_configuration(self, monkeypatch: pytest.MonkeyPatch, isolated: bool) -> None:
+        sandbox = AsyncMock()
+        sandbox.id = "isolated"
+        sandbox.name = "isolated"
+        sandbox.state = "started"
+        sandbox.exec.return_value = ExecResult(exit_code=0)
+        monkeypatch.setattr(sandbox_module, "_stream_controlled_output", AsyncMock(return_value=(None, 0.0)))
+        contract = _controlled_contract().model_copy(update={"isolate_agent_uid": isolated})
+
+        await run_agent(
+            sandbox,
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            _ignore_output,
+            "/workspace",
+            object_store=_mock_object_store(),
+            plan=GenerationPlan(allowance_seconds=10, staged=True, episode=Episode(command="true", parallel_agents=1)),
+            deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=10),
+            log_line=_ignore_output,
+        )
+
+        config = json.loads(sandbox.upload_file.await_args_list[1].args[1])
+        assert config["isolate_agent_uid"] is isolated
+        commands = [call.args[0] for call in sandbox.exec.await_args_list]
+        assert any("chown root:root" in command for command in commands) is isolated
+        assert any("chmod 600 /run/valkyrie-stage/key" in command for command in commands)
+        assert "mkdir -m 700 /run/valkyrie-stage && mkdir -m 700 /run/valkyrie-stage/ack" in commands
+        assert not any("chmod 700" in command for command in commands)
+
+    @pytest.mark.description("UID isolation rejects an explicit agent user and non-episode execution before launch.")
+    @pytest.mark.parametrize("user,episode", [("1000", Episode(command="true", parallel_agents=1)), (None, None)])
+    async def test_agent_uid_conflicts(self, user: str | None, episode: Episode | None) -> None:
+        sandbox = AsyncMock()
+        contract = _controlled_contract().model_copy(update={"isolate_agent_uid": True})
+
+        with pytest.raises(InvalidSandboxConfigurationError, match="requires an episode without agent.user"):
+            await run_agent(
+                sandbox,
+                contract,
+                "/tmp/problem.txt",
+                "task_0",
+                _ignore_output,
+                "/workspace",
+                object_store=_mock_object_store(),
+                plan=GenerationPlan(allowance_seconds=10, staged=True, episode=episode),
+                deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=10),
+                log_line=_ignore_output,
+                user=user,
+            )
+
+        sandbox.exec.assert_not_awaited()
+
     @pytest.mark.description("An agent run collects outputs before it raises the agent error again.")
     async def test_run_agent_collects_outputs_before_reraising_agent_error(
         self,

@@ -76,6 +76,7 @@ class AgentContract(BaseModel):
     egress_allowlist: list[str] = Field(default_factory=list)
     install_egress: EgressPolicy | None = None
     allow_provider_tools: bool = False
+    isolate_agent_uid: bool = False
     secrets: dict[str, str] = Field(default_factory=dict)
     ingest_lambda: str | None = None
     defaults: dict[str, Parameter] = Field(
