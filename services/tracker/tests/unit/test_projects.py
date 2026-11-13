@@ -25,6 +25,7 @@ from tracker.clients.projects import ProjectServiceClient
 from tracker.exceptions import ProjectNameTakenError, SecretNotFoundError
 import tracker.repositories.project as project_repository
 from tracker.repositories.executor_release import ExecutorReleaseRepository
+from tracker.repositories import project as project_repository_module
 from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
     Benchmark,
@@ -1649,6 +1650,35 @@ def test_admitted_start_reads_the_project_service_before_the_admission_lock(
     database_session.expire_all()
     link = database_session.exec(select(RunProject).where(RunProject.benchmark_id == benchmark.id)).one()
     assert link.project_id == router_bench.id
+
+
+@pytest.mark.description(
+    "Retrying or resuming a run whose linked project the service answers 404 for raises `LookupError` and leaves the run unchanged."
+)
+@pytest.mark.parametrize("query", ["", "?retry=true"])
+def test_retry_or_resume_of_a_run_whose_project_the_service_lost_fails_without_changing_the_run(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    router_bench: Project,
+    query: str,
+) -> None:
+    benchmark = _saved_run(database_session, contract)
+    benchmark.status = BenchmarkStatus.STOPPED
+    database_session.add(benchmark)
+    database_session.add(RunProject(benchmark_id=benchmark.id, project_id=router_bench.id))
+    database_session.commit()
+    service = ProjectServiceClient(
+        httpx.Client(base_url="http://projects", transport=httpx.MockTransport(lambda _request: httpx.Response(404)))
+    )
+    monkeypatch.setattr(project_repository_module, "project_service_reader", lambda: service)
+
+    with pytest.raises(LookupError, match=str(router_bench.id)):
+        _ = client.post(f"/retry-or-resume-benchmark/{benchmark.id}{query}")
+
+    database_session.expire_all()
+    stored = database_session.get(Benchmark, benchmark.id)
+    assert stored is not None and stored.status == BenchmarkStatus.STOPPED
 
 
 def _archive_in_the_background(database_session: Session, project: Project) -> None:

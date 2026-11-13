@@ -15,6 +15,20 @@ Each push makes an immutable version.
 - A `dataset.toml` in the parent folder pins the exact tasks and their digests, and its version
   becomes a tag.
 
+## Read secrets in task environments
+
+- In `task.toml`, use a whole-value `${NAME}` to read a secret available to the run.
+  For JSON secrets, this reads the field named `NAME`.
+- Use `${SECRET#FIELD}` to select a different JSON field, or
+  `${SECRET#FIELD:-fallback}` to use a default when the secret or field is unavailable.
+- These references work in agent, verifier, verifier sandbox, and solution environment
+  values, including step verifiers. A field reference requires a JSON object secret.
+
+```toml
+[verifier.env]
+API_KEY = "${ClientConfig#API_KEY}"
+```
+
 ## Push a folder
 
 ```bash

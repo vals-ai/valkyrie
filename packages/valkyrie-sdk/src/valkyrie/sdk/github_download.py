@@ -1,7 +1,9 @@
 """GitHub downloads that agents and datasets are installed from."""
 
 import asyncio
+import logging
 import re
+import shutil
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +11,8 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urljoin
 
 from valkyrie.sdk.errors import ValkyrieInputError
+
+logger = logging.getLogger(__name__)
 
 
 async def _run_git_command(repo_path: Path | None, *args: str) -> str:
@@ -45,7 +49,32 @@ async def _run_git_command(repo_path: Path | None, *args: str) -> str:
     return stdout.decode()
 
 
-async def _checkout_submodules(repository_path: Path, repository_url: str) -> None:
+def _overlaps(path: str, within: str | None) -> bool:
+    return within is None or path == within or path.startswith(f"{within}/") or within.startswith(f"{path}/")
+
+
+def _discard_partial_submodule(repository_path: Path, gitdir: Path, name: str, path: str) -> None:
+    for container, relative in (((gitdir / "modules").resolve(), name), (repository_path.resolve(), path)):
+        target = container / relative
+        if target.name in {"", ".", ".."}:
+            continue
+        parent = target.parent.resolve()
+        if parent.is_relative_to(container):
+            shutil.rmtree(parent / target.name, ignore_errors=True)
+
+
+async def _fetch_submodule(repository_path: Path, name: str, path: str) -> None:
+    command = ("submodule", "update", "--init", "--checkout")
+    try:
+        await _run_git_command(repository_path, *command, "--depth", "1", "--", path)
+    except ChildProcessError:
+        logger.warning("Shallow fetch of submodule %s failed; fetching full history", path)
+        gitdir = Path((await _run_git_command(repository_path, "rev-parse", "--absolute-git-dir")).rstrip("\n"))
+        await asyncio.to_thread(_discard_partial_submodule, repository_path, gitdir, name, path)
+        await _run_git_command(repository_path, *command, "--no-recommend-shallow", "--", path)
+
+
+async def _checkout_submodules(repository_path: Path, repository_url: str, within: str | None = None) -> None:
     if not await asyncio.to_thread((repository_path / ".gitmodules").is_file):
         return
     config = await _run_git_command(repository_path, "config", "--file", ".gitmodules", "--null", "--list")
@@ -58,6 +87,8 @@ async def _checkout_submodules(repository_path: Path, repository_url: str) -> No
             submodules.setdefault(name, {})[field] = value
     for name, fields in submodules.items():
         path, url = fields.get("path", ""), fields.get("url", "")
+        if not _overlaps(path, within):
+            continue
         if url.startswith(("./", "../")):
             url = urljoin(repository_url.rstrip("/") + "/", url)
         match = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/?", url)
@@ -70,8 +101,9 @@ async def _checkout_submodules(repository_path: Path, repository_url: str) -> No
         if not resolved.is_relative_to(repository_path.resolve()):
             raise ValueError("Submodule path escapes repository")
         await _run_git_command(repository_path, "config", "--local", f"submodule.{name}.url", url)
-        await _run_git_command(repository_path, "submodule", "update", "--init", "--checkout", "--", path)
-        await _checkout_submodules(submodule_path, url)
+        await _fetch_submodule(repository_path, name, path)
+        remaining = within.removeprefix(f"{path}/") if within and within.startswith(f"{path}/") else None
+        await _checkout_submodules(submodule_path, url, within=remaining)
 
 
 async def _split_tree_path(repository_path: Path, parts: list[str]) -> tuple[str, str]:
@@ -116,7 +148,7 @@ async def download_github(github_url: str) -> AsyncGenerator[Path, None]:
             await _run_git_command(repository_path, "sparse-checkout", "init", "--cone")
             await _run_git_command(repository_path, "sparse-checkout", "set", "--", subfolder)
         await _run_git_command(repository_path, "checkout", reference, "--")
-        await _checkout_submodules(repository_path, repository_url)
+        await _checkout_submodules(repository_path, repository_url, within=subfolder or None)
         checkout_path = repository_path / subfolder if subfolder else repository_path
         if not checkout_path.resolve().is_relative_to(repository_path.resolve()):
             raise ValueError("GitHub subfolder escapes repository")

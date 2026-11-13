@@ -27,7 +27,9 @@ The Valkyrie CLI clones the repository on your machine with Git, including submo
 uploads it.
 
 - A `/tree/BRANCH/FOLDER` URL installs only *`FOLDER`* from branch *`BRANCH`*.
-- Submodules must be HTTPS GitHub repositories.
+- Only submodules inside the selected folder, or containing it, are fetched.
+- Each submodule is fetched shallowly at its pinned commit when the server allows it.
+- Fetched submodules must be HTTPS GitHub repositories.
 
 ## List agents
 

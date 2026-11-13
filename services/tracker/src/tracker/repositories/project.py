@@ -167,7 +167,7 @@ class ProjectRepository:
     def reads_from_service(self) -> bool:
         return self._reader is not None
 
-    def get_for_run(self, benchmark_id: UUID) -> Project | None:
+    def get_for_run(self, benchmark_id: UUID, *, strict: bool = False) -> Project | None:
         if self._reader is not None:
             link = self._session.exec(
                 select(Benchmark.org_id, RunProject.project_id)
@@ -176,7 +176,12 @@ class ProjectRepository:
                 .order_by(col(RunProject.id).desc())
                 .limit(1)
             ).first()
-            return None if link is None else self._reader.get(*link)
+            if link is None:
+                return None
+            project = self._reader.get(*link)
+            if project is None and strict:
+                raise LookupError(f"Project {link[1]} is not in the project service")
+            return project
         return self._session.exec(
             select(Project)
             .join(RunProject, col(RunProject.project_id) == col(Project.id))

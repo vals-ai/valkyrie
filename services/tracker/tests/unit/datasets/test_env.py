@@ -31,6 +31,28 @@ class StubStore:
 
 @pytest.mark.description("Values become literals, secrets or defaults.")
 class TestResolveEnv:
+    @pytest.mark.description("Explicit JSON fields resolve without changing the stored secret name.")
+    @pytest.mark.parametrize("field_value", ["token", "", 0])
+    async def test_explicit_field(self, field_value: str | int) -> None:
+        read = secret_reader(StubStore({"tenant/Config": {"API_KEY": field_value}}), lambda name: [f"tenant/{name}"])
+
+        resolved, from_secrets = await resolve_env({"KEY": "${Config#API_KEY}"}, read, "[verifier].env")
+
+        assert resolved == {"KEY": str(field_value)}
+        assert from_secrets == ["KEY"]
+
+    @pytest.mark.description("Unreadable JSON fields use the default or report the missing reference.")
+    @pytest.mark.parametrize("secret_value", [{"OTHER": "token"}, "plain"])
+    async def test_unreadable_field(self, secret_value: SecretValue) -> None:
+        read = secret_reader(StubStore({"Config": secret_value}), lambda name: [name])
+
+        resolved, from_secrets = await resolve_env({"KEY": "${Config#API_KEY:-fallback}"}, read, "[verifier].env")
+
+        assert resolved == {"KEY": "fallback"}
+        assert from_secrets == []
+        with pytest.raises(SecretsError, match="Config#API_KEY"):
+            await resolve_env({"KEY": "${Config#API_KEY}"}, read, "[verifier].env")
+
     @pytest.mark.description("Literals pass through and templates read secrets.")
     async def test_literals_pass_through_and_templates_read_secrets(self) -> None:
         resolved, from_secrets = await resolve_env(

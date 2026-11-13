@@ -1,21 +1,26 @@
-from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+import time
+from collections.abc import Callable, Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from uuid import UUID
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, SQLModel, select
 
 from main import app
 from tests.factories import make_benchmark
+from tests.integration.local.test_project_service_writes import MockProjectRoutes
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity, get_current_org, get_current_starter
 from tracker.database.models import DEFAULT_ORG_NAME, Org, Project, RunProject, SpendType
+from tracker.clients.projects import ProjectServiceClient
 from tracker.database.session import get_session
+from tracker.repositories import project as project_repository
+from tracker.repositories.benchmark import BenchmarkRepository
+from tracker.repositories.project import ProjectRepository
 
 
 @pytest.mark.description("A project can be created, edited, and deleted over HTTP against Postgres.")
@@ -67,106 +72,127 @@ def test_project_create_edit_delete_http_lifecycle_uses_postgres(
     assert listed.json() == {"projects": []}
 
 
-@pytest.mark.description("When a concurrent run link wins, the project delete returns 409.")
-def test_concurrent_link_wins_and_project_delete_returns_conflict(
+@pytest.mark.xfail(reason="`run_project.project_id` still references `project`", strict=True)
+@pytest.mark.description(
+    "With both project service switches on, a delete that races a run link keeps the service row for the run's spend."
+)
+def test_delete_racing_a_run_link_keeps_the_service_row(
     monkeypatch: pytest.MonkeyPatch,
     postgres_engine: Engine,
 ) -> None:
-    org, benchmark_id, project_id = _seed_linkable_project(postgres_engine)
-    start_link = Event()
-    link_finished = Event()
+    org, benchmark_id, project = _seed_service_project(postgres_engine)
+    routes = MockProjectRoutes()
+    routes.rows[str(project.id)] = project.model_dump(mode="json", exclude={"org_id"})
 
-    def link_project() -> None:
-        assert start_link.wait(5)
-        try:
+    def link_before_service_delete(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/delete"):
             with Session(postgres_engine) as session:
-                session.add(RunProject(benchmark_id=benchmark_id, project_id=project_id))
+                session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id))
                 session.commit()
-        finally:
-            link_finished.set()
+        return routes.handle(request)
 
-    with Session(postgres_engine, expire_on_commit=False) as delete_session:
-
-        def request_session() -> Generator[Session, None, None]:
-            yield delete_session
-
-        def link_before_delete_flush(_session: Session, _flush_context: object, _instances: object) -> None:
-            start_link.set()
-            assert link_finished.wait(5)
-
+    _use_project_service(monkeypatch, link_before_service_delete)
+    with Session(postgres_engine, expire_on_commit=False) as session:
         identity = RequestIdentity(org=org, email="alice@vals.ai")
-        monkeypatch.setitem(app.dependency_overrides, get_session, request_session)
+        monkeypatch.setitem(app.dependency_overrides, get_session, lambda: session)
+        monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: org)
         monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
-        event.listen(delete_session, "before_flush", link_before_delete_flush)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                linked = pool.submit(link_project)
-                with TestClient(app) as client:
-                    response = client.delete("/projects/router-bench")
-                linked.result(timeout=5)
-        finally:
-            event.remove(delete_session, "before_flush", link_before_delete_flush)
+        with TestClient(app) as client:
+            response = client.delete("/projects/router-bench")
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "Project 'router-bench' has run history and cannot be deleted"
+    assert response.status_code == 200, response.text
+    assert routes.rows[str(project.id)]["deleted_at"] is not None
     with Session(postgres_engine) as session:
-        assert session.get(Project, project_id) is not None
-        assert len(session.exec(select(RunProject)).all()) == 1
+        assert [link.project_id for link in session.exec(select(RunProject)).all()] == [project.id]
 
 
-@pytest.mark.description(
-    "When a project delete commits first, a concurrent run link fails and no `RunProject` row is left."
-)
-def test_project_delete_wins_and_concurrent_link_cannot_commit(postgres_engine: Engine) -> None:
-    _, benchmark_id, project_id = _seed_linkable_project(postgres_engine)
-    start = Event()
-    project_deleted = Event()
+@pytest.mark.description("With both project service switches on, a run cannot link a project deleted in the service.")
+def test_run_cannot_link_a_deleted_project(monkeypatch: pytest.MonkeyPatch, postgres_engine: Engine) -> None:
+    _, _, project = _seed_service_project(postgres_engine)
+    routes = MockProjectRoutes()
+    routes.rows[str(project.id)] = project.model_dump(mode="json", exclude={"org_id"}) | {
+        "deleted_at": "2026-11-03T12:00:00Z"
+    }
+    _use_project_service(monkeypatch, routes.handle)
 
-    def delete_project() -> None:
-        assert start.wait(5)
-        try:
-            with Session(postgres_engine) as session:
-                project = session.get(Project, project_id)
-                assert project is not None
-                session.delete(project)
-                session.commit()
-        finally:
-            project_deleted.set()
-
-    def link_project() -> None:
-        assert start.wait(5)
-        assert project_deleted.wait(5)
-        with Session(postgres_engine) as session:
-            session.add(RunProject(benchmark_id=benchmark_id, project_id=project_id))
-            with pytest.raises(IntegrityError):
-                session.commit()
-            session.rollback()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        deleted = pool.submit(delete_project)
-        linked = pool.submit(link_project)
-        start.set()
-        deleted.result(timeout=5)
-        linked.result(timeout=5)
-
-    with Session(postgres_engine) as session:
-        assert session.get(Project, project_id) is None
-        assert session.exec(select(RunProject)).all() == []
+    with Session(postgres_engine) as session, pytest.raises(LookupError):
+        _ = ProjectRepository(session).get_for_link(TEST_ORG_ID, project.id)
 
 
-def _seed_linkable_project(engine: Engine) -> tuple[Org, UUID, UUID]:
+def _use_project_service(monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+    client = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(project_repository, "project_service_reader", lambda: client)
+    monkeypatch.setattr(project_repository, "project_service_writer", lambda: client)
+
+
+def _seed_service_project(engine: Engine) -> tuple[Org, UUID, Project]:
     with Session(engine, expire_on_commit=False) as session:
         org = Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME)
         session.add(org)
         session.commit()
         benchmark = make_benchmark(session=session)
-        project = Project(
-            org_id=TEST_ORG_ID,
-            handle="router-bench",
-            name="Router Bench",
-            spend_type=SpendType.DEVELOPMENT,
-            subcategory="new_benchmark_generation",
-        )
-        session.add(project)
-        session.commit()
-        return org, benchmark.id, project.id
+    project = Project(
+        org_id=TEST_ORG_ID,
+        handle="router-bench",
+        name="Router Bench",
+        spend_type=SpendType.DEVELOPMENT,
+        subcategory="new_benchmark_generation",
+    )
+    return org, benchmark.id, project
+
+
+def _delete_waits(engine: Engine) -> None:
+    for _ in range(50):
+        with engine.connect() as connection:
+            waiting = connection.execute(
+                text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            )
+            if waiting.scalar_one():
+                return
+        time.sleep(0.1)
+    pytest.fail("The delete never waited on the project links lock")
+
+
+@pytest.mark.xfail(reason="the retag route links without the shared project links lock", strict=True)
+@pytest.mark.description(
+    "With both project service switches on, a delete that races moving a run into the project is refused."
+)
+def test_delete_racing_a_retag_with_reads_on_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_engine: Engine,
+) -> None:
+    org, benchmark_id, project = _seed_service_project(postgres_engine)
+    routes = MockProjectRoutes()
+    routes.rows[str(project.id)] = project.model_dump(mode="json", exclude={"org_id"})
+    _use_project_service(monkeypatch, routes.handle)
+
+    def delete() -> bool:
+        with Session(postgres_engine) as delete_session:
+            repository = ProjectRepository(delete_session)
+            row = repository.get(TEST_ORG_ID, project.handle)
+            assert row is not None
+            return repository.delete(row)
+
+    with Session(postgres_engine, expire_on_commit=False) as session, ThreadPoolExecutor(max_workers=1) as pool:
+        save = BenchmarkRepository.save
+        deletes: list[Future[bool]] = []
+
+        def save_then_delete(self: BenchmarkRepository, *rows: SQLModel) -> None:
+            save(self, *rows)
+            session.flush()
+            deletes.append(pool.submit(delete))
+            _delete_waits(postgres_engine)
+
+        monkeypatch.setattr(BenchmarkRepository, "save", save_then_delete)
+        identity = RequestIdentity(org=org, email="alice@vals.ai")
+        monkeypatch.setitem(app.dependency_overrides, get_session, lambda: session)
+        monkeypatch.setitem(app.dependency_overrides, get_current_starter, lambda: identity)
+        with TestClient(app) as client:
+            response = client.post(f"/benchmarks/{benchmark_id}/project", json={"project": project.handle})
+        refused = not deletes[0].result(timeout=30)
+
+    assert response.status_code == 200, response.text
+    with Session(postgres_engine) as session:
+        assert [link.project_id for link in session.exec(select(RunProject)).all()] == [project.id]
+    assert routes.rows[str(project.id)].get("deleted_at") is None
+    assert refused

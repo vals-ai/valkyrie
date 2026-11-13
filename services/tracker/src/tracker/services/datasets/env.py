@@ -11,6 +11,8 @@ SecretReader = Callable[[str], Awaitable[str | None]]
 
 def secret_reader(store: SecretStore, stored_names: Callable[[str], list[str]]) -> SecretReader:
     async def read(name: str) -> str | None:
+        name, separator, field = name.partition("#")
+        selected_field = field if separator else name
         try:
             candidates = stored_names(name)
         except ValueError:
@@ -21,8 +23,10 @@ def secret_reader(store: SecretStore, stored_names: Callable[[str], list[str]]) 
             except SecretNotFoundError:
                 continue
             if isinstance(value, dict):
-                if name in value:
-                    return str(value[name])
+                if selected_field in value:
+                    return str(value[selected_field])
+                continue
+            if separator:
                 continue
             return str(value)
         return None

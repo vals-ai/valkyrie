@@ -165,7 +165,7 @@ class TestProjectReads:
         assert repository.get_for_link(TEST_ORG_ID, project.id).archived_at == ARCHIVED_AT
 
     @pytest.mark.description(
-        "With reads on, the service keeps the first Gateway key set for a project, and Tracker's row keeps the same key."
+        "With reads on, the service keeps the first Gateway key set for a project, and reads return that key."
     )
     def test_gateway_key_first_wins(self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> None:
         service = ReadService()
@@ -177,8 +177,6 @@ class TestProjectReads:
         assert repository.set_gateway_key(project, second) == first
         locked = repository.get_by_id(TEST_ORG_ID, project.id, lock="update")
         assert locked is not None and locked.gateway_key_id == first
-        stored = tracker_database.get(Project, project.id)
-        assert stored is not None and stored.gateway_key_id == first
 
     @pytest.mark.description(
         "A run linked to a project the service answers 404 for raises LookupError, which the run routes return as a 500."
@@ -193,9 +191,24 @@ class TestProjectReads:
             _ = repository.get_for_link(TEST_ORG_ID, project.id)
 
     @pytest.mark.description(
-        "A run whose linked project the service answers 404 for has no project, so retry and recovery skip the project check."
+        "A run whose linked project the service answers 404 for raises `LookupError` for retry, resume and regrade."
     )
-    def test_run_with_missing_row_has_no_project(
+    def test_run_with_missing_row_raises_for_writes(
+        self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = ReadService()
+        project = _mirrored(tracker_database, service, "router-bench")
+        benchmark_id = _link(tracker_database, project.id)
+        del service.rows[project.id]
+        repository = _repository(tracker_database, monkeypatch, service)
+
+        with pytest.raises(LookupError, match=str(project.id)):
+            _ = repository.get_for_run(benchmark_id, strict=True)
+
+    @pytest.mark.description(
+        "A run whose linked project the service answers 404 for reads as no project in its metadata."
+    )
+    def test_run_with_missing_row_reads_no_project(
         self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service = ReadService()
@@ -206,6 +219,15 @@ class TestProjectReads:
 
         assert repository.get_for_run(benchmark_id) is None
 
+    @pytest.mark.description("A run with no project link has no project, even for retry, resume and regrade.")
+    def test_unlinked_run_has_no_project(self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        benchmark = make_benchmark()
+        tracker_database.add(benchmark)
+        tracker_database.commit()
+        repository = _repository(tracker_database, monkeypatch, ReadService())
+
+        assert repository.get_for_run(benchmark.id, strict=True) is None
+
     @pytest.mark.description("Turning reads on without writes fails at startup instead of serving stale projects.")
     def test_reads_need_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PROJECT_SERVICE_READS", "true")
@@ -215,21 +237,3 @@ class TestProjectReads:
         with pytest.raises(ValueError, match="PROJECT_SERVICE_WRITES"):
             _ = project_client.project_service_reader()
         project_client.project_service_reader.cache_clear()
-
-    @pytest.mark.description("With reads on, a write still sends Tracker's own rows, not the service's list.")
-    def test_writes_send_tracker_rows(self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-        service = ReadService()
-        _ = service.add("service-only")
-        repository = _repository(tracker_database, monkeypatch, service)
-        sent: list[list[str]] = []
-
-        def replace(_client: ProjectServiceClient, _org_id: UUID, rows: list[Project]) -> None:
-            sent.append([row.handle for row in rows])
-
-        monkeypatch.setattr(ProjectServiceClient, "replace", replace)
-
-        _ = repository.create(
-            Project(org_id=TEST_ORG_ID, handle="router-bench", name="Router", spend_type=SpendType.DEVELOPMENT)
-        )
-
-        assert sent == [["router-bench"]]

@@ -61,7 +61,7 @@ default-groups = ["dev", "database"]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/executor_protocol.py" }, { file = "src/metric_process.py" }]
 
 [tool.uv.sources]
-create-benchmark-service = { git = "https://github.com/vals-ai/create-benchmark-service.git", tag = "v0.73.0" }
+create-benchmark-service = { git = "https://github.com/vals-ai/create-benchmark-service.git", tag = "v0.73.1" }
 
 [tool.hatch.metadata]
 allow-direct-references = true

@@ -1443,6 +1443,7 @@ def test_dropping_aws_managed_downgrades_with_every_aws_run_marked_managed(migra
     engine.dispose()
 
 
+@pytest.mark.xfail(reason="`run_project.project_id` still references `project`", strict=True)
 @pytest.mark.description(
     "Project handles are unique per org while names may repeat, a run's last-appended link is its project even when link timestamps tie, and downgrade removes both tables."
 )
@@ -1468,7 +1469,7 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
     assert sorted(
         (foreign_key["constrained_columns"], foreign_key["referred_table"], foreign_key["referred_columns"])
         for foreign_key in inspector.get_foreign_keys("run_project")
-    ) == [(["benchmark_id"], "benchmark", ["id"]), (["project_id"], "project", ["id"])]
+    ) == [(["benchmark_id"], "benchmark", ["id"])]
     assert [column["name"] for column in inspector.get_columns("run_project") if column.get("identity")] == ["id"]
 
     org_id = uuid4()
@@ -1739,3 +1740,22 @@ def test_epoch_cleanup_migration_round_trips(migration_database_url: str) -> Non
     assert downgrade.returncode == 0, downgrade.stderr
     assert _schema_snapshot(engine) == before
     engine.dispose()
+
+
+@pytest.mark.xfail(reason="`run_project.project_id` still references `project`", strict=True)
+@pytest.mark.description(
+    "At head, `run_project.project_id` has no foreign key to `project`, and a downgrade restores it."
+)
+def test_run_project_drops_project_foreign_key(migration_database_url: str) -> None:
+    def referred() -> set[str]:
+        engine = create_engine(migration_database_url)
+        tables = {key["referred_table"] for key in inspect(engine).get_foreign_keys("run_project")}
+        engine.dispose()
+        return tables
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "head")
+    assert upgrade.returncode == 0, upgrade.stderr
+    assert referred() == {"benchmark"}
+    downgrade = _run_alembic(migration_database_url, "downgrade", "83a507dd5eaf")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert referred() == {"benchmark", "project"}

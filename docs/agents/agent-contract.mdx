@@ -47,8 +47,9 @@ For each task, Valkyrie:
   before the task fails.
 - Uploading leaves out every file and directory whose whole name matches `.git`, `.venv`,
   `venv`, `__pycache__`, `*.egg-info`, `.env`, `.env.*`, `*.env`, `.envrc`, `*.pyc`,
-  `*.pyo`, `*.pyd`, `*.so`, `*.so.*`, `*.dll`, `*.dylib`, or `.DS_Store`. Symbolic links
-  are refused.
+  `*.pyo`, `*.pyd`, `*.so`, `*.so.*`, `*.dll`, `*.dylib`, or `.DS_Store`. Internal symbolic
+  links are copied as their targets.
+- Links outside the agent folder, broken links, and symlink loops are refused.
 
 ## Placeholders
 

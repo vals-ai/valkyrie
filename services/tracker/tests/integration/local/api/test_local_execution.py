@@ -609,6 +609,44 @@ def test_regrade_at_run_limit_is_refused(
 
 
 @pytest.mark.description(
+    "Regrade of a run whose linked project the service answers 404 for raises `LookupError` and commits no new run or link."
+)
+def test_regrade_of_a_run_whose_project_the_service_lost_creates_no_run(
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
+    project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
+    control_postgres_session.add(project)
+    control_postgres_session.flush()
+    control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
+    control_postgres_session.commit()
+    source_status = source.status
+    service = ProjectServiceClient(
+        httpx.Client(base_url="http://projects", transport=httpx.MockTransport(lambda _request: httpx.Response(404)))
+    )
+    monkeypatch.setattr(project_repository_module, "project_service_reader", lambda: service)
+
+    async def verify_task_ids(
+        _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
+    ) -> VerifyTaskIdsResponse:
+        return VerifyTaskIdsResponse(task_ids=task_ids)
+
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+    runs_before = len(control_postgres_session.exec(select(Benchmark)).all())
+    links_before = len(control_postgres_session.exec(select(RunProject)).all())
+
+    with pytest.raises(LookupError, match=str(project.id)):
+        _ = local_tracker.post(f"/regrade-benchmark/{source.id}", json={"dataset": "target-dataset"})
+
+    control_postgres_session.expire_all()
+    assert len(control_postgres_session.exec(select(Benchmark)).all()) == runs_before
+    assert len(control_postgres_session.exec(select(RunProject)).all()) == links_before
+    stored = control_postgres_session.get(Benchmark, source.id)
+    assert stored is not None and stored.status == source_status
+
+
+@pytest.mark.description(
     "Regrade onto the source run's own dataset works, so a run can be regraded as a noise control."
 )
 def test_regrade_onto_the_source_dataset(

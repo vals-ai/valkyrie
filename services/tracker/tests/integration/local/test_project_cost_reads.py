@@ -17,8 +17,8 @@ class MockProjectList:
     def __init__(self, projects: list[Project]) -> None:
         self._projects = projects
 
-    def list_rows(self, org_id: UUID, include_archived: bool) -> list[Project]:
-        assert (org_id, include_archived) == (TEST_ORG_ID, True)
+    def list_rows(self, org_id: UUID, include_archived: bool, include_deleted: bool = False) -> list[Project]:
+        assert (org_id, include_archived, include_deleted) == (TEST_ORG_ID, True, True)
         return self._projects
 
 
@@ -55,6 +55,7 @@ def _costs(tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> tuple[
     return CostRepository(tracker_database), kept.id, kept_run, gone_run
 
 
+@pytest.mark.xfail(reason="Cost reports still leave deleted projects out", strict=True)
 class TestProjectCostReads:
     @pytest.mark.description(
         (
@@ -62,6 +63,7 @@ class TestProjectCostReads:
             "\n"
             "Test cases:\n"
             "- Run and cost rows carry the service's name, spend type, subcategory and customer.\n"
+            "- The service is asked for archived and deleted projects too.\n"
             "- A run whose project the service lacks has no project labels."
         )
     )

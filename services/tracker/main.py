@@ -2189,6 +2189,7 @@ async def retry_or_resume_benchmark(
     project = await asyncio.to_thread(
         ProjectRepository(session).get_for_run,
         assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org).id,
+        strict=True,
     )
     if project is not None:
         reject_archived_project(project)
@@ -2584,7 +2585,7 @@ async def regrade_benchmark(
 
 
 def _linked_project(projects: ProjectRepository, run_id: UUID) -> Project | None:
-    project = projects.get_for_run(run_id)
+    project = projects.get_for_run(run_id, strict=True)
     if project is not None:
         reject_archived_project(projects.get_for_link(project.org_id, project.id))
     return project
