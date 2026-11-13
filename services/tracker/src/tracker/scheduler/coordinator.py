@@ -40,6 +40,7 @@ _READINESS_BATCH_SIZE = 10
 _CAPACITY_CACHE_SECONDS = 2.0
 _ORPHAN_CLEANUP_GRACE = timedelta(minutes=5)
 _RELEASED_RESERVATION_RETENTION = timedelta(minutes=2)
+_SCHEDULER_LEADER_RESOURCE_ID = "shared-pool-scheduler"
 
 
 @dataclass(frozen=True)
@@ -401,6 +402,7 @@ class SharedPoolScheduler:
         self._task: asyncio.Task[None] | None = None
         self._pools: dict[str, asyncio.Task[None]] = {}
         self._last_references: dict[str, UUID] = {}
+        self._leader = PostgresAdvisoryLock(engine, resource_id=_SCHEDULER_LEADER_RESOURCE_ID)
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="shared-pool-scheduler")
@@ -412,10 +414,29 @@ class SharedPoolScheduler:
                 await self._task
             self._task = None
 
+    async def _lead(self) -> bool:
+        try:
+            if await self._leader.still_held() or await self._leader.acquire():
+                return True
+        except Exception:
+            logger.warning("Shared pool scheduler could not confirm leadership", exc_info=True)
+        await self._stop_pools()
+        return False
+
+    async def _stop_pools(self) -> None:
+        tasks = list(self._pools.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._pools.clear()
+
     async def _run(self) -> None:
         try:
             while True:
                 try:
+                    if not await self._lead():
+                        await asyncio.sleep(self.interval_seconds)
+                        continue
                     references = await asyncio.to_thread(read_pool_references, self.engine)
                     by_pool: dict[str, list[PoolReference]] = {}
                     for reference in references:
@@ -465,3 +486,7 @@ class SharedPoolScheduler:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._pools.clear()
             self._last_references.clear()
+            try:
+                await self._leader.release()
+            except Exception:
+                logger.warning("Shared pool scheduler leader release failed", exc_info=True)

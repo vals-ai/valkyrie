@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from valkyrie.sdk.login import ApiKeyAuth, LoginSession, SessionAuth
 
-DEFAULT_TRACKER_URL = "https://benchmark-tracker.vals.ai"
+DEFAULT_TRACKER_URL = "https://benchmark-tracker-prod.vals.ai"
 
 
 class ValkyrieConfig(BaseModel):

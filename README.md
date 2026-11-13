@@ -6,62 +6,73 @@ Valkyrie orchestrates scalable, reproducible evaluations for AI agents. Run it o
 
 Guides, the CLI reference and the Python SDK reference are published at [docs.valkyrie.vals.ai](https://docs.valkyrie.vals.ai/introduction/what-is-valkyrie).
 
+<p align="center">
+  <img src="docs/images/valk-tui.gif" alt="valkyrie tui showing a run's tasks, errors first, next to the highlighted task's log" width="720">
+</p>
+
 ## Quickstart
 
-> **Note:** Valkyrie can be invoked using either `valkyrie` or the alias `valk`. For example: `valkyrie run start` or `valk run start`.
+Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie. You need [uv](https://docs.astral.sh/uv/), a Vals AI account (email [contact@vals.ai](mailto:contact@vals.ai)), a [Modal](https://modal.com) account, and an Anthropic API key.
 
-Install the CLI:
+1. Install the CLI. It installs as `valkyrie`, with the short alias `valk`:
 
-```bash
-uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false --exclude-newer-package valkyrie-cli=false --exclude-newer-package valkyrie-sdk=false valkyrie-cli
-```
+   ```bash
+   uv tool install valkyrie-cli
+   ```
 
-If you installed the CLI from GitHub before, remove that install first:
+   If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
 
-```bash
-uv tool uninstall valkyrie
-```
+2. Sign in:
 
-Sign in with your Vals account:
+   ```bash
+   valkyrie login
+   ```
 
-```bash
-valkyrie login
-```
+3. Connect Modal by following [Set up Modal](https://docs.valkyrie.vals.ai/get-started/sandbox-providers#set-up-modal). It's set once per organization, so skip it if someone in yours already did.
 
-Install an agent from the [public agent registry](https://github.com/vals-ai/public-agent-registry):
+4. Install Claude Code from the [public agent registry](https://github.com/vals-ai/public-agent-registry), and store your Anthropic API key at the prompt:
 
-```bash
-valkyrie agent install https://github.com/vals-ai/public-agent-registry/tree/main/agents/mini_swe_agent
-```
+   ```bash
+   valkyrie agent install \
+     https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
 
-Store your model provider's API key as a secret. The CLI prompts for the value:
+   valkyrie secret set anthropic-api-key
+   ```
 
-```bash
-valkyrie secret set anthropic-key
-```
+5. Install Terminal-Bench 2 from Harbor as the dataset `tb/tb2`:
 
-Start a benchmark run, passing the secret to the agent as `ANTHROPIC_API_KEY` with `-s`:
+   ```bash
+   valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
+   ```
 
-```bash
-valkyrie run start \
-  --agent mini_swe_agent \
-  --benchmark swebench \
-  --model anthropic/claude-sonnet-4-6 \
-  -s ANTHROPIC_API_KEY anthropic-key \
-  -k config benchmarks/swebench.yaml \
-  --slice "0:10" \
-  --connect
-```
+6. Run one task:
+
+   ```bash
+   valkyrie run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
+     --model anthropic/claude-sonnet-4-6 --provider modal \
+     -s ANTHROPIC_API_KEY anthropic-api-key --slice 0:1 --concurrency 1
+   ```
+
+7. Watch it with `valkyrie tui`.
+
+The [quickstart guide](https://docs.valkyrie.vals.ai/get-started/quickstart) walks through each step and how to read the result.
+
+## Browse runs in the terminal
+
+`valkyrie tui` lists your organization's runs with live status, so everyone signed in to the same organization sees the same runs. Open one to see its tasks, errors first, next to the highlighted task's log.
+
+- `/` filters the list, `e` groups a run's errors by message, and `s` picks how far back the list goes.
+- `y` copies the matching `valkyrie` command, to run yourself or hand to an agent.
+- `valkyrie tui --fake` opens it on sample runs, with no account needed.
 
 ## Where to go next
 
 | Topic | Location |
 | --- | --- |
-| Install and run your first benchmark | [get-started/quickstart](https://docs.valkyrie.vals.ai/get-started/quickstart) |
-| Uploading agents and writing a contract | [agents/agent-contract](https://docs.valkyrie.vals.ai/agents/agent-contract) |
+| Packaging an agent and writing a contract | [agents/package-an-agent](https://docs.valkyrie.vals.ai/agents/package-an-agent) |
 | Starting, monitoring, and managing runs | [runs/start](https://docs.valkyrie.vals.ai/runs/start) |
 | Results and output artifacts | [runs/results-and-outputs](https://docs.valkyrie.vals.ai/runs/results-and-outputs) |
-| Hosting your own benchmark service | [benchmarks/custom-services](https://docs.valkyrie.vals.ai/benchmarks/custom-services) |
+| Publishing your own tasks as a dataset | [benchmarks/datasets](https://docs.valkyrie.vals.ai/benchmarks/datasets) |
 | Every CLI command | [reference/cli/index](https://docs.valkyrie.vals.ai/reference/cli/index) |
 | Python SDK | [sdk/quickstart](https://docs.valkyrie.vals.ai/sdk/quickstart) |
 | Running Tracker locally without AWS | [self-hosting/local-tracker](https://docs.valkyrie.vals.ai/self-hosting/local-tracker) |

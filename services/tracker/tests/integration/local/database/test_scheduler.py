@@ -29,6 +29,7 @@ from benchmark_service import (
     Sandbox,
     SandboxCapacity,
     SandboxCapacityDomain,
+    SandboxCreatedData,
     SandboxReservationDemand,
     SandboxCreateRequest,
     SandboxError,
@@ -44,6 +45,7 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.grading_credentials import current_grading_credentials
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.schemas import (
+    EvalSandboxSpec,
     EvaluateResponseRequest,
     FinalScoreResult,
     RetrieveTaskResponse,
@@ -88,6 +90,7 @@ from tracker.database.models import (
     RunProject,
     SandboxAdmissionCandidate,
     SandboxBuildReservation,
+    SandboxGradingReservation,
     SpendType,
     Task,
 )
@@ -1854,6 +1857,109 @@ async def test_setup_retry_reenters_fifo_before_competitor(
 
 
 @pytest.mark.description(
+    "A queued task with a grading sandbox holds its capacity from admission until the grading sandbox is announced."
+)
+@pytest.mark.parametrize("release_fails", [False, True], ids=["released", "release-fails-score-kept"])
+async def test_queued_worker_holds_grading_capacity_until_the_grading_sandbox_exists(
+    postgres_engine: Engine,
+    postgres_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    bound_controls: Callable[..., dict[str, object]],
+    runtime_services: RuntimeServices,
+    release_fails: bool,
+) -> None:
+    events: list[str] = []
+    provider_pool_id = f"daytona:{uuid4()}"
+    pool_id = reserved_queue_pool_id(queue_pool_id(provider_pool_id))
+    org, benchmark, (task,) = _run(postgres_session, pool_id, [("grades", TaskStatus.PENDING, _ATTEMPT)])
+    bound = bound_controls(benchmark, session=postgres_session)
+    task_control = cast(TaskControl, bound["task_control"])
+    context = _context(cast(QueueControl, bound["queue_control"]), provider_pool_id, events, reserved=True)
+    grading_resources = Resources(vcpu=4, memory=8, disk=10)
+    charged_during_grading: list[float] = []
+
+    def grading_vcpu_charged() -> float:
+        with Session(postgres_engine) as session:
+            repository = SchedulerRepository(session)
+            charged = repository.charged_reservations_by_domain(context.pool_id, repository.database_now())
+        return charged[("region-a", "sysbox")].vcpu if ("region-a", "sysbox") in charged else 0
+
+    async def evaluate(*_args: Any, on_sandbox_created: Callable[[SandboxCreatedData], None], **_kwargs: Any) -> Any:
+        charged_during_grading.append(grading_vcpu_charged())
+        on_sandbox_created(SandboxCreatedData(provider="daytona", sandbox_id="grader-1"))
+        return {"score": 1.0}
+
+    service = AsyncMock(spec=BenchmarkServiceClient)
+    _use_real_sandbox_recovery(service)
+    service.retrieve_task.return_value = RetrieveTaskResponse(
+        source=_SOURCE,
+        resources=_RESOURCES,
+        problem_path="/tmp/problem.txt",
+        cwd="/testbed",
+        eval_sandbox=EvalSandboxSpec(resources=grading_resources),
+    )
+    service.evaluate_instance.side_effect = evaluate
+
+    async def create(request: SandboxCreateRequest) -> Sandbox:
+        sandbox = Mock(
+            id="agent-sandbox",
+            state="started",
+            labels=request.labels,
+            clear_egress_rules=AsyncMock(),
+            modify_egress_rules=AsyncMock(),
+            block_all_egress=AsyncMock(),
+        )
+        sandbox.name = request.name
+        return cast(Sandbox, sandbox)
+
+    monkeypatch.setattr(context.provider, "create_sandbox", create)
+    monkeypatch.setattr(context.provider, "delete_sandbox", AsyncMock())
+    if release_fails:
+        failure = httpx.HTTPStatusError(
+            "control failed", request=httpx.Request("POST", "http://control"), response=httpx.Response(500)
+        )
+        monkeypatch.setattr(context.control, "release_grading", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(task_execution.TaskLogBuffer, "buffer_logs", Mock())
+    monkeypatch.setattr(task_execution, "upload_agent_artifacts", AsyncMock())
+    monkeypatch.setattr(task_execution, "install_agent_dependencies", AsyncMock())
+    monkeypatch.setattr(task_execution, "run_agent", _run_agent_success)
+    state = (
+        await task_control.read(
+            AttemptRef(org_id=task.org_id, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
+        )
+    ).task
+    async with _drive_queue(postgres_engine, context):
+        result = await asyncio.wait_for(
+            task_execution.process_task(
+                state,
+                benchmark.managed_start_benchmark_request(),
+                cast(BenchmarkServiceClient, service),
+                benchmark.id,
+                task.task_id,
+                runtime_services,
+                OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
+                sandbox_provider_config=DaytonaProviderConfig(
+                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+                ),
+                sandbox_provider=context.provider,
+                creation_semaphore=Semaphore(1),
+                control=task_control,
+                queue_context=context,
+                started_by_email=benchmark.started_by_email,
+            ),
+            10,
+        )
+
+    assert result == {task.task_id: {"score": 1.0}}
+    assert charged_during_grading == [grading_resources.vcpu]
+    with Session(postgres_engine) as session:
+        hold = session.get(SandboxGradingReservation, (task.id, task.started_at))
+    assert hold is not None
+    assert (hold.requested_vcpu, hold.requested_memory, hold.requested_disk) == (4, 8, 10)
+    assert (hold.released_at is None) == release_fails
+
+
+@pytest.mark.description(
     "A setup retry schedules an error row, runs setup a second time on a fresh grant, and evaluates once."
 )
 async def test_queued_worker_setup_retry_waits_for_retention_then_finishes_with_a_fresh_grant(
@@ -2034,6 +2140,7 @@ def _prepare(
     *,
     admission_ready: bool = True,
     dispatch_id: UUID | None = None,
+    grading_demand: SandboxReservationDemand | None = None,
 ) -> UUID:
     if dispatch_id is None:
         dispatch = session.exec(
@@ -2047,6 +2154,7 @@ def _prepare(
         dispatch_id,
         demand,
         admission_ready=admission_ready,
+        grading_demand=grading_demand,
     )
     session.commit()
 
@@ -2184,7 +2292,7 @@ async def test_recovery_removes_candidates_without_current_execution_authority(
     bound = bound_controls(benchmark, session=postgres_session)
     control = cast(QueueControl, bound["queue_control"])
     attempt = AttemptRef(org_id=task.org_id, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
-    await control.prepare(pool_id, attempt, admission.QueueDemand(**_DEMAND.model_dump()), True)
+    await control.prepare(pool_id, attempt, admission.QueueDemand(**_DEMAND.model_dump()), True, None)
     assert _candidate_count(postgres_engine, pool_id) == 1
     if interruption == "superseded":
         with Session(postgres_engine) as session:

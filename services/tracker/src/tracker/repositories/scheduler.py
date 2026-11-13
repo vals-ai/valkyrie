@@ -6,7 +6,7 @@ from uuid import UUID
 
 from benchmark_service import SandboxCapacity, SandboxReservationDemand
 from fastapi import Depends
-from sqlalchemy import JSON, Subquery, and_, case, or_, text, tuple_, type_coerce
+from sqlalchemy import JSON, Subquery, and_, case, or_, text, tuple_, type_coerce, union
 from sqlalchemy import select as sa_select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
@@ -22,6 +22,7 @@ from tracker.database.models import (
     Org,
     SandboxAdmissionCandidate,
     SandboxBuildReservation,
+    SandboxGradingReservation,
     Task,
     TaskStatus,
 )
@@ -44,7 +45,7 @@ _ADMISSION_SCAN_CHUNK = 256
 _ACTIVE_STATUSES = (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 
 _ARGUMENTS = type_coerce(col(Benchmark.arguments), JSON)
-_IS_QUEUED = _ARGUMENTS["queue_pool_id"].as_string().is_not(None)
+_IS_QUEUED = col(Benchmark.queue_pool_id).is_not(None)
 
 
 def _open_runs(pool_id: str):
@@ -58,7 +59,7 @@ def _open_runs(pool_id: str):
             and_(col(active_task.benchmark) == col(Benchmark.id), col(active_task.status).in_(_ACTIVE_STATUSES)),
         )
         .where(col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS)
-        .where(_ARGUMENTS["queue_pool_id"].as_string() == pool_id)
+        .where(col(Benchmark.queue_pool_id) == pool_id)
         .where(
             col(Benchmark.id).in_(
                 select(col(ExecutorDispatch.benchmark_id)).where(
@@ -69,6 +70,28 @@ def _open_runs(pool_id: str):
         .group_by(col(Benchmark.id))
         .having(active < concurrency)
         .subquery()
+    )
+
+
+def _with_demand(reserved: ActiveReservations, demand: SandboxReservationDemand) -> ActiveReservations:
+    return replace(
+        reserved,
+        count=reserved.count + 1,
+        vcpu=reserved.vcpu + demand.vcpu,
+        memory=reserved.memory + demand.memory,
+        disk=reserved.disk + demand.disk,
+        gpu=reserved.gpu + demand.gpu,
+    )
+
+
+def _grading_attempt_in(statuses: Sequence[TaskStatus]):
+    return (
+        select(col(Task.id))
+        .where(col(Task.id) == col(SandboxGradingReservation.task_row_id))
+        .where(col(Task.started_at) == col(SandboxGradingReservation.attempt_started_at))
+        .where(col(Task.status).in_(statuses))
+        .correlate(SandboxGradingReservation)
+        .exists()
     )
 
 
@@ -110,12 +133,17 @@ def _current_candidate_attempt():
     return (
         select(col(Task.id))
         .join(Benchmark, col(Benchmark.id) == col(Task.benchmark))
-        .join(ExecutorDispatch, col(ExecutorDispatch.benchmark_id) == col(Benchmark.id))
+        .join(
+            ExecutorDispatch,
+            and_(
+                col(ExecutorDispatch.id) == col(SandboxAdmissionCandidate.executor_dispatch_id),
+                col(ExecutorDispatch.benchmark_id) == col(Benchmark.id),
+            ),
+        )
         .where(col(Task.id) == col(SandboxAdmissionCandidate.task_row_id))
         .where(col(Task.started_at) == col(SandboxAdmissionCandidate.attempt_started_at))
         .where(col(Task.status) == TaskStatus.PENDING)
         .where(col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS)
-        .where(col(ExecutorDispatch.id) == col(SandboxAdmissionCandidate.executor_dispatch_id))
         .where(col(ExecutorDispatch.status) == ExecutorDispatchStatus.RUNNING)
     )
 
@@ -182,7 +210,7 @@ class SchedulerRepository:
         offset: int = 0,
     ) -> tuple[list[tuple[Task, Benchmark, int, str, int]], dict[str, int]]:
         priority = _ARGUMENTS["priority"].as_integer()
-        pool_id = _ARGUMENTS["queue_pool_id"].as_string()
+        pool_id = col(Benchmark.queue_pool_id)
         queued_tasks = (
             sa_select(
                 cast(ColumnElement[UUID], col(Task.id).label("task_id")),
@@ -238,7 +266,7 @@ class SchedulerRepository:
         *,
         org_id: UUID,
     ) -> dict[str, set[PoolProviderReference]]:
-        pool_id = _ARGUMENTS["queue_pool_id"].as_string()
+        pool_id = col(Benchmark.queue_pool_id)
         provider_type = _ARGUMENTS["sandbox_provider"].as_string()
         secret_name = _ARGUMENTS["sandbox_provider_secret_name"].as_string()
         lifecycle_scope = or_(
@@ -390,6 +418,7 @@ class SchedulerRepository:
         demand: SandboxReservationDemand,
         *,
         admission_ready: bool,
+        grading_demand: SandboxReservationDemand | None = None,
     ) -> None:
         values = {
             "task_row_id": task_row_id,
@@ -413,6 +442,24 @@ class SchedulerRepository:
                 index_elements=["task_row_id", "attempt_started_at"],
                 set_=values,
             )
+        )
+        if grading_demand is None:
+            return
+        grading = {
+            "task_row_id": task_row_id,
+            "attempt_started_at": expected_started_at,
+            "pool_id": queue_pool_lock_id(pool_id),
+            "target_id": grading_demand.target_id,
+            "sandbox_class": grading_demand.sandbox_class,
+            "requested_vcpu": grading_demand.vcpu,
+            "requested_memory": grading_demand.memory,
+            "requested_disk": grading_demand.disk,
+            "requested_gpu": grading_demand.gpu,
+        }
+        self._session.exec(
+            insert(SandboxGradingReservation)
+            .values(**grading)
+            .on_conflict_do_update(index_elements=["task_row_id", "attempt_started_at"], set_=grading)
         )
 
     def clear_admission_candidate(self, task_row_id: UUID, expected_started_at: datetime, dispatch_id: UUID) -> None:
@@ -522,7 +569,14 @@ class SchedulerRepository:
         open_runs = _open_runs(pool_id)
         candidates = self._session.exec(
             _pending_tasks(
-                select(col(Task.benchmark), SandboxAdmissionCandidate, priority, open_runs.c.slots), open_runs
+                select(
+                    col(Task.benchmark),
+                    SandboxAdmissionCandidate,
+                    SandboxGradingReservation,
+                    priority,
+                    open_runs.c.slots,
+                ),
+                open_runs,
             )
             .outerjoin(
                 SandboxAdmissionCandidate,
@@ -533,6 +587,13 @@ class SchedulerRepository:
                     _current_candidate_attempt().correlate(SandboxAdmissionCandidate).exists(),
                 ),
             )
+            .outerjoin(
+                SandboxGradingReservation,
+                and_(
+                    col(SandboxGradingReservation.task_row_id) == col(Task.id),
+                    col(SandboxGradingReservation.attempt_started_at) == col(Task.started_at),
+                ),
+            )
             .order_by(priority, col(Task.started_at), col(Task.id))
             .execution_options(yield_per=_ADMISSION_SCAN_CHUNK)
         )
@@ -541,7 +602,7 @@ class SchedulerRepository:
         slots: dict[UUID, int] = {}
         selected = 0
         unknown_priority: int | None = None
-        for benchmark_id, joined_candidate, rank, available_slots in candidates:
+        for benchmark_id, joined_candidate, joined_grading, rank, available_slots in candidates:
             if limit is not None and selected >= limit:
                 return
             if unknown_priority is not None and rank > unknown_priority:
@@ -569,17 +630,34 @@ class SchedulerRepository:
             )
             if not fits_in_capacity(demand, capacities[domain], charged[domain]):
                 continue
+            grading = cast(SandboxGradingReservation | None, joined_grading)
+            grading_demand = (
+                None
+                if grading is None
+                else SandboxReservationDemand(
+                    target_id=grading.target_id,
+                    sandbox_class=grading.sandbox_class,
+                    vcpu=grading.requested_vcpu,
+                    memory=grading.requested_memory,
+                    disk=grading.requested_disk,
+                    gpu=grading.requested_gpu,
+                )
+            )
+            if grading_demand is not None:
+                grading_domain = grading_demand.target_id, grading_demand.sandbox_class
+                if grading_domain not in capacities:
+                    continue
+                reserved = charged[grading_domain]
+                if grading_domain == domain:
+                    reserved = _with_demand(reserved, demand)
+                if not fits_in_capacity(grading_demand, capacities[grading_domain], reserved):
+                    continue
             slots[benchmark_id] -= 1
             selected += 1
-            prior = charged[domain]
-            charged[domain] = replace(
-                prior,
-                count=prior.count + 1,
-                vcpu=prior.vcpu + demand.vcpu,
-                memory=prior.memory + demand.memory,
-                disk=prior.disk + demand.disk,
-                gpu=prior.gpu + demand.gpu,
-            )
+            charged[domain] = _with_demand(charged[domain], demand)
+            if grading_demand is not None:
+                grading_domain = grading_demand.target_id, grading_demand.sandbox_class
+                charged[grading_domain] = _with_demand(charged[grading_domain], grading_demand)
             yield candidate
 
     def grant_prepared_tasks(
@@ -753,10 +831,9 @@ class SchedulerRepository:
         if not revoked:
             return
 
-        arguments = type_coerce(col(Benchmark.arguments), JSON)
         queued_benchmarks = select(col(Benchmark.id)).where(
             col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
-            arguments["queue_pool_id"].as_string() == pool_id,
+            col(Benchmark.queue_pool_id) == pool_id,
         )
         self._session.exec(
             update(Task)
@@ -813,10 +890,37 @@ class SchedulerRepository:
             )
             .group_by(col(SandboxBuildReservation.target_id), col(SandboxBuildReservation.sandbox_class))
         )
-        return {
-            (target_id, sandbox_class): ActiveReservations(count=count, vcpu=vcpu, memory=memory, disk=disk, gpu=gpu)
-            for target_id, sandbox_class, count, vcpu, memory, disk, gpu in rows
-        }
+        grading_rows = self._session.connection().execute(
+            sa_select(
+                col(SandboxGradingReservation.target_id),
+                col(SandboxGradingReservation.sandbox_class),
+                func.count(col(SandboxGradingReservation.task_row_id)),
+                func.sum(col(SandboxGradingReservation.requested_vcpu)),
+                func.sum(col(SandboxGradingReservation.requested_memory)),
+                func.sum(col(SandboxGradingReservation.requested_disk)),
+                func.sum(col(SandboxGradingReservation.requested_gpu)),
+            )
+            .where(col(SandboxGradingReservation.pool_id) == queue_pool_lock_id(pool_id))
+            .where(_grading_attempt_in(_ACTIVE_STATUSES))
+            .where(
+                col(SandboxGradingReservation.released_at).is_(None)
+                | (col(SandboxGradingReservation.released_at) > capacity_read_at)
+            )
+            .group_by(col(SandboxGradingReservation.target_id), col(SandboxGradingReservation.sandbox_class))
+        )
+        charged: dict[tuple[str, str], ActiveReservations] = {}
+        for target_id, sandbox_class, count, vcpu, memory, disk, gpu in [*rows, *grading_rows]:
+            prior = charged.get(
+                (target_id, sandbox_class), ActiveReservations(count=0, vcpu=0, memory=0, disk=0, gpu=0)
+            )
+            charged[(target_id, sandbox_class)] = ActiveReservations(
+                count=prior.count + count,
+                vcpu=prior.vcpu + vcpu,
+                memory=prior.memory + memory,
+                disk=prior.disk + disk,
+                gpu=prior.gpu + gpu,
+            )
+        return charged
 
     def admissions_since(self, pool_id: str, since: datetime) -> int:
         return (
@@ -838,11 +942,28 @@ class SchedulerRepository:
             .values(released_at=self.database_now())
         )
 
+    def release_grading_reservation(self, task_row_id: UUID, expected_started_at: datetime) -> None:
+        self._session.exec(
+            update(SandboxGradingReservation)
+            .where(col(SandboxGradingReservation.task_row_id) == task_row_id)
+            .where(col(SandboxGradingReservation.attempt_started_at) == expected_started_at)
+            .where(col(SandboxGradingReservation.released_at).is_(None))
+            .values(released_at=self.database_now())
+        )
+
     def purge_released_reservations(self, pool_id: str, released_before: datetime) -> None:
         self._session.exec(
             delete(SandboxBuildReservation)
             .where(col(SandboxBuildReservation.pool_id) == queue_pool_lock_id(pool_id))
             .where(col(SandboxBuildReservation.released_at) < released_before)
+        )
+        self._session.exec(
+            delete(SandboxGradingReservation)
+            .where(col(SandboxGradingReservation.pool_id) == queue_pool_lock_id(pool_id))
+            .where(
+                (col(SandboxGradingReservation.released_at) < released_before)
+                | ~_grading_attempt_in((TaskStatus.PENDING, *_ACTIVE_STATUSES))
+            )
         )
 
     def handoff_dispatch_phases(self, dispatch_id: UUID) -> None:
@@ -929,10 +1050,9 @@ class SchedulerRepository:
         return {keys[key] for (key,) in locked}
 
     def reset_abandoned_builds(self, pool_id: str, now: datetime) -> None:
-        arguments = type_coerce(col(Benchmark.arguments), JSON)
         queued_benchmarks = select(col(Benchmark.id)).where(
             col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
-            arguments["queue_pool_id"].as_string() == pool_id,
+            col(Benchmark.queue_pool_id) == pool_id,
         )
         unhanded_reservations = select(col(SandboxBuildReservation.task_row_id)).where(
             col(SandboxBuildReservation.released_at).is_(None),
@@ -990,18 +1110,17 @@ class SchedulerRepository:
         return result.rowcount == 1
 
     def contributing_runs(self) -> Sequence[tuple[Benchmark, Org]]:
-        pool_id = _ARGUMENTS["queue_pool_id"].as_string()
-        candidates = select(col(SandboxAdmissionCandidate.task_row_id))
-        reservations = select(col(SandboxBuildReservation.task_row_id)).where(
-            col(SandboxBuildReservation.released_at).is_(None)
+        pool_id = col(Benchmark.queue_pool_id)
+        queued_task_ids = union(
+            select(col(SandboxAdmissionCandidate.task_row_id)),
+            select(col(SandboxBuildReservation.task_row_id)).where(col(SandboxBuildReservation.released_at).is_(None)),
         )
+        queued_runs = select(col(Task.benchmark)).where(col(Task.id).in_(queued_task_ids))
         return self._session.exec(
             select(Benchmark, Org)
-            .join(Task, col(Task.benchmark) == col(Benchmark.id))
             .join(Org, col(Org.id) == col(Benchmark.org_id))
+            .where(col(Benchmark.id).in_(queued_runs))
             .where(pool_id.is_not(None))
-            .where(or_(col(Task.id).in_(candidates), col(Task.id).in_(reservations)))
-            .distinct(pool_id, col(Benchmark.id))
             .order_by(pool_id, col(Benchmark.id))
         ).all()
 

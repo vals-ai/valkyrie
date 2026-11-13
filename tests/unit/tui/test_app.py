@@ -1,29 +1,34 @@
 import asyncio
+import json
 import subprocess
 import sys
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from rich.text import Text
+from textual.content import Content
 from textual.pilot import Pilot
 from textual.screen import Screen
 from textual.timer import Timer
-from textual.widgets import DataTable, Log, Static
+from textual.widget import Widget
+from textual.widgets import ContentSwitcher, DataTable, Log, Static
 
 from valkyrie.tui.app import ValkyrieApp
 from valkyrie.tui.browse import KeysScreen
 from valkyrie.tui.datasets import DatasetPreview, DatasetsScreen, DatasetTasksScreen
 from valkyrie.tui.errors import ErrorsScreen
-from valkyrie.tui.fake import FakeSource
+from valkyrie.tui.fake import FIXTURES, FakeSource
 from valkyrie.sdk import ValkyrieAPIError, ValkyrieClient, ValkyrieConfig, ValkyrieSDKError
 from valkyrie.sdk.models import (
+    BenchmarkStatus,
     BenchmarkStatusEntry,
+    BenchmarkTableRow,
     DatasetResponse,
     LogEvent,
     SingleTaskResponse,
@@ -31,8 +36,8 @@ from valkyrie.sdk.models import (
     TaskStatus,
 )
 from valkyrie.tui.run import RunScreen, TaskLog, log_line
-from valkyrie.tui.runs import RunsScreen
-from valkyrie.tui.source import Environment, RunSource, TrackerSource
+from valkyrie.tui.runs import MenuScreen, RunsScreen
+from valkyrie.tui.source import FINAL_STATUSES, LIVE_STATUSES, Environment, RunSource, TrackerSource
 from valkyrie.tui.widgets import TopBar
 
 from tests.unit.tui.conftest import MockClock
@@ -51,6 +56,10 @@ async def _open_app(clock: MockClock) -> AsyncGenerator[Pilot[None]]:
 
 def _row_keys(screen: Screen[None]) -> list[str]:
     return [str(key.value) for key in screen.query_one(DataTable).rows]
+
+
+def _title(widget: Widget) -> str:
+    return Content.from_markup(str(widget.border_title)).plain
 
 
 async def _settle(pilot: Pilot[None]) -> None:
@@ -87,6 +96,37 @@ class TestRunsScreen:
 
             progress = cast(Text, screen.query_one(DataTable).get_cell(_LIVE_RUN, "progress"))
             assert f"{after.finished_tasks}/{after.total_tasks}" in progress.plain
+
+    @pytest.mark.description("A run whose polled status no longer matches the filter leaves the filtered list.")
+    async def test_status_poll_refilters_a_run_whose_status_changed(self, clock: MockClock) -> None:
+        async with _open_app(clock) as pilot:
+            screen = cast(RunsScreen, pilot.app.screen)
+            await pilot.press("slash", *"in progress", "enter")
+            assert _LIVE_RUN in _row_keys(screen)
+
+            async def finished(run_ids: Sequence[UUID]) -> list[BenchmarkStatusEntry]:
+                entry = BenchmarkStatusEntry.model_validate(screen.rows[_LIVE_RUN].model_dump())
+                return [entry.model_copy(update={"status": BenchmarkStatus.FINISHED})]
+
+            screen.source.statuses = finished
+            screen.poll_statuses()
+            await _settle(pilot)
+
+            assert _LIVE_RUN not in _row_keys(screen)
+
+    @pytest.mark.description("A failed run-list load after picking a window clears `loading` from the title.")
+    async def test_failed_window_load_clears_loading_from_the_title(self, clock: MockClock) -> None:
+        async with _open_app(clock) as pilot:
+            screen = cast(RunsScreen, pilot.app.screen)
+
+            async def down(since: datetime, limit: int) -> list[BenchmarkTableRow]:
+                raise ValkyrieSDKError("connection reset")
+
+            screen.source.runs = down
+            await pilot.press("s", "down", "enter")
+            await _settle(pilot)
+
+            assert _title(screen.query_one(DataTable)) == "Runs · 8 · last 7 days"
 
     @pytest.mark.description("A status poll slower than the poll interval still finishes and updates the live runs.")
     async def test_slow_status_poll_is_not_cancelled_by_the_next_tick(
@@ -208,6 +248,12 @@ class TestRunsScreen:
         app = ValkyrieApp(sources[urls[0]], now=clock, switcher=Switcher())
         async with app.run_test(size=_SIZE) as pilot:
             await _settle(pilot)
+            runs = pilot.app.screen
+            await pilot.press("c")
+            assert isinstance(pilot.app.screen, MenuScreen)
+            await pilot.press("c")
+            assert pilot.app.screen is runs
+
             await pilot.press("c", "down", "enter")
             await _settle(pilot)
 
@@ -217,6 +263,31 @@ class TestRunsScreen:
 
             await pilot.press("y")
             assert app.clipboard.startswith("VALKYRIE_URL=http://localhost:8000 valk run ")
+
+    @pytest.mark.description(
+        "`s` opens a menu of how many days back the run list goes, and runs still going show whatever the window."
+    )
+    async def test_s_picks_how_far_back_the_list_goes_and_runs_still_going_always_show(self, clock: MockClock) -> None:
+        async with _open_app(clock) as pilot:
+            screen = cast(RunsScreen, pilot.app.screen)
+            table = screen.query_one(DataTable)
+            assert _title(table) == "Runs · 8 · last 2 days"
+            assert "mle-bench-lite" not in {run.name for run in screen.rows.values()}
+
+            await pilot.press("s")
+            assert isinstance(pilot.app.screen, MenuScreen)
+            await pilot.press("s")
+            assert pilot.app.screen is screen
+            await pilot.press("s", "down", "enter")
+            await _settle(pilot)
+            assert _title(table) == "Runs · 9 · last 7 days"
+            assert "mle-bench-lite" in {run.name for run in screen.rows.values()}
+
+            clock.advance(seconds=timedelta(days=8).total_seconds())
+            await pilot.press("r")
+            await _settle(pilot)
+            assert screen.rows
+            assert all(run.status not in FINAL_STATUSES for run in screen.rows.values())
 
     @pytest.mark.description("Any key or click closes the keys overlay and does nothing else.")
     @pytest.mark.parametrize("close", ["x", "q", "click"])
@@ -465,6 +536,12 @@ class TestRunScreen:
             await pilot.press("right_square_bracket", "y")
             assert pilot.app.clipboard == f"valk run task {_LIVE_RUN} {first.task_id}"
 
+            pane = screen.query_one(ContentSwitcher)
+            await pilot.click(pane, offset=(4, 0))
+            assert pane.current == "logs"
+            await pilot.click(pane, offset=(12, 0))
+            assert pane.current == "detail"
+
             await pilot.press("escape")
             runs = cast(RunsScreen, pilot.app.screen)
             assert runs.query_one(DataTable).cursor_row == 3
@@ -654,6 +731,39 @@ async def test_tracker_source_lists_the_datasets_of_every_benchmark() -> None:
         ("swe-bench", "lite"),
         ("swe-bench", "verified"),
     ]
+
+
+@pytest.mark.description(
+    "The Tracker source pages through the window and every run still going, listing each run once."
+)
+async def test_tracker_source_pages_through_the_window_and_every_run_still_going() -> None:
+    rows = json.loads((FIXTURES / "runs.json").read_text())["runs"]
+    requests: list[httpx.QueryParams] = []
+
+    def tracker(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        requests.append(params)
+        page = int(params["cursor"] or 0)
+        if "status" in params:
+            live = [rows[0], rows[-1]]
+            return httpx.Response(200, json={"benchmarks": live[page : page + 1], "next_cursor": None if page else "1"})
+        return httpx.Response(200, json={"benchmarks": rows[2 * page : 2 * page + 2], "next_cursor": str(page + 1)})
+
+    source = TrackerSource(
+        ValkyrieClient(ValkyrieConfig(), transport=httpx.MockTransport(tracker)), Environment("dev", "")
+    )
+    since = datetime(2026, 10, 8, tzinfo=timezone.utc)
+
+    runs = await source.runs(since, 3)
+
+    assert [str(run.id) for run in runs] == [row["id"] for row in rows[:3] + rows[-1:]]
+    recent = [params for params in requests if "status" not in params]
+    live = [params for params in requests if "status" in params]
+    assert len(recent) == 2
+    assert len(live) == 2
+    assert all(datetime.fromisoformat(params["started_after"]) == since for params in recent)
+    assert all("started_before" not in params for params in live)
+    assert set(live[0].get_list("status")) == {status.value for status in LIVE_STATUSES}
 
 
 @pytest.mark.description("Pressing `o` opens a Docent link only when it is an HTTP or HTTPS URL.")

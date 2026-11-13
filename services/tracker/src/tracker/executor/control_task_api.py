@@ -66,17 +66,26 @@ _TASK_WALL_SECONDS = GATEWAY_TOKEN_TTL_SECONDS - 2 * 60 * 60
 
 
 def _owned_dispatch(
-    session: Session, invocation: Invocation, ref: DispatchRef, *, live: bool, admission: bool, lock: bool = True
+    session: Session,
+    invocation: Invocation,
+    ref: DispatchRef,
+    *,
+    live: bool,
+    admission: bool,
+    lock: bool = True,
+    shared: bool = False,
 ) -> tuple[Benchmark, ExecutorAdmission, ExecutorDispatch]:
     if invocation.dispatch_id != ref.dispatch_id:
         raise HTTPException(status_code=403)
     state = share_executor_admission(session)
     if admission and state.maintenance_target_sha is not None:
         raise MaintenanceModeError("Executor maintenance is in progress")
-    benchmark = BenchmarkRepository(session).get_by_id(ref.benchmark_id, for_update=lock)
+    benchmark = BenchmarkRepository(session).get_by_id(ref.benchmark_id, for_update=lock, for_share=lock and shared)
     if benchmark is None:
         raise HTTPException(status_code=403)
-    dispatch = require_dispatch_owner(session, ref.dispatch_id, invocation.invocation_key, lock=lock, require_live=live)
+    dispatch = require_dispatch_owner(
+        session, ref.dispatch_id, invocation.invocation_key, lock=lock, require_live=live, shared=shared
+    )
     if dispatch.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
     return benchmark, state, dispatch
@@ -90,8 +99,9 @@ def _owner(
     live: bool = True,
     admission: bool = False,
     lock: bool = True,
+    shared: bool = False,
 ) -> Benchmark:
-    return _owned_dispatch(session, invocation, ref, live=live, admission=admission, lock=lock)[0]
+    return _owned_dispatch(session, invocation, ref, live=live, admission=admission, lock=lock, shared=shared)[0]
 
 
 def _task(session: Session, benchmark: Benchmark, ref: TaskRef) -> Task:
@@ -128,7 +138,7 @@ def read_task(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskReadResponse:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.task)
     return complete_response(
         session,
@@ -253,7 +263,7 @@ def ensure_task_deadline(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDeadlineResponse:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     if task.status == TaskStatus.STOPPED:
         raise ExecutionAuthorityRevoked("Task stopped")
@@ -274,7 +284,7 @@ def save_task_resume(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     require_task_phase_owner(body.ref.dispatch_id, body.phase, scope="evaluation", task=task)
     if task.status != TaskStatus.EVALUATING:
@@ -295,7 +305,7 @@ def claim_task_evaluation(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskEvaluationResponse:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     if task.status != TaskStatus.EVALUATING:
         return complete_response(session, TaskEvaluationResponse(phase=None, resume_state=None))
@@ -322,7 +332,7 @@ def write_task_breakdown(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     if task.status != TaskStatus.IN_PROGRESS:
         return complete_response(session, TaskDecision(accepted=False))
@@ -351,7 +361,7 @@ def write_task_accounting(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     if task.status == TaskStatus.STOPPED:
         return complete_response(session, TaskDecision(accepted=False))
@@ -386,7 +396,7 @@ def write_task_search_costs(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     attempt_id = queued_sandbox_name(task.id, task.started_at).removeprefix("queued-")
     CostRepository(session).add_search_costs(
@@ -502,7 +512,7 @@ def publish_output(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref)
+    benchmark = _owner(session, invocation, body.ref, shared=True)
     task = _task(session, benchmark, body.attempt)
     if task.status not in (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS):
         return complete_response(session, TaskDecision(accepted=False))
@@ -521,7 +531,7 @@ def clear_output(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref, live=False)
+    benchmark = _owner(session, invocation, body.ref, live=False, shared=True)
     task = _task(session, benchmark, body.attempt)
     clear_native_output(session, task, body.descriptor)
     session.commit()
@@ -536,7 +546,7 @@ def record_link(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref, live=False)
+    benchmark = _owner(session, invocation, body.ref, live=False, shared=True)
     if body.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
     BenchmarkRepository(session).record_sandbox_link(
@@ -556,7 +566,7 @@ def record_cost(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskDecision:
-    benchmark = _owner(session, invocation, body.ref, live=False)
+    benchmark = _owner(session, invocation, body.ref, live=False, shared=True)
     if body.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
     CostRepository(session).add_sandbox_cost(

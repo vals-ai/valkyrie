@@ -47,6 +47,7 @@ RETRYABLE_OPERATIONS = frozenset(
         "queue-clear",
         "queue-clock",
         "queue-eligibility",
+        "queue-release-grading",
         "queue-round",
         "queue-state",
         "queue-states",

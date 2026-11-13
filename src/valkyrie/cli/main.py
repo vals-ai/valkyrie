@@ -47,7 +47,7 @@ class _ValkyrieCLI(LazyGroup):
         "whoami": ("valkyrie.cli.login:whoami", "Show which Tracker, organization and account your requests use."),
         "token": ("valkyrie.cli.login:token", "Create and revoke access keys for CI and other headless use."),
         "org": ("valkyrie.cli.org:org", "Create, join and switch organizations, and manage their members."),
-        "ui": ("valkyrie.cli.ui:ui", "Browse runs, tasks and logs in a terminal UI."),
+        "tui": ("valkyrie.cli.tui:tui", "Browse runs, tasks and logs in a terminal UI."),
     },
     help="Run agents against benchmarks and manage their runs.",
 )

@@ -6,7 +6,7 @@ from threading import Event, Thread
 from sqlmodel import Session
 
 from tracker.database.session import engine
-from tracker.executor.release_control import retire_drained_releases
+from tracker.executor.release_control import has_retirable_releases, retire_drained_releases
 
 _RECONCILIATION_INTERVAL_SECONDS = 60.0
 _SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -14,6 +14,9 @@ _logger = logging.getLogger(__name__)
 
 
 def retire_drained_releases_once() -> list[str]:
+    with Session(engine) as session:
+        if not has_retirable_releases(session):
+            return []
     with Session(engine) as session:
         try:
             retired_ids = retire_drained_releases(session)

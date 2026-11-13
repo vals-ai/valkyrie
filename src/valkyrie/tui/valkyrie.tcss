@@ -168,13 +168,14 @@ KeysScreen {
     border-subtitle-color: $text-muted;
 }
 
-EnvironmentScreen {
+MenuScreen {
     align: center middle;
     background: $background 60%;
 }
 
-#environments {
+#menu {
     width: auto;
+    min-width: 32;
     height: auto;
     padding: 1 2;
     border: round $border;

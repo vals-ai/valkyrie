@@ -13,6 +13,7 @@ from benchmark_service import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
+    SandboxReservationDemand,
     SandboxSource,
 )
 from tracker.executor.control_protocol import AttemptRef, PhaseRef
@@ -153,6 +154,17 @@ async def _start_sandbox(
     return sandbox
 
 
+def _queue_demand(demand: SandboxReservationDemand) -> QueueDemand:
+    return QueueDemand(
+        target_id=demand.target_id,
+        sandbox_class=demand.sandbox_class,
+        vcpu=demand.vcpu,
+        memory=demand.memory,
+        disk=demand.disk,
+        gpu=demand.gpu,
+    )
+
+
 async def enter_queued_sandbox(
     *,
     stack: AsyncExitStack,
@@ -160,6 +172,7 @@ async def enter_queued_sandbox(
     attempt: AttemptRef,
     source: SandboxSource,
     resources: Resources,
+    grading: tuple[SandboxSource, Resources] | None = None,
     creation_state: SandboxCreationState,
     create: SandboxFactory,
     preparation_stack: AsyncExitStack,
@@ -174,19 +187,12 @@ async def enter_queued_sandbox(
             return None
         if state.status != "PENDING":
             return None
-        provider_demand = await context.provider.reservable_demand(source, resources)
-        demand = QueueDemand(
-            target_id=provider_demand.target_id,
-            sandbox_class=provider_demand.sandbox_class,
-            vcpu=provider_demand.vcpu,
-            memory=provider_demand.memory,
-            disk=provider_demand.disk,
-            gpu=provider_demand.gpu,
-        )
+        demand = _queue_demand(await context.provider.reservable_demand(source, resources))
+        grading_demand = None if grading is None else _queue_demand(await context.provider.reservable_demand(*grading))
         prepared = False
         try:
             admission_ready = await context.provider.check_admission(source, resources)
-            await context.control.prepare(context.pool_id, attempt, demand, admission_ready)
+            await context.control.prepare(context.pool_id, attempt, demand, admission_ready, grading_demand)
             prepared = True
             await preparation_stack.aclose()
             last_request = None
@@ -215,7 +221,9 @@ async def enter_queued_sandbox(
                     async with context.preparation_slots:
                         if await context.control.begin_readiness(context.pool_id, attempt, request):
                             admission_ready = await context.provider.check_admission(source, resources)
-                            await context.control.prepare(context.pool_id, attempt, demand, admission_ready)
+                            await context.control.prepare(
+                                context.pool_id, attempt, demand, admission_ready, grading_demand
+                            )
                 await _poll_sleep(context)
         except ExecutionAuthorityRevoked:
             return None

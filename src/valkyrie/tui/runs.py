@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from rich.console import Group, RenderableType
@@ -21,7 +22,7 @@ from valkyrie.tui.theme import palette
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.datasets import DatasetsScreen
 from valkyrie.tui.run import RunScreen
-from valkyrie.tui.source import FINAL_STATUSES, Environment, RunSource
+from valkyrie.tui.source import FINAL_STATUSES, RunSource
 from valkyrie.tui.widgets import (
     CommandLine,
     KeyBar,
@@ -40,7 +41,8 @@ from valkyrie.tui.widgets import (
 if TYPE_CHECKING:
     from valkyrie.tui.app import ValkyrieApp
 
-RUN_LIMIT = 50
+WINDOW_DAYS = (2, 7, 30)
+RUN_LIMIT = 1000
 STATUS_POLL_SECONDS = 3
 LIST_REFRESH_SECONDS = 30
 COUNT_ORDER = [
@@ -107,35 +109,42 @@ def _counts(run: BenchmarkTableRow) -> list[Text]:
     return lines
 
 
-class EnvironmentScreen(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape,q,c", "dismiss", show=False)]
+class MenuScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape,q", "dismiss", show=False)]
 
-    def __init__(self, choices: list[Environment], current: str) -> None:
+    def __init__(self, heading: str, choices: dict[str, str], current: str, key: str) -> None:
         super().__init__()
+        self.heading = heading
         self.choices = choices
         self.current = current
+        self.close_key = key
 
     def compose(self) -> ComposeResult:
         colors = palette()
         options = [
             Option(
                 Text.assemble(
-                    ("● " if choice.url == self.current else "  ", colors.accent), (choice.url, f"bold {colors.text}")
+                    ("● " if choice == self.current else "  ", colors.accent), (label, f"bold {colors.text}")
                 ),
-                id=choice.url,
+                id=choice,
             )
-            for choice in self.choices
+            for choice, label in self.choices.items()
         ]
-        yield OptionList(*options, id="environments")
+        yield OptionList(*options, id="menu")
 
     def on_mount(self) -> None:
         menu = self.query_one(OptionList)
-        menu.border_title = "Tracker"
-        menu.border_subtitle = "enter switches · esc closes"
-        menu.highlighted = next(index for index, choice in enumerate(self.choices) if choice.url == self.current)
+        menu.border_title = self.heading
+        menu.border_subtitle = "enter picks · esc closes"
+        menu.highlighted = list(self.choices).index(self.current)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option.id)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == self.close_key:
+            event.stop()
+            self.dismiss(None)
 
     def on_click(self, event: events.Click) -> None:
         if event.widget is self:
@@ -145,6 +154,7 @@ class EnvironmentScreen(ModalScreen[str | None]):
 class RunsScreen(BrowseScreen[None]):
     BINDINGS = [
         Binding("r", "reload", "reload"),
+        Binding("s", "pick_window", "since"),
         Binding("c", "switch_environment", "tracker"),
         Binding("d", "open_datasets", show=False),
     ]
@@ -154,6 +164,7 @@ class RunsScreen(BrowseScreen[None]):
         ("enter", "open the run"),
         ("/", "filter by benchmark, agent, model, label, status or who started it"),
         ("esc", "clear the filter"),
+        ("s", "pick how far back the list goes, or click it in the title. Runs still going always show"),
         ("y", "copy the command on the bottom line"),
         ("r", "reload the list"),
         ("c", "switch to another Tracker you've logged in to; clicking its name does too"),
@@ -163,6 +174,9 @@ class RunsScreen(BrowseScreen[None]):
         super().__init__()
         self.source = source
         self.rows: dict[str, BenchmarkTableRow] = {}
+        self.window_days = WINDOW_DAYS[0]
+        self.capped = False
+        self.fetching = False
 
     def compose(self) -> ComposeResult:
         yield TopBar(self.source.environment)
@@ -179,7 +193,13 @@ class RunsScreen(BrowseScreen[None]):
         for label, key in [("model", "model"), ("progress", "progress"), ("", "errors"), ("age", "age")]:
             table.add_column(label, key=key)
         self.query_one(KeyBar).show(
-            ("enter", "open"), ("/", "filter"), ("c", "tracker"), ("y", "copy cmd"), ("?", "keys"), ("q", "quit")
+            ("enter", "open"),
+            ("/", "filter"),
+            ("s", "since"),
+            ("c", "tracker"),
+            ("y", "copy cmd"),
+            ("?", "keys"),
+            ("q", "quit"),
         )
         self.query_one(CommandLine).show("valk run list")
         self.load_runs()
@@ -198,7 +218,8 @@ class RunsScreen(BrowseScreen[None]):
         if len(choices) < 2:
             self.notify("Only this Tracker has a saved login. `VALKYRIE_URL=<url> valk login` adds another.")
             return
-        app.push_screen(EnvironmentScreen(choices, current.url), self._switch_to)
+        menu = MenuScreen("Tracker", {choice.url: choice.url for choice in choices}, current.url, key="c")
+        app.push_screen(menu, self._switch_to)
 
     def on_top_bar_badge_clicked(self) -> None:
         self.action_switch_environment()
@@ -219,12 +240,17 @@ class RunsScreen(BrowseScreen[None]):
     async def load_runs(self) -> None:
         if self.rows and not self.is_current:
             return
+        since = self._since()
         try:
-            runs = await self.source.runs(RUN_LIMIT)
+            runs = await self.source.runs(since, RUN_LIMIT)
         except ValkyrieSDKError as error:
+            self.fetching = False
+            self.refilter()
             self.report(error)
             return
         self.rows = {str(run.id): run for run in runs}
+        self.capped = sum(run.started_at > since for run in runs) >= RUN_LIMIT
+        self.fetching = False
         self.refilter()
         self.fresh()
 
@@ -232,8 +258,9 @@ class RunsScreen(BrowseScreen[None]):
         table = self.query_one(Table)
         visible = {key: run for key, run in self.rows.items() if self._matches(run)}
         table.show_rows({key: self._cells(run) for key, run in visible.items()})
-        count = self.filter_count(len(visible), len(self.rows))
-        table.border_title = f"Runs · {count}{self.filter_label()}"
+        count = self.filter_count(len(visible), len(self.rows)) + ("+" if self.capped else "")
+        window = f"[@click=screen.pick_window]last {self.window_days} days[/]{' · loading' if self.fetching else ''}"
+        table.border_title = f"Runs · {count} · {window}{self.filter_label()}"
         self._show_highlighted()
 
     def _matches(self, run: BenchmarkTableRow) -> bool:
@@ -250,15 +277,22 @@ class RunsScreen(BrowseScreen[None]):
         except ValkyrieSDKError as error:
             self.report(error)
             return
+        table = self.query_one(Table)
+        changed = False
         for entry in entries:
-            self._apply_status(entry)
-        self.refilter()
+            key = str(entry.id)
+            if key in self.rows:
+                changed |= self.rows[key].status != entry.status
+                self._apply_status(key, entry)
+                if key in table.rows:
+                    table.update_row(key, self._cells(self.rows[key]))
+        if changed and self.filter:
+            self.refilter()
+        else:
+            self._show_highlighted()
         self.fresh()
 
-    def _apply_status(self, entry: BenchmarkStatusEntry) -> None:
-        key = str(entry.id)
-        if key not in self.rows:
-            return
+    def _apply_status(self, key: str, entry: BenchmarkStatusEntry) -> None:
         run = self.rows[key].model_copy(
             update={
                 "status": entry.status,
@@ -300,6 +334,25 @@ class RunsScreen(BrowseScreen[None]):
 
     def action_open_datasets(self) -> None:
         self.app.push_screen(DatasetsScreen(self.source))
+
+    def action_pick_window(self) -> None:
+        choices = {str(days): f"last {days} days" for days in WINDOW_DAYS}
+        self.app.push_screen(MenuScreen("Runs from", choices, str(self.window_days), key="s"), self._pick_window)
+
+    def _pick_window(self, days: str | None) -> None:
+        if days is None or int(days) == self.window_days:
+            return
+        self.window_days = int(days)
+        since = self._since()
+        self.rows = {
+            key: run for key, run in self.rows.items() if run.started_at > since or run.status not in FINAL_STATUSES
+        }
+        self.fetching = True
+        self.refilter()
+        self.load_runs()
+
+    def _since(self) -> datetime:
+        return cast("ValkyrieApp", self.app).now() - timedelta(days=self.window_days)
 
     def _show_highlighted(self) -> None:
         key = self.query_one(Table).highlighted_key()

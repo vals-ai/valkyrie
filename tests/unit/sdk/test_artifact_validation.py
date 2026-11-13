@@ -95,7 +95,7 @@ def test_cli_requires_sdk_benchmark_and_dataset_methods() -> None:
         dependencies = tomllib.load(root_file)["project"]["dependencies"]
     requirement = next(Requirement(value) for value in dependencies if value.startswith("valkyrie-sdk"))
     assert not requirement.specifier.contains("0.32.0")
-    assert requirement.specifier.contains("0.33.1")
+    assert requirement.specifier.contains("0.34.0")
 
 
 @pytest.mark.description("A correctly built wheel and sdist pass validation.")

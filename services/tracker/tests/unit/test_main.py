@@ -3140,7 +3140,9 @@ class TestTrackerAPI:
             queued["custom_benchmark_service"],
         ) == ("e2b", "e2bsecret", local_url)
 
-    @pytest.mark.description("Listing runs filters by dataset.")
+    @pytest.mark.description(
+        "Listing runs filters by dataset, and the `default` filter also matches runs with no or a blank dataset."
+    )
     async def test_fetch_benchmarks_filters_by_dataset(
         self, database_session: Session, contract: AgentContractRequest
     ) -> None:
@@ -3154,6 +3156,11 @@ class TestTrackerAPI:
                 org_id=TEST_ORG_ID,
                 name="terminal-bench",
                 arguments=AWSBenchmarkArguments(contract=contract, concurrency=1, dataset="default"),
+            ),
+            Benchmark(
+                org_id=TEST_ORG_ID,
+                name="terminal-bench",
+                arguments=AWSBenchmarkArguments(contract=contract, concurrency=1, dataset=""),
             ),
             Benchmark(
                 org_id=TEST_ORG_ID,
@@ -3175,7 +3182,7 @@ class TestTrackerAPI:
 
         assert response.status_code == 200
         response_json = response.json()
-        assert response_json["total_count"] == 2
+        assert response_json["total_count"] == 3
         assert {row["dataset"] for row in response_json["benchmarks"]} == {"default"}
 
     @pytest.mark.description("A run start records who started it.")

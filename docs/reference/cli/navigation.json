@@ -11,5 +11,5 @@
   "reference/cli/login",
   "reference/cli/token",
   "reference/cli/org",
-  "reference/cli/ui"
+  "reference/cli/tui"
 ]

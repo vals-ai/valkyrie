@@ -31,6 +31,7 @@ from benchmark_service import (
     SandboxRecoveryAttempt,
 )
 from benchmark_service.client import BenchmarkServiceError
+from benchmark_service.grading_spec import resolve_grading_spec
 from benchmark_service.schemas import EgressPolicy
 
 from tracker.runtime.lifecycle import finish_cleanup
@@ -1230,6 +1231,7 @@ async def _process_task_attempt(
         await _acquire_queue_preparation(preparation_stack, queue_context)
         async with enforce_wall_deadline(task_row.credited_wall_deadline_at):
             task_data = await recovery_attempt.retrieve_task()
+        grading_spec = None if task_data.eval_sandbox is None else resolve_grading_spec(task_data)
         unrestricted_docker = sandbox_provider_config.type == "docker"
         run_egress_policy = combine_run_egress_policies(
             task_data.egress.run, start_benchmark_request.contract.egress_allowlist
@@ -1404,6 +1406,7 @@ async def _process_task_attempt(
                     attempt=task_row.ref,
                     source=task_data.source,
                     resources=task_data.resources,
+                    grading=None if grading_spec is None else (grading_spec.source, grading_spec.resources),
                     creation_state=creation_state,
                     create=sandbox_context,
                     preparation_stack=preparation_stack,
@@ -1758,22 +1761,42 @@ async def _process_task_attempt(
                     if not unrestricted_docker:
                         await apply_egress_policy(sandbox, task_data.egress.evaluation)
                     task_logs.last_log_time = time.monotonic()
-                    async with grading_credentials(resolved_secrets) as grading_token:
-                        evaluation_result = await until_stream_ends(
-                            run_benchmark_service_websocket(
-                                benchmark_service.evaluate_instance(
-                                    task_row.task_id,
-                                    sandbox.id,
-                                    on_message=task_logs.write_line,
-                                    on_eval_resume_state=on_eval_resume_state,
-                                    on_sandbox_created=on_sandbox_created,
-                                    dataset=start_benchmark_request.dataset,
-                                    sandbox_provider=sandbox_provider_config,
-                                    child_egress=child_egress,
-                                    grading_token=grading_token,
+                    grading_releases: list[asyncio.Task[None]] = []
+
+                    def on_evaluation_sandbox_created(created: SandboxCreatedData) -> None:
+                        on_sandbox_created(created)
+                        if grading_spec is not None and queue_context is not None and not grading_releases:
+                            grading_releases.append(
+                                asyncio.create_task(
+                                    queue_context.control.release_grading(queue_context.pool_id, task_row.ref)
                                 )
                             )
-                        )
+
+                    try:
+                        async with grading_credentials(resolved_secrets) as grading_token:
+                            evaluation_result = await until_stream_ends(
+                                run_benchmark_service_websocket(
+                                    benchmark_service.evaluate_instance(
+                                        task_row.task_id,
+                                        sandbox.id,
+                                        on_message=task_logs.write_line,
+                                        on_eval_resume_state=on_eval_resume_state,
+                                        on_sandbox_created=on_evaluation_sandbox_created,
+                                        dataset=start_benchmark_request.dataset,
+                                        sandbox_provider=sandbox_provider_config,
+                                        child_egress=child_egress,
+                                        grading_token=grading_token,
+                                    )
+                                )
+                            )
+                    finally:
+                        for failure in await asyncio.gather(*grading_releases, return_exceptions=True):
+                            if failure is not None:
+                                logger.warning(
+                                    "task.grading_release_failed",
+                                    extra={"benchmark_id": str(benchmark_id), "task_id": task_row.task_id},
+                                    exc_info=failure,
+                                )
                     evaluation_run_duration = time.perf_counter() - evaluation_start_time
 
                 assert start_sandbox_run_time is not None

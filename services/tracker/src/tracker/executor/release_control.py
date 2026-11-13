@@ -221,6 +221,14 @@ def promote_release(session: Session, release_id: str) -> ExecutorRelease:
     return release
 
 
+def has_retirable_releases(session: Session) -> bool:
+    draining_ids = set(ExecutorReleaseRepository(session).draining_ids())
+    if not draining_ids:
+        return False
+    active_work = active_executor_release_work(session)
+    return not active_work.unattributed_executions and bool(draining_ids - active_work.counts_by_release.keys())
+
+
 def retire_drained_releases(session: Session) -> list[str]:
     admission = get_executor_admission(session, for_update=True)
     draining_releases = ExecutorReleaseRepository(session).lock_draining()

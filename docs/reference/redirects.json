@@ -36,6 +36,10 @@
     "destination": "/self-hosting/local-tracker"
   },
   {
+    "source": "/reference/cli/ui",
+    "destination": "/reference/cli/tui"
+  },
+  {
     "source": "/reference/cli/config/provider/set",
     "destination": "/reference/cli/provider#set"
   },

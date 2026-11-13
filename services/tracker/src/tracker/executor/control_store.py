@@ -68,9 +68,10 @@ def require_dispatch_owner(
     *,
     lock: bool,
     require_live: bool,
+    shared: bool = False,
 ) -> ExecutorDispatch:
     repository = ExecutorDispatchRepository(session)
-    dispatch = repository.lock(dispatch_id) if lock else repository.get(dispatch_id)
+    dispatch = repository.lock(dispatch_id, shared=shared) if lock else repository.get(dispatch_id)
     if (
         dispatch is None
         or dispatch.invocation_key_digest is None

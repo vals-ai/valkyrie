@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
@@ -18,7 +19,7 @@ from benchmark_service import (
     SandboxProviderConfig,
 )
 from benchmark_service.client import BenchmarkServiceClient
-from sqlalchemy import text
+from sqlalchemy import NullPool, create_engine, text
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, select
 
@@ -53,6 +54,7 @@ from tracker.database.models import (
     Org,
     SandboxAdmissionCandidate,
     SandboxBuildReservation,
+    SandboxGradingReservation,
     Task,
     TaskStatus,
 )
@@ -403,6 +405,70 @@ def test_batch_cannot_overgrant_any_capacity_dimension(
     assert _grant(postgres_session, pool_id, capacities=capacities) == 1
     assert _grant(postgres_session, pool_id, capacities=capacities) == 0
     assert [_task(postgres_engine, task).status for task in tasks] == [TaskStatus.BUILDING, TaskStatus.PENDING]
+
+
+@pytest.mark.description("An agent is granted only when its grading sandbox also fits beside it.")
+@pytest.mark.parametrize(("grading_vcpu", "granted"), [(6, 1), (7, 0)])
+def test_grant_requires_room_for_the_grading_sandbox(
+    postgres_engine: Engine,
+    postgres_session: Session,
+    grading_vcpu: float,
+    granted: int,
+) -> None:
+    pool_id = reserved_queue_pool_id(f"daytona:{uuid4()}")
+    _, _, (task,) = _run(postgres_session, pool_id, [("grades", TaskStatus.PENDING, _ATTEMPT)])
+    _prepare(postgres_session, pool_id, task, grading_demand=_DEMAND.model_copy(update={"vcpu": grading_vcpu}))
+    assert _grant(postgres_session, pool_id) == granted
+    assert _task(postgres_engine, task).status == (TaskStatus.BUILDING if granted else TaskStatus.PENDING)
+
+
+@pytest.mark.description(
+    "Grading capacity stays charged after the agent build until the grading sandbox is released or the attempt ends."
+)
+def test_grading_hold_blocks_new_agents_until_released(postgres_engine: Engine, postgres_session: Session) -> None:
+    pool_id = reserved_queue_pool_id(f"daytona:{uuid4()}")
+    _, _, (grader, next_agent) = _run(
+        postgres_session,
+        pool_id,
+        [("grader", TaskStatus.PENDING, _ATTEMPT), ("next", TaskStatus.PENDING, _ATTEMPT + timedelta(seconds=1))],
+        concurrency=2,
+    )
+    _prepare(postgres_session, pool_id, grader, grading_demand=_DEMAND.model_copy(update={"vcpu": 3}))
+    _prepare(postgres_session, pool_id, next_agent, _DEMAND.model_copy(update={"vcpu": 5}))
+    assert _grant(postgres_session, pool_id) == 1
+    repository = SchedulerRepository(postgres_session)
+    repository.release_reservation(grader.id, grader.started_at)
+    _update_task(postgres_engine, grader, TaskStatus.EVALUATING, grader.started_at)
+    postgres_session.commit()
+    after_build = repository.database_now() + timedelta(seconds=1)
+    assert repository.charged_reservations_by_domain(pool_id, after_build)[("region-a", "sysbox")].vcpu == 3
+    assert _grant(postgres_session, pool_id, read_at=after_build) == 0
+
+    repository.release_grading_reservation(grader.id, grader.started_at)
+    postgres_session.commit()
+    after_release = repository.database_now() + timedelta(seconds=1)
+    assert repository.charged_reservations_by_domain(pool_id, after_release) == {}
+    assert _grant(postgres_session, pool_id, read_at=after_release) == 1
+    assert _task(postgres_engine, next_agent).status == TaskStatus.BUILDING
+
+
+@pytest.mark.description(
+    "An unreleased grading hold stops counting once its attempt finishes, and the purge deletes it."
+)
+def test_finished_attempt_frees_its_grading_hold(postgres_engine: Engine, postgres_session: Session) -> None:
+    pool_id = reserved_queue_pool_id(f"daytona:{uuid4()}")
+    _, _, (task,) = _run(postgres_session, pool_id, [("grades", TaskStatus.PENDING, _ATTEMPT)])
+    _prepare(postgres_session, pool_id, task, grading_demand=_DEMAND)
+    assert _grant(postgres_session, pool_id) == 1
+    repository = SchedulerRepository(postgres_session)
+    repository.release_reservation(task.id, task.started_at)
+    _update_task(postgres_engine, task, TaskStatus.FINISHED, task.started_at)
+    postgres_session.commit()
+    later = repository.database_now() + timedelta(seconds=1)
+    assert repository.charged_reservations_by_domain(pool_id, later) == {}
+    repository.purge_released_reservations(pool_id, later)
+    postgres_session.commit()
+    assert postgres_session.get(SandboxGradingReservation, (task.id, task.started_at)) is None
 
 
 @pytest.mark.description("A batch skips work that does not fit without starving work that does.")
@@ -2001,3 +2067,111 @@ async def test_ready_worker_cancellation_clears_candidate_and_later_worker_recei
             waiting.cancel()
             await asyncio.gather(waiting, return_exceptions=True)
     capacity.assert_not_awaited()
+
+
+@pytest.mark.description(
+    "Only one scheduler process discovers pools, and another takes over discovery when the leader stops."
+)
+async def test_one_scheduler_leads_discovery_and_another_takes_over(
+    postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    discoveries: list[int] = []
+
+    def read_references(engine: Engine) -> list[coordinator.PoolReference]:
+        discoveries.append(id(engine))
+        return []
+
+    monkeypatch.setattr(coordinator, "read_pool_references", read_references)
+    first = coordinator.SharedPoolScheduler(postgres_engine, interval_seconds=0.01)
+    second_engine = create_engine(postgres_engine.url, poolclass=NullPool)
+    second = coordinator.SharedPoolScheduler(second_engine, interval_seconds=0.01)
+    first.start()
+    try:
+        await _until(lambda: id(postgres_engine) in discoveries)
+        second.start()
+        discoveries.clear()
+        await asyncio.sleep(0.2)
+        assert set(discoveries) == {id(postgres_engine)}
+        await first.stop()
+        discoveries.clear()
+        await _until(lambda: id(second_engine) in discoveries)
+    finally:
+        await first.stop()
+        await second.stop()
+        second_engine.dispose()
+
+
+@pytest.mark.description(
+    "When the leader loses its database connection, it stops its pools and another scheduler takes them over."
+)
+async def test_lost_leader_connection_hands_active_pools_to_another_scheduler(
+    postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool_id = f"pool_{uuid4()}"
+    reference = cast(coordinator.PoolReference, SimpleNamespace(pool_id=pool_id, benchmark=SimpleNamespace(id=uuid4())))
+    running: list[int] = []
+
+    class Coordinator:
+        def __init__(self, engine: Engine, _reference: coordinator.PoolReference, **_: object) -> None:
+            self.engine = engine
+
+        async def run(self) -> None:
+            running.append(id(self.engine))
+            try:
+                await asyncio.Event().wait()
+            finally:
+                running.remove(id(self.engine))
+
+    monkeypatch.setattr(coordinator, "read_pool_references", lambda _engine: [reference])
+    monkeypatch.setattr(coordinator, "PoolCoordinator", Coordinator)
+    first_engine = create_engine(postgres_engine.url, poolclass=NullPool)
+    second_engine = create_engine(postgres_engine.url, poolclass=NullPool)
+    first = coordinator.SharedPoolScheduler(first_engine, interval_seconds=0.01)
+    second = coordinator.SharedPoolScheduler(second_engine, interval_seconds=0.01)
+    first.start()
+    try:
+        await _until(lambda: running == [id(first_engine)])
+        second.start()
+        await asyncio.sleep(0.2)
+        assert running == [id(first_engine)]
+        monkeypatch.setattr(first._leader, "_try_acquire", lambda: False)
+        _terminate_leader(postgres_engine)
+        await _until(lambda: running == [id(second_engine)])
+    finally:
+        await first.stop()
+        await second.stop()
+        first_engine.dispose()
+        second_engine.dispose()
+
+
+@pytest.mark.description("A scheduler stops cleanly after its leader connection drops between leadership checks.")
+async def test_scheduler_stops_cleanly_after_leader_connection_drops(
+    postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    discoveries: list[int] = []
+    monkeypatch.setattr(coordinator, "read_pool_references", lambda _engine: discoveries.append(1) or [])
+    engine = create_engine(postgres_engine.url, poolclass=NullPool)
+    scheduler = coordinator.SharedPoolScheduler(engine, interval_seconds=60)
+    scheduler.start()
+    try:
+        await _until(lambda: bool(discoveries))
+        _terminate_leader(postgres_engine)
+        await scheduler.stop()
+    finally:
+        engine.dispose()
+
+
+def _terminate_leader(engine: Engine) -> None:
+    with engine.connect() as connection:
+        terminated = (
+            connection.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND granted"
+                    " AND ((classid::bigint << 32) | objid::bigint) = :key"
+                ),
+                {"key": advisory_lock.advisory_lock_key(coordinator._SCHEDULER_LEADER_RESOURCE_ID)},
+            )
+            .scalars()
+            .all()
+        )
+    assert terminated == [True]

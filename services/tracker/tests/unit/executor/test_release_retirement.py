@@ -178,3 +178,27 @@ async def test_tracker_lifespan_starts_and_stops_automatic_retirement(monkeypatc
         "recovery stopped",
         "stopped",
     ]
+
+
+@pytest.mark.description("The retirement loop leaves the admission fence alone when no release can retire.")
+def test_retirement_skips_the_admission_fence_without_retirable_releases(
+    database_session: Session,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    register_release(
+        database_session,
+        ExecutorRelease(
+            id="active",
+            artifact_uri="source:///artifacts/active/src",
+            artifact_digest="b" * 64,
+            protocol_version="1",
+        ),
+    )
+    promote_release(database_session, "active")
+    database_session.commit()
+    locked = Mock(side_effect=AssertionError("took the admission fence"))
+    monkeypatch.setattr(release_retirement, "engine", database_session.get_bind())
+    monkeypatch.setattr(release_retirement, "retire_drained_releases", locked)
+
+    assert release_retirement.retire_drained_releases_once() == []
+    locked.assert_not_called()

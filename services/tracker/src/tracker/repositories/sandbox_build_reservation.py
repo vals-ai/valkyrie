@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import JSON, or_, type_coerce
+from sqlalchemy import or_
 from sqlmodel import Session, col, select
 
 from tracker.database.models import Benchmark, BenchmarkStatus, SandboxBuildReservation, Task, TaskStatus
@@ -70,7 +70,7 @@ class SandboxBuildReservationRepository:
                     col(SandboxBuildReservation.task_row_id).is_not(None),
                 )
             )
-            .where(type_coerce(col(Benchmark.arguments), JSON)["queue_pool_id"].as_string() == pool_id)
+            .where(col(Benchmark.queue_pool_id) == pool_id)
             .with_for_update(of=Task, skip_locked=True)
         ).all()
 

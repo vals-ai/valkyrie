@@ -619,11 +619,11 @@ async def test_tracker_url_only_start_sends_the_provider_only_when_given(provide
         await client.runs.start("agent", "test", provider=provider)
 
 
-@pytest.mark.description("A client created without a config talks to `https://benchmark-tracker.vals.ai`.")
+@pytest.mark.description("A client created without a config talks to `https://benchmark-tracker-prod.vals.ai`.")
 async def test_a_client_without_a_config_uses_the_default_config() -> None:
     async with ValkyrieClient() as client:
         assert client.config == ValkyrieConfig()
-        assert str(client._client.base_url) == "https://benchmark-tracker.vals.ai"
+        assert str(client._client.base_url) == "https://benchmark-tracker-prod.vals.ai"
 
 
 @pytest.mark.description("Project create sends the budget and its reason.")

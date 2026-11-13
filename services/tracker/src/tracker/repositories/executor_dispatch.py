@@ -68,6 +68,7 @@ class ExecutorDispatchRepository:
         expired_before: datetime | None = None,
         ecs_task_arn: str | None = None,
         claim_expired_before: datetime | None = None,
+        shared: bool = False,
     ) -> ExecutorDispatch | None:
         query = select(ExecutorDispatch).where(col(ExecutorDispatch.id) == dispatch_id)
         if benchmark_id is not None:
@@ -80,7 +81,9 @@ class ExecutorDispatchRepository:
             query = query.where(ExecutorDispatch.ecs_task_arn == ecs_task_arn)
         if claim_expired_before is not None:
             query = query.where(col(ExecutorDispatch.claim_deadline_at) <= claim_expired_before)
-        return self._session.exec(query.execution_options(populate_existing=True).with_for_update()).one_or_none()
+        return self._session.exec(
+            query.execution_options(populate_existing=True).with_for_update(read=shared)
+        ).one_or_none()
 
     def lock_skip_locked(self, dispatch_id: UUID) -> ExecutorDispatch | None:
         return self._session.exec(

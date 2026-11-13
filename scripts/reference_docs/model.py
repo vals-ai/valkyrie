@@ -32,6 +32,7 @@ STATIC_REDIRECTS = [
     {"source": "/contributing/tracker-service", "destination": "/self-hosting/local-tracker"},
     {"source": "/contributing/database", "destination": "/self-hosting/local-tracker"},
     {"source": "/self-hosting/aws-permissions", "destination": "/self-hosting/local-tracker"},
+    {"source": "/reference/cli/ui", "destination": "/reference/cli/tui"},
     {"source": "/reference/cli/config/provider/set", "destination": "/reference/cli/provider#set"},
     {"source": "/reference/cli/config/provider/default", "destination": "/reference/cli/provider#default"},
     {"source": "/reference/cli/config/provider/remove", "destination": "/reference/cli/provider#remove"},
@@ -59,7 +60,7 @@ GUIDE_LINKS = {
     "login": "/get-started/configuration#sign-in",
     "token": "/get-started/configuration#create-an-access-key-for-ci",
     "org": "/get-started/configuration#join-an-organization",
-    "ui": "/runs/monitor#browse-runs-in-the-terminal",
+    "tui": "/runs/monitor#browse-runs-in-the-terminal",
 }
 
 CLI_CARDS = {
@@ -77,10 +78,10 @@ CLI_CARDS = {
     "login": ("log-in", "signing in, signing out, and checking which account your requests use"),
     "token": ("key-round", "creating and revoking access keys for CI and other headless use"),
     "org": ("building-2", "creating, joining and switching organizations, and managing their members"),
-    "ui": ("monitor", "browsing runs, tasks, and logs in a terminal UI"),
+    "tui": ("monitor", "browsing runs, tasks, and logs in a terminal UI"),
 }
 CLI_PAGE_GROUPS = {"logout": "login", "whoami": "login"}
-CLI_TITLES = {"ui": "UI"}
+CLI_TITLES = {"tui": "TUI"}
 
 RESOURCE_CARDS = {
     "ArtifactsResource": ("Artifacts", "folder", "listing and downloading run artifact paths"),

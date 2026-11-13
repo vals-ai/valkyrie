@@ -10,7 +10,7 @@ license-files = ["LICENSE"]
 dependencies = [
   "click>=8.1.0",
   "python-dotenv",
-  "valkyrie-sdk>=0.33.1,<1",
+  "valkyrie-sdk>=0.34.0,<1",
   "pyyaml>=6.0.3",
   "textual>=8.2,<9",
 ]

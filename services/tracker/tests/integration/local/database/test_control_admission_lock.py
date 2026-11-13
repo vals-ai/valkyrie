@@ -1,5 +1,6 @@
 import threading
 import time
+from datetime import UTC, datetime
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -12,7 +13,15 @@ from sqlalchemy.engine import Engine
 from sqlmodel import Session
 
 from tests.factories import make_benchmark, make_task
-from tracker.database.models import ExecutorDispatch, ExecutorDispatchKind, ExecutorDispatchStatus, ExecutorRelease, Org
+from tracker.database.models import (
+    ExecutorDispatch,
+    ExecutorDispatchKind,
+    ExecutorDispatchStatus,
+    ExecutorRelease,
+    Org,
+    Task,
+)
+from tracker.domain import TaskStatus
 from tracker.database.session import get_session
 from tracker.executor import dispatch_recovery
 from tracker.executor.control_app import app as control_app
@@ -312,3 +321,76 @@ def test_scheduler_cycle_shares_the_admission_fence_with_control(
             finish.set()
         assert cycle.result(timeout=10) == {}
         writing.result(timeout=10)
+
+
+def _deadline_call(client: TestClient, ref: tuple[str, str, str], task: Task) -> int:
+    benchmark_id, dispatch_id, key = ref
+    response = client.post(
+        "/executor-control/v1/ensure_task_deadline",
+        headers={"X-Executor-Dispatch-ID": dispatch_id, "Authorization": f"Bearer {key}"},
+        json={
+            "ref": {"benchmark_id": benchmark_id, "dispatch_id": dispatch_id},
+            "attempt": {
+                "org_id": str(task.org_id),
+                "task_row_id": str(task.id),
+                "task_id": task.task_id,
+                "started_at": task.started_at.isoformat(),
+            },
+        },
+    )
+    return response.status_code
+
+
+def _started_tasks(session: Session, benchmark_id: str, count: int) -> list[Task]:
+    benchmark = BenchmarkRepository(session).get_by_id(UUID(benchmark_id))
+    assert benchmark is not None
+    tasks = [
+        make_task(benchmark, f"started-{index}", status=TaskStatus.IN_PROGRESS, started_at=datetime.now(UTC))
+        for index in range(count)
+    ]
+    session.add_all(tasks)
+    session.commit()
+    for task in tasks:
+        session.refresh(task)
+    return tasks
+
+
+@pytest.mark.description(
+    "A task-scoped control write proceeds while another task write in the same run holds the run and dispatch rows."
+)
+def test_task_scoped_writes_in_one_run_do_not_serialize(
+    postgres_engine: Engine, postgres_session: Session, control_client: TestClient
+) -> None:
+    (ref,) = _running_dispatches(postgres_session, 1)
+    benchmark_id, dispatch_id, _ = ref
+    (task,) = _started_tasks(postgres_session, benchmark_id, 1)
+    with Session(postgres_engine) as in_flight, ThreadPoolExecutor(max_workers=1) as pool:
+        in_flight.execute(text("SET LOCAL lock_timeout = '5s'"))
+        BenchmarkRepository(in_flight).get_by_id(UUID(benchmark_id), for_share=True)
+        ExecutorDispatchRepository(in_flight).lock(UUID(dispatch_id), shared=True)
+        call = pool.submit(_deadline_call, control_client, ref, task)
+        try:
+            assert call.result(timeout=10) == 200
+        finally:
+            in_flight.rollback()
+
+
+@pytest.mark.description("A run-row writer blocks task-scoped control writes until it commits.")
+def test_run_row_writer_still_fences_task_scoped_writes(
+    postgres_engine: Engine,
+    postgres_session: Session,
+    control_client: TestClient,
+    wait_for_database_lock: Callable[[], None],
+) -> None:
+    (ref,) = _running_dispatches(postgres_session, 1)
+    benchmark_id, _, _ = ref
+    (task,) = _started_tasks(postgres_session, benchmark_id, 1)
+    with Session(postgres_engine) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        BenchmarkRepository(writer).lock_by_id(UUID(benchmark_id))
+        call = pool.submit(_deadline_call, control_client, ref, task)
+        try:
+            wait_for_database_lock()
+            assert not call.done()
+        finally:
+            writer.commit()
+        assert call.result(timeout=10) == 200

@@ -237,7 +237,7 @@ class RunScreen(BrowseScreen[None]):
     KEYS: ClassVar[list[tuple[str, str]]] = [
         ("j k ↑ ↓", "move through tasks, or scroll the log"),
         ("tab", "switch between the task list and the log"),
-        ("[ ]", "logs, detail"),
+        ("[ ]", "switch between logs and detail, or click their titles"),
         ("z", "zoom the log"),
         ("G", "jump to the end of the log and follow it"),
         ("/", "filter by task id, status, failure category or error message, or search the log when it has focus"),
@@ -485,7 +485,10 @@ class RunScreen(BrowseScreen[None]):
         return task.finished_at is not None and now - task.finished_at > SETTLED_AFTER
 
     def action_switch_tab(self, step: int) -> None:
-        self.tab = TABS[(TABS.index(self.tab) + step) % len(TABS)]
+        self.action_select_tab(TABS[(TABS.index(self.tab) + step) % len(TABS)])
+
+    def action_select_tab(self, tab: str) -> None:
+        self.tab = tab
         self._show_tab()
 
     def action_open_search(self) -> None:
@@ -564,7 +567,8 @@ class RunScreen(BrowseScreen[None]):
     def _show_tab(self) -> None:
         self.query_one(ContentSwitcher).current = self.tab
         titles = [
-            f"[bold $accent]{tab.title()}[/]" if tab == self.tab else f"[$text-muted]{tab.title()}[/]" for tab in TABS
+            f"[@click=screen.select_tab('{tab}')][{'bold $accent' if tab == self.tab else '$text-muted'}]{tab.title()}[/][/]"
+            for tab in TABS
         ]
         self.query_one(ContentSwitcher).border_title = " [$text-muted]│[/] ".join(titles)
         self._show_log_state()

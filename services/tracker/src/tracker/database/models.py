@@ -7,6 +7,7 @@ from pydantic import field_serializer
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Computed,
     Connection,
     DateTime,
     Dialect,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    String,
     event,
     text,
 )
@@ -340,6 +342,21 @@ class SandboxBuildReservation(SQLModel, table=True):
     requested_gpu: float
 
 
+class SandboxGradingReservation(SQLModel, table=True):
+    __table_args__ = (Index("ix_sandboxgradingreservation_pool", "pool_id"),)
+
+    task_row_id: UUID = Field(primary_key=True, foreign_key="task.id")
+    attempt_started_at: datetime = Field(primary_key=True)
+    released_at: datetime | None = None
+    pool_id: str
+    target_id: str
+    sandbox_class: str
+    requested_vcpu: float
+    requested_memory: float
+    requested_disk: float
+    requested_gpu: float
+
+
 class BenchmarkServiceWake(SQLModel, table=True):
     name: str = Field(primary_key=True)
     requested_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
@@ -388,6 +405,7 @@ class Benchmark(SQLModel, table=True):
             text("started_at DESC"),
             "id",
         ),
+        Index("ix_benchmark_queue_pool_id", "queue_pool_id", postgresql_where=text("queue_pool_id IS NOT NULL")),
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -411,6 +429,18 @@ class Benchmark(SQLModel, table=True):
     custom_benchmark_service: str | None = Field(default=None)
     arguments: BenchmarkArguments = Field(
         sa_column=Column(BenchmarkArgumentsType),
+    )
+    queue_pool_id: str | None = Field(
+        default=None, sa_column=Column(String, Computed("arguments ->> 'queue_pool_id'", persisted=True))
+    )
+    agent_name: str | None = Field(
+        default=None, sa_column=Column(String, Computed("(arguments -> 'contract') ->> 'name'", persisted=True))
+    )
+    agent_model: str | None = Field(
+        default=None, sa_column=Column(String, Computed("(arguments -> 'contract') ->> 'model'", persisted=True))
+    )
+    dataset: str | None = Field(
+        default=None, sa_column=Column(String, Computed("arguments ->> 'dataset'", persisted=True))
     )
     started_by_id: str | None = Field(default=None)
     started_by_email: str | None = Field(default=None, index=True)

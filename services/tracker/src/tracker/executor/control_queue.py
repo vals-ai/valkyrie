@@ -55,6 +55,7 @@ class QueueDemand(BaseModel):
 class QueuePrepareRequest(QueueAttemptRequest):
     demand: QueueDemand
     admission_ready: bool
+    grading_demand: QueueDemand | None = None
 
 
 class QueueStateResponse(BaseModel):
@@ -159,11 +160,21 @@ class QueueControl:
         )
         return await self.control.call("queue-round", request, QueueRoundResponse)
 
-    async def prepare(self, pool_id: str, attempt: AttemptRef, demand: QueueDemand, ready: bool) -> None:
+    async def prepare(
+        self, pool_id: str, attempt: AttemptRef, demand: QueueDemand, ready: bool, grading_demand: QueueDemand | None
+    ) -> None:
         request = QueuePrepareRequest(
-            **self.request(pool_id).model_dump(), attempt=attempt, demand=demand, admission_ready=ready
+            **self.request(pool_id).model_dump(),
+            attempt=attempt,
+            demand=demand,
+            admission_ready=ready,
+            grading_demand=grading_demand,
         )
         await self.control.call("queue-prepare", request, QueueBuildResponse)
+
+    async def release_grading(self, pool_id: str, attempt: AttemptRef) -> None:
+        request = QueueAttemptRequest(**self.request(pool_id).model_dump(), attempt=attempt)
+        await self.control.call("queue-release-grading", request, QueueBuildResponse)
 
     async def state(self, pool_id: str, attempt: AttemptRef) -> QueueStateResponse:
         loop = asyncio.get_running_loop()

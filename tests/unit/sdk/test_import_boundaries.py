@@ -40,7 +40,7 @@ BOUNDARIES = (
         name="cli",
         paths=("src/valkyrie/cli",),
         forbidden=("tracker", "valkyrie.tui", "httpx"),
-        lazy_allowed={"src/valkyrie/cli/ui.py": ("valkyrie.tui",)},
+        lazy_allowed={"src/valkyrie/cli/tui.py": ("valkyrie.tui",)},
         sdk_allowed=PUBLIC_SDK,
     ),
     Boundary(
@@ -240,19 +240,19 @@ def test_public_sdk_imports_pass(tmp_path: Path) -> None:
 def test_lazy_allowance_only_covers_function_scope(tmp_path: Path) -> None:
     cli = tmp_path / "src/valkyrie/cli"
     cli.mkdir(parents=True)
-    (cli / "ui.py").write_text("def ui():\n    from valkyrie.tui.app import App\n")
+    (cli / "tui.py").write_text("def tui():\n    from valkyrie.tui.app import App\n")
     (cli / "main.py").write_text("from valkyrie.tui.app import App\n")
     boundary = Boundary(
         name="cli",
         paths=("src/valkyrie/cli",),
         forbidden=("valkyrie.tui",),
-        lazy_allowed={"src/valkyrie/cli/ui.py": ("valkyrie.tui",)},
+        lazy_allowed={"src/valkyrie/cli/tui.py": ("valkyrie.tui",)},
     )
 
     assert find_violations(boundary, tmp_path) == ["src/valkyrie/cli/main.py:1 imports valkyrie.tui.app"]
 
-    (cli / "ui.py").write_text("from valkyrie.tui.app import App\n")
-    assert "src/valkyrie/cli/ui.py:1 imports valkyrie.tui.app" in find_violations(boundary, tmp_path)
+    (cli / "tui.py").write_text("from valkyrie.tui.app import App\n")
+    assert "src/valkyrie/cli/tui.py:1 imports valkyrie.tui.app" in find_violations(boundary, tmp_path)
 
 
 @pytest.mark.description("An SDK allowlist without the SDK source fails with `does not exist`.")

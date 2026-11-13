@@ -87,7 +87,7 @@ _EXPECTED_CLI_PATHS = (
     "org decline",
     "org members",
     "org remove",
-    "ui",
+    "tui",
 )
 _EXPECTED_RESOURCES = {
     "ArtifactsResource": ("list", "download_url", "download"),

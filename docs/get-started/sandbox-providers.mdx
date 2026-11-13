@@ -1,15 +1,14 @@
 ---
 title: "Configure sandbox providers"
 sidebarTitle: "Sandbox providers"
-description: "Store your Daytona or Modal credentials and choose which provider your runs use."
+description: "Connect your Daytona or Modal account and choose where your tasks run."
 ---
 
-Valkyrie creates each task's sandbox with your organization's own sandbox provider
-account.
+Each task runs in a sandbox: a separate environment for the agent and task. Sandboxes
+run in your organization's Daytona or Modal account.
 
-- An organization sets up each provider once: store its credentials as an organization
-  secret, then map the provider to that secret.
-- Every member's runs on that provider use the mapping.
+- Connect a provider once, and everyone in the organization can use it.
+- Save the provider's credentials in Valkyrie, then connect the provider to them.
 
 ## Set up Daytona
 
@@ -29,8 +28,7 @@ account.
 
    Replace *`API_KEY`* with your Daytona API key.
 
-4. Store the file as a secret, then map the `daytona` provider to the reference that
-   `secret set` prints:
+4. Upload the credentials and connect Daytona:
 
    ```bash
    valkyrie secret set daytona < daytona.json
@@ -57,7 +55,7 @@ account.
    }
    ```
 
-3. Store the file as a secret and map it to the provider named `modal`:
+3. Upload the credentials and connect Modal:
 
    ```bash
    valkyrie secret set modal < modal.json
@@ -65,34 +63,50 @@ account.
    valkyrie provider set modal modal
    ```
 
-The provider name selects the provider, so map Modal credentials to `modal`, never to
-another name.
-
 ## Choose the provider for a run
 
-A run uses the provider you pass with `--provider`, otherwise your default provider,
-otherwise `daytona`:
+Choose a provider when starting a run:
 
 ```bash
 valkyrie run start --agent my-agent --benchmark swebench --provider modal
 ```
 
-- Set your own default with `valkyrie provider default modal`. The default is yours alone
-  in the current organization and needs a login.
-- `valkyrie provider list` shows each mapped provider's secret and marks your default.
+- Without `--provider`, runs use your default. If you haven't set a default, they use
+  Daytona.
+- Your default applies only to you in the current organization.
+
+To set your default, sign in and run:
+
+```bash
+valkyrie provider default modal
+```
+
+To see connected providers and your default:
+
+```bash
+valkyrie provider list
+```
 
 ## Rotate or remove credentials
 
-- To replace the credentials, run `valkyrie secret set` again with the new file. The
-  mapping keeps pointing at the same secret.
-- Remove a mapping with `valkyrie provider remove modal`.
-- A run on a provider with no mapping fails with `No secret is set for provider modal`.
+To replace credentials, save the new values under the same secret name:
+
+```bash
+valkyrie secret set modal < modal.json
+```
+
+To disconnect a provider:
+
+```bash
+valkyrie provider remove modal
+```
+
+Runs using that provider will fail until you connect it again.
 
 ## Limits
 
 - Modal sandboxes last at most 24 hours, so a longer task fails on Modal.
-- Benchmark services built with a create-benchmark-service version earlier than v0.14.0
-  can't create Modal sandboxes. Their runs fail with
-  `Modal sandbox provider is not implemented`.
+- If a benchmark reports `Modal sandbox provider is not implemented`, ask its author to
+  update the benchmark service.
 - Docker sandboxes are available only on a [local
   Tracker](/self-hosting/local-tracker#docker-sandboxes).

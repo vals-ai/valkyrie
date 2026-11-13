@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 from urllib.parse import urlparse
 from uuid import UUID
@@ -23,12 +24,14 @@ from valkyrie.sdk.models import (
     TaskStatus,
 )
 
+RUN_PAGE_LIMIT = 500
 TASK_PAGE_LIMIT = 500
 URGENT_TASKS = [TaskStatus.ERROR, TaskStatus.EVALUATING, TaskStatus.IN_PROGRESS, TaskStatus.BUILDING]
 ACTIVE_TASKS = (TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 OTHER_TASKS = [TaskStatus.PENDING, TaskStatus.STOPPED, TaskStatus.FINISHED]
 TRIAGE_ORDER = URGENT_TASKS + OTHER_TASKS
 FINAL_STATUSES = frozenset({BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED})
+LIVE_STATUSES = [status for status in BenchmarkStatus if status not in FINAL_STATUSES]
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ class Environment:
 class RunSource(Protocol):
     environment: Environment
 
-    async def runs(self, limit: int) -> list[BenchmarkTableRow]: ...
+    async def runs(self, since: datetime, limit: int) -> list[BenchmarkTableRow]: ...
 
     async def statuses(self, run_ids: Sequence[UUID]) -> list[BenchmarkStatusEntry]: ...
 
@@ -78,9 +81,13 @@ class TrackerSource:
     def from_config(cls, config: ValkyrieConfig) -> TrackerSource:
         return cls(ValkyrieClient(config), Environment.of(config.url))
 
-    async def runs(self, limit: int) -> list[BenchmarkTableRow]:
-        page = await self._client.runs.list(FetchBenchmarksRequest(limit=limit))
-        return page.benchmarks
+    async def runs(self, since: datetime, limit: int) -> list[BenchmarkTableRow]:
+        recent = FetchBenchmarksRequest(started_after=since, limit=min(limit, RUN_PAGE_LIMIT))
+        live = FetchBenchmarksRequest(status=LIVE_STATUSES, limit=RUN_PAGE_LIMIT)
+        runs, still_going = await asyncio.gather(
+            _take(self._client.runs.iter(recent), limit), _take(self._client.runs.iter(live))
+        )
+        return list({run.id: run for run in runs + still_going}.values())
 
     async def statuses(self, run_ids: Sequence[UUID]) -> list[BenchmarkStatusEntry]:
         response = await self._client.benchmarks.statuses(run_ids)
@@ -135,3 +142,12 @@ class TrackerSwitcher:
 
     def open(self, url: str) -> RunSource:
         return TrackerSource.from_config(ValkyrieConfig(url=url))
+
+
+async def _take(rows: AsyncIterator[BenchmarkTableRow], count: int | None = None) -> list[BenchmarkTableRow]:
+    taken: list[BenchmarkTableRow] = []
+    async for row in rows:
+        taken.append(row)
+        if len(taken) == count:
+            break
+    return taken

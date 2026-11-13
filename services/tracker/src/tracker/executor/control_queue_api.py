@@ -206,6 +206,9 @@ def prepare(body: QueuePrepareRequest, request: Request, session: Session = Depe
         body.ref.dispatch_id,
         demand,
         admission_ready=body.admission_ready,
+        grading_demand=None
+        if body.grading_demand is None
+        else SandboxReservationDemand(**body.grading_demand.model_dump()),
     )
     session.commit()
     return complete_response(session, QueueBuildResponse(started=True))
@@ -478,6 +481,22 @@ def clear(body: QueueAttemptRequest, request: Request, session: Session = Depend
     SchedulerRepository(session).clear_admission_candidate(
         body.attempt.task_row_id, body.attempt.started_at, body.ref.dispatch_id
     )
+    session.commit()
+    return complete_response(session, QueueBuildResponse(started=False))
+
+
+@router.post(
+    "/queue-release-grading",
+    response_model=QueueBuildResponse,
+    description="Release the capacity held for an owned task attempt's grading sandbox once that sandbox exists.",
+)
+def release_grading(
+    body: QueueAttemptRequest, request: Request, session: Session = Depends(get_session)
+) -> QueueBuildResponse:
+    benchmark, _, _ = _owner(session, request, body.ref)
+    _pool(body, benchmark)
+    if _attempt(session, body.attempt, benchmark) is not None:
+        SchedulerRepository(session).release_grading_reservation(body.attempt.task_row_id, body.attempt.started_at)
     session.commit()
     return complete_response(session, QueueBuildResponse(started=False))
 

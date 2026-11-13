@@ -152,9 +152,12 @@ class FakeSource:
         rows = [BenchmarkTableRow.model_validate(raw) for raw in fixture["runs"]]
         self._runs = [self._load_run(row, offset) for row in rows]
 
-    async def runs(self, limit: int) -> list[BenchmarkTableRow]:
+    async def runs(self, since: datetime, limit: int) -> list[BenchmarkTableRow]:
         self._advance()
-        return [self._row(run) for run in self._runs[:limit]]
+        rows = [self._row(run) for run in self._runs]
+        recent = [row for row in rows if row.started_at > since][:limit]
+        shown = {row.id for row in recent}
+        return recent + [row for row in rows if row.id not in shown and row.status not in FINAL_STATUSES]
 
     async def statuses(self, run_ids: Sequence[UUID]) -> list[BenchmarkStatusEntry]:
         self._advance()

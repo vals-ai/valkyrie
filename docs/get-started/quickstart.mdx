@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Install Claude Code from the public registry and run one Terminal-Bench task on Modal."
+description: "Run your first agent evaluation on one Terminal-Bench task with Modal."
 ---
 
 Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie.
@@ -8,7 +8,6 @@ Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie.
 You need:
 
 - Python 3.12, [uv](https://docs.astral.sh/uv/), and Git.
-- A Vals AI account. To get one, send an email to [contact@vals.ai](mailto:contact@vals.ai).
 - A [Modal](https://modal.com) account for task sandboxes.
 - An [Anthropic API key](https://platform.claude.com/settings/keys) for Claude Code.
 
@@ -22,11 +21,17 @@ uv tool install valkyrie-cli
 
 <a id="sign-in" style={{ display: "block", scrollMarginTop: "12rem" }} />
 
-## 2. Sign in
+## 2. Sign in and create an organization
 
 ```bash
 valkyrie login
+
+valkyrie org create my-team
 ```
+
+- Replace `my-team` with an unused organization ID. See the
+  [ID requirements](/get-started/configuration#create-an-organization).
+- Later commands use this organization.
 
 ## 3. Connect Modal
 
@@ -45,11 +50,13 @@ valkyrie agent install \
 
 - The CLI confirms that `claude_code-v1.0.0` is installed in your organization's library.
 
-Store your Anthropic API key at the hidden prompt:
+Save your Anthropic API key:
 
 ```bash
 valkyrie secret set anthropic-api-key
 ```
+
+Enter the key when prompted. It is hidden as you type.
 
 ## 5. Install a Harbor dataset
 
@@ -57,8 +64,7 @@ valkyrie secret set anthropic-api-key
 valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
 ```
 
-- The CLI downloads the tasks from Harbor and publishes them as `tb/tb2` in your
-  organization, creating the benchmark and dataset if needed.
+- The tasks are saved as `tb/tb2` in your organization.
 
 <a id="run-one-task" style={{ display: "block", scrollMarginTop: "12rem" }} />
 

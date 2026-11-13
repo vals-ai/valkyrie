@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from uuid import UUID
 
-from sqlalchemy import JSON, case, literal, tuple_, type_coerce
+from sqlalchemy import JSON, case, literal, tuple_, type_coerce, union_all
 from sqlalchemy import select as sa_select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased, selectinload
@@ -55,12 +55,12 @@ FinishedEvaluationRow = tuple[
 ]
 
 
-class FilterRow(NamedTuple):
-    benchmark_name: str
-    agent_name: str
-    model: str | None
-    dataset: str | None
-    email: str | None
+class FilterOptions(NamedTuple):
+    benchmark_names: list[str]
+    agent_names: list[str]
+    models: list[str]
+    datasets: list[str]
+    started_by_emails: list[str]
 
 
 class BenchmarkRepository:
@@ -71,12 +71,12 @@ class BenchmarkRepository:
         benchmark = self._session.get(Benchmark, benchmark_id)
         return benchmark if benchmark is not None and benchmark.org_id == org_id else None
 
-    def get_by_id(self, benchmark_id: UUID, *, for_update: bool = False) -> Benchmark | None:
+    def get_by_id(self, benchmark_id: UUID, *, for_update: bool = False, for_share: bool = False) -> Benchmark | None:
         return self._session.get(
             Benchmark,
             benchmark_id,
-            populate_existing=for_update,
-            with_for_update=for_update or None,
+            populate_existing=for_update or for_share,
+            with_for_update={"read": True} if for_share else for_update or None,
         )
 
     def lock_by_id(self, benchmark_id: UUID) -> Benchmark:
@@ -93,7 +93,7 @@ class BenchmarkRepository:
     def lock_pool(self, pool_id: str) -> Sequence[Benchmark]:
         return self._session.exec(
             select(Benchmark)
-            .where(type_coerce(col(Benchmark.arguments), JSON)["queue_pool_id"].as_string() == pool_id)
+            .where(col(Benchmark.queue_pool_id) == pool_id)
             .order_by(col(Benchmark.id))
             .with_for_update()
         ).all()
@@ -109,18 +109,17 @@ class BenchmarkRepository:
 
     def _filtered(self, filters: BenchmarkFilters, org_id: UUID) -> SelectOfScalar[Benchmark]:
         query = select(Benchmark).where(Benchmark.org_id == org_id).options(selectinload(Benchmark.final_evaluation))
-        arguments_json = type_coerce(col(Benchmark.arguments), JSON)
 
         if filters.agent_name:
-            query = query.where(arguments_json["contract"]["name"].as_string().in_(filters.agent_name))
+            query = query.where(col(Benchmark.agent_name).in_(filters.agent_name))
 
         if filters.model:
-            query = query.where(arguments_json["contract"]["model"].as_string() == filters.model)
+            query = query.where(col(Benchmark.agent_model) == filters.model)
 
         if filters.dataset:
-            dataset_value = arguments_json["dataset"].as_string()
+            dataset_value = col(Benchmark.dataset)
             if filters.dataset == "default":
-                query = query.where(or_(dataset_value == "default", dataset_value.is_(None)))
+                query = query.where(or_(dataset_value == "default", dataset_value == "", dataset_value.is_(None)))
             else:
                 query = query.where(dataset_value == filters.dataset)
 
@@ -250,20 +249,28 @@ class BenchmarkRepository:
             failures.setdefault(task_id, (error_message or "No error message was provided", category))
         return failures
 
-    def filter_rows(self, org_id: UUID) -> Sequence[FilterRow]:
-        arguments = type_coerce(col(Benchmark.arguments), JSON)
-        statement = (
-            cast(Any, select)(
-                col(Benchmark.name).label("benchmark_name"),
-                arguments["contract"]["name"].as_string().label("agent_name"),
-                arguments["contract"]["model"].as_string().label("model"),
-                arguments["dataset"].as_string().label("dataset"),
-                col(Benchmark.started_by_email).label("email"),
+    def filter_options(self, org_id: UUID) -> FilterOptions:
+        columns = {
+            "benchmark_names": col(Benchmark.name),
+            "agent_names": col(Benchmark.agent_name),
+            "models": col(Benchmark.agent_model),
+            "datasets": func.coalesce(func.nullif(col(Benchmark.dataset), ""), "default"),
+            "started_by_emails": col(Benchmark.started_by_email),
+        }
+        statement = union_all(
+            *(
+                sa_select(literal(field).label("field"), value.label("value"))
+                .where(col(Benchmark.org_id) == org_id)
+                .where(value.is_not(None))
+                .where(value != "")
+                .group_by(value)
+                for field, value in columns.items()
             )
-            .where(Benchmark.org_id == org_id)
-            .distinct()
         )
-        return cast(Sequence[FilterRow], cast(Any, self._session.exec(statement)).all())
+        values: dict[str, list[str]] = {field: [] for field in columns}
+        for field, value in self._session.execute(statement):
+            values[field].append(value)
+        return FilterOptions(**values)
 
     def get_task(self, org_id: UUID, benchmark_id: UUID, task_id: str, *, refresh: bool = False) -> Task | None:
         return self._session.exec(
@@ -504,7 +511,7 @@ class BenchmarkRepository:
                 select(Task.id)
                 .join(Benchmark, col(Task.benchmark) == col(Benchmark.id))
                 .where(col(Task.status) == TaskStatus.BUILDING)
-                .where(type_coerce(col(Benchmark.arguments), JSON)["queue_pool_id"].as_string() == pool_id)
+                .where(col(Benchmark.queue_pool_id) == pool_id)
             ).first()
             is not None
         )

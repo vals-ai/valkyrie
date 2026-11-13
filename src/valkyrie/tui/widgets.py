@@ -169,12 +169,15 @@ class Table(DataTable[Text]):
         row_key, _ = self.coordinate_to_cell_key(self.cursor_coordinate)
         return str(row_key.value)
 
+    def update_row(self, key: str, cells: list[Text]) -> None:
+        for column, cell in zip(self.columns, cells, strict=True):
+            self.update_cell(key, column, cell)
+
     def show_rows(self, rows: Mapping[str, list[Text]]) -> None:
         with self.app.batch_update():
             if list(rows) == [row.value for row in self.rows]:
                 for key, cells in rows.items():
-                    for column, cell in zip(self.columns, cells, strict=True):
-                        self.update_cell(key, column, cell)
+                    self.update_row(key, cells)
                 return
             highlighted = self.highlighted_key()
             self.clear()

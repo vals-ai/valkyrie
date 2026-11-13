@@ -31,6 +31,11 @@ class ExecutorReleaseRepository:
             select(ExecutorRelease.task_definition_arn).where(ExecutorRelease.id == release_id)
         ).one()
 
+    def draining_ids(self) -> Sequence[str]:
+        return self._session.exec(
+            select(ExecutorRelease.id).where(ExecutorRelease.status == ExecutorReleaseStatus.DRAINING)
+        ).all()
+
     def lock_draining(self) -> Sequence[ExecutorRelease]:
         return self._session.exec(
             select(ExecutorRelease)
@@ -51,10 +56,7 @@ class ExecutorReleaseRepository:
     def shared_admission(self) -> ExecutorAdmission | None:
         self._queue_on_admission_fence("pg_advisory_xact_lock_shared")
         statement = (
-            select(ExecutorAdmission)
-            .where(col(ExecutorAdmission.id) == 1)
-            .execution_options(populate_existing=True)
-            .with_for_update(read=True)
+            select(ExecutorAdmission).where(col(ExecutorAdmission.id) == 1).execution_options(populate_existing=True)
         )
         return self._session.exec(statement).one_or_none()
 

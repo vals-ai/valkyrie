@@ -29,11 +29,5 @@ def get_filter_options(
     org: Org = Depends(get_current_org),
 ) -> FilterOptionsResponse:
 
-    rows = repository.filter_rows(org.id)
-    return FilterOptionsResponse(
-        benchmark_names=sorted({row.benchmark_name for row in rows}),
-        agent_names=sorted({row.agent_name for row in rows}),
-        models=sorted({row.model for row in rows if row.model}),
-        datasets=sorted({row.dataset or "default" for row in rows}),
-        started_by_emails=sorted({row.email for row in rows if row.email}),
-    )
+    options = repository.filter_options(org.id)
+    return FilterOptionsResponse(**{name: sorted(values) for name, values in options._asdict().items()})
