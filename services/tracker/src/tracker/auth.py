@@ -1,20 +1,25 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Generator, Mapping
+import asyncio
+from collections.abc import Callable, Collection, Generator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import json
 import math
+import random
 import secrets
 from threading import Condition
 import time
-from typing import Any, cast
+from typing import Any, TypeVar, cast
+from weakref import WeakKeyDictionary, ref, ReferenceType
 
 from cachetools import TLRUCache, cached
 from descope import DescopeClient
-from descope.exceptions import AuthException
+from descope.exceptions import AuthException, RateLimitException
 from descope.management.access_key import AccessKey
 from descope.mgmt import MGMT
 from fastapi import Depends, HTTPException, Request
@@ -36,7 +41,7 @@ from tracker.config import (
 from tracker.aws.tenant_storage import TenantBucketError, ensure_managed_org_bucket
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.repositories.organization import OrganizationRepository
-from tracker.database.session import get_session
+from tracker.database.session import database_call, get_session
 from tracker.logging import get_logger
 from tracker.outbound_security import validate_service_headers
 
@@ -57,6 +62,18 @@ LOGIN_REQUIRED = "This needs a `valkyrie login` session; unset VALKYRIE_API_KEY 
 _ACCESS_KEY_CACHE_MAX_SIZE = 1024
 _ACCESS_KEY_CACHE_TTL_SECONDS = 60.0
 _ACCESS_KEY_EXPIRY_SKEW_SECONDS = 1.0
+_USER_LOOKUP_TIMEOUT_SECONDS = 2.0
+_USER_LOOKUP_RETRY_BUDGET_SECONDS = 15.0
+_USER_LOOKUP_ATTEMPTS = 5
+_USER_LOOKUP_CACHE_TTL_SECONDS = 5.0
+_USER_LOOKUP_CACHE_MAX_SIZE = 1024
+_DESCOPE_CONCURRENCY = 8
+_descope_executor = ThreadPoolExecutor(max_workers=_DESCOPE_CONCURRENCY, thread_name_prefix="tracker-auth-user")
+_credential_executor = ThreadPoolExecutor(max_workers=_DESCOPE_CONCURRENCY, thread_name_prefix="tracker-auth-key")
+_descope_slots: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[ThreadPoolExecutor, ReferenceType[asyncio.Semaphore]]
+] = WeakKeyDictionary()
+_SDKResult = TypeVar("_SDKResult")
 
 
 @dataclass(frozen=True)
@@ -67,6 +84,23 @@ class RequestIdentity:
     name: str | None = None
     user_id: str | None = None
     passkey: bool = False
+
+    @property
+    def tenant_name(self) -> str:
+        return self.org.name
+
+
+@dataclass(frozen=True)
+class _Credentials:
+    tenant_name: str
+    access_key_id: str | None = None
+    email: str | None = None
+    name: str | None = None
+    user_id: str | None = None
+    passkey: bool = False
+
+
+_Identity = TypeVar("_Identity", RequestIdentity, _Credentials)
 
 
 @dataclass(frozen=True)
@@ -97,6 +131,7 @@ class CachedAccessKeyClaims:
     user_id: str | None
     read_only: bool
     cache_deadline_monotonic: float
+    requires_membership: bool = False
 
 
 _access_key_digest_secret = secrets.token_bytes(32)
@@ -114,6 +149,53 @@ _descope_client: DescopeClient | None = (
     if AUTH_REQUIRED and DESCOPE_PROJECT_ID
     else None
 )
+_descope_user_client: DescopeClient | None = (
+    DescopeClient(
+        project_id=DESCOPE_PROJECT_ID,
+        management_key=DESCOPE_MANAGEMENT_KEY or None,
+        timeout_seconds=_USER_LOOKUP_TIMEOUT_SECONDS,
+    )
+    if AUTH_REQUIRED and DESCOPE_PROJECT_ID
+    else None
+)
+_live_user_cache_condition = Condition()
+_live_user_cache: TLRUCache[tuple[str, DescopeClient | None, str], dict[str, Any] | None, float] = TLRUCache(
+    maxsize=_USER_LOOKUP_CACHE_MAX_SIZE,
+    ttu=lambda _key, user, now: now + _USER_LOOKUP_CACHE_TTL_SECONDS if user is not None else now,
+    timer=lambda: time.monotonic(),
+)
+_live_user_pending: dict[
+    tuple[asyncio.AbstractEventLoop, str, DescopeClient | None, str], asyncio.Task[dict[str, Any] | None]
+] = {}
+_live_user_tasks: set[asyncio.Task[dict[str, Any] | None]] = set()
+
+
+async def _descope_call(
+    work: Callable[..., _SDKResult], *args: Any, executor: ThreadPoolExecutor = _descope_executor
+) -> _SDKResult:
+    loop = asyncio.get_running_loop()
+    with _live_user_cache_condition:
+        references = _descope_slots.setdefault(loop, {})
+        reference = references.get(executor)
+        slots = reference() if reference is not None else None
+        if slots is None:
+            slots = asyncio.Semaphore(_DESCOPE_CONCURRENCY)
+            references[executor] = ref(slots)
+    await slots.acquire()
+    try:
+        context = copy_context()
+        future = loop.run_in_executor(executor, lambda: context.run(work, *args))
+    except BaseException:
+        slots.release()
+        raise
+
+    def finished(completed: asyncio.Future[_SDKResult]) -> None:
+        slots.release()
+        if not completed.cancelled():
+            completed.exception()
+
+    future.add_done_callback(finished)
+    return await asyncio.shield(future)
 
 
 def _clean_string(value: object, *, lowercase: bool = False) -> str | None:
@@ -214,8 +296,6 @@ def _normalize_access_key_claims(jwt_response: Mapping[str, object]) -> CachedAc
     user_id = _string_claim(claims, "user_id") or (
         _string_claim(cast(Mapping[str, object], custom), "user_id") if isinstance(custom, Mapping) else None
     )
-    if _has_claim(claims, USER_KEY_CLAIM) and not _is_member(user_id, str(tenant_names[0])):
-        raise HTTPException(status_code=401, detail="Invalid API key")
     expires_at = claims.get("exp")
     try:
         jwt_expires_at = float(expires_at) if isinstance(expires_at, (int, float)) else 0.0
@@ -228,6 +308,7 @@ def _normalize_access_key_claims(jwt_response: Mapping[str, object]) -> CachedAc
         name=_string_claim(claims, "name"),
         user_id=user_id,
         read_only=_has_claim(jwt_response, READ_ONLY_KEY_CLAIM) or _has_claim(claims_from_token, READ_ONLY_KEY_CLAIM),
+        requires_membership=_has_claim(claims, USER_KEY_CLAIM),
         cache_deadline_monotonic=_cache_deadline(
             jwt_expires_at if math.isfinite(jwt_expires_at) else 0.0,
             wall_now=time.time(),
@@ -357,13 +438,13 @@ def _require_read_method(request: Request, read_only: bool) -> None:
         raise HTTPException(status_code=403, detail="This access key is read-only")
 
 
-def get_current_identity(request: Request, session: Session = Depends(get_session)) -> RequestIdentity:
+async def _get_credentials(request: Request) -> _Credentials | None:
     if not AUTH_REQUIRED:
-        return RequestIdentity(org=get_default_org(session))
+        return None
 
     token, is_session = _request_credentials(request)
     if is_session:
-        claims = _validate_bearer(token)
+        claims = await _descope_call(_validate_bearer, token, executor=_credential_executor)
         tenants_claim = claims.get("tenants")
         tenants = (
             [str(name) for name in cast(Mapping[object, object], tenants_claim)]
@@ -377,8 +458,8 @@ def get_current_identity(request: Request, session: Session = Depends(get_sessio
         is_access_key = bound_user_id is not None
         _require_read_method(request, _has_claim(claims, READ_ONLY_KEY_CLAIM))
         user_id = bound_user_id if is_access_key else _string_claim(claims, "sub")
-        return RequestIdentity(
-            org=_require_org(tenant, session),
+        return _Credentials(
+            tenant_name=tenant,
             access_key_id=_string_claim(claims, "sub") if is_access_key else None,
             email=_string_claim(claims, "email", lowercase=True),
             name=_string_claim(claims, "name"),
@@ -386,15 +467,37 @@ def get_current_identity(request: Request, session: Session = Depends(get_sessio
             passkey=not is_access_key and "webauthn" in (claims.get("amr") or ()),
         )
 
-    key = _exchange_and_normalize_access_key(token)
+    key = await _descope_call(_exchange_and_normalize_access_key, token, executor=_credential_executor)
+    if key.requires_membership and not await _is_member(key.user_id, key.tenant_name):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     _require_read_method(request, key.read_only)
-    return RequestIdentity(
-        org=_require_org(key.tenant_name, session),
+    return _Credentials(
+        tenant_name=key.tenant_name,
         access_key_id=key.access_key_id,
         email=key.email,
         name=key.name,
         user_id=key.user_id,
     )
+
+
+async def _identity_from_credentials(credentials: _Credentials | None, session: Session) -> RequestIdentity:
+    if credentials is None:
+        return RequestIdentity(org=await database_call(lambda: get_default_org(session)))
+    org = await database_call(lambda: _require_org(credentials.tenant_name, session))
+    return RequestIdentity(
+        org=org,
+        access_key_id=credentials.access_key_id,
+        email=credentials.email,
+        name=credentials.name,
+        user_id=credentials.user_id,
+        passkey=credentials.passkey,
+    )
+
+
+async def get_current_identity(
+    credentials: _Credentials | None = Depends(_get_credentials), session: Session = Depends(get_session)
+) -> RequestIdentity:
+    return await _identity_from_credentials(credentials, session)
 
 
 def get_current_org(identity: RequestIdentity = Depends(get_current_identity)) -> Org:
@@ -409,14 +512,97 @@ def descope_access_keys() -> AccessKey | None:
     return management.access_key if (management := descope_management()) else None
 
 
-def _live_user(management: MGMT, user_id: str) -> dict[str, Any] | None:
+def _user_lookup_retry_after(exc: Exception) -> float:
+    parameters = getattr(exc, "rate_limit_parameters", None)
+    if not isinstance(parameters, Mapping):
+        return 0.0
+    value = cast(Mapping[str, object], parameters).get("Retry-After")
+    if not isinstance(value, (str, int, float)):
+        return 0.0
     try:
-        return cast(dict[str, Any], management.user.load_by_user_id(user_id)["user"])
-    except Exception as exc:
-        if isinstance(exc, AuthException) and exc.status_code in (400, 404):
-            return None
-        logger.warning("Descope user lookup failed: %s", type(exc).__name__, exc_info=True)
-        raise HTTPException(status_code=503, detail="Auth service unavailable") from exc
+        delay = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return delay if math.isfinite(delay) and delay > 0 else 0.0
+
+
+def invalidate_user_cache(user_id: str) -> None:
+    with _live_user_cache_condition:
+        for key in list(_live_user_cache):
+            if key[2] == user_id:
+                _live_user_cache.pop(key, None)
+        for key in list(_live_user_pending):
+            if key[-1] == user_id:
+                _live_user_pending.pop(key, None)
+
+
+def _user_lookup_finished(task: asyncio.Task[dict[str, Any] | None]) -> None:
+    _live_user_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _cached_run_owner_user(user_id: str) -> dict[str, Any] | None:
+    key = (DESCOPE_PROJECT_ID, _descope_user_client, user_id)
+    pending_key = (asyncio.get_running_loop(), *key)
+    with _live_user_cache_condition:
+        try:
+            return _live_user_cache[key]
+        except KeyError:
+            pass
+        task = _live_user_pending.get(pending_key)
+        if task is None:
+            task = asyncio.create_task(_refresh_run_owner_user(pending_key))
+            _live_user_pending[pending_key] = task
+            _live_user_tasks.add(task)
+            task.add_done_callback(_user_lookup_finished)
+    return await asyncio.shield(task)
+
+
+async def _refresh_run_owner_user(
+    pending_key: tuple[asyncio.AbstractEventLoop, str, DescopeClient | None, str],
+) -> dict[str, Any] | None:
+    key = pending_key[1:]
+    task = asyncio.current_task()
+    try:
+        user = await _live_user(key[2])
+        with _live_user_cache_condition:
+            if user is not None and _live_user_pending.get(pending_key) is task:
+                _live_user_cache[key] = user
+        return user
+    finally:
+        with _live_user_cache_condition:
+            if _live_user_pending.get(pending_key) is task:
+                del _live_user_pending[pending_key]
+
+
+async def _live_user(user_id: str) -> dict[str, Any] | None:
+    deadline = time.monotonic() + _USER_LOOKUP_RETRY_BUDGET_SECONDS
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if _descope_user_client is None:
+                raise RuntimeError("Descope client not initialized")
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                response = await _descope_call(
+                    cast(Callable[[str], dict[str, Any]], _descope_user_client.mgmt.user.load_by_user_id), user_id
+                )
+            return cast(dict[str, Any], response["user"])
+        except Exception as exc:
+            if isinstance(exc, AuthException) and exc.status_code in (400, 404):
+                return None
+            rate_limited = isinstance(exc, RateLimitException) or (
+                isinstance(exc, AuthException) and str(exc.status_code) in ("429", "E130429")
+            )
+            if rate_limited and attempt < _USER_LOOKUP_ATTEMPTS:
+                delay = max(_user_lookup_retry_after(exc), random.uniform(0, min(4.0, 0.5 * 2 ** (attempt - 1))))
+                if time.monotonic() + delay + 2 * _USER_LOOKUP_TIMEOUT_SECONDS < deadline:
+                    await asyncio.sleep(delay)
+                    if time.monotonic() + 2 * _USER_LOOKUP_TIMEOUT_SECONDS < deadline:
+                        continue
+            logger.warning("Descope user lookup failed: %s", type(exc).__name__, exc_info=True)
+            raise HTTPException(status_code=503, detail="Auth service unavailable") from exc
 
 
 def _descope_failure(exc: Exception) -> str:
@@ -447,11 +633,11 @@ def user_tenant_roles(user: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     return {t["tenantId"]: tuple(t.get("roleNames") or ()) for t in user.get("userTenants") or ()}
 
 
-def _is_member(user_id: str | None, tenant: str) -> bool:
+async def _is_member(user_id: str | None, tenant: str) -> bool:
     management = descope_management()
     if management is None or user_id is None:
         return False
-    user = _live_user(management, user_id)
+    user = await _live_user(user_id)
     return user is not None and tenant in user_tenant_roles(user)
 
 
@@ -459,15 +645,15 @@ def primary_login_id(user: Mapping[str, Any]) -> str | None:
     return next(iter(user.get("loginIds") or []), None)
 
 
-def get_current_login(request: Request) -> LoginIdentity:
+async def get_current_login(request: Request) -> LoginIdentity:
     management = descope_management()
     if management is None:
         raise HTTPException(status_code=404, detail="This Tracker cannot look up logins")
     token, is_session = _request_credentials(request)
-    claims = _validate_bearer(token) if is_session else {}
+    claims = await _descope_call(_validate_bearer, token, executor=_credential_executor) if is_session else {}
     if (user_id := _string_claim(claims, "sub")) is None:
         raise HTTPException(status_code=403, detail=LOGIN_REQUIRED)
-    if (user := _live_user(management, user_id)) is None:
+    if (user := await _live_user(user_id)) is None:
         raise HTTPException(status_code=403, detail=LOGIN_REQUIRED)
     organizations = user_tenant_roles(user)
     return LoginIdentity(
@@ -486,11 +672,11 @@ def get_current_starter(identity: RequestIdentity = Depends(get_current_identity
     return identity
 
 
-def _resolve_run_owner(
-    management: MGMT, identity: RequestIdentity, subject_id: str
-) -> tuple[RequestIdentity, dict[str, Any] | None]:
+async def _resolve_run_owner(
+    management: MGMT, identity: _Identity, subject_id: str
+) -> tuple[_Identity, dict[str, Any] | None]:
     if identity.user_id is not None:
-        user = _live_user(management, identity.user_id)
+        user = await _cached_run_owner_user(identity.user_id)
         if user is not None:
             return identity, user
         if identity.access_key_id is not None:
@@ -498,7 +684,12 @@ def _resolve_run_owner(
 
     with descope_call("load the access key"):
         try:
-            key = management.access_key.load(subject_id)["key"]
+            response = await _descope_call(
+                cast(Callable[[str], dict[str, Any]], management.access_key.load),
+                subject_id,
+                executor=_credential_executor,
+            )
+            key = response["key"]
         except AuthException as exc:
             if exc.status_code in (400, 404):
                 raise HTTPException(status_code=403, detail="This user cannot start or retry benchmarks") from exc
@@ -507,26 +698,26 @@ def _resolve_run_owner(
     identity = replace(identity, access_key_id=subject_id, user_id=bound_user_id)
     if bound_user_id is None:
         return identity, None
-    user = _live_user(management, bound_user_id)
+    user = await _cached_run_owner_user(bound_user_id)
     if user is None:
         raise HTTPException(status_code=403, detail="This user cannot start or retry benchmarks")
     return identity, user
 
 
-def get_current_runner(identity: RequestIdentity = Depends(get_current_identity)) -> RequestIdentity:
-    if identity.org.name in PASSKEY_ORGS and not identity.passkey:
-        raise HTTPException(status_code=403, detail=f"Runs in {identity.org.name} need a passkey `valkyrie login`")
+async def _authorize_runner(identity: _Identity) -> _Identity:
+    if identity.tenant_name in PASSKEY_ORGS and not identity.passkey:
+        raise HTTPException(status_code=403, detail=f"Runs in {identity.tenant_name} need a passkey `valkyrie login`")
     subject_id = identity.user_id or identity.access_key_id
     if subject_id is None:
         return identity
     management = descope_management()
     if management is None:
         raise HTTPException(status_code=503, detail="Auth service unavailable")
-    identity, user = _resolve_run_owner(management, identity, subject_id)
+    identity, user = await _resolve_run_owner(management, identity, subject_id)
     if user is None:
         return identity
     if "valkyrie-no-start" in (user.get("roleNames") or ()) or "valkyrie-no-start" in user_tenant_roles(user).get(
-        identity.org.name, ()
+        identity.tenant_name, ()
     ):
         raise HTTPException(status_code=403, detail="This user cannot start or retry benchmarks")
     if identity.email is None:
@@ -536,3 +727,12 @@ def get_current_runner(identity: RequestIdentity = Depends(get_current_identity)
             name=identity.name or _clean_string(user.get("name") or user.get("displayName")),
         )
     return identity
+
+
+async def get_current_runner(
+    credentials: _Credentials | None = Depends(_get_credentials), session: Session = Depends(get_session)
+) -> RequestIdentity:
+    if credentials is None:
+        return await _authorize_runner(await _identity_from_credentials(None, session))
+    credentials = await _authorize_runner(credentials)
+    return await _identity_from_credentials(credentials, session)

@@ -12,6 +12,7 @@ from tracker.auth import (
     descope_call,
     descope_management,
     get_current_login,
+    invalidate_user_cache,
     primary_login_id,
     user_tenant_roles,
 )
@@ -172,6 +173,8 @@ def create_organization(
                     extra={"organization": request.id},
                 )
             raise
+        finally:
+            invalidate_user_cache(login.user_id)
     logger.info("Created organization", extra={"organization": request.id})
     return OrganizationResponse(id=request.id, name=name)
 
@@ -267,7 +270,10 @@ def remove_member(
             if (key.get("customClaims") or {}).get("user_id") == member["userId"]:
                 management.access_key.delete(key["id"])
         management.user.logout_user_by_user_id(member["userId"])
-        management.user.remove_tenant(primary_login_id(member) or email, organization)
+        try:
+            management.user.remove_tenant(primary_login_id(member) or email, organization)
+        finally:
+            invalidate_user_cache(member["userId"])
 
 
 @router.post(
@@ -287,7 +293,10 @@ def accept_invitation(
     with descope_call("join the organization"):
         exists = bool(management.tenant.search_all(ids=[organization]).get("tenants"))
         if exists and organization not in login.organizations:
-            management.user.add_tenant(login.login_id, organization)
+            try:
+                management.user.add_tenant(login.login_id, organization)
+            finally:
+                invalidate_user_cache(login.user_id)
     invites.commit()
     if not exists:
         raise HTTPException(status_code=404, detail=f"Organization {organization!r} does not exist")

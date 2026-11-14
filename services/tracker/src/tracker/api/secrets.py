@@ -4,12 +4,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 
-from tracker.auth import get_current_login, get_current_org
+from tracker.auth import _Credentials, _get_credentials, LoginIdentity, get_current_login, get_current_org
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.resolver import resolve_org_aws_runtime
 from tracker.aws.secrets import SecretBeingDeletedError, SecretsManagerStore
 from tracker.aws.tags import ORG_ID_TAG
-from tracker.database.models import Org
+from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.config import AUTH_REQUIRED, DESCOPE_ORG_ADMIN_ROLE, VALKYRIE_STAGE
 from tracker.exceptions import SecretNotFoundError
 from tracker.local import config as local_config
@@ -31,23 +31,41 @@ _PROVIDER_URL_FIELDS = ("DAYTONA_API_URL",)
 ADMINS_ONLY = {"description": "This organization lets only signed-in admins change its secrets"}
 
 
-def _require_org_secret_admin(request: Request, org: Org) -> None:
-    if DESCOPE_ORG_ADMIN_ROLE not in get_current_login(request).organizations.get(org.name, ()):
+async def secret_writer_login(
+    request: Request, credentials: _Credentials | None = Depends(_get_credentials)
+) -> LoginIdentity | None:
+    org = Org(name=credentials.tenant_name if credentials is not None else DEFAULT_ORG_NAME)
+    name = str(request.path_params.get("name", ""))
+    if (VALKYRIE_STAGE, org.name) == ("bench", "vals.ai") or (
+        automatic_project_gateway(org) and is_generated_project_gateway_secret_name(name)
+    ):
+        return await get_current_login(request)
+    return None
+
+
+def _require_org_secret_admin(login: LoginIdentity | None, org: Org) -> None:
+    if login is None or DESCOPE_ORG_ADMIN_ROLE not in login.organizations.get(org.name, ()):
         logger.info("Refused a secret change from a non-admin", extra={"org_id": str(org.id)})
         raise HTTPException(
             status_code=403, detail=f"Only {DESCOPE_ORG_ADMIN_ROLE}s of {org.name} can change its secrets."
         )
 
 
-def require_secret_writer(request: Request, org: Org = Depends(get_current_org)) -> Org:
+def require_secret_writer(
+    login: LoginIdentity | None = Depends(secret_writer_login), org: Org = Depends(get_current_org)
+) -> Org:
     if (VALKYRIE_STAGE, org.name) == ("bench", "vals.ai"):
-        _require_org_secret_admin(request, org)
+        _require_org_secret_admin(login, org)
     return org
 
 
-def require_named_secret_writer(name: SecretName, request: Request, org: Org = Depends(require_secret_writer)) -> Org:
+def require_named_secret_writer(
+    name: SecretName,
+    login: LoginIdentity | None = Depends(secret_writer_login),
+    org: Org = Depends(require_secret_writer),
+) -> Org:
     if automatic_project_gateway(org) and is_generated_project_gateway_secret_name(name):
-        _require_org_secret_admin(request, org)
+        _require_org_secret_admin(login, org)
     return org
 
 

@@ -81,14 +81,15 @@ def access_key_auth(local_app: FastAPI) -> Generator[None, None, None]:
             "user_id": "U_caller",
             "email": "caller@example.com",
         }
-        yield
+        with patch.object(auth_module, "_descope_user_client", mock_client):
+            yield
 
 
 @pytest.fixture
 def session_client(local_app: FastAPI) -> Generator[TestClient, None, None]:
     with patch.object(auth_module, "_descope_client") as mock_client:
         mock_client.validate_session.return_value = {"tenants": {"default": {}}}
-        with TestClient(local_app) as test_client:
+        with patch.object(auth_module, "_descope_user_client", mock_client), TestClient(local_app) as test_client:
             yield test_client
 
 

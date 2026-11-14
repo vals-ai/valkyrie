@@ -180,6 +180,7 @@ class TestNoStartRoleHTTP:
         monkeypatch.setattr(auth_module, "DESCOPE_MANAGEMENT_KEY", "management-key")
         descope = MagicMock()
         monkeypatch.setattr(auth_module, "_descope_client", descope)
+        monkeypatch.setattr(auth_module, "_descope_user_client", descope)
         descope.validate_session.return_value = {"sub": "U-alice", "tenants": {"default": {}}}
         if credential.startswith("key-derived-bearer"):
             descope.validate_session.return_value = {

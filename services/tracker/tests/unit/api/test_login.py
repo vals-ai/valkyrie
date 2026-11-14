@@ -42,6 +42,7 @@ def access_keys(monkeypatch: pytest.MonkeyPatch) -> _LoadableAccessKeys:
     user = {"email": "alice@example.com", "verifiedEmail": True, "userTenants": [{"tenantId": "acme"}]}
     management = MagicMock(access_key=fake)
     management.user.load_by_user_id.return_value = {"user": user}
+    monkeypatch.setattr("tracker.auth._descope_user_client", MagicMock(mgmt=management))
     monkeypatch.setattr("tracker.auth.descope_management", lambda: management)
     monkeypatch.setattr("tracker.auth._validate_bearer", MagicMock(return_value={"sub": "U-alice"}))
     return fake

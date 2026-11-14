@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 import tracker.api.secrets as secrets_api
+import tracker.auth as auth
 from main import app
 from tests.utils import TEST_ORG_ID
 from tracker import config
@@ -150,10 +151,11 @@ def test_only_admins_change_vals_ai_providers_on_bench(
     monkeypatch.setattr(secrets_api, "VALKYRIE_STAGE", "bench")
     acting = Org(id=TEST_ORG_ID, name="vals.ai", storage_key="test-bucket")
     monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: acting)
+    monkeypatch.setitem(app.dependency_overrides, auth._get_credentials, lambda: auth._Credentials(acting.name))
     login = LoginIdentity(
         user_id="U", login_id="U", email=None, organizations={"vals.ai": roles}, organization="vals.ai"
     )
-    monkeypatch.setattr(secrets_api, "get_current_login", MagicMock(return_value=login))
+    monkeypatch.setattr(secrets_api, "get_current_login", AsyncMock(return_value=login))
 
     put = _client.put("/sandbox-providers/daytona", json={"secret_name": "mine"})
     deleted = _client.delete("/sandbox-providers/daytona")

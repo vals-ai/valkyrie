@@ -740,6 +740,7 @@ def gateway_key_login(monkeypatch: MonkeyPatch) -> MagicMock:
         "user": {"userId": "U-alice", "userTenants": [{"tenantId": "default", "roleNames": []}]}
     }
     monkeypatch.setattr(tracker_auth, "_descope_client", descope)
+    monkeypatch.setattr(tracker_auth, "_descope_user_client", descope)
     return descope
 
 

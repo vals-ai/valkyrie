@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from descope.exceptions import AuthException
@@ -13,6 +15,7 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from main import app
+import tracker.auth as auth_module
 from tracker.api import organizations
 from tracker.auth import NO_ORGANIZATION, NOT_A_MEMBER, SEVERAL_ORGANIZATIONS, LoginIdentity, get_current_login
 from tracker.database.models import Org, OrganizationInvite
@@ -181,6 +184,45 @@ def test_creating_an_organization_makes_the_creator_its_admin(
     assert response.status_code == 201, response.text
     assert response.json() == {"id": organization, "name": "Acme"}
     assert descope.user.users["google-alice"]["userTenants"] == [{"tenantId": organization, "roleNames": [ADMIN]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.description(
+    "Creating or joining an organization invalidates run-owner data and the next login sees membership."
+)
+@pytest.mark.parametrize("action", ["create", "accept"])
+@pytest.mark.usefixtures("self_serve")
+async def test_membership_write_is_visible_immediately(
+    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, database_session: Session, action: str
+) -> None:
+    def load(_user_id: str) -> dict[str, Any]:
+        user = deepcopy(descope.user.users["google-alice"])
+        user["verifiedEmail"] = True
+        return {"user": user}
+
+    client = MagicMock()
+    client.mgmt.user.load_by_user_id.side_effect = load
+    monkeypatch.setattr(auth_module, "_descope_user_client", client)
+    monkeypatch.setattr(auth_module, "descope_management", lambda: descope)
+    monkeypatch.setattr(auth_module, "_validate_bearer", lambda _token: {"sub": "U-alice"})
+    monkeypatch.delitem(app.dependency_overrides, get_current_login, raising=False)
+    headers = {"Authorization": "Bearer login"}
+    assert (await auth_module._cached_run_owner_user("U-alice"))["userTenants"] == []
+    if action == "accept":
+        descope.tenant.create("Acme", "acme")
+        _invite(database_session, "alice@acme.com")
+        response = _client.post("/orgs/invitations/acme/accept", headers=headers)
+    else:
+        response = _client.post("/orgs", json={"id": "acme"}, headers=headers)
+
+    assert response.status_code in (201, 204), response.text
+    assert not any(key[2] == "U-alice" for key in auth_module._live_user_cache)
+    assert (await auth_module._cached_run_owner_user("U-alice"))["userTenants"][0]["tenantId"] == "acme"
+
+    response = _client.get("/orgs", headers={**headers, "x-valkyrie-tenant": "acme"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["organizations"][0]["id"] == "acme"
 
 
 @pytest.mark.description("Only verified logins on self serve Trackers can create organizations.")

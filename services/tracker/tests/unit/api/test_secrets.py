@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -12,12 +12,52 @@ from tracker.aws.secrets import SecretBeingDeletedError, SecretsManagerStore
 from main import app
 from tests.utils import TEST_ORG_ID
 from tracker.auth import LOGIN_REQUIRED, LoginIdentity, get_current_org
+import tracker.auth as auth
 from tracker.database.models import Org
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
 
 _client = TestClient(app)
 _PREFIX = f"valkyrie/tenants/{TEST_ORG_ID}/"
+
+
+@pytest.mark.description(
+    "Secret writes await a fresh admin login before resolving the organization and preserve member denials."
+)
+@pytest.mark.parametrize("admin", [False, True], ids=["member", "admin"])
+def test_secret_writes_use_real_login_dependency(
+    store: MagicMock, monkeypatch: pytest.MonkeyPatch, admin: bool
+) -> None:
+    client = MagicMock()
+    client.mgmt.user.load_by_user_id.return_value = {
+        "user": {
+            "userTenants": [{"tenantId": "vals.ai", "roleNames": [config.DESCOPE_ORG_ADMIN_ROLE] if admin else []}]
+        }
+    }
+    monkeypatch.setattr(auth, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(auth, "DESCOPE_MANAGEMENT_KEY", "local-fake")
+    monkeypatch.setattr(auth, "_descope_client", client)
+    monkeypatch.setattr(auth, "_descope_user_client", client)
+    monkeypatch.setattr(auth, "_validate_bearer", lambda _token: {"sub": "U-secret", "tenants": {"vals.ai": {}}})
+    monkeypatch.setattr(secrets_api, "VALKYRIE_STAGE", "bench")
+    monkeypatch.setattr(secrets_api, "get_current_login", auth.get_current_login)
+    monkeypatch.delitem(app.dependency_overrides, auth._get_credentials, raising=False)
+    visits = 0
+
+    def organization() -> Org:
+        nonlocal visits
+        visits += 1
+        assert client.mgmt.user.load_by_user_id.call_count == visits
+        return Org(id=TEST_ORG_ID, name="vals.ai", storage_key="test-bucket")
+
+    monkeypatch.setitem(app.dependency_overrides, get_current_org, organization)
+    headers = {"Authorization": "Bearer local-fake"}
+    saved = _client.put("/secrets/daytona", headers=headers, json={"value": "local-value"})
+    removed = _client.delete("/secrets/daytona", headers=headers)
+
+    assert saved.status_code == removed.status_code == (200 if admin else 403)
+    assert client.mgmt.user.load_by_user_id.call_count == 2
+    assert store.put.await_count == store.delete.await_count == int(admin)
 
 
 @pytest.fixture
@@ -208,8 +248,9 @@ def test_on_bench_only_admins_change_vals_ai_secrets(
     monkeypatch.setattr(secrets_api, "VALKYRIE_STAGE", "bench")
     vals = Org(id=TEST_ORG_ID, name="vals.ai", storage_key="test-bucket")
     monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: vals)
+    monkeypatch.setitem(app.dependency_overrides, auth._get_credentials, lambda: auth._Credentials(vals.name))
     login = HTTPException(403, LOGIN_REQUIRED) if roles is None else LoginIdentity("U-1", "alice", None, roles, None)
-    monkeypatch.setattr(secrets_api, "get_current_login", MagicMock(side_effect=[login]))
+    monkeypatch.setattr(secrets_api, "get_current_login", AsyncMock(side_effect=[login]))
 
     response = _client.put("/secrets/daytona", json={"value": "v"})
 
@@ -247,9 +288,10 @@ def test_only_organization_admins_change_generated_gateway_secrets(
     monkeypatch.setattr(local_config, "resources", None)
     org = Org(id=TEST_ORG_ID, name=org_name, storage_key="test-bucket")
     monkeypatch.setitem(app.dependency_overrides, get_current_org, lambda: org)
+    monkeypatch.setitem(app.dependency_overrides, auth._get_credentials, lambda: auth._Credentials(org.name))
     roles = {org_name: (config.DESCOPE_ORG_ADMIN_ROLE,) if admin else ()}
     monkeypatch.setattr(
-        secrets_api, "get_current_login", MagicMock(return_value=LoginIdentity("U-1", "alice", None, roles, None))
+        secrets_api, "get_current_login", AsyncMock(return_value=LoginIdentity("U-1", "alice", None, roles, None))
     )
 
     saved = _client.put(f"/secrets/{name}", json={"value": "replacement"})
