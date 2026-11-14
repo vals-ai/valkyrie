@@ -17,6 +17,36 @@ from tracker.services.projects import migrate_projects
 
 
 class TestProjectBackfill:
+    @pytest.mark.description("Startup skips confirmed project baselines without making project-service requests.")
+    def test_confirmed_startup_without_http(
+        self, tracker_database: Session, project_service: MockProjectRoutes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        projects = [
+            Project(org_id=TEST_ORG_ID, handle=handle, name=handle, spend_type=SpendType.INTERNAL)
+            for handle in ("first", "second")
+        ]
+        for project in projects:
+            tracker_database.add(project)
+            tracker_database.add(
+                ProjectBackfill(
+                    project_id=project.id, org_id=project.org_id, source_hash=project_hash(project), confirmed=True
+                )
+            )
+        tracker_database.commit()
+        project_service.seed(*projects)
+        requests: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return project_service.handle(request)
+
+        client = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+        monkeypatch.setattr("tracker.repositories.project.project_service", lambda: client)
+
+        assert ProjectRepository(tracker_database).backfill() == (0, 2)
+
+        assert requests == []
+
     @pytest.mark.description(
         "A concurrent importer keeps the first saved project when the same ID is already inserted."
     )
@@ -82,7 +112,10 @@ class TestProjectBackfill:
 
         assert tracker_database.get(ProjectCutover, 1) is None
 
-        assert any("unavailable during startup backfill" in warning for warning in warnings)
+        if confirmed:
+            assert warnings == []
+        else:
+            assert any("unavailable during startup backfill" in warning for warning in warnings)
         error = httpx.HTTPStatusError if status in (401, 500) else ProjectServiceUnavailableError
         with pytest.raises(error):
             migrate_projects(reconcile=True)
@@ -455,6 +488,13 @@ class TestProjectReconciliation:
         client = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
         monkeypatch.setattr("tracker.repositories.project.project_service", lambda: client)
         repository = ProjectRepository(tracker_database)
+
+        if not reconcile:
+            assert repository.backfill() == (0, 1)
+            assert baseline.source_hash == original_hash
+            assert baseline.copied_at == copied_at
+            assert str(legacy.id) not in project_service.rows
+            return
 
         if reconcile and not matches_source:
             with pytest.raises(ProjectMigrationConflictError, match="differing fields: name"):

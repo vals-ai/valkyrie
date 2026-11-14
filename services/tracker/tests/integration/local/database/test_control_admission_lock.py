@@ -265,7 +265,15 @@ def test_dispatch_recovery_releases_admission_before_calling_ecs(
     def describe(task_arns: list[str]) -> dict[str, list[dict[str, str]]]:
         maintenance_can_close_admission("describe")
         return {
-            "tasks": [{"taskArn": arn, "lastStatus": "STOPPED", "stopCode": "TaskFailedToStart"} for arn in task_arns],
+            "tasks": [
+                {
+                    "taskArn": arn,
+                    "lastStatus": "STOPPED",
+                    "stopCode": "TaskFailedToStart",
+                    "stoppedReason": "CannotPullContainerError: image not found",
+                }
+                for arn in task_arns
+            ],
             "failures": [],
         }
 

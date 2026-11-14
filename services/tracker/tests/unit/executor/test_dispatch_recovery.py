@@ -25,6 +25,7 @@ from tracker.executor import dispatch_recovery, launcher
 from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW
 from tracker.executor.dispatch_payload import generate_payload_key, seal_payload
 from tracker.executor.release_control import create_executor_dispatch, pin_benchmark_to_release, register_release
+from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 
 _STOPPED_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/cluster/0123456789abcdef0123456789abcdef"
 _REPLACEMENT_TASK_ARN = "arn:aws:ecs:us-east-1:123456789012:task/cluster/replacement"
@@ -254,6 +255,7 @@ def test_recovery_fails_dispatches_whose_task_stopped(
     ecs = Mock()
     described = {
         "taskArn": dispatch.ecs_task_arn,
+        "stopCode": "TaskFailedToStart",
         "lastStatus": last_status.removesuffix("_OLD"),
         "stoppedReason": "Essential container in task exited",
         "containers": [{"reason": "OutOfMemoryError: Container killed due to memory usage"}],
@@ -289,7 +291,7 @@ def test_recovery_fails_dispatches_whose_task_stopped(
         assert "OutOfMemoryError: Container killed due to memory usage" in error.error_message
 
 
-@pytest.mark.description("Recovery relaunches a dispatch whose runner failed to start, once.")
+@pytest.mark.description("Recovery retries pre-claim image pulls within a bounded relaunch budget.")
 @pytest.mark.usefixtures("ecs_runner_env")
 @pytest.mark.parametrize(
     (
@@ -317,10 +319,30 @@ def test_recovery_fails_dispatches_whose_task_stopped(
             1,
             _REPLACEMENT_TASK_ARN,
             None,
+            ExecutorDispatchStatus.QUEUED,
+            _REPLACEMENT_TASK_ARN,
+            1,
+            id="replacement_also_failed_to_start",
+        ),
+        pytest.param(
+            timedelta(0),
+            2,
+            _REPLACEMENT_TASK_ARN,
+            None,
+            ExecutorDispatchStatus.QUEUED,
+            _REPLACEMENT_TASK_ARN,
+            1,
+            id="last_relaunch",
+        ),
+        pytest.param(
+            timedelta(0),
+            3,
+            _REPLACEMENT_TASK_ARN,
+            None,
             ExecutorDispatchStatus.FAILED,
             _STOPPED_TASK_ARN,
             1,
-            id="replacement_also_failed_to_start",
+            id="relaunch_budget_exhausted",
         ),
         pytest.param(
             timedelta(0),
@@ -331,6 +353,16 @@ def test_recovery_fails_dispatches_whose_task_stopped(
             _STOPPED_TASK_ARN,
             0,
             id="run_task_failed",
+        ),
+        pytest.param(
+            timedelta(0),
+            0,
+            {"tasks": [], "failures": [{"reason": "RESOURCE:MEMORY"}]},
+            None,
+            ExecutorDispatchStatus.FAILED,
+            _STOPPED_TASK_ARN,
+            1,
+            id="definitive_rejection",
         ),
         pytest.param(
             timedelta(0),
@@ -347,8 +379,8 @@ def test_recovery_fails_dispatches_whose_task_stopped(
             0,
             _REPLACEMENT_TASK_ARN,
             None,
-            ExecutorDispatchStatus.FAILED,
-            _STOPPED_TASK_ARN,
+            ExecutorDispatchStatus.QUEUED,
+            _REPLACEMENT_TASK_ARN,
             1,
             id="claim_window_closing",
         ),
@@ -361,7 +393,7 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
     caplog: pytest.LogCaptureFixture,
     age: timedelta,
     prior_relaunches: int,
-    run_task_outcome: str | Exception,
+    run_task_outcome: str | Exception | dict[str, object],
     concurrent_task_arn: str | None,
     expected_status: ExecutorDispatchStatus,
     expected_task_arn: str,
@@ -383,6 +415,8 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
     dispatch.ecs_task_arn = _STOPPED_TASK_ARN
     dispatch.relaunch_count = prior_relaunches
     dispatch.created_at -= age
+    dispatch.claim_deadline_at -= age
+    original_deadline = dispatch.claim_deadline_at.replace(tzinfo=None)
     task = Task(
         org_id=benchmark.org_id,
         benchmark=benchmark.id,
@@ -408,6 +442,8 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
         )
     if isinstance(run_task_outcome, Exception):
         ecs.run_task.side_effect = run_task_outcome
+    elif isinstance(run_task_outcome, dict):
+        ecs.run_task.return_value = run_task_outcome
     else:
         ecs.run_task.return_value = {"tasks": [{"taskArn": run_task_outcome}], "failures": []}
     monkeypatch.setattr(dispatch_recovery.boto3, "client", lambda *_args, **_kwargs: ecs)
@@ -424,8 +460,14 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
 
     relaunched = expected_task_arn == _REPLACEMENT_TASK_ARN
     assert (stored.relaunch_count, stored.last_relaunch_reason) == (
-        (1, "CannotPullContainerError") if relaunched else (prior_relaunches, None)
+        (prior_relaunches + 1, "CannotPullContainerError") if relaunched else (prior_relaunches, None)
     )
+    if relaunched:
+        assert stored.claim_deadline_at.replace(tzinfo=None) >= datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=295
+        )
+    else:
+        assert stored.claim_deadline_at.replace(tzinfo=None) == original_deadline
     assert [
         (record.__dict__["benchmark_id"], record.__dict__["relaunch_reason"], record.__dict__["stopped_reason"])
         for record in caplog.records
@@ -444,8 +486,8 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
 
     relaunches = [call.kwargs for call in ecs.run_task.call_args_list]
     assert [(relaunch["clientToken"], relaunch["taskDefinition"]) for relaunch in relaunches] == (
-        [(f"{dispatch.id}-relaunch", release.task_definition_arn)]
-        if age == timedelta(0) and not prior_relaunches
+        [(f"{dispatch.id}-relaunch-{prior_relaunches + 1}", release.task_definition_arn)]
+        if prior_relaunches < 3
         else []
     )
 
@@ -461,6 +503,136 @@ def _describe_after_another_tracker_relaunched(
     database_session.commit()
 
     return {"tasks": [stopped_task], "failures": []}
+
+
+@pytest.mark.description("Recovery preserves a completed dispatch when it finishes during an ECS batch.")
+@pytest.mark.usefixtures("ecs_runner_env")
+@pytest.mark.parametrize("finish_during", ["describe", "replacement"])
+def test_recovery_preserves_dispatch_that_finishes_during_batch(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: MonkeyPatch,
+    finish_during: str,
+) -> None:
+    release = ExecutorRelease(
+        id="batch-race", artifact_uri="source:///runner", artifact_digest="a" * 64, protocol_version="3"
+    )
+    benchmark = example_benchmark_object
+    other = Benchmark.model_validate({**benchmark.model_dump(), "id": uuid4()})
+    register_release(database_session, release)
+    dispatches = []
+    for row in (benchmark, other):
+        pin_benchmark_to_release(row, release)
+        dispatch = create_executor_dispatch(row.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4())
+        dispatch.ecs_task_arn = str(uuid4())
+        dispatches.append(dispatch)
+        database_session.add_all([row, dispatch])
+    finished, queued = dispatches
+    finished.status = ExecutorDispatchStatus.RUNNING
+    database_session.commit()
+    finished_id, queued_id, benchmark_id = finished.id, queued.id, benchmark.id
+
+    def finish() -> None:
+        with Session(database_session.get_bind()) as writer:
+            writer.exec(
+                update(ExecutorDispatch)
+                .where(col(ExecutorDispatch.id) == finished_id)
+                .values(status=ExecutorDispatchStatus.FINISHED, finished_at=datetime.now(UTC))
+            )
+            writer.exec(
+                update(Benchmark)
+                .where(col(Benchmark.id) == benchmark_id)
+                .values(status=BenchmarkStatus.FINISHED, finished_at=datetime.now(UTC))
+            )
+            writer.commit()
+
+    def describe(_arns: list[str]) -> dict[str, object]:
+        if finish_during == "describe":
+            finish()
+        return {
+            "tasks": [
+                {
+                    "taskArn": finished.ecs_task_arn,
+                    "lastStatus": "STOPPED",
+                    "stoppedReason": "Essential container exited",
+                },
+                {
+                    "taskArn": queued.ecs_task_arn,
+                    "lastStatus": "STOPPED",
+                    "stopCode": "TaskFailedToStart",
+                    "stoppedReason": _PULL_FAILURE,
+                },
+            ],
+            "failures": [],
+        }
+
+    def relaunch(_dispatch: ExecutorDispatch) -> str:
+        if finish_during == "replacement":
+            finish()
+        return _REPLACEMENT_TASK_ARN
+
+    monkeypatch.setattr(dispatch_recovery, "engine", database_session.get_bind())
+    monkeypatch.setattr(dispatch_recovery, "describe_executor_tasks", describe)
+    monkeypatch.setattr(dispatch_recovery, "relaunch_dispatch", relaunch)
+    assert dispatch_recovery.reconcile_dispatches_once() == 1
+    database_session.expire_all()
+    assert database_session.get(ExecutorDispatch, finished_id).status == ExecutorDispatchStatus.FINISHED
+    assert database_session.get(Benchmark, benchmark_id).status == BenchmarkStatus.FINISHED
+    assert database_session.get(ExecutorDispatch, queued_id).ecs_task_arn == _REPLACEMENT_TASK_ARN
+    assert database_session.exec(select(ErrorResult)).all() == []
+
+
+@pytest.mark.description("Relaunch fencing advances only the queued task and preserves newer claim deadlines.")
+@pytest.mark.parametrize(
+    ("status", "prior_relaunches", "stale_arn", "long_deadline"),
+    [
+        (ExecutorDispatchStatus.QUEUED, 0, False, False),
+        (ExecutorDispatchStatus.QUEUED, 2, False, False),
+        (ExecutorDispatchStatus.QUEUED, 3, False, False),
+        (ExecutorDispatchStatus.QUEUED, 0, True, False),
+        (ExecutorDispatchStatus.RUNNING, 0, False, False),
+        (ExecutorDispatchStatus.FINISHED, 0, False, False),
+        (ExecutorDispatchStatus.QUEUED, 0, False, True),
+    ],
+)
+def test_relaunch_update_fences_task_and_budget(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    status: ExecutorDispatchStatus,
+    prior_relaunches: int,
+    stale_arn: bool,
+    long_deadline: bool,
+) -> None:
+    release = ExecutorRelease(
+        id="relaunch-fence", artifact_uri="source:///runner", artifact_digest="a" * 64, protocol_version="3"
+    )
+    benchmark = example_benchmark_object
+    register_release(database_session, release)
+    dispatch = create_executor_dispatch(benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4())
+    dispatch.status = status
+    dispatch.relaunch_count = prior_relaunches
+    dispatch.ecs_task_arn = _STOPPED_TASK_ARN
+    deadline = datetime(2026, 11, 14, 14)
+    original = deadline + timedelta(seconds=300 if long_deadline else -60)
+    dispatch.claim_deadline_at = original
+    database_session.add_all([benchmark, dispatch])
+    database_session.commit()
+    recorded = ExecutorDispatchRepository(database_session).record_relaunch(
+        dispatch.id,
+        _OTHER_TRACKER_TASK_ARN if stale_arn else _STOPPED_TASK_ARN,
+        _REPLACEMENT_TASK_ARN,
+        "CannotPullContainerError",
+        max_relaunches=3,
+        claim_deadline_at=deadline,
+    )
+    database_session.commit()
+    database_session.expire_all()
+    stored = database_session.get(ExecutorDispatch, dispatch.id)
+    expected = status == ExecutorDispatchStatus.QUEUED and prior_relaunches < 3 and not stale_arn
+    assert recorded == expected
+    assert stored.ecs_task_arn == (_REPLACEMENT_TASK_ARN if expected else _STOPPED_TASK_ARN)
+    assert stored.relaunch_count == prior_relaunches + int(expected)
+    assert stored.claim_deadline_at == (max(original, deadline) if expected else original)
 
 
 @pytest.mark.description("An expired launch with no saved ARN recovers during an ECS outage.")

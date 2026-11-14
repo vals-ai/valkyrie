@@ -93,8 +93,13 @@ def _run_task_params(dispatch: ExecutorDispatch, client_token: str) -> dict[str,
 
 def relaunch_dispatch(dispatch: ExecutorDispatch) -> str:
     response = _call_run_task(
-        ecs_client(recovery=True), _run_task_params(dispatch, client_token=f"{dispatch.id}-relaunch")
+        ecs_client(recovery=True),
+        _run_task_params(dispatch, client_token=f"{dispatch.id}-relaunch-{dispatch.relaunch_count + 1}"),
     )
+    if response["failures"] and not response["tasks"]:
+        raise DefinitiveLaunchFailure(
+            f"ECS rejected replacement for executor dispatch {dispatch.id}: {response['failures']}"
+        )
     if len(response["tasks"]) != 1:
         raise RuntimeError(
             f"ECS did not start a replacement for executor dispatch {dispatch.id}: {response['failures']}"

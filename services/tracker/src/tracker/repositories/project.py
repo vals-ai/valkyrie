@@ -205,6 +205,10 @@ class ProjectRepository:
         copied = 0
         skipped = 0
         for project in projects:
+            baseline = baselines.get(project.id)
+            if not reconcile and baseline is not None and baseline.confirmed:
+                skipped += 1
+                continue
             source_hash = project_hash(project)
             concurrent_insert = False
             if project.org_id not in existing:

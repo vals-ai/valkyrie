@@ -515,7 +515,14 @@ def test_relaunch_cannot_revive_a_dispatch_that_stop_revoked(
     monkeypatch.setattr(launcher, "engine", postgres_engine)
     ecs = Mock()
     ecs.describe_tasks.return_value = {
-        "tasks": [{"taskArn": stopped_task_arn, "lastStatus": "STOPPED", "stopCode": "TaskFailedToStart"}],
+        "tasks": [
+            {
+                "taskArn": stopped_task_arn,
+                "lastStatus": "STOPPED",
+                "stopCode": "TaskFailedToStart",
+                "stoppedReason": "CannotPullContainerError: image not found",
+            }
+        ],
         "failures": [],
     }
     ecs.run_task.return_value = {"tasks": [{"taskArn": "arn:task:replacement"}], "failures": []}
@@ -599,17 +606,22 @@ def test_a_database_error_during_a_relaunch_fails_the_pass_instead_of_dropping_i
                 "stopCode": "EssentialContainerExited",
                 "stoppedReason": "Essential container in task exited",
             },
-            {"taskArn": task_arns["unstarted"], "lastStatus": "STOPPED", "stopCode": "TaskFailedToStart"},
+            {
+                "taskArn": task_arns["unstarted"],
+                "lastStatus": "STOPPED",
+                "stopCode": "TaskFailedToStart",
+                "stoppedReason": "CannotPullContainerError: image not found",
+            },
         ],
         "failures": [],
     }
     monkeypatch.setattr(dispatch_recovery.boto3, "client", lambda *_args, **_kwargs: ecs)
 
-    def relaunch_into_a_database_error(dispatch: ExecutorDispatch) -> str:
-        session = Session.object_session(dispatch)
-        assert session is not None
-        session.execute(text("SELECT 1 / 0"))
-        return "arn:task:never-started"
+    def relaunch_into_a_database_error(
+        repository: ExecutorDispatchRepository, *_args: object, **_kwargs: object
+    ) -> bool:
+        repository._session.execute(text("SELECT 1 / 0"))
+        return False
 
     def stored() -> tuple[ExecutorDispatch, ExecutorDispatch]:
         postgres_session.expire_all()
@@ -617,7 +629,9 @@ def test_a_database_error_during_a_relaunch_fails_the_pass_instead_of_dropping_i
         assert dispatches[0] is not None and dispatches[1] is not None
         return dispatches[0], dispatches[1]
 
-    monkeypatch.setattr(dispatch_recovery, "relaunch_dispatch", relaunch_into_a_database_error)
+    record_relaunch = ExecutorDispatchRepository.record_relaunch
+    monkeypatch.setattr(dispatch_recovery, "relaunch_dispatch", lambda *_args: "arn:task:replacement")
+    monkeypatch.setattr(ExecutorDispatchRepository, "record_relaunch", relaunch_into_a_database_error)
     with pytest.raises(DBAPIError):
         dispatch_recovery.reconcile_dispatches_once()
 
@@ -625,7 +639,7 @@ def test_a_database_error_during_a_relaunch_fails_the_pass_instead_of_dropping_i
     assert stopped.status == ExecutorDispatchStatus.RUNNING
     assert (unstarted.status, unstarted.ecs_task_arn) == (ExecutorDispatchStatus.QUEUED, task_arns["unstarted"])
 
-    monkeypatch.setattr(dispatch_recovery, "relaunch_dispatch", lambda *_args: "arn:task:replacement")
+    monkeypatch.setattr(ExecutorDispatchRepository, "record_relaunch", record_relaunch)
     assert dispatch_recovery.reconcile_dispatches_once() == 2
 
     stopped, unstarted = stored()

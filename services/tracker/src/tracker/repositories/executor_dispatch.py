@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import and_, delete, func, or_, text, update
+from sqlalchemy import and_, case, delete, func, or_, text, update
 from sqlmodel import Session, SQLModel, col, select
 
 from tracker.database.models import ExecutorDispatch, ExecutorDispatchPayload, ExecutorDispatchStatus
@@ -210,7 +210,14 @@ class ExecutorDispatchRepository:
         ).all()
 
     def record_relaunch(
-        self, dispatch_id: UUID, stopped_task_arn: str, replacement_task_arn: str, reason: str | None
+        self,
+        dispatch_id: UUID,
+        stopped_task_arn: str,
+        replacement_task_arn: str,
+        reason: str | None,
+        *,
+        max_relaunches: int,
+        claim_deadline_at: datetime,
     ) -> bool:
         return (
             self._session.exec(
@@ -218,10 +225,16 @@ class ExecutorDispatchRepository:
                 .where(col(ExecutorDispatch.id) == dispatch_id)
                 .where(col(ExecutorDispatch.status) == ExecutorDispatchStatus.QUEUED)
                 .where(col(ExecutorDispatch.ecs_task_arn) == stopped_task_arn)
+                .where(col(ExecutorDispatch.relaunch_count) < max_relaunches)
                 .values(
                     ecs_task_arn=replacement_task_arn,
                     relaunch_count=col(ExecutorDispatch.relaunch_count) + 1,
                     last_relaunch_reason=reason,
+                    claim_deadline_at=case(
+                        (col(ExecutorDispatch.claim_deadline_at).is_(None), claim_deadline_at),
+                        (col(ExecutorDispatch.claim_deadline_at) < claim_deadline_at, claim_deadline_at),
+                        else_=col(ExecutorDispatch.claim_deadline_at),
+                    ),
                 )
                 .returning(col(ExecutorDispatch.id))
             ).first()
