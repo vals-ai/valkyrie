@@ -255,7 +255,7 @@ def test_recovery_fails_dispatches_whose_task_stopped(
     ecs = Mock()
     described = {
         "taskArn": dispatch.ecs_task_arn,
-        "stopCode": "TaskFailedToStart",
+        "stopCode": "EssentialContainerExited",
         "lastStatus": last_status.removesuffix("_OLD"),
         "stoppedReason": "Essential container in task exited",
         "containers": [{"reason": "OutOfMemoryError: Container killed due to memory usage"}],
@@ -490,6 +490,62 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
         if prior_relaunches < 3
         else []
     )
+
+
+@pytest.mark.description(
+    "A non-pull startup failure gets one replacement within the original claim window and none afterward."
+)
+@pytest.mark.parametrize("age", [timedelta(0), DISPATCH_CLAIM_WINDOW - timedelta(seconds=30)])
+def test_non_pull_start_failure_gets_one_relaunch(
+    database_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: MonkeyPatch,
+    age: timedelta,
+) -> None:
+    release = ExecutorRelease(
+        id="non-pull-relaunch", artifact_uri="source:///runner", artifact_digest="a" * 64, protocol_version="3"
+    )
+    benchmark = example_benchmark_object
+    register_release(database_session, release)
+    pin_benchmark_to_release(benchmark, release)
+    dispatch = create_executor_dispatch(benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4())
+    dispatch.ecs_task_arn = _STOPPED_TASK_ARN
+    dispatch.created_at -= age
+    dispatch.claim_deadline_at -= age
+    deadline = dispatch.claim_deadline_at.replace(tzinfo=None)
+    database_session.add_all([benchmark, dispatch])
+    database_session.commit()
+    reason = "ResourceInitializationError: failed to create log stream"
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
+    monkeypatch.setattr(dispatch_recovery, "engine", database_session.get_bind())
+    monkeypatch.setattr(
+        dispatch_recovery,
+        "describe_executor_tasks",
+        lambda arns: {
+            "tasks": [
+                {"taskArn": arn, "lastStatus": "STOPPED", "stopCode": "TaskFailedToStart", "stoppedReason": reason}
+                for arn in arns
+            ],
+            "failures": [],
+        },
+    )
+    relaunch = Mock(return_value=_REPLACEMENT_TASK_ARN)
+    monkeypatch.setattr(dispatch_recovery, "relaunch_dispatch", relaunch)
+    assert dispatch_recovery.reconcile_dispatches_once() == 1
+    database_session.expire_all()
+    stored = database_session.get(ExecutorDispatch, dispatch.id)
+    eligible = age == timedelta(0)
+    assert stored.status == (ExecutorDispatchStatus.QUEUED if eligible else ExecutorDispatchStatus.FAILED)
+    assert stored.ecs_task_arn == (_REPLACEMENT_TASK_ARN if eligible else _STOPPED_TASK_ARN)
+    assert stored.relaunch_count == int(eligible)
+    assert stored.last_relaunch_reason == ("ResourceInitializationError" if eligible else None)
+    assert stored.claim_deadline_at.replace(tzinfo=None) == deadline
+    assert dispatch_recovery.reconcile_dispatches_once() == int(eligible)
+    database_session.expire_all()
+    assert database_session.get(ExecutorDispatch, dispatch.id).status == ExecutorDispatchStatus.FAILED
+    assert database_session.get(ExecutorDispatch, dispatch.id).relaunch_count == int(eligible)
+    assert database_session.get(ExecutorDispatch, dispatch.id).claim_deadline_at.replace(tzinfo=None) == deadline
+    assert relaunch.call_count == int(eligible)
 
 
 def _describe_after_another_tracker_relaunched(

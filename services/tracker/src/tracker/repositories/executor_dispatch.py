@@ -217,7 +217,7 @@ class ExecutorDispatchRepository:
         reason: str | None,
         *,
         max_relaunches: int,
-        claim_deadline_at: datetime,
+        claim_deadline_at: datetime | None,
     ) -> bool:
         return (
             self._session.exec(
@@ -234,7 +234,9 @@ class ExecutorDispatchRepository:
                         (col(ExecutorDispatch.claim_deadline_at).is_(None), claim_deadline_at),
                         (col(ExecutorDispatch.claim_deadline_at) < claim_deadline_at, claim_deadline_at),
                         else_=col(ExecutorDispatch.claim_deadline_at),
-                    ),
+                    )
+                    if claim_deadline_at is not None
+                    else col(ExecutorDispatch.claim_deadline_at),
                 )
                 .returning(col(ExecutorDispatch.id))
             ).first()

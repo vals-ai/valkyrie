@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import timedelta
 from threading import Event, Thread
 from typing import Any
@@ -26,9 +27,11 @@ from tracker.run_access_keys import delete_finished_run_keys
 
 _ECS_MISSING_GRACE = timedelta(minutes=10)
 _MAX_PULL_RELAUNCHES = 3
+_RELAUNCH_CLAIM_ALLOWANCE = timedelta(seconds=90)
 _RECONCILIATION_INTERVAL_SECONDS = 60.0
 _SHUTDOWN_TIMEOUT_SECONDS = 5.0
 _logger = logging.getLogger(__name__)
+_ECS_ERROR_CODE = re.compile(r"\w+(?=:)")
 
 
 _STOPPED_TASK_FAILURES = {
@@ -38,11 +41,18 @@ _STOPPED_TASK_FAILURES = {
 
 
 def _record_replacement(
-    session: Session, dispatch: ExecutorDispatch, stopped_task_arn: str, replacement_task_arn: str, stopped_reason: str
+    session: Session,
+    dispatch: ExecutorDispatch,
+    stopped_task_arn: str,
+    replacement_task_arn: str,
+    stopped_reason: str,
+    *,
+    is_pull_failure: bool,
 ) -> bool:
     dispatch_id = dispatch.id
     benchmark_id = dispatch.benchmark_id
-    relaunch_reason = "CannotPullContainerError"
+    error_code = _ECS_ERROR_CODE.match(stopped_reason)
+    relaunch_reason = "CannotPullContainerError" if is_pull_failure else error_code.group() if error_code else None
     share_executor_admission(session)
     repository = ExecutorDispatchRepository(session)
     recorded = repository.record_relaunch(
@@ -50,8 +60,8 @@ def _record_replacement(
         stopped_task_arn,
         replacement_task_arn,
         relaunch_reason,
-        max_relaunches=_MAX_PULL_RELAUNCHES,
-        claim_deadline_at=repository.now() + DISPATCH_CLAIM_WINDOW,
+        max_relaunches=_MAX_PULL_RELAUNCHES if is_pull_failure else 1,
+        claim_deadline_at=repository.now() + DISPATCH_CLAIM_WINDOW if is_pull_failure else None,
     )
     session.commit()
     if recorded:
@@ -81,6 +91,7 @@ def _reconcile_stopped_tasks(session: Session) -> int:
     repository = ExecutorDispatchRepository(session)
     now = repository.now()
     cutoff = now - _ECS_MISSING_GRACE
+    relaunch_cutoff = now - DISPATCH_CLAIM_WINDOW + _RELAUNCH_CLAIM_ALLOWANCE
     candidates = [ExecutorDispatch.model_validate(row.model_dump()) for row in repository.list_with_task_arn()]
     if not candidates:
         return 0
@@ -100,11 +111,16 @@ def _reconcile_stopped_tasks(session: Session) -> int:
             dispatch = batch[task_arn]
             reasons = [task.get("stoppedReason"), *(c.get("reason") for c in task.get("containers", []))]
             details = "; ".join(reason for reason in reasons if reason) or "ECS no longer reports the task"
+            is_pull_failure = any(reason and reason.startswith("CannotPullContainerError:") for reason in reasons)
+            eligible = (
+                dispatch.relaunch_count < _MAX_PULL_RELAUNCHES
+                if is_pull_failure
+                else dispatch.relaunch_count == 0 and dispatch.created_at > relaunch_cutoff
+            )
             if not (
                 dispatch.status == ExecutorDispatchStatus.QUEUED
                 and task.get("stopCode") == "TaskFailedToStart"
-                and any(reason and reason.startswith("CannotPullContainerError:") for reason in reasons)
-                and dispatch.relaunch_count < _MAX_PULL_RELAUNCHES
+                and eligible
             ):
                 failures.append((task_arn, dispatch, details))
                 continue
@@ -119,7 +135,9 @@ def _reconcile_stopped_tasks(session: Session) -> int:
                     extra={"event": "executor_dispatch_relaunch_failed", "executor_dispatch_id": str(dispatch.id)},
                 )
                 continue
-            if _record_replacement(session, dispatch, task_arn, replacement_task_arn, details):
+            if _record_replacement(
+                session, dispatch, task_arn, replacement_task_arn, details, is_pull_failure=is_pull_failure
+            ):
                 recovered += 1
         if failures:
             share_executor_admission(session)
