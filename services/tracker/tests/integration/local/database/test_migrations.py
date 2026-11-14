@@ -25,6 +25,7 @@ from tests.project_service import MockProjectRoutes
 from executor_protocol import ExecutorDispatchStatus
 from tracker.database.models import (
     Benchmark,
+    DescopeMembership,
     ExecutorDispatch,
     ExecutorRelease,
     Project,
@@ -103,6 +104,44 @@ def test_migration_graph_has_single_head() -> None:
 
     assert len(heads) == 1, f"Expected one Alembic head, found {heads}"
     assert scripts.get_revision(_CONTROL_BOUNDARY_REVISION) is not None
+
+
+@pytest.mark.description(
+    "The membership cache migration stores only scoped tenant roles and timestamps and downgrades cleanly."
+)
+def test_membership_cache_round_trip(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "c9e2f4a6b803")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    before = _schema_snapshot(engine)
+    upgrade = _run_alembic(migration_database_url, "upgrade", "d3e4f5a6b7c8")
+    assert upgrade.returncode == 0, upgrade.stderr
+    assert {column["name"] for column in inspect(engine).get_columns("descopemembership")} == {
+        "project_id",
+        "user_id",
+        "tenant_roles",
+        "fetched_at",
+        "cooldown_until",
+    }
+    with Session(engine) as session:
+        session.add(
+            DescopeMembership(
+                project_id="project", user_id="user", tenant_roles={"org": ["viewer"]}, fetched_at=datetime.now(UTC)
+            )
+        )
+        session.commit()
+    with Session(engine) as session:
+        row = session.get(DescopeMembership, ("project", "user"))
+        assert row is not None and row.tenant_roles == {"org": ["viewer"]}
+        assert row.fetched_at is not None and row.fetched_at.utcoffset() == timedelta(0)
+    downgrade = _run_alembic(migration_database_url, "downgrade", "c9e2f4a6b803")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert _schema_snapshot(engine) == before
+    upgrade = _run_alembic(migration_database_url, "upgrade", "d3e4f5a6b7c8")
+    assert upgrade.returncode == 0, upgrade.stderr
+    with Session(engine) as session:
+        assert session.get(DescopeMembership, ("project", "user")) is None
+    engine.dispose()
 
 
 @pytest.mark.description("The dispatch lease migration adds the lease columns and the status and lease expiry index.")

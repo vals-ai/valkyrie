@@ -491,6 +491,48 @@ class TestCurrentStarterResolution:
 
 
 class TestLiveUser:
+    @pytest.mark.description("Membership checks share user lookups for sixty seconds, then observe revoked membership.")
+    async def test_membership_cache_and_expiry(
+        self, mock_descope: MagicMock, clock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(auth_module, "DESCOPE_MANAGEMENT_KEY", "management-key")
+        lookup = mock_descope.mgmt.user.load_by_user_id
+        lookup.return_value = {"user": {"userTenants": [{"tenantId": "org"}]}}
+
+        results = await asyncio.gather(*(auth_module._is_member("U-alice", "org") for _ in range(25)))
+
+        assert results == [True] * 25
+        assert not await auth_module._is_member("U-alice", "another-org")
+        clock.monotonic.return_value = 4.999
+        assert await auth_module._is_member("U-alice", "org")
+        lookup.assert_called_once_with("U-alice")
+
+        lookup.return_value = {"user": {"userTenants": []}}
+        clock.monotonic.return_value = 60.0
+
+        assert not await auth_module._is_member("U-alice", "org")
+        assert lookup.call_count == 2
+
+    @pytest.mark.description("Membership checks reject missing users and fail closed when the provider is unavailable.")
+    @pytest.mark.parametrize("user", [None, {}, AuthException(503)])
+    async def test_membership_missing_or_unavailable(
+        self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch, user: dict[str, Any] | None | AuthException
+    ) -> None:
+        monkeypatch.setattr(auth_module, "DESCOPE_MANAGEMENT_KEY", "management-key")
+        lookup = mock_descope.mgmt.user.load_by_user_id
+        if isinstance(user, AuthException):
+            lookup.side_effect = user
+        else:
+            lookup.return_value = {"user": user}
+
+        if isinstance(user, AuthException):
+            with pytest.raises(HTTPException) as raised:
+                await auth_module._is_member("U-alice", "org")
+
+            assert raised.value.status_code == 503
+        else:
+            assert not await auth_module._is_member("U-alice", "org")
+
     @pytest.fixture(autouse=True)
     def clock(self, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
         clock = MagicMock()
@@ -892,7 +934,7 @@ class TestCurrentRunnerResolution:
             )
         ).user_id == "U-alice"
         mock_descope.exchange_access_key.assert_called_once_with("bound-key")
-        assert mock_descope.mgmt.user.load_by_user_id.call_count == 4
+        assert mock_descope.mgmt.user.load_by_user_id.call_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.description("A console key with no bound user keeps its access.")

@@ -41,7 +41,9 @@ from tracker.config import (
 from tracker.aws.tenant_storage import TenantBucketError, ensure_managed_org_bucket
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.repositories.organization import OrganizationRepository
-from tracker.database.session import database_call, get_session
+from tracker.database.session import database_call, get_session, server_engine
+from tracker.exceptions import MembershipUnavailableError
+from tracker.services.memberships import MembershipCache
 from tracker.logging import get_logger
 from tracker.outbound_security import validate_service_headers
 
@@ -527,13 +529,16 @@ def _user_lookup_retry_after(exc: Exception) -> float:
 
 
 def invalidate_user_cache(user_id: str) -> None:
-    with _live_user_cache_condition:
-        for key in list(_live_user_cache):
-            if key[2] == user_id:
-                _live_user_cache.pop(key, None)
-        for key in list(_live_user_pending):
-            if key[-1] == user_id:
-                _live_user_pending.pop(key, None)
+    try:
+        _membership_cache.invalidate(DESCOPE_PROJECT_ID, user_id)
+    finally:
+        with _live_user_cache_condition:
+            for key in list(_live_user_cache):
+                if key[2] == user_id:
+                    _live_user_cache.pop(key, None)
+            for key in list(_live_user_pending):
+                if key[-1] == user_id:
+                    _live_user_pending.pop(key, None)
 
 
 def _user_lookup_finished(task: asyncio.Task[dict[str, Any] | None]) -> None:
@@ -633,12 +638,36 @@ def user_tenant_roles(user: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     return {t["tenantId"]: tuple(t.get("roleNames") or ()) for t in user.get("userTenants") or ()}
 
 
+async def _load_membership_roles(user_id: str) -> dict[str, tuple[str, ...]]:
+    if _descope_user_client is None:
+        raise RuntimeError("Descope client not initialized")
+    try:
+        response = await _descope_call(
+            cast(Callable[[str], dict[str, Any]], _descope_user_client.mgmt.user.load_by_user_id), user_id
+        )
+    except AuthException as error:
+        if error.status_code in (400, 404):
+            return {}
+        raise
+    user = response.get("user")
+    return user_tenant_roles(user) if isinstance(user, dict) else {}
+
+
+_membership_cache = MembershipCache(server_engine, _load_membership_roles)
+
+
+async def _cached_membership_roles(user_id: str) -> dict[str, tuple[str, ...]]:
+    return await _membership_cache.get(DESCOPE_PROJECT_ID, user_id)
+
+
 async def _is_member(user_id: str | None, tenant: str) -> bool:
     management = descope_management()
     if management is None or user_id is None:
         return False
-    user = await _live_user(user_id)
-    return user is not None and tenant in user_tenant_roles(user)
+    try:
+        return tenant in await _cached_membership_roles(user_id)
+    except MembershipUnavailableError as error:
+        raise HTTPException(status_code=503, detail="Auth service unavailable") from error
 
 
 def primary_login_id(user: Mapping[str, Any]) -> str | None:

@@ -63,6 +63,14 @@ DEFAULT_ORG_NAME = "default"
 FINISHED_BENCHMARK_STATUSES = (BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED)
 
 
+class DescopeMembership(SQLModel, table=True):
+    project_id: str = Field(primary_key=True)
+    user_id: str = Field(primary_key=True)
+    tenant_roles: dict[str, list[str]] | None = Field(default=None, sa_column=Column(JSON(none_as_null=True)))
+    fetched_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    cooldown_until: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+
+
 class Org(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str = Field(unique=True, index=True)

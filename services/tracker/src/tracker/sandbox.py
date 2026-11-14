@@ -82,6 +82,7 @@ from tracker.exceptions import (
     SSLConnectionError,
 )
 from tracker.logging import get_logger
+from tracker.logging.context import get_context_tags
 from tracker.executor.control_tasks import SandboxLink
 from tracker.logging.events import LogEvent
 from tracker.search_cost import SEARCH_COST_MAX_BYTES, SEARCH_COST_PATH_ENV, SearchCharge, parse_search_costs
@@ -99,6 +100,7 @@ logger = get_logger(__name__)
 bundle_path = PurePosixPath("/bundle")
 SANDBOX_AUTO_STOP_INTERVAL = 10 * 60
 SANDBOX_CREATE_TIMEOUT = 360
+_SANDBOX_CREATE_WARNING_INTERVAL_SECONDS = 120
 BUILD_LOG_CHARS = 2_000
 AGENT_INSTALL_TIMEOUT_SECONDS = 10 * 60
 GENERATION_CREDIT_REFRESH_GRACE_SECONDS = 10.0
@@ -378,6 +380,19 @@ def _reject_plaintext_secret_collisions(
         )
 
 
+async def _warn_slow_sandbox_creation(sandbox_name: str, started_at: float) -> None:
+    while True:
+        await asyncio.sleep(_SANDBOX_CREATE_WARNING_INTERVAL_SECONDS)
+        logger.warning(
+            "sandbox.create.slow",
+            extra={
+                **get_context_tags(),
+                "sandbox_name": sandbox_name,
+                "elapsed_seconds": time.monotonic() - started_at,
+            },
+        )
+
+
 @logfire.instrument("sandbox.create", extract_args=False)
 async def _create_sandbox(
     provider: SandboxProvider,
@@ -392,20 +407,24 @@ async def _create_sandbox(
     _reject_plaintext_secret_collisions(env_vars, sandbox_secrets)
     provider_source = _provider_source(source)
     _set_sandbox_create_span_attributes(sandbox_name, provider_source, resources)
-    sandbox = await provider.create_sandbox(
-        SandboxCreateRequest(
-            source=provider_source,
-            resources=resources,
-            name=sandbox_name,
-            labels=labels or {},
-            env_vars=env_vars or {},
-            sandbox_secrets=sandbox_secrets or {},
-            volumes=volumes or [],
-            auto_stop_interval=SANDBOX_AUTO_STOP_INTERVAL,
-            create_timeout=SANDBOX_CREATE_TIMEOUT,
-            network_block_all=False,
-        )
+    request = SandboxCreateRequest(
+        source=provider_source,
+        resources=resources,
+        name=sandbox_name,
+        labels=labels or {},
+        env_vars=env_vars or {},
+        sandbox_secrets=sandbox_secrets or {},
+        volumes=volumes or [],
+        auto_stop_interval=SANDBOX_AUTO_STOP_INTERVAL,
+        create_timeout=SANDBOX_CREATE_TIMEOUT,
+        network_block_all=False,
     )
+    warning_task = asyncio.create_task(_warn_slow_sandbox_creation(sandbox_name, time.monotonic()))
+    try:
+        sandbox = await provider.create_sandbox(request)
+    finally:
+        warning_task.cancel()
+        await asyncio.gather(warning_task, return_exceptions=True)
     _set_sandbox_span_attributes(sandbox)
     return sandbox
 

@@ -60,7 +60,7 @@ async def test_rate_limited_starts_leave_resources_free(
     owner_requests = 0
     owners_waiting = asyncio.Event()
     membership = credential_kind == "bound-key"
-    cached_owner = auth._live_user if membership else auth._cached_run_owner_user
+    cached_owner = auth._cached_membership_roles if membership else auth._cached_run_owner_user
     key_token = f"local-key-{uuid4()}"
     client.exchange_access_key.return_value = {
         "tenants": {"probe": {}},
@@ -83,7 +83,7 @@ async def test_rate_limited_starts_leave_resources_free(
     monkeypatch.setattr(auth, "DESCOPE_MANAGEMENT_KEY", "local-fake")
     monkeypatch.setattr(auth, "_descope_client", client)
     monkeypatch.setattr(auth, "_descope_user_client", client)
-    monkeypatch.setattr(auth, "_live_user" if membership else "_cached_run_owner_user", owner)
+    monkeypatch.setattr(auth, "_cached_membership_roles" if membership else "_cached_run_owner_user", owner)
     monkeypatch.setattr(auth, "_validate_bearer", lambda token: {"sub": token, "tenants": {"probe": {}}})
     monkeypatch.setattr(auth.random, "uniform", lambda _low, _high: 0.5)
     monkeypatch.setattr(main, "check_database_connection", healthy)
@@ -97,7 +97,7 @@ async def test_rate_limited_starts_leave_resources_free(
             await http.get("/health")
             warmup = await http.post(
                 f"/retry-or-resume-benchmark/{uuid4()}",
-                headers={"x-api-key": key_token} if membership else {"Authorization": "Bearer warmup"},
+                headers={"Authorization": "Bearer warmup"},
                 json={},
             )
             assert warmup.status_code == 503
@@ -133,8 +133,9 @@ async def test_rate_limited_starts_leave_resources_free(
             finally:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        assert pending
-        assert lookup.call_count > 0
+        if not membership:
+            assert pending
+        assert lookup.call_count == 1 if membership else lookup.call_count > 0
         assert tokens == 0
         assert connections == 0
         assert credential_available

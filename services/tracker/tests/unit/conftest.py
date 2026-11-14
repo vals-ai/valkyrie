@@ -2,9 +2,10 @@ import base64
 import os
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from types import ModuleType
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import (
@@ -45,12 +46,47 @@ from tracker.aws.runtime import AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
 from tracker.services.tasks.execute import TaskMonitor
+from tracker.repositories.membership import MembershipSnapshot
+from tracker.repositories.membership import MembershipRepository
+from tracker.services import memberships
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 
 from main import app
+
+
+@pytest.fixture(autouse=True)
+def membership_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshots: dict[tuple[str, str], MembershipSnapshot] = {}
+    origin = datetime.now(UTC) - timedelta(seconds=auth_module.time.monotonic())
+
+    def now() -> datetime:
+        return origin + timedelta(seconds=auth_module.time.monotonic())
+
+    cache = memberships.MembershipCache(
+        auth_module.server_engine,
+        auth_module._load_membership_roles,
+        now=now,
+    )
+
+    def read(project_id: str, user_id: str, _connection: object = None) -> MembershipSnapshot | None:
+        return snapshots.get((project_id, user_id))
+
+    def save(project_id: str, user_id: str, snapshot: MembershipSnapshot, _connection: object) -> None:
+        snapshots[project_id, user_id] = snapshot
+
+    def invalidate(_repository: MembershipRepository, project_id: str, user_id: str) -> None:
+        snapshots.pop((project_id, user_id), None)
+
+    lock = MagicMock()
+    lock.__aenter__.return_value = True
+    monkeypatch.setattr(memberships, "PostgresAdvisoryLock", MagicMock(return_value=lock))
+    monkeypatch.setattr(cache, "_read", read)
+    monkeypatch.setattr(cache, "_save", save)
+    monkeypatch.setattr(MembershipRepository, "invalidate", invalidate)
+    monkeypatch.setattr(auth_module, "_membership_cache", cache)
 
 
 @pytest.fixture

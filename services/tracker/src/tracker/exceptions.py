@@ -28,6 +28,10 @@ class BundlerError(Exception):
     pass
 
 
+class MembershipUnavailableError(Exception):
+    pass
+
+
 class RunLimitExceededError(Exception):
     def __init__(self, limit: int, active: int) -> None:
         super().__init__(

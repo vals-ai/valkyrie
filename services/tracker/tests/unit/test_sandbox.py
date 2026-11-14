@@ -4562,7 +4562,95 @@ class TestSandboxLifecycle:
         assert request.sandbox_secrets == sandbox_secrets
         assert request.volumes == volumes
         assert request.auto_stop_interval == sandbox_module.SANDBOX_AUTO_STOP_INTERVAL
-        assert request.create_timeout == sandbox_module.SANDBOX_CREATE_TIMEOUT
+        assert request.create_timeout == 360
+
+    @pytest.mark.description("Sandbox creation preserves the image build allowance alongside its startup timeout.")
+    async def test_create_sandbox_preserves_build_timeout(self) -> None:
+        provider = AsyncMock()
+        source = DockerfileSource(dockerfile="/task/environment/Dockerfile", build_timeout=600)
+
+        await _create_sandbox(provider, "task-alias", source, Resources(vcpu=1, memory=2, disk=5))
+
+        request = provider.create_sandbox.await_args.args[0]
+        assert request.source == source
+        assert request.source.build_timeout == 600
+        assert request.create_timeout == 360
+        assert request.provider_timeout == 960
+
+    @pytest.mark.description("In-flight creation warns every two minutes and stops warning when creation ends.")
+    @pytest.mark.parametrize("ticks", [0, 2])
+    @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+    async def test_create_sandbox_warns_while_in_flight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        ticks: int,
+        outcome: str,
+    ) -> None:
+        sleeping: asyncio.Queue[float] = asyncio.Queue()
+        timer: asyncio.Queue[None] = asyncio.Queue()
+        finished = asyncio.Event()
+        timer_cancelled = asyncio.Event()
+        clock = [1000.0]
+        context = {"benchmark_id": "run-123", "task_id": "hello-b", "attempt_started_at": "attempt-123"}
+        sandbox = Mock(id="sandbox-123", name="provider-name", state="started")
+
+        async def sleep(seconds: float) -> None:
+            sleeping.put_nowait(seconds)
+            try:
+                await timer.get()
+            except asyncio.CancelledError:
+                timer_cancelled.set()
+                raise
+
+        async def create(_request: Any) -> Mock:
+            await finished.wait()
+            if outcome == "failure":
+                raise ProviderSandboxError("creation failed")
+            return sandbox
+
+        monkeypatch.setattr(sandbox_module.asyncio, "sleep", sleep)
+        monkeypatch.setattr(sandbox_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(sandbox_module, "get_context_tags", lambda: context)
+        monkeypatch.setattr(sandbox_module.logger, "handlers", [*sandbox_module.logger.handlers, caplog.handler])
+        caplog.set_level(logging.WARNING, logger=sandbox_module.logger.name)
+        provider = AsyncMock()
+        provider.create_sandbox.side_effect = create
+        creation = asyncio.create_task(
+            _create_sandbox(
+                provider, "task-alias", ImageSource(image="ubuntu:24.04"), Resources(vcpu=1, memory=2, disk=5)
+            )
+        )
+
+        assert await sleeping.get() == 120
+        assert not caplog.records
+        for _ in range(ticks):
+            clock[0] += 120
+            timer.put_nowait(None)
+            assert await sleeping.get() == 120
+
+        if outcome == "cancelled":
+            creation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creation
+        elif outcome == "failure":
+            finished.set()
+            with pytest.raises(ProviderSandboxError, match="creation failed"):
+                await creation
+        else:
+            finished.set()
+            assert await creation is sandbox
+
+        assert timer_cancelled.is_set()
+        records = [record for record in caplog.records if record.message == "sandbox.create.slow"]
+        assert len(records) == ticks
+        for index, record in enumerate(records, start=1):
+            assert record.levelno == logging.WARNING
+            assert record.sandbox_name == "task-alias"
+            assert record.elapsed_seconds == index * 120
+            assert record.benchmark_id == "run-123"
+            assert record.task_id == "hello-b"
+            assert record.attempt_started_at == "attempt-123"
 
     @pytest.mark.description("Sandbox creation rejects a name in both plain and secret environments.")
     async def test_create_sandbox_rejects_plaintext_and_secret_environment_collision(self) -> None:
