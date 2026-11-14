@@ -9,6 +9,7 @@ import tempfile
 import types
 import threading
 from asyncio import Semaphore
+from hashlib import sha256
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
@@ -48,6 +49,7 @@ from benchmark_service.schemas import (
     EvalSandboxSpec,
     EvaluateResponseRequest,
     FinalScoreResult,
+    GradingRequirementsResponse,
     RetrieveTaskResponse,
     SetupTaskResponse,
     StreamChunk,
@@ -87,6 +89,7 @@ from tracker.database.models import (
     Org,
     OrgProviderSecret,
     Project,
+    RemoteGraderGrant,
     RunProject,
     SandboxAdmissionCandidate,
     SandboxBuildReservation,
@@ -101,7 +104,7 @@ from tracker.exceptions import ExecutionAuthorityRevoked, SandboxSetupError
 import tracker.executor.dispatch_control as dispatch_control
 from tracker.executor.control_protocol import AttemptRef, PhaseRef
 from tracker.executor.control_runs import RunControl
-from tracker.executor.control_tasks import SandboxLink, TaskControl, TaskState
+from tracker.executor.control_tasks import SandboxLink, TaskControl, TaskMutationRequest, TaskState
 from tracker.executor.control_queue import (
     QueueControl,
     QueueBuildResponse,
@@ -111,6 +114,7 @@ from tracker.executor.control_queue import (
     queue_pool_lock_id,
 )
 from tracker.executor.release_control import promote_release
+import tracker.remote_grader as remote_grader
 import tracker.runtime.model_gateway as model_gateway
 import tracker.scheduler.admission as admission
 import tracker.scheduler.coordinator as coordinator
@@ -539,11 +543,13 @@ async def test_http_admission_waits_for_real_postgres_row_lock_without_blocking_
     else:
         original_select_active_release = dispatch_control.select_active_release
 
-        def observed_start_lock(session: Session, *, for_update: bool = False) -> ExecutorRelease:
-            if for_update:
+        def observed_start_lock(
+            session: Session, *, for_update: bool = False, for_share: bool = False
+        ) -> ExecutorRelease:
+            if for_update or for_share:
                 session.connection().execute(text("SET LOCAL lock_timeout = '5s'"))
                 lock_entered.set()
-            return original_select_active_release(session, for_update=for_update)
+            return original_select_active_release(session, for_update=for_update, for_share=for_share)
 
         monkeypatch.setattr(dispatch_control, "select_active_release", observed_start_lock)
         url = "/start-benchmark"
@@ -1629,9 +1635,10 @@ async def test_two_recovery_handoffs_leave_one_evaluation_owner(
 
 
 @pytest.mark.description(
-    "A resumed evaluation gets a child grading token and stores the updated `eval_resume_state` when the task finishes."
+    "A resumed evaluation persists updated eval state on one connection, with selected-project child or remote grants."
 )
-@pytest.mark.parametrize("grading_path", ["nonproject", "project"])
+@pytest.mark.usefixtures("kms_grader_tokens")
+@pytest.mark.parametrize("grading_path", ["nonproject", "project", "remote-project"])
 async def test_resumed_evaluation_persists_callback_before_result(
     postgres_engine: Engine,
     postgres_session: Session,
@@ -1646,8 +1653,10 @@ async def test_resumed_evaluation_persists_callback_before_result(
         reserved_queue_pool_id(queue_pool_id(provider_pool_id)),
         [("resume-on-one-connection", TaskStatus.EVALUATING, _ATTEMPT)],
     )
-    if grading_path == "project":
+    if grading_path != "nonproject":
         org.name = "vals.ai"
+        if grading_path == "remote-project":
+            benchmark.name = "vcb"
         project = Project(org_id=org.id, handle="selected", name="Selected", spend_type=SpendType.INTERNAL)
         project.gateway_key_id = uuid4()
         postgres_session.add(project)
@@ -1675,12 +1684,17 @@ async def test_resumed_evaluation_persists_callback_before_result(
     control = cast(TaskControl, bound_controls(benchmark, session=postgres_session)["task_control"])
     dispatch = postgres_session.get(ExecutorDispatch, control.ref.dispatch_id)
     assert dispatch is not None
+    if grading_path == "remote-project":
+        dispatch.assigned_task_ids = [task.task_id]
     task.started_at = dispatch.created_at
     postgres_session.add(task)
     postgres_session.commit()
 
     service = AsyncMock(spec=BenchmarkServiceClient)
-    if grading_path == "project":
+    if grading_path != "nonproject":
+        service.grading_requirements_response.return_value = GradingRequirementsResponse(
+            models=["openai/gpt-5"], remote_grader_service="vcb" if grading_path == "remote-project" else None
+        )
         service.grading_requirements.return_value = ["openai/gpt-5"]
         monkeypatch.setattr(
             model_gateway,
@@ -1697,7 +1711,14 @@ async def test_resumed_evaluation_persists_callback_before_result(
             ),
         )
 
-    async def resume_evaluation(*_args: object, on_eval_resume_state: Any, **_kwargs: object) -> dict[str, float]:
+    async def resume_evaluation(*_args: object, on_eval_resume_state: Any, **kwargs: Any) -> dict[str, float]:
+        if grading_path == "remote-project":
+            authorization = kwargs["remote_grading_authorization"]
+            with Session(postgres_engine) as session:
+                grant = session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == task.id)).one()
+                assert grant.token_digest == sha256(authorization.token.encode()).hexdigest()
+                assert grant.token_ciphertext is not None
+                assert grant.closed_at is None
         await on_eval_resume_state({"job_id": "updated-job"})
         return {"score": 1.0}
 
@@ -1712,14 +1733,12 @@ async def test_resumed_evaluation_persists_callback_before_result(
     else:
         resolve = AsyncMock(side_effect=AssertionError("nonproject resume must not load grading secrets"))
     monkeypatch.setattr(task_execution, "resolve_secrets", resolve)
+    if grading_path == "remote-project":
+        monkeypatch.setattr(remote_grader, "Session", Mock(side_effect=AssertionError("executor DB unavailable")))
     monkeypatch.setattr(task_execution.TaskLogBuffer, "buffer_logs", Mock())
     task_control = cast(
         TaskControl,
-        bound_controls(
-            benchmark,
-            session=postgres_session,
-            dispatch_id=dispatch.id,
-        )["task_control"],
+        bound_controls(benchmark, session=postgres_session, dispatch_id=dispatch.id)["task_control"],
     )
     task_state = (
         await task_control.read(
@@ -1748,7 +1767,18 @@ async def test_resumed_evaluation_persists_callback_before_result(
 
     assert result == {task.task_id: {"score": 1.0}}
     service.resume_evaluation.assert_awaited_once()
-    if grading_path == "project":
+    if grading_path == "remote-project":
+        authorization = service.resume_evaluation.await_args.kwargs["remote_grading_authorization"]
+        assert authorization.issuer == task_execution.VALKYRIE_STAGE
+        assert service.resume_evaluation.await_args.kwargs["grading_token"] is None
+        with Session(postgres_engine) as session:
+            grant = session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == task.id)).one()
+            assert grant.token_ciphertext is None
+            assert grant.token_digest == sha256(authorization.token.encode()).hexdigest()
+            assert grant.worker_service == "vcb"
+            assert grant.closed_at is not None
+        service.grading_requirements.assert_not_awaited()
+    elif grading_path == "project":
         assert service.resume_evaluation.await_args.kwargs["grading_token"] == "grader-child"
     else:
         resolve.assert_not_awaited()
@@ -2408,8 +2438,9 @@ async def test_reservations_bound_parallel_builds(
 
 
 @pytest.mark.description(
-    "After a failed reserved create is cleaned up, its released phase survives queue-exit and the task can start again."
+    "A failed requeued build closes its old grant after cleanup, and the replacement attempt records its dispatch owner."
 )
+@pytest.mark.usefixtures("kms_grader_tokens")
 async def test_failed_reserved_create_recovers_after_provider_cleanup(
     postgres_engine: Engine,
     postgres_session: Session,
@@ -2420,8 +2451,37 @@ async def test_failed_reserved_create_recovers_after_provider_cleanup(
     events: list[str] = []
     pool_id = reserved_queue_pool_id(queue_pool_id(provider_pool_id))
     _, benchmark, (task,) = _run(postgres_session, pool_id, [("failing", TaskStatus.PENDING, _ATTEMPT)])
+    benchmark.name = "vcb"
+    postgres_session.add(benchmark)
+    postgres_session.commit()
     bound = bound_controls(benchmark, session=postgres_session)
     context = _context(cast(QueueControl, bound["queue_control"]), provider_pool_id, events, reserved=True)
+    task_control = cast(TaskControl, bound["task_control"])
+    task.status = TaskStatus.IN_PROGRESS
+    postgres_session.add(task)
+    postgres_session.commit()
+    previous_attempt = remote_grader.attempt_id_for(task)
+    with Session(postgres_engine) as issuer_session:
+        grant = remote_grader.issue_remote_grader_grant(
+            issuer_session,
+            benchmark_id=benchmark.id,
+            task_row_id=task.id,
+            attempt_id=previous_attempt,
+            worker_service="vcb",
+            gateway_secret_ref=f"{tenant_secret_prefix(benchmark.org_id)}model-gateway-{uuid4()}",
+        )
+    assert await task_control.transition(
+        TaskMutationRequest(
+            ref=task_control.ref,
+            attempt=AttemptRef(
+                org_id=task.org_id, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at
+            ),
+            to_status=TaskStatus.PENDING,
+            expected_status=TaskStatus.IN_PROGRESS,
+        )
+    )
+    with Session(postgres_engine) as session:
+        assert session.exec(select(RemoteGraderGrant)).one().closed_at is None
 
     async def fail_create() -> None:
         raise SandboxSetupError("provider rejected the create")
@@ -2457,10 +2517,19 @@ async def test_failed_reserved_create_recovers_after_provider_cleanup(
     assert _task(postgres_engine, task).status == TaskStatus.PENDING
     assert _reservation_count(postgres_engine, context.pool_id) == 0
     recovered = _task(postgres_engine, task)
+    assert recovered.started_at > task.started_at
+    with Session(postgres_engine) as session:
+        prior_grant = session.exec(select(RemoteGraderGrant)).one()
+        assert prior_grant.token_digest == sha256(grant.encode()).hexdigest()
+        assert prior_grant.token_ciphertext is None
+        assert prior_grant.closed_at is not None
 
     async with AsyncExitStack() as stack:
         assert await _enter(stack, context, recovered, events, postgres_engine) is not None
-        assert _task(postgres_engine, task).status == TaskStatus.IN_PROGRESS
+        resumed = _task(postgres_engine, task)
+        assert resumed.status == TaskStatus.IN_PROGRESS
+        assert resumed.build_phase_dispatch_id == context.control.ref.dispatch_id
+        assert resumed.build_phase_token is None
 
     assert _reservation_count(postgres_engine, context.pool_id) == 0
 
@@ -3669,7 +3738,8 @@ async def test_provider_rejection_publishes_candidate_and_releases_preparation_s
     assert _candidate_count(postgres_engine, context.pool_id) == 0
     assert _reservation_count(postgres_engine, context.pool_id) == 0
     assert not preparation_slot.locked()
-    assert _task(postgres_engine, task).build_phase_dispatch_id is None
+    expected_dispatch_id = context.control.ref.dispatch_id if outcome == "ready" else None
+    assert _task(postgres_engine, task).build_phase_dispatch_id == expected_dispatch_id
 
 
 @pytest.mark.description("Cancelling during preparation makes no create call and frees the build lock.")
@@ -3883,10 +3953,145 @@ async def runtime_services(aws_runtime: AWSRuntime) -> AsyncGenerator[RuntimeSer
     yield runtime
 
 
-@pytest.mark.description("Evaluation uses the saved project grading root.")
+@pytest.mark.description(
+    "Remote grading grants require live dispatch attempt ownership and an eligible saved project binding.\n"
+    "\n"
+    "Test cases:\n"
+    "- Repeated issuance for one attempt replays its token.\n"
+    "- A task assigned to another live dispatch rejects issuance.\n"
+    "- An ineligible saved project binding rejects issuance.\n"
+    "- A stale live dispatch cannot issue for a later attempt of the same assigned task."
+)
+@pytest.mark.usefixtures("kms_grader_tokens")
+async def test_control_remote_grader_grant_assignment_and_project(
+    postgres_engine: Engine,
+    postgres_session: Session,
+    bound_controls: Callable[..., dict[str, object]],
+) -> None:
+    org, benchmark, (first_task, second_task) = _run(
+        postgres_session,
+        queue_pool_id(f"daytona:{uuid4()}"),
+        [
+            ("first", TaskStatus.EVALUATING, _ATTEMPT),
+            ("second", TaskStatus.EVALUATING, _ATTEMPT),
+        ],
+    )
+    org.name = "vals.ai"
+    benchmark.name = "vcb"
+    project = Project(org_id=org.id, handle="selected", name="Selected", spend_type=SpendType.INTERNAL)
+    project.gateway_key_id = uuid4()
+    postgres_session.add(project)
+    postgres_session.flush()
+    postgres_session.add(RunProject(benchmark_id=benchmark.id, project_id=project.id))
+    reference = f"{tenant_secret_prefix(org.id)}model-gateway-{project.gateway_key_id}"
+    benchmark.arguments = benchmark.arguments.model_copy(
+        update={
+            "contract": benchmark.arguments.contract.model_copy(
+                update={"secrets": {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}}
+            ),
+            "selected_project_gateway_secret_ref": reference,
+        }
+    )
+    postgres_session.add_all([org, benchmark])
+    postgres_session.commit()
+    first_control = cast(TaskControl, bound_controls(benchmark, session=postgres_session)["task_control"])
+    second_control = cast(TaskControl, bound_controls(benchmark, session=postgres_session)["task_control"])
+    first_dispatch = postgres_session.get(ExecutorDispatch, first_control.ref.dispatch_id)
+    second_dispatch = postgres_session.get(ExecutorDispatch, second_control.ref.dispatch_id)
+    assert first_dispatch is not None and second_dispatch is not None
+    first_dispatch.assigned_task_ids = [first_task.task_id]
+    second_dispatch.assigned_task_ids = [second_task.task_id]
+    first_task.evaluation_phase_dispatch_id = first_dispatch.id
+    first_task.evaluation_phase_token = uuid4()
+    second_task.evaluation_phase_dispatch_id = second_dispatch.id
+    second_task.evaluation_phase_token = uuid4()
+    postgres_session.commit()
+    first_attempt = AttemptRef(
+        org_id=org.id, task_row_id=first_task.id, task_id=first_task.task_id, started_at=first_task.started_at
+    )
+    second_attempt = AttemptRef(
+        org_id=org.id, task_row_id=second_task.id, task_id=second_task.task_id, started_at=second_task.started_at
+    )
+
+    token = await first_control.issue_remote_grader_grant(first_attempt, "vcb")
+    replay = await first_control.issue_remote_grader_grant(first_attempt, "vcb")
+
+    assert replay == token
+    with Session(postgres_engine) as session:
+        grant = session.exec(select(RemoteGraderGrant)).one()
+        assert grant.token_digest == sha256(token.encode()).hexdigest()
+        assert grant.token_ciphertext is not None
+
+    with pytest.raises(httpx.HTTPStatusError) as foreign:
+        await first_control.issue_remote_grader_grant(second_attempt, "vcb")
+    assert foreign.value.response.status_code == 403
+
+    benchmark.arguments = benchmark.arguments.model_copy(
+        update={"selected_project_gateway_secret_ref": f"{tenant_secret_prefix(org.id)}model-gateway-{uuid4()}"}
+    )
+    postgres_session.add(benchmark)
+    postgres_session.commit()
+
+    with pytest.raises(httpx.HTTPStatusError) as ineligible:
+        await second_control.issue_remote_grader_grant(second_attempt, "vcb")
+    assert ineligible.value.response.status_code == 409
+    with Session(postgres_engine) as session:
+        assert session.exec(select(RemoteGraderGrant)).one().token_digest == sha256(token.encode()).hexdigest()
+
+    assert await first_control.transition(
+        TaskMutationRequest(
+            ref=first_control.ref,
+            attempt=first_attempt,
+            to_status=TaskStatus.STOPPED,
+            expected_status=TaskStatus.EVALUATING,
+        )
+    )
+    postgres_session.refresh(first_task)
+    first_task.status = TaskStatus.EVALUATING
+    first_task.started_at = max(first_task.started_at, second_dispatch.created_at) + timedelta(microseconds=1)
+    first_task.evaluation_phase_dispatch_id = second_dispatch.id
+    first_task.evaluation_phase_token = uuid4()
+    second_dispatch.assigned_task_ids = [second_task.task_id, first_task.task_id]
+    benchmark.arguments = benchmark.arguments.model_copy(update={"selected_project_gateway_secret_ref": reference})
+    postgres_session.add_all([first_task, second_dispatch, benchmark])
+    postgres_session.commit()
+    later_attempt = AttemptRef(
+        org_id=org.id, task_row_id=first_task.id, task_id=first_task.task_id, started_at=first_task.started_at
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as stale:
+        await first_control.issue_remote_grader_grant(later_attempt, "vcb")
+    assert stale.value.response.status_code == 403
+
+    later_token = await second_control.issue_remote_grader_grant(later_attempt, "vcb")
+    with Session(postgres_engine) as session:
+        issued = session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == first_task.id)).all()
+        assert {grant.token_digest for grant in issued} == {
+            sha256(token.encode()).hexdigest(),
+            sha256(later_token.encode()).hexdigest(),
+        }
+        closed = next(grant for grant in issued if grant.token_digest == sha256(token.encode()).hexdigest())
+        assert closed.closed_at is not None
+        assert closed.token_ciphertext is None
+
+
+@pytest.mark.description(
+    "Evaluation uses the saved project root or a real remote grading grant after sandbox admission."
+)
+@pytest.mark.usefixtures("kms_grader_tokens")
 @pytest.mark.parametrize(
     "grading_path",
-    ["project", "old-service", "byok", "custom-service", "projectless-retag", "mismatched-root", "mismatched-url"],
+    [
+        "project",
+        "remote-direct",
+        "remote-queued",
+        "old-service",
+        "byok",
+        "custom-service",
+        "projectless-retag",
+        "mismatched-root",
+        "mismatched-url",
+    ],
 )
 async def test_evaluation_uses_saved_project_grading_root(
     postgres_engine: Engine,
@@ -3897,10 +4102,13 @@ async def test_evaluation_uses_saved_project_grading_root(
     grading_path: str,
 ) -> None:
     events: list[str] = []
+    remote = grading_path in {"remote-direct", "remote-queued"}
     provider_pool_id = f"daytona:{uuid4()}"
     org, benchmark, (task,) = _run(
         postgres_session, queue_pool_id(provider_pool_id), [("task_0", TaskStatus.PENDING, _ATTEMPT)]
     )
+    if remote:
+        benchmark.name = "vcb"
     org.name = "vals.ai"
     saved_project = Project(org_id=org.id, handle="selected", name="Selected", spend_type=SpendType.INTERNAL)
     current_project = Project(org_id=org.id, handle="retagged", name="Retagged", spend_type=SpendType.INTERNAL)
@@ -3954,6 +4162,11 @@ async def test_evaluation_uses_saved_project_grading_root(
         assert benchmark.arguments.contract.secrets["MODEL_GATEWAY_URL"] == replacement
     controls = bound_controls(benchmark, session=postgres_session)
     task_control = cast(TaskControl, controls["task_control"])
+    if remote:
+        dispatch = postgres_session.get(ExecutorDispatch, task_control.ref.dispatch_id)
+        assert dispatch is not None
+        dispatch.assigned_task_ids = [task.task_id]
+        postgres_session.commit()
     context = _context(cast(QueueControl, controls["queue_control"]), provider_pool_id, events)
     task_state = (
         await task_control.read(
@@ -3977,13 +4190,22 @@ async def test_evaluation_uses_saved_project_grading_root(
 
     monkeypatch.setattr(model_gateway, "_client", httpx.AsyncClient(transport=httpx.MockTransport(gateway)))
     monkeypatch.setattr(task_execution, "resolve_secrets", resolve)
+    if remote:
+        monkeypatch.setattr(remote_grader, "Session", Mock(side_effect=AssertionError("executor DB unavailable")))
 
     monkeypatch.setattr(task_execution.TaskLogBuffer, "buffer_logs", Mock())
+
+    async def assert_no_grant_at_creation() -> None:
+        if remote:
+            with Session(postgres_engine) as session:
+                assert (
+                    session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == task.id)).all() == []
+                )
 
     def mock_create_sandbox(
         *_args: Any, creation_state: SandboxCreationState, **_kwargs: Any
     ) -> AbstractAsyncContextManager[Sandbox]:
-        return _sandbox(events, creation_state=creation_state)()
+        return _sandbox(events, creation_state=creation_state, on_create=assert_no_grant_at_creation)()
 
     monkeypatch.setattr(task_execution, "create_sandbox", mock_create_sandbox)
     monkeypatch.setattr(task_execution, "upload_agent_artifacts", AsyncMock())
@@ -3995,10 +4217,39 @@ async def test_evaluation_uses_saved_project_grading_root(
         source=_SOURCE, resources=_RESOURCES, problem_path="/tmp/problem.txt", cwd="/testbed"
     )
     service.setup_task.return_value = SetupTaskResponse(status="ok")
+    service.grading_requirements_response.return_value = GradingRequirementsResponse(
+        models=["openai/gpt-5", "anthropic/claude-sonnet"],
+        remote_grader_service="vcb" if remote else None,
+    )
     service.grading_requirements.return_value = ["openai/gpt-5", "anthropic/claude-sonnet"]
     if grading_path == "old-service":
+        service.grading_requirements_response.side_effect = BenchmarkServiceError("Not found", status_code=404)
         service.grading_requirements.side_effect = BenchmarkServiceError("Not found", status_code=404)
     service.evaluate_instance.return_value = {"score": 1.0}
+    handed_off_tokens: list[str] = []
+    if remote:
+
+        async def setup_task(*_args: Any, **kwargs: Any) -> SetupTaskResponse:
+            events.append("setup")
+            authorization = kwargs["remote_grading_authorization"]
+            assert authorization.issuer == task_execution.VALKYRIE_STAGE
+            with Session(postgres_engine) as session:
+                grant = session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == task.id)).one()
+                assert grant.closed_at is None
+                assert grant.token_digest == sha256(authorization.token.encode()).hexdigest()
+                assert grant.token_ciphertext is not None
+                assert grant.worker_service == "vcb"
+            handed_off_tokens.append(authorization.token)
+            return SetupTaskResponse(status="ok")
+
+        async def evaluate_instance(*_args: Any, **kwargs: Any) -> dict[str, float]:
+            events.append("evaluate")
+            assert kwargs["remote_grading_authorization"].token == handed_off_tokens[0]
+            assert kwargs["grading_token"] is None
+            return {"score": 1.0}
+
+        service.setup_task.side_effect = setup_task
+        service.evaluate_instance.side_effect = evaluate_instance
 
     result = await task_execution.process_task(
         task_state,
@@ -4013,7 +4264,7 @@ async def test_evaluation_uses_saved_project_grading_root(
         ),
         sandbox_provider=context.provider,
         creation_semaphore=Semaphore(1),
-        queue_context=context,
+        queue_context=None if grading_path == "remote-direct" else context,
         control=task_control,
         started_by_email=benchmark.started_by_email,
     )
@@ -4022,10 +4273,37 @@ async def test_evaluation_uses_saved_project_grading_root(
     assert _task(postgres_engine, task).status == TaskStatus.FINISHED
     evaluation = service.evaluate_instance.await_args
     assert evaluation.kwargs["grading_token"] == ("grading-child" if grading_path == "project" else None)
+    if remote:
+        assert events.index("create") < events.index("setup") < events.index("evaluate")
+        service.setup_task.assert_awaited_once()
+        with Session(postgres_engine) as session:
+            grant = session.exec(select(RemoteGraderGrant).where(RemoteGraderGrant.task_row_id == task.id)).one()
+            assert grant.token_ciphertext is None
+            assert grant.token_digest == sha256(handed_off_tokens[0].encode()).hexdigest()
+            assert grant.attempt_id == task_execution.task_attempt_id(task.id, task.started_at)
+            assert grant.gateway_secret_ref == reference
+            assert grant.identity == {"benchmark_name": "vcb", "agent_name": "grader"}
+            assert grant.closed_at is not None
+        with Session(postgres_engine) as issuer_session, pytest.raises(HTTPException) as rejected:
+            remote_grader.issue_remote_grader_grant(
+                issuer_session,
+                benchmark_id=benchmark.id,
+                task_row_id=task.id,
+                attempt_id=task_execution.task_attempt_id(task.id, task.started_at),
+                worker_service="vcb",
+                gateway_secret_ref=reference,
+            )
+        assert rejected.value.status_code == 409
     if grading_path in {"byok", "custom-service", "projectless-retag", "mismatched-root", "mismatched-url"}:
+        service.grading_requirements_response.assert_not_awaited()
         service.grading_requirements.assert_not_awaited()
     else:
-        service.grading_requirements.assert_awaited_once_with("task_0", dataset=None)
+        if remote:
+            service.grading_requirements_response.assert_awaited_once_with("task_0", dataset=None)
+            service.grading_requirements.assert_not_awaited()
+        else:
+            service.grading_requirements_response.assert_not_awaited()
+            service.grading_requirements.assert_awaited_once_with("task_0", dataset=None)
     if grading_path == "project":
         assert gateway_calls == [
             (

@@ -620,17 +620,19 @@ async def test_capacity_timeout_closes_provider_and_pool_drift_skips_observation
 async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     active = 0
     peak = 0
-    cancelled = 0
+    finished = 0
+    reads_started = asyncio.Barrier(2)
 
     async def blocking_provider_config(*_args: object) -> None:
-        nonlocal active, peak, cancelled
+        nonlocal active, peak, finished
         active += 1
         peak = max(peak, active)
         try:
-            await asyncio.Event().wait()
+            await reads_started.wait()
+            raise TimeoutError
         finally:
             active -= 1
-            cancelled += 1
+            finished += 1
 
     pool_ids = [f"pool_{index}" for index in range(6)]
     overview = SchedulerOverviewResponse(
@@ -654,8 +656,8 @@ async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch:
         for index, pool_id in enumerate(pool_ids)
     }
     monkeypatch.setattr(scheduler_overview_api, "_CAPACITY_MAX_CONCURRENCY", 2)
-    monkeypatch.setattr(scheduler_overview_api, "_CAPACITY_READ_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler_overview_api, "_CAPACITY_REQUEST_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(scheduler_overview_api, "_CAPACITY_READ_TIMEOUT_SECONDS", float("inf"))
+    monkeypatch.setattr(scheduler_overview_api, "_CAPACITY_REQUEST_TIMEOUT_SECONDS", float("inf"))
     monkeypatch.setattr(
         scheduler_overview_api,
         "deployment_aws_runtime",
@@ -667,15 +669,16 @@ async def test_capacity_enrichment_bounds_concurrent_provider_reads(monkeypatch:
         blocking_provider_config,
     )
 
-    result = await scheduler_overview_api._enrich_scheduler_capacity(  # pyright: ignore[reportPrivateUsage]
-        overview,
-        org=_TEST_ORG,
-        references=references,
-    )
+    async with asyncio.timeout(10):
+        result = await scheduler_overview_api._enrich_scheduler_capacity(  # pyright: ignore[reportPrivateUsage]
+            overview,
+            org=_TEST_ORG,
+            references=references,
+        )
 
     assert peak == 2
     assert active == 0
-    assert cancelled == 2
+    assert finished == len(pool_ids)
     assert [pool.capacity_domains for pool in result.pools] == [None] * len(pool_ids)
 
 

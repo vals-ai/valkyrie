@@ -6,10 +6,32 @@ from pydantic import BaseModel
 
 from tracker.executor import control_client
 from tracker.executor.control_client import ControlClient
+from tracker.executor.control_tasks import RemoteGraderGrantResponse
 
 
 class _Body(BaseModel):
     ok: bool
+
+
+@pytest.mark.description(
+    "Remote grading grant issuance replays after a dropped response and a temporary gateway error."
+)
+async def test_remote_grader_grant_retries_lost_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(control_client.random, "uniform", lambda _low, _high: 0)
+    attempts: list[str] = []
+    client = _client(
+        [
+            httpx.ReadTimeout("response lost after issuance"),
+            httpx.Response(503),
+            httpx.Response(200, json={"grant_token": "same-attempt-grant"}),
+        ],
+        attempts,
+    )
+
+    response = await client.call("issue_remote_grader_grant", _Body(ok=True), RemoteGraderGrantResponse)
+
+    assert response.grant_token == "same-attempt-grant"
+    assert attempts == ["/executor-control/v1/issue_remote_grader_grant"] * 3
 
 
 def _client(responses: list[Exception | httpx.Response], attempts: list[str]) -> ControlClient:

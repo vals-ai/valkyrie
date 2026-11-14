@@ -17,13 +17,13 @@ class ExecutorReleaseRepository:
         self._session = session
 
     def get(
-        self, release_id: str, *, populate_existing: bool = False, for_update: bool = False
+        self, release_id: str, *, populate_existing: bool = False, for_update: bool = False, for_share: bool = False
     ) -> ExecutorRelease | None:
         return self._session.get(
             ExecutorRelease,
             release_id,
-            populate_existing=populate_existing or for_update,
-            with_for_update=for_update or None,
+            populate_existing=populate_existing or for_update or for_share,
+            with_for_update={"read": True} if for_share else for_update or None,
         )
 
     def task_definition_arn(self, release_id: str) -> str | None:
@@ -44,13 +44,16 @@ class ExecutorReleaseRepository:
             .with_for_update()
         ).all()
 
-    def admission(self, *, for_update: bool = False) -> ExecutorAdmission | None:
+    def admission(self, *, for_update: bool = False, for_share: bool = False) -> ExecutorAdmission | None:
         statement = (
             select(ExecutorAdmission).where(col(ExecutorAdmission.id) == 1).execution_options(populate_existing=True)
         )
         if for_update:
             self._queue_on_admission_fence("pg_advisory_xact_lock")
             statement = statement.with_for_update()
+        elif for_share:
+            self._queue_on_admission_fence("pg_advisory_xact_lock_shared")
+            statement = statement.with_for_update(read=True)
         return self._session.exec(statement).one_or_none()
 
     def shared_admission(self) -> ExecutorAdmission | None:

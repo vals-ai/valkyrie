@@ -110,14 +110,6 @@ def project_service_configuration() -> tuple[str, str]:
     return url, token
 
 
-def project_service_writes() -> bool:
-    return os.environ.get("PROJECT_SERVICE_WRITES") == "true"
-
-
-def project_service_reads() -> bool:
-    return os.environ.get("PROJECT_SERVICE_READS") == "true"
-
-
 RUN_ACCESS_KEY_TTL_SECONDS = _positive_int_setting("RUN_ACCESS_KEY_TTL_SECONDS", 14 * 24 * 3600)
 AGENT_UPLOAD_MAX_BYTES = _positive_int_setting("AGENT_UPLOAD_MAX_BYTES", 1073741824)
 DATASET_TASK_UPLOAD_MAX_BYTES = _positive_int_setting("DATASET_TASK_UPLOAD_MAX_BYTES", 4294967296)

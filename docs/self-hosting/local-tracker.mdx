@@ -56,7 +56,9 @@ export EXECUTOR_BOOTSTRAP_KEY=YOUR_BOOTSTRAP_SECRET
 make local-tracker
 ```
 
-This starts PostgreSQL in Docker, explicitly applies migrations, and serves Tracker at `http://127.0.0.1:8000`.
+This starts PostgreSQL and the project service in Docker, explicitly applies migrations,
+and serves Tracker at `http://127.0.0.1:8000`. The project service listens at
+`http://127.0.0.1:8010` and has its own PostgreSQL.
 
 - Runs, including retries and resumes, use code from your checkout after changes.
 - If you restart Tracker while tasks are waiting to start, retry the run afterwards.
@@ -153,6 +155,7 @@ rm -rf .local
 | `secrets_file` | `local-server.yaml` | File the provider settings and agent secrets come from |
 | `secrets_manager_region` | `local-server.yaml` | Reads named secrets from AWS Secrets Manager in this Region instead of `secrets_file`, with the AWS credentials in the Tracker's environment |
 | `BENCHMARK_SERVICE_BASE_URL` | Tracker environment | Domain of the hosted benchmark services |
+| `PROJECT_SERVICE_TOKEN` | Tracker and project service environment | Token Tracker sends to the project service. Defaults to `local-project-token` |
 
 With `secrets_manager_region`, map each provider to its secret with `valkyrie provider set`.
 Only this source can send a benchmark service's

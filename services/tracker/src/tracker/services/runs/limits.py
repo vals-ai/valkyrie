@@ -93,6 +93,7 @@ def ensure_run_capacity(session: Session, org_id: UUID, run_id: UUID) -> None:
     limit = run_limits.current().for_org(org.name)
     if limit is None:
         return
+    OrganizationRepository(session).lock_run_capacity(org_id)
     active = BenchmarkRepository(session).count_active(org_id, excluding=run_id)
     if active >= limit:
         raise RunLimitExceededError(limit=limit, active=active)

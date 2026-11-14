@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from tests.project_service import MockProjectRoutes
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
 import tracker.api.costs as costs_api
@@ -217,7 +218,7 @@ class TestCostsByEmail:
 
 
 def _project(
-    session: Session, handle: str, spend_type: SpendType, subcategory: str, *, org_id: UUID = TEST_ORG_ID
+    service: MockProjectRoutes, handle: str, spend_type: SpendType, subcategory: str, *, org_id: UUID = TEST_ORG_ID
 ) -> Project:
     project = Project(
         org_id=org_id,
@@ -227,8 +228,7 @@ def _project(
         subcategory=subcategory,
         customer="google" if spend_type is SpendType.CUSTOMER else None,
     )
-    session.add(project)
-    session.commit()
+    service.seed(project)
     return project
 
 
@@ -287,12 +287,14 @@ class TestCostsByProject:
             "- Every run in the window is listed with its project handle."
         )
     )
-    def test_groups_costs_under_each_runs_newest_project(self, client: TestClient, database_session: Session) -> None:
+    def test_groups_costs_under_each_runs_newest_project(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
         stamp = datetime(2026, 10, 20, tzinfo=utc)
-        router = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
-        blog = _project(database_session, "blog-xyz", SpendType.INTERNAL, "blog")
-        google = _project(database_session, "google-report-xyz", SpendType.CUSTOMER, "report")
+        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        blog = _project(project_service, "blog-xyz", SpendType.INTERNAL, "blog")
+        google = _project(project_service, "google-report-xyz", SpendType.CUSTOMER, "report")
 
         moved = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0, 0.5])
         _link(database_session, moved, router, created_at=stamp)
@@ -312,7 +314,7 @@ class TestCostsByProject:
             database_session, started_at=datetime(2026, 10, 8, tzinfo=utc), amounts=[9.0], org_id=other_org.id
         )
         foreign_project = _project(
-            database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation", org_id=other_org.id
+            project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation", org_id=other_org.id
         )
         _link(database_session, foreign, foreign_project, created_at=stamp)
         database_session.commit()
@@ -382,10 +384,12 @@ class TestCostsByProject:
             "- Stopped with no finish, started inside the window: listed."
         )
     )
-    def test_runs_lists_every_run_alive_during_the_window(self, client: TestClient, database_session: Session) -> None:
+    def test_runs_lists_every_run_alive_during_the_window(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
         stamp = datetime(2026, 10, 20, tzinfo=utc)
-        project = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         finished_inside = _tagged_run(
             database_session,
             started_at=datetime(2026, 9, 28, tzinfo=utc),
@@ -512,10 +516,13 @@ class TestCostsByProject:
         )
     )
     def test_runs_lists_every_run_with_a_cost_in_the_window(
-        self, client: TestClient, database_session: Session
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
     ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         carried_in = _tagged_run(
             database_session,
             started_at=datetime(2026, 9, 28, tzinfo=utc),
@@ -560,15 +567,16 @@ class TestCostsByProject:
         )
     )
     def test_a_link_to_another_orgs_project_is_not_attributed(
-        self, client: TestClient, database_session: Session
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
     ) -> None:
         utc = ZoneInfo("UTC")
         other_org = Org(id=uuid4(), name="other-tenant")
         database_session.add(other_org)
         database_session.commit()
-        foreign_project = _project(
-            database_session, "secret-project", SpendType.CUSTOMER, "report", org_id=other_org.id
-        )
+        foreign_project = _project(project_service, "secret-project", SpendType.CUSTOMER, "report", org_id=other_org.id)
         run = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0])
         _link(database_session, run, foreign_project, created_at=datetime(2026, 10, 6, tzinfo=utc))
         database_session.commit()
@@ -592,9 +600,11 @@ class TestCostsByProject:
             "- The by-project response is identical before and after the project is archived."
         )
     )
-    def test_an_archived_projects_spend_keeps_its_totals(self, client: TestClient, database_session: Session) -> None:
+    def test_an_archived_projects_spend_keeps_its_totals(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         run = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0, 0.5])
         _link(database_session, run, router, created_at=datetime(2026, 10, 5, tzinfo=utc))
         database_session.commit()
@@ -619,10 +629,13 @@ class TestCostsByProject:
         )
     )
     def test_a_sandbox_is_placed_in_the_month_its_usage_ended(
-        self, client: TestClient, database_session: Session
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
     ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         ran_into_november = _tagged_run(
             database_session,
             started_at=datetime(2026, 10, 30, tzinfo=utc),
@@ -886,9 +899,11 @@ class TestProjectDaytonaCosts:
             "- The response echoes the window's exact start and end."
         )
     )
-    def test_a_datetime_window_counts_runs_by_the_hour(self, client: TestClient, database_session: Session) -> None:
+    def test_a_datetime_window_counts_runs_by_the_hour(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
-        project = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for started_at, amount in [
             (datetime(2026, 10, 30, 21, 30, tzinfo=utc), 1.0),
             (datetime(2026, 10, 30, 20, 30, tzinfo=utc), 2.0),
@@ -918,9 +933,11 @@ class TestProjectDaytonaCosts:
             "- The response echoes each date as given."
         )
     )
-    def test_a_date_window_counts_the_whole_utc_day(self, client: TestClient, database_session: Session) -> None:
+    def test_a_date_window_counts_the_whole_utc_day(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
-        project = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for started_at, amount in [
             (datetime(2026, 10, 30, 21, 30, tzinfo=utc), 1.0),
             (datetime(2026, 10, 30, 20, 30, tzinfo=utc), 2.0),
@@ -952,10 +969,12 @@ class TestProjectSandboxCosts:
             "- The Daytona route still returns only the Daytona total for that project."
         )
     )
-    def test_each_provider_gets_its_own_row(self, client: TestClient, database_session: Session) -> None:
+    def test_each_provider_gets_its_own_row(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
         utc = ZoneInfo("UTC")
         started_at = datetime(2026, 10, 30, 21, 30, tzinfo=utc)
-        project = _project(database_session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for provider, amounts in [("daytona", [1.0, 0.5]), ("modal", [32.69])]:
             run = _tagged_run(database_session, started_at=started_at, amounts=amounts, provider=provider)
             _link(database_session, run, project, created_at=started_at)
@@ -994,10 +1013,10 @@ def _sandbox_cost(
     session.commit()
 
 
-def _seed_november_sandbox_rows(session: Session) -> dict[str, UUID]:
+def _seed_november_sandbox_rows(session: Session, service: MockProjectRoutes) -> dict[str, UUID]:
     utc = ZoneInfo("UTC")
-    blog = _project(session, "blog-xyz", SpendType.INTERNAL, "blog")
-    router = _project(session, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+    blog = _project(service, "blog-xyz", SpendType.INTERNAL, "blog")
+    router = _project(service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
     tagged = _tagged_run(
         session,
         started_at=datetime(2026, 10, 20, tzinfo=utc),
@@ -1049,8 +1068,10 @@ class TestSandboxCostRows:
             "- A run moved from one project to another comes back once per row, under its newest handle."
         )
     )
-    def test_each_row_comes_back_with_its_kind_and_day(self, client: TestClient, database_session: Session) -> None:
-        runs = _seed_november_sandbox_rows(database_session)
+    def test_each_row_comes_back_with_its_kind_and_day(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
+        runs = _seed_november_sandbox_rows(database_session, project_service)
 
         response = client.get(
             "/costs/sandbox-rows",
@@ -1094,8 +1115,10 @@ class TestSandboxCostRows:
             "- The day totals sum to the Daytona rows of `/by-project` for the same window and org."
         )
     )
-    def test_day_totals_match_by_project(self, client: TestClient, database_session: Session) -> None:
-        _seed_november_sandbox_rows(database_session)
+    def test_day_totals_match_by_project(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
+        _seed_november_sandbox_rows(database_session, project_service)
         params = {"start": "2026-11-01", "end": "2026-11-06"}
 
         rows = client.get("/costs/sandbox-rows", params=params, headers={"X-Api-Key": "fake"})
@@ -1123,8 +1146,10 @@ class TestSandboxCostRows:
             "- A limit above 20,000 or below 1, or a negative offset, receives 422."
         )
     )
-    def test_pages_walk_every_row_once(self, client: TestClient, database_session: Session) -> None:
-        _seed_november_sandbox_rows(database_session)
+    def test_pages_walk_every_row_once(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
+        _seed_november_sandbox_rows(database_session, project_service)
         params = {"start": "2026-11-01", "end": "2026-11-06"}
         whole = client.get("/costs/sandbox-rows", params=params, headers={"X-Api-Key": "fake"}).json()
 

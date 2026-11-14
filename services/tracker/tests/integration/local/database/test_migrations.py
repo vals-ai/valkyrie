@@ -21,12 +21,14 @@ from sqlmodel import Session, SQLModel, create_engine
 from testcontainers.postgres import PostgresContainer
 
 import tracker.config as tracker_config
+from tests.project_service import MockProjectRoutes
 from executor_protocol import ExecutorDispatchStatus
 from tracker.database.models import (
     Benchmark,
     ExecutorDispatch,
     ExecutorRelease,
     Project,
+    ProjectCutover,
     RunProject,
     Task,
 )
@@ -64,6 +66,34 @@ _DROP_AWS_MANAGED_REVISION = "c4d5e6f7a8b9"
 _PROJECT_PREDECESSOR = "b7e4c1a9d2f0"
 _UNIQUE_PROJECT_NAME_REVISION = "4c9d2e7f1a3b"
 _UNIQUE_PROJECT_NAME_PREDECESSOR = "3222f9e0a6ce"
+
+
+@pytest.mark.description("The project cutover marker upgrades, persists completion, downgrades and upgrades again.")
+def test_project_cutover_round_trip(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "b6d8e1c3f902")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    before = _schema_snapshot(engine)
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "c9e2f4a6b803")
+    assert upgrade.returncode == 0, upgrade.stderr
+    with Session(engine) as session:
+        assert session.get(ProjectCutover, 1) is None
+        session.add(ProjectCutover())
+        session.commit()
+    with Session(engine) as session:
+        marker = session.get(ProjectCutover, 1)
+        assert marker is not None and marker.completed_at.utcoffset() == timedelta(0)
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "b6d8e1c3f902")
+    assert downgrade.returncode == 0, downgrade.stderr
+    assert _schema_snapshot(engine) == before
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "c9e2f4a6b803")
+    assert upgrade.returncode == 0, upgrade.stderr
+    with Session(engine) as session:
+        assert session.get(ProjectCutover, 1) is None
+    engine.dispose()
 
 
 @pytest.mark.description("Alembic migrations resolve to exactly one head revision.")
@@ -1443,11 +1473,12 @@ def test_dropping_aws_managed_downgrades_with_every_aws_run_marked_managed(migra
     engine.dispose()
 
 
-@pytest.mark.xfail(reason="`run_project.project_id` still references `project`", strict=True)
 @pytest.mark.description(
     "Project handles are unique per org while names may repeat, a run's last-appended link is its project even when link timestamps tie, and downgrade removes both tables."
 )
-def test_project_migration_matches_the_models_and_downgrades(migration_database_url: str) -> None:
+def test_project_migration_matches_the_models_and_downgrades(
+    migration_database_url: str, project_service: MockProjectRoutes
+) -> None:
     upgrade = _run_alembic(migration_database_url, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
     engine = create_engine(migration_database_url)
@@ -1519,6 +1550,7 @@ def test_project_migration_matches_the_models_and_downgrades(migration_database_
             customer="google",
             extra_tags={"engagement": "q4"},
         )
+        project_service.seed(router_bench, google_report)
         session.add_all([router_bench, google_report])
         session.flush()
         moved_at = datetime.now(UTC)
@@ -1724,7 +1756,7 @@ def test_epoch_cleanup_migration_round_trips(migration_database_url: str) -> Non
     upgrade = _run_alembic(migration_database_url, "upgrade", "a7d2c4e9f1b3")
     assert upgrade.returncode == 0, upgrade.stderr
     before = _schema_snapshot(engine)
-    upgrade = _run_alembic(migration_database_url, "upgrade", "d4e8a1c6b9f2")
+    upgrade = _run_alembic(migration_database_url, "upgrade", "d967e427b9ad")
     assert upgrade.returncode == 0, upgrade.stderr
     inspector = inspect(engine)
     assert not {"migrationepoch", "migrationparticipant"} & set(inspector.get_table_names())
@@ -1742,7 +1774,6 @@ def test_epoch_cleanup_migration_round_trips(migration_database_url: str) -> Non
     engine.dispose()
 
 
-@pytest.mark.xfail(reason="`run_project.project_id` still references `project`", strict=True)
 @pytest.mark.description(
     "At head, `run_project.project_id` has no foreign key to `project`, and a downgrade restores it."
 )

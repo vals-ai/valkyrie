@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: projects
+      POSTGRES_PASSWORD: projects
+      POSTGRES_DB: projects
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U projects -d projects"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  projects:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn projects.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:8010:8000"
+    environment:
+      DATABASE_URL: postgresql://projects:projects@postgres:5432/projects
+      PROJECT_SERVICE_TOKEN: local-project-token
+    depends_on:
+      postgres:
+        condition: service_healthy

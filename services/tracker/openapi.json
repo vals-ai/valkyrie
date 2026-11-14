@@ -2568,6 +2568,171 @@
         }
       }
     },
+    "/remote-grader/registrations": {
+      "post": {
+        "tags": [
+          "remote-grader"
+        ],
+        "summary": "Register Remote Grader",
+        "description": "Register a remote grader attempt with its fixed model scope and first-pickup deadline.",
+        "operationId": "register_remote_grader",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteGraderRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoteGraderRegistrationResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RemoteGraderWorkerKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/remote-grader/registrations/{registration_id}/lease": {
+      "post": {
+        "tags": [
+          "remote-grader"
+        ],
+        "summary": "Pickup Remote Grader Lease",
+        "description": "Return a Gateway lease for a registered model scope, minting only before the first-pickup deadline.",
+        "operationId": "pickup_remote_grader_lease",
+        "parameters": [
+          {
+            "name": "registration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Registration Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteGraderPickup"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoteGraderCredential"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RemoteGraderWorkerKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/remote-grader/registrations/{registration_id}/stop": {
+      "post": {
+        "tags": [
+          "remote-grader"
+        ],
+        "summary": "Stop Remote Grader Lease",
+        "description": "Close a remote grader registration by ID and revoke its Gateway lease.",
+        "operationId": "stop_remote_grader_lease",
+        "parameters": [
+          {
+            "name": "registration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Registration Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteGraderAttempt"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoteGraderStopped"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RemoteGraderWorkerKeyAuth": []
+          }
+        ]
+      }
+    },
     "/projects": {
       "post": {
         "summary": "Create Project",
@@ -9581,6 +9746,164 @@
         "title": "RegradeBenchmarkResponse",
         "description": "The new run and which source tasks it regrades or skips."
       },
+      "RemoteGraderAttempt": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "attempt_id": {
+            "type": "string",
+            "title": "Attempt Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "task_id",
+          "attempt_id"
+        ],
+        "title": "RemoteGraderAttempt"
+      },
+      "RemoteGraderCredential": {
+        "properties": {
+          "gateway_url": {
+            "type": "string",
+            "title": "Gateway Url"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "lease_id": {
+            "type": "string",
+            "title": "Lease Id"
+          },
+          "expires_at": {
+            "type": "number",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "gateway_url",
+          "token",
+          "lease_id",
+          "expires_at"
+        ],
+        "title": "RemoteGraderCredential"
+      },
+      "RemoteGraderPickup": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "attempt_id": {
+            "type": "string",
+            "title": "Attempt Id"
+          },
+          "allowed_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Allowed Models"
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Ttl Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "task_id",
+          "attempt_id",
+          "allowed_models",
+          "ttl_seconds"
+        ],
+        "title": "RemoteGraderPickup"
+      },
+      "RemoteGraderRegistrationRequest": {
+        "properties": {
+          "authorization": {
+            "type": "string",
+            "title": "Authorization"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "attempt_id": {
+            "type": "string",
+            "title": "Attempt Id"
+          },
+          "allowed_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Allowed Models"
+          },
+          "first_pickup_deadline": {
+            "type": "number",
+            "title": "First Pickup Deadline"
+          }
+        },
+        "type": "object",
+        "required": [
+          "authorization",
+          "job_id",
+          "task_id",
+          "attempt_id",
+          "allowed_models",
+          "first_pickup_deadline"
+        ],
+        "title": "RemoteGraderRegistrationRequest"
+      },
+      "RemoteGraderRegistrationResponse": {
+        "properties": {
+          "registration_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Registration Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "registration_id"
+        ],
+        "title": "RemoteGraderRegistrationResponse"
+      },
+      "RemoteGraderStopped": {
+        "properties": {
+          "stopped": {
+            "type": "boolean",
+            "title": "Stopped"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stopped"
+        ],
+        "title": "RemoteGraderStopped"
+      },
       "RescoreBenchmarkResponse": {
         "properties": {
           "benchmark_id": {
@@ -11735,6 +12058,11 @@
         "type": "apiKey",
         "in": "header",
         "name": "x-api-key"
+      },
+      "RemoteGraderWorkerKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Remote-Grader-Worker-Key"
       }
     }
   },

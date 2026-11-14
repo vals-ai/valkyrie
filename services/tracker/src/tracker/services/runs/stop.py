@@ -10,6 +10,7 @@ from sqlmodel import Session
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.egress_policy import EgressPolicyRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.database.models import (
     Benchmark,
     BenchmarkStatus,
@@ -47,6 +48,7 @@ def apply_stop_benchmark(
 
     repository = BenchmarkRepository(session)
     stopped = repository.stop_tasks(org.id, benchmark_row.id, stoppable_statuses, task_ids)
+    RemoteGraderRepository(session).close_stopped_tasks(benchmark_row.id)
 
     if force:
         stopped_attempts = None
@@ -95,6 +97,7 @@ def apply_shed_benchmark(benchmark_row: Benchmark, concurrency: int, session: Se
     for task in shed_tasks:
         task.status = TaskStatus.STOPPED
         task.active_native_output = None
+        RemoteGraderRepository(session).close_attempt(task.id, task_attempt_id(task.id, task.started_at))
     EgressPolicyRepository(session).revoke_attempts(
         benchmark_row.id, [task_attempt_id(task.id, task.started_at) for task in shed_tasks]
     )
@@ -103,22 +106,22 @@ def apply_shed_benchmark(benchmark_row: Benchmark, concurrency: int, session: Se
     return [task.task_id for task in shed_tasks]
 
 
-async def initiate_stop_benchmark(
+def commit_stop_benchmark(
     benchmark_row: Benchmark,
     session: Session,
     force: bool,
     org: Org,
     task_ids: list[str] | None = None,
-) -> None:
-    def commit_stop() -> list[str]:
+) -> list[str]:
+    try:
         task_arns = apply_stop_benchmark(benchmark_row, session, force, org, task_ids)
         session.commit()
         return task_arns
-
-    try:
-        task_arns = await database_call(commit_stop)
     except Exception as e:
         raise TrackerServiceError(f"Unexpected error stopping run {benchmark_row.id}: {str(e)}") from e
+
+
+async def stop_executor_tasks(task_arns: list[str]) -> None:
     if task_arns:
         ecs = boto3.client("ecs", config=Config(connect_timeout=3, read_timeout=8, retries={"max_attempts": 1}))
         for task_arn in task_arns:
@@ -131,3 +134,14 @@ async def initiate_stop_benchmark(
                 )
             except Exception:
                 logger.exception("Failed to stop unclaimed executor task %s", task_arn)
+
+
+async def initiate_stop_benchmark(
+    benchmark_row: Benchmark,
+    session: Session,
+    force: bool,
+    org: Org,
+    task_ids: list[str] | None = None,
+) -> None:
+    task_arns = await database_call(lambda: commit_stop_benchmark(benchmark_row, session, force, org, task_ids))
+    await stop_executor_tasks(task_arns)

@@ -3,7 +3,9 @@ import gc
 import json
 import re
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier, Event
 from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
@@ -41,6 +43,69 @@ def _lines(*messages: str) -> list[TaskLogLine]:
     return [TaskLogLine(received_at=1_700_000_000.0, message=message, fields={}) for message in messages]
 
 
+@pytest.mark.description("ECS launch and recovery reuse separate clients with bounded standard retry budgets.")
+def test_ecs_clients_cache_separate_retry_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    launch = MagicMock()
+    recovery = MagicMock()
+    factory = MagicMock(side_effect=[launch, recovery])
+    monkeypatch.setattr(aws_clients.boto3, "client", factory)
+    getattr(aws_clients, "_ecs_client").cache_clear()
+    try:
+        assert aws_clients.ecs_client() is launch
+        assert aws_clients.ecs_client() is launch
+        assert aws_clients.ecs_client(recovery=True) is recovery
+        assert aws_clients.ecs_client(recovery=True) is recovery
+        assert factory.call_args_list == [
+            call("ecs", config=aws_clients.ECS_RUN_TASK_CONFIG),
+            call("ecs", config=aws_clients.ECS_CONFIG),
+        ]
+        for config, attempts in [(aws_clients.ECS_RUN_TASK_CONFIG, 1), (aws_clients.ECS_CONFIG, 3)]:
+            assert getattr(config, "retries") == {"mode": "standard", "total_max_attempts": attempts}
+            assert getattr(config, "max_pool_connections") == 200
+        for client in [launch, recovery]:
+            client.meta.events.register_last.assert_called_once_with(
+                "before-send", getattr(aws_clients, "_check_ecs_launch_deadline")
+            )
+    finally:
+        getattr(aws_clients, "_ecs_client").cache_clear()
+
+
+@pytest.mark.description("Concurrent cold ECS client lookups construct one client and register its deadline hook once.")
+def test_ecs_client_concurrent_cold_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = MagicMock()
+    ready = Barrier(16)
+    creating = Event()
+    release = Event()
+
+    def create_client(*_args: Any, **_kwargs: Any) -> Any:
+        creating.set()
+        assert release.wait(timeout=5)
+        return client
+
+    def lookup() -> Any:
+        ready.wait(timeout=5)
+        return aws_clients.ecs_client()
+
+    factory = MagicMock(side_effect=create_client)
+    monkeypatch.setattr(aws_clients.boto3, "client", factory)
+    getattr(aws_clients, "_ecs_client").cache_clear()
+    try:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = [pool.submit(lookup) for _ in range(16)]
+            try:
+                assert creating.wait(timeout=5)
+            finally:
+                release.set()
+            assert all(future.result(timeout=5) is client for future in futures)
+        factory.assert_called_once_with("ecs", config=aws_clients.ECS_RUN_TASK_CONFIG)
+        client.meta.events.register_last.assert_called_once_with(
+            "before-send", getattr(aws_clients, "_check_ecs_launch_deadline")
+        )
+    finally:
+        release.set()
+        getattr(aws_clients, "_ecs_client").cache_clear()
+
+
 @pytest.mark.description("Credential selection and presigned URL lifetime behavior.")
 class TestAWSClientProviders:
     @pytest.mark.description("The default chain provider passes no explicit credentials.")
@@ -63,7 +128,7 @@ class TestAWSClientProviders:
         session_factory.assert_called_once_with(region_name=region)
         assert session.client.call_args_list == [
             call("s3", config=ANY),
-            call("logs"),
+            call("logs", config=ANY),
             call("secretsmanager"),
             call("lambda", config=None),
         ]
@@ -238,7 +303,7 @@ class TestTenantRoleAWSClientProvider:
         provider.cloudwatch_logs_async_client()
         provider.lambda_client()
 
-        assert session.client.call_args_list == [call("logs"), call("lambda", config=None)]
+        assert session.client.call_args_list == [call("logs", config=ANY), call("lambda", config=None)]
         sts.assume_role.assert_not_called()
 
 
@@ -286,6 +351,19 @@ class TestS3ClientRetry:
     async def test_uses_standard_retry_mode(self, provider: AWSClientProvider) -> None:
         async with provider.s3_client() as client:
             assert client.meta.config.retries["mode"] == "standard"
+
+
+@pytest.mark.description("CloudWatch clients back off on throttled log setup requests.")
+class TestCloudWatchClientRetry:
+    @pytest.mark.description("Sync and async Logs clients use adaptive retries with twenty total attempts.")
+    async def test_logs_clients_use_adaptive_retries(self) -> None:
+        provider = AWSClientProvider("us-east-1")
+
+        sync_client = provider.cloudwatch_logs_client()
+        async with provider.cloudwatch_logs_async_client() as async_client:
+            for client in (sync_client, async_client):
+                assert client.meta.config.retries == {"mode": "adaptive", "total_max_attempts": 20}
+                assert client.meta.config.max_pool_connections == 200
 
 
 @pytest.mark.description("CloudWatch exception translation at the client boundary.")

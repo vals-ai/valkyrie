@@ -37,6 +37,17 @@ make tracker-service
   - The separate control service listens on `127.0.0.1:8002` for executors, not CLI traffic.
 - Docker Compose reads AWS credentials and `EXECUTOR_BOOTSTRAP_KEY` from your shell.
   - Its local-only payload key is shared by the API and control containers; do not use this fixed key in a deployed stage.
+  - Remote grading requires a dedicated `REMOTE_GRADER_KMS_KEY_ID`, AWS credentials,
+    a configured region, and a chosen nonempty `VALKYRIE_STAGE` issuer; Compose uses
+    `AWS_REGION`, while host processes can use `AWS_DEFAULT_REGION` or an AWS profile.
+  - Set matching Tracker API and grading-service worker keys for each enabled service:
+    `vcb` uses `VCB_REMOTE_GRADER_WORKER_API_KEY`, `vcb-1-100` uses
+    `VCB100_REMOTE_GRADER_WORKER_API_KEY`, and `cyber-range` uses
+    `CYBER_REMOTE_GRADER_WORKER_API_KEY`; configure the service's issuer-to-Tracker
+    URL and worker-key maps for that same issuer.
+  - `VALKYRIE_STAGE` also applies existing local API policies: `bench` restricts
+    `vals.ai` secret changes to admins, and enabled project Gateway key requests
+    use the stage as their environment.
   - Runs still need a benchmark service and AWS access.
   - To run benchmarks without AWS, use `make local-tracker`; see [Run Tracker locally](https://docs.valkyrie.vals.ai/self-hosting/local-tracker).
 - Rebuild the image to run changed code. Every dispatch, including a retry or resume, runs

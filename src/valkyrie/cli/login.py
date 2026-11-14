@@ -20,7 +20,7 @@ from valkyrie.sdk import (
 def show_organizations(listing: OrganizationsResponse) -> None:
     if not listing.organizations and not listing.invitations:
         click.echo(
-            "You're not in an organization yet. Ask Vals AI to add you, "
+            "You're not in an organization yet. Run `valkyrie org create my-team` to create one, "
             "or ask an organization admin to run `valkyrie org invite EMAIL`."
         )
     for entry in listing.organizations:

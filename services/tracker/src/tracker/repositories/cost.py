@@ -178,7 +178,7 @@ class CostRepository:
         )
 
     def _projects(self, org_id: UUID) -> dict[UUID, Project]:
-        return {project.id: project for project in ProjectRepository(self._session).list_all(org_id, True)}
+        return {project.id: project for project in ProjectRepository(self._session).list_all(org_id, True, True)}
 
     def _current_projects(self, org_id: UUID, *filters: Any) -> Any:
         ranked = (

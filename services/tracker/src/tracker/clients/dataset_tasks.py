@@ -15,9 +15,11 @@ from benchmark_service import (
     run_with_sandbox_recovery,
 )
 from benchmark_service.sandbox import SandboxProviderConfig
+from benchmark_service.remote_grading import RemoteGradingAuthorization
 from benchmark_service.sandbox.types import Sandbox, SandboxSource
 from benchmark_service.schemas import (
     ChildEgress,
+    GradingRequirementsResponse,
     JsonValue,
     MonitoringRequirementsResponse,
     RetrieveTaskResponse,
@@ -248,6 +250,7 @@ class DatasetTaskService:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> SetupTaskResponse:
         task = await self._task(task_id)
         outer = await self._sandbox(instance_id, sandbox_provider)
@@ -393,6 +396,11 @@ class DatasetTaskService:
     async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
         return []
 
+    async def grading_requirements_response(
+        self, task_id: str, dataset: str | None = None
+    ) -> GradingRequirementsResponse:
+        return GradingRequirementsResponse(models=[])
+
     async def monitoring_requirements(
         self, task_ids: list[str], dataset: str | None = None
     ) -> MonitoringRequirementsResponse:
@@ -415,6 +423,7 @@ class DatasetTaskService:
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
         grading_token: str | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> JsonValue:
         provider = self._provider(sandbox_provider)
         outer = await provider.get_sandbox(instance_id)

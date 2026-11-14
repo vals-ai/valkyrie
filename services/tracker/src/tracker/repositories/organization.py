@@ -2,11 +2,13 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from tracker.database.models import Org
 from tracker.database.session import get_session
+from tracker.repositories.advisory_lock import advisory_lock_key
 
 
 class OrganizationRepository:
@@ -15,6 +17,13 @@ class OrganizationRepository:
 
     def get(self, org_id: UUID) -> Org | None:
         return self._session.get(Org, org_id)
+
+    def lock_run_capacity(self, org_id: UUID) -> None:
+        if self._session.get_bind().dialect.name == "postgresql":
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": advisory_lock_key(f"org-run-capacity:{org_id}")},
+            )
 
     def list_ids(self) -> list[UUID]:
         return list(self._session.exec(select(Org.id).order_by(col(Org.id))).all())

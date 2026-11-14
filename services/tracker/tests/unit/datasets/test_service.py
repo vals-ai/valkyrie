@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from benchmark_service import DockerfileSource, ImageSource, Resources
 from benchmark_service.sandbox import DockerProviderConfig, ModalProviderConfig, SandboxProviderConfig
+from benchmark_service.remote_grading import RemoteGradingAuthorization
 
 from tests.unit.datasets.support import FakeSandbox, OuterSandbox, store_archive, zip_bytes
 from tracker.services.datasets import artifacts
@@ -270,13 +271,22 @@ class TestWorkingDirectoryOwner:
 @pytest.mark.description("Putting the instruction in the sandbox.")
 class TestSetupTask:
     @pytest.mark.description("The instruction is uploaded to the problem path.")
+    @pytest.mark.parametrize("authorization", [None, RemoteGradingAuthorization(issuer="dev", token="test-grant")])
     async def test_the_instruction_is_uploaded_to_the_problem_path(
-        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch, authorization: RemoteGradingAuthorization | None
     ) -> None:
         sandbox = FakeSandbox()
         service = service_for(LocalFolderSource(dataset), sandbox, monkeypatch)
 
-        response = await service.setup_task("task-b", "sandbox-1", PROVIDER)
+        response = await service.setup_task(
+            "task-b",
+            "sandbox-1",
+            sandbox_provider=PROVIDER,
+            on_message=lambda _message: None,
+            dataset=None,
+            child_egress={},
+            remote_grading_authorization=authorization,
+        )
 
         assert response.status == "ok"
         assert sandbox.files == {"/app/instruction.md": b"Instruction for task-b."}
@@ -553,15 +563,34 @@ class TestOracleSolution:
 
 @pytest.mark.description("Grading in the agent's sandbox.")
 class TestEvaluateInstance:
+    @pytest.mark.description("Dataset grading requires no gateway models or remote grader service.")
+    async def test_grading_requirements(self, dataset: Path) -> None:
+        async with DatasetTaskService(LocalFolderSource(dataset)) as service:
+            requirements = await service.grading_requirements_response("task-a", dataset="dataset")
+            models = await service.grading_requirements("task-a", dataset="dataset")
+
+        assert requirements.models == models == []
+        assert requirements.remote_grader_service is None
+
     @pytest.mark.description("The task is graded and its result returned.")
+    @pytest.mark.parametrize("authorization", [None, RemoteGradingAuthorization(issuer="dev", token="test-grant")])
     async def test_the_task_is_graded_and_its_result_returned(
-        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch, authorization: RemoteGradingAuthorization | None
     ) -> None:
         sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
         messages: list[str] = []
 
         result = await service_for(LocalFolderSource(dataset), sandbox, monkeypatch).evaluate_instance(
-            "task-a", "sandbox-1", PROVIDER, messages.append
+            "task-a",
+            "sandbox-1",
+            sandbox_provider=PROVIDER,
+            on_message=messages.append,
+            on_eval_resume_state=lambda _state: None,
+            on_sandbox_created=lambda _sandbox: None,
+            dataset=None,
+            child_egress={},
+            grading_token=None,
+            remote_grading_authorization=authorization,
         )
 
         assert isinstance(result, dict)

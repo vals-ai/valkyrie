@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from tests.integration.local.test_project_service_writes import MockProjectRoutes
+from tests.project_service import MockProjectRoutes
 from tests.utils import TEST_ORG_ID
 from tracker import project_gateway
 from tracker.clients.projects import ProjectServiceClient
@@ -28,20 +28,32 @@ async def _second_run_waits(engine: Engine) -> None:
     pytest.fail("The second run never waited on the Gateway key lock")
 
 
-@pytest.mark.xfail(reason="Run start still locks a Tracker project row", strict=True)
 @pytest.mark.description("Two first runs of a project collect its Gateway key once and both start on that key.")
 def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     routes = MockProjectRoutes()
-    client = ProjectServiceClient(
-        httpx.Client(base_url="http://projects", transport=httpx.MockTransport(routes.handle))
-    )
-    monkeypatch.setattr(project_repository, "project_service_reader", lambda: client)
-    monkeypatch.setattr(project_repository, "project_service_writer", lambda: client)
+    reads: list[str | None] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = routes.handle(request)
+        if request.method == "GET":
+            with postgres_engine.connect() as connection:
+                assert connection.execute(
+                    text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted")
+                ).scalar_one()
+            reads.append(response.json()["gateway_key_id"])
+        return response
+
+    client = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(project_repository, "project_service", lambda: client)
     org = Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME)
-    project = Project(org_id=TEST_ORG_ID, handle="router-bench", name="Router Bench", spend_type=SpendType.DEVELOPMENT)
-    routes.rows[str(project.id)] = project.model_dump(mode="json", exclude={"org_id"}) | {
-        "gateway_request_id": str(uuid4())
-    }
+    project = Project(
+        org_id=TEST_ORG_ID,
+        handle="router-bench",
+        name="Router Bench",
+        spend_type=SpendType.DEVELOPMENT,
+        gateway_request_id=uuid4(),
+    )
+    routes.seed(project)
     key_id = uuid4()
     collects: list[UUID] = []
 
@@ -55,7 +67,7 @@ def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: 
 
     def start(_: int) -> dict[str, str]:
         return project_gateway._prepare_project_gateway_key(  # pyright: ignore[reportPrivateUsage]
-            postgres_engine, project.id, org, MagicMock()
+            postgres_engine, project, org, MagicMock()
         )
 
     monkeypatch.setattr(project_gateway, "_collect_project_gateway_key", collect)
@@ -66,3 +78,5 @@ def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: 
     assert str(key_id) in first["MODEL_GATEWAY_API_KEY"]
     assert collects == [key_id]
     assert routes.rows[str(project.id)]["gateway_key_id"] == str(key_id)
+    assert reads == [None, str(key_id)]
+    client._client.close()

@@ -19,7 +19,7 @@ def secret() -> None:
         "\n"
         "Example:\n"
         "    valkyrie secret set openai-key\n"
-        "    valkyrie secret set daytona < daytona.json"
+        "    valkyrie secret set daytona-credentials < daytona.json"
     ),
 )
 @click.argument("name", type=str)

@@ -9,16 +9,18 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
+from opentelemetry import trace
+from opentelemetry.context import Context
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.trace import TracerProvider
 import pytest
 import sentry_sdk
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import sentry_sdk.scope as sentry_scope
-from opentelemetry import trace
-from opentelemetry.context import Context
-from opentelemetry.sdk.trace import TracerProvider
 from sentry_sdk.consts import INSTRUMENTER
 from sentry_sdk.envelope import Envelope
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from sentry_sdk.integrations.otlp import OTLPIntegration
 from sentry_sdk.transport import Transport
 from sentry_sdk.types import Event, Hint, Log
@@ -144,6 +146,65 @@ class TestBeforeSendTransaction:
 
         assert result is event
         assert event == expected
+
+
+@pytest.mark.description(
+    "Captured HTTP errors and transactions exclude the remote worker key while retaining request context."
+)
+@pytest.mark.parametrize(
+    ("instrumenter", "expected_kinds"),
+    [(INSTRUMENTER.SENTRY, {"event", "transaction"}), (INSTRUMENTER.OTEL, {"event", "transaction"})],
+    ids=["native-transaction", "otel-transaction"],
+)
+def test_remote_worker_key_is_absent_from_captured_requests(instrumenter: str, expected_kinds: set[str]) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    class CaptureTransport(Transport):
+        def capture_envelope(self, envelope: Envelope) -> None:
+            for item in envelope.items:
+                if item.type in {"event", "transaction"}:
+                    captured.append((item.type, json.loads(item.get_bytes())))
+
+    app = FastAPI()
+
+    @app.get("/ok")
+    async def ok() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/fail")
+    async def fail() -> None:
+        raise RuntimeError("request failed")
+
+    provider = TracerProvider()
+    if instrumenter == INSTRUMENTER.OTEL:
+        provider.add_span_processor(tracing_module._FilteredSentrySpanProcessor())
+        FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
+
+    try:
+        with sentry_sdk.init(
+            dsn="https://public@example.com/1",
+            transport=CaptureTransport,
+            default_integrations=False,
+            traces_sample_rate=1.0,
+            instrumenter=instrumenter,
+            send_default_pii=False,
+            max_request_body_size="never",
+            include_local_variables=False,
+            before_send=sentry_module._before_send,
+            before_send_transaction=sentry_module._before_send_transaction,
+        ):
+            with TestClient(SentryAsgiMiddleware(app), raise_server_exceptions=False) as api:
+                headers = {"X-Remote-Grader-Worker-Key": "private-worker-key", "X-Test-Context": "retained"}
+                assert api.get("/ok", headers=headers).status_code == 200
+                assert api.get("/fail", headers=headers).status_code == 500
+    finally:
+        provider.shutdown()
+
+    assert {kind for kind, _ in captured} == expected_kinds
+    for _, event in captured:
+        assert "private-worker-key" not in json.dumps(event)
+        assert event["request"]["headers"]["x-test-context"] == "retained"
+        assert event["request"]["headers"]["x-remote-grader-worker-key"] == "[Filtered]"
 
 
 @pytest.mark.description("Sentry initialization and log context behavior.")
@@ -599,6 +660,10 @@ async def test_unhandled_task_error_tags_sentry_and_log_with_stored_category(
 
     async def body() -> dict[str, dict[str, object] | None]:
         raise SandboxSetupError("provider rejected the sandbox request")
+
+    monitor_logger = task_monitor_module.logger
+    monkeypatch.setattr(monitor_logger, "handlers", [*monitor_logger.handlers, caplog.handler])
+    monkeypatch.setattr(monitor_logger, "propagate", False)
 
     with sentry_sdk.init(
         dsn="https://public@example.com/1",

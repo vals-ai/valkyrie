@@ -12,15 +12,17 @@ from botocore.exceptions import BotoCoreError, ClientError
 from sqlmodel import Session
 
 from executor_protocol import ExecutorDispatchStatus
+from tracker.aws.clients import ECS_CONFIG
 from tracker.database.models import ExecutorDispatch
 from tracker.database.session import engine
 from tracker.domain import FailureCategory
 from tracker.egress_proxy.policy import PolicyStore
 from tracker.executor.dispatch_control import DISPATCH_CLAIM_WINDOW, record_dispatch_failure, unowned_pending_task_ids
-from tracker.executor.launcher import ECS_CONFIG, DefinitiveLaunchFailure, relaunch_dispatch
+from tracker.executor.launcher import DefinitiveLaunchFailure, relaunch_dispatch
 from tracker.executor.release_control import share_executor_admission
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.run_access_keys import delete_finished_run_keys
 
 _ECS_MISSING_GRACE = timedelta(minutes=10)
@@ -228,6 +230,12 @@ def run_dispatch_recovery_loop(
             PolicyStore(engine).revoke_finished()
         except Exception:
             _logger.exception("egress_proxy_policy_cleanup_failed")
+        try:
+            with Session(engine) as session:
+                RemoteGraderRepository(session).clear_expired_child_tokens()
+                session.commit()
+        except Exception:
+            _logger.exception("remote_grader_token_cleanup_failed")
         stop_event.wait(interval_seconds)
 
 

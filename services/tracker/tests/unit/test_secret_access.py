@@ -1,13 +1,57 @@
 from uuid import UUID
+from unittest.mock import AsyncMock
 
 import pytest
 
 from tracker import config
-from tracker.runtime.secrets import secret_display_name
-from tracker.secret_access import resolve_secret_name, secret_name_candidates, validate_secret_names
+from tracker.exceptions import SecretNotFoundError
+from tracker.runtime.secrets import SecretValue, secret_display_name
+from tracker.runtime.services import RuntimeServices
+from tracker.services.runs.start import _task_secret_reader
+from tracker.secret_access import OrgSecretStore, resolve_secret_name, secret_name_candidates, validate_secret_names
+from tracker.types import AgentContractRequest, OrgContext, RunExecutionRequest
 
 _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
 _OTHER_ORG_ID = UUID("00000000-0000-0000-0000-000000000002")
+
+
+@pytest.mark.description(
+    "Dataset fallback reads an overlapping shared secret exactly while contract names stay tenant-first."
+)
+@pytest.mark.parametrize("shared_value", [{"FIELD": "shared-field"}, {"OTHER": "shared-other"}, None])
+async def test_dataset_fallback_preserves_overlapping_contract_secret(
+    shared_value: SecretValue,
+    runtime_services: RuntimeServices,
+    contract: AgentContractRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = f"valkyrie/tenants/{_ORG_ID}/"
+    values = {f"{prefix}dataset-config": {"OTHER": "tenant-value"}}
+
+    async def read(name: str) -> SecretValue:
+        if name == "dataset-config":
+            if shared_value is None:
+                raise SecretNotFoundError("Shared secret is missing")
+            return shared_value
+        return values[name]
+
+    source = AsyncMock()
+    source.get.side_effect = read
+    store = OrgSecretStore(source, ["dataset-config"], org_id=_ORG_ID, org_name="internal.example", auth_required=True)
+    assert await store.get("dataset-config") == {"OTHER": "tenant-value"}
+    source.get.reset_mock()
+    runtime_services.secrets = store
+    monkeypatch.setattr("tracker.services.runs.start.AUTH_REQUIRED", True)
+    reader = _task_secret_reader(
+        RunExecutionRequest(benchmark_name="swebench", contract=contract),
+        runtime_services,
+        OrgContext(id=_ORG_ID, name="internal.example", storage_key="test-bucket"),
+    )
+
+    assert await reader("dataset-config#FIELD") == (
+        "shared-field" if shared_value == {"FIELD": "shared-field"} else None
+    )
+    assert [call.args[0] for call in source.get.await_args_list] == [f"{prefix}dataset-config", "dataset-config"]
 
 
 @pytest.fixture(autouse=True)

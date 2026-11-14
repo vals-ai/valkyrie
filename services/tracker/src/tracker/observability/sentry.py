@@ -39,6 +39,13 @@ def task_scope(task_id: str, *, attempt_started_at: str) -> Iterator[None]:
             task_id_var.reset(token)
 
 
+def _omit_remote_grader_worker_key(event: Event) -> None:
+    headers = event.get("request", {}).get("headers", {})
+    for name in headers:
+        if name.lower() == "x-remote-grader-worker-key":
+            headers[name] = "[Filtered]"
+
+
 def _before_send(
     event: Event,
     hint: Hint,
@@ -53,6 +60,7 @@ def _before_send(
     for key, value in get_context_tags().items():
         if value:
             tags[key] = value
+    _omit_remote_grader_worker_key(event)
     return event
 
 
@@ -61,6 +69,7 @@ def _before_send_transaction(event: Event, _hint: Hint) -> Event | None:
     for key in get_context_tags():
         if key in attributes:
             event.setdefault("tags", {})[key] = attributes[key]
+    _omit_remote_grader_worker_key(event)
     return event
 
 

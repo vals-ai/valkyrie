@@ -6,6 +6,7 @@ from benchmark_service.client import BenchmarkServiceError
 from sqlmodel import Session
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.database.models import (
     Benchmark,
     BenchmarkStatus,
@@ -17,6 +18,7 @@ from tracker.database.models import (
 from tracker.exceptions import TrackerServiceError
 from tracker.services.runs.attempts import PriorAttempt, prior_attempts
 from tracker.services.benchmarks import fetch_benchmark_row
+from tracker.services.tasks.execute import task_attempt_id
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,7 @@ def reset_to_in_progress_status(
         repository.save(benchmark_row)
 
         for task in existing_rows:
+            RemoteGraderRepository(session).close_attempt(task.id, task_attempt_id(task.id, task.started_at))
             task.status = (
                 TaskStatus.EVALUATING
                 if retry_mode == RetryMode.AUTO and task.eval_resume_state is not None

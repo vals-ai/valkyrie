@@ -25,13 +25,24 @@ uv tool install valkyrie-cli
 
 ```bash
 valkyrie login
+```
 
+If a teammate already set up your organization, join it instead of creating one:
+
+- If they invited you, run `valkyrie org accept ORG_ID`. See
+  [Join an organization](/get-started/configuration#join-an-organization).
+- If you already belong to it, run `valkyrie org use ORG_ID`.
+
+Otherwise, create one:
+
+```bash
 valkyrie org create my-team
 ```
 
 - Replace `my-team` with an unused organization ID. See the
   [ID requirements](/get-started/configuration#create-an-organization).
 - Later commands use this organization.
+- Everyone in the organization sees its runs, datasets, and agents.
 
 ## 3. Connect Modal
 
@@ -91,6 +102,12 @@ Replace *`RUN_ID`* with the ID from the **Run ID** line.
 
 - The CLI prints the saved results file's path.
 - Open that JSON file to inspect the task's result and score.
+
+To browse the run's tasks and logs, and your organization's other runs and datasets:
+
+```bash
+valkyrie tui
+```
 
 ## Next steps
 

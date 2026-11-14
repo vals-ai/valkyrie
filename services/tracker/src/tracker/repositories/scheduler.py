@@ -27,11 +27,13 @@ from tracker.database.models import (
     TaskStatus,
 )
 from tracker.database.session import get_session
+from tracker.executor.control_queue import queued_sandbox_name
 from tracker.repositories.advisory_lock import (
     advisory_lock_key,
     task_build_lock_resource_id,
     task_evaluation_lock_resource_id,
 )
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.scheduler.store import (
     GRANT_ACCEPTANCE_TIMEOUT,
     READINESS_CHECK_TIMEOUT,
@@ -835,7 +837,7 @@ class SchedulerRepository:
             col(Benchmark.status) == BenchmarkStatus.IN_PROGRESS,
             col(Benchmark.queue_pool_id) == pool_id,
         )
-        self._session.exec(
+        reset = self._session.exec(
             update(Task)
             .where(tuple_(col(Task.id), col(Task.started_at)).in_(revoked))
             .where(col(Task.status) == TaskStatus.BUILDING)
@@ -847,7 +849,12 @@ class SchedulerRepository:
                     else_=now,
                 ),
             )
-        )
+            .returning(col(Task.id))
+        ).all()
+        previous = dict(revoked)
+        for (task_row_id,) in reset:
+            attempt_id = queued_sandbox_name(task_row_id, previous[task_row_id]).removeprefix("queued-")
+            RemoteGraderRepository(self._session).close_attempt(task_row_id, attempt_id)
 
     def database_now(self) -> datetime:
         return self._session.connection().execute(sa_select(func.clock_timestamp())).scalar_one()
@@ -1068,10 +1075,23 @@ class SchedulerRepository:
         abandoned = self.try_task_build_transaction_locks(self._session.exec(building).all())
         if not abandoned:
             return
+        current = dict(
+            self._session.exec(
+                select(col(Task.id), col(Task.started_at))
+                .where(col(Task.id).in_(abandoned))
+                .where(col(Task.status) == TaskStatus.BUILDING)
+                .where(col(Task.benchmark).in_(queued_benchmarks))
+                .where(col(Task.id).not_in(unhanded_reservations))
+                .order_by(col(Task.id))
+                .with_for_update(skip_locked=True)
+            ).all()
+        )
+        if not current:
+            return
 
-        self._session.exec(
+        reset = self._session.exec(
             update(Task)
-            .where(col(Task.id).in_(abandoned))
+            .where(col(Task.id).in_(current))
             .where(col(Task.status) == TaskStatus.BUILDING)
             .where(col(Task.benchmark).in_(queued_benchmarks))
             .where(col(Task.id).not_in(unhanded_reservations))
@@ -1082,7 +1102,11 @@ class SchedulerRepository:
                     else_=now,
                 ),
             )
-        )
+            .returning(col(Task.id))
+        ).all()
+        for (task_row_id,) in reset:
+            attempt_id = queued_sandbox_name(task_row_id, current[task_row_id]).removeprefix("queued-")
+            RemoteGraderRepository(self._session).close_attempt(task_row_id, attempt_id)
 
     def is_waiting(self, task_row_id: UUID, expected_started_at: datetime) -> bool:
         return (

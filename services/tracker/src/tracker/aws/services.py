@@ -3,6 +3,7 @@ from uuid import UUID
 
 from botocore.config import Config
 
+from tracker import config
 from tracker._lambda import dry_run_lambda, invoke_lambda
 from tracker.aws.cloudwatch_logs import (
     CloudWatchBenchmarkLogLocations,
@@ -16,6 +17,7 @@ from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import TrackerServiceError
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.secrets import resolve_secrets
+from tracker.secret_access import OrgSecretStore
 from tracker.types import FinalViewResponse, OrgContext, StartBenchmarkRequest
 
 
@@ -95,5 +97,9 @@ class CloudRuntimeFactory:
             sandbox_provider=request.sandbox_provider,
             sandbox_provider_secret_name=request.sandbox_provider_secret_name,
         )
+        if config.AUTH_REQUIRED:
+            runtime.secrets = OrgSecretStore(
+                runtime.secrets, request.contract.secrets.values(), org_id=org.id, org_name=org.name, auth_required=True
+            )
         await runtime.prepare_execution(request, benchmark_id)
         return runtime

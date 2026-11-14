@@ -22,6 +22,43 @@ services:
     networks:
       - tracker-network
 
+  projects-postgres:
+    image: postgres:16-alpine
+    container_name: tracker-projects-postgres
+    environment:
+      POSTGRES_USER: projects
+      POSTGRES_PASSWORD: projects
+      POSTGRES_DB: projects
+    volumes:
+      - projects_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U projects -d projects"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tracker-network
+
+  projects:
+    build: ../projects
+    container_name: tracker-projects
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn projects.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:8010:8000"
+    environment:
+      - DATABASE_URL=postgresql://projects:projects@projects-postgres:5432/projects
+      - PROJECT_SERVICE_TOKEN=${PROJECT_SERVICE_TOKEN:-local-project-token}
+    depends_on:
+      projects-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - tracker-network
+
   migration:
     image: tracker-service
     build:
@@ -45,6 +82,11 @@ services:
       EXECUTOR_BOOTSTRAP_KEY: ${EXECUTOR_BOOTSTRAP_KEY:?Set EXECUTOR_BOOTSTRAP_KEY for local control}
       EXECUTOR_LAUNCHER: local
       EXECUTOR_PAYLOAD_LOCAL_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      REMOTE_GRADER_KMS_KEY_ID: ${REMOTE_GRADER_KMS_KEY_ID}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
     depends_on:
       migration:
         condition: service_completed_successfully
@@ -68,6 +110,11 @@ services:
       - EXECUTOR_BOOTSTRAP_KEY=${EXECUTOR_BOOTSTRAP_KEY:?Set EXECUTOR_BOOTSTRAP_KEY for local control}
       - EXECUTOR_LAUNCHER=local
       - EXECUTOR_PAYLOAD_LOCAL_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      - REMOTE_GRADER_KMS_KEY_ID=${REMOTE_GRADER_KMS_KEY_ID}
+      - VALKYRIE_STAGE
+      - VCB_REMOTE_GRADER_WORKER_API_KEY
+      - VCB100_REMOTE_GRADER_WORKER_API_KEY
+      - CYBER_REMOTE_GRADER_WORKER_API_KEY
       - DATABASE_URL=postgresql://tracker:tracker@postgres:5432/tracker
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -84,11 +131,16 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
       - AWS_REGION
+      - AWS_DEFAULT_REGION=${AWS_REGION}
       - BENCHMARK_SERVICE_BASE_URL=${BENCHMARK_SERVICE_BASE_URL:-benchmarks.vals.ai}
       - BENCHMARK_CATALOG_URL=${BENCHMARK_CATALOG_URL:-}
       - DAYTONA_HAPPY_EYEBALLS_DELAY=none
+      - PROJECT_SERVICE_URL=http://projects:8000
+      - PROJECT_SERVICE_TOKEN=${PROJECT_SERVICE_TOKEN:-local-project-token}
     depends_on:
       control:
+        condition: service_healthy
+      projects:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -100,3 +152,4 @@ services:
 
 volumes:
   postgres_data:
+  projects_data:

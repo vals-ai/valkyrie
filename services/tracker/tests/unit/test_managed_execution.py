@@ -22,7 +22,8 @@ from tracker.database.models import (
     Org,
 )
 from tracker.domain import BenchmarkStatus
-from tracker.exceptions import TrackerServiceError
+from tracker.exceptions import SecretNotFoundError, TrackerServiceError
+from tracker.runtime.secrets import resolve_secrets
 from tracker.executor.dependencies import get_execution_runtime
 from tracker.local.resources import LocalResources
 from tracker.types import (
@@ -35,12 +36,88 @@ from tracker.types import (
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
 from tracker.services.runs.start import (
     _parse_queued_execution,  # pyright: ignore[reportPrivateUsage]
+    _task_secret_reader,
     process_benchmark,
 )
 
 
 _TASK_IDS = ["task-1", "task-2"]
 _EXPECTED_BUCKET_OWNER = "123456789012"
+
+
+@pytest.mark.description(
+    "Managed execution reads tenant secrets before shared secrets and preserves explicit references."
+)
+@pytest.mark.parametrize("reference", ["api-key", f"valkyrie/tenants/{TEST_ORG_ID}/api-key"])
+@pytest.mark.parametrize("tenant_exists", [True, False])
+async def test_execution_runtime_resolves_org_secrets(
+    reference: str,
+    tenant_exists: bool,
+    contract: AgentContractRequest,
+    aws_runtime: AWSRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = f"valkyrie/tenants/{TEST_ORG_ID}/"
+    values = {
+        "api-key": "shared-value",
+        "sandbox-provider-secret": "shared-provider",
+        f"{prefix}sandbox-provider-secret": "tenant-provider",
+    }
+    if tenant_exists:
+        values[f"{prefix}api-key"] = "tenant-value"
+
+    async def read(name: str) -> str:
+        if name not in values:
+            raise SecretNotFoundError("Secret does not exist")
+        return values[name]
+
+    store = MagicMock()
+    store.get = AsyncMock(side_effect=read)
+
+    def secret_store(_clients: AWSClientProvider) -> MagicMock:
+        return store
+
+    def deployment(_org: OrgContext, _properties: AWSResources | None) -> AWSRuntime:
+        return aws_runtime
+
+    monkeypatch.setattr("tracker.config.AUTH_REQUIRED", True)
+    monkeypatch.setattr("tracker.config.AWS_SHARED_SECRET_TENANTS", "vals.ai")
+    monkeypatch.setattr("tracker.aws.services.SecretsManagerStore", secret_store)
+    monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", deployment)
+    monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", AsyncMock())
+    request = _managed_request(contract.model_copy(update={"secrets": {"TOKEN": reference}}))
+    org = OrgContext(id=TEST_ORG_ID, name="vals.ai", storage_key="test-bucket")
+
+    if not tenant_exists and reference.startswith(prefix):
+        with pytest.raises(SecretNotFoundError):
+            await CloudRuntimeFactory.create_execution_runtime(request, org, uuid4())
+        return
+
+    runtime = await CloudRuntimeFactory.create_execution_runtime(request, org, uuid4())
+
+    assert await resolve_secrets(request.contract.secrets, runtime.secrets) == {
+        "TOKEN": "tenant-value" if tenant_exists else "shared-value"
+    }
+    expected_calls = [f"{prefix}api-key"] if tenant_exists else [f"{prefix}api-key", "api-key"]
+    assert [call.args[0] for call in store.get.await_args_list] == expected_calls * 2
+
+    store.get.reset_mock()
+
+    assert await runtime.secrets.get("sandbox-provider-secret") == "shared-provider"
+    store.get.assert_awaited_once_with("sandbox-provider-secret")
+
+    store.get.reset_mock()
+    store.get.side_effect = None
+    store.get.side_effect = [
+        {"OTHER": "tenant-value"},
+        {"FIELD": "shared-field"},
+    ]
+
+    monkeypatch.setattr("tracker.services.runs.start.AUTH_REQUIRED", True)
+    read_dataset_secret = _task_secret_reader(request, runtime, org)
+
+    assert await read_dataset_secret("dataset-config#FIELD") == "shared-field"
+    assert [call.args[0] for call in store.get.await_args_list] == [f"{prefix}dataset-config", "dataset-config"]
 
 
 @pytest.fixture

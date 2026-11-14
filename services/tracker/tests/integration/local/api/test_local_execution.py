@@ -1,4 +1,6 @@
+import asyncio
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,13 +12,15 @@ import httpx
 import pytest
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import VerifyTaskIdsResponse, VersionResponse
-from executor_protocol import SUPPORTED_PROTOCOL_VERSION
+from botocore.exceptions import ClientError
+from executor_protocol import ExecutorDispatchStatus, SUPPORTED_PROTOCOL_VERSION
 from fastapi.testclient import TestClient
 from sqlmodel import Session, col, select
 
 import main as main_module
 import tracker.repositories.project as project_repository_module
 import tracker.services.runs.limits as run_limits_module
+from tests.project_service import MockProjectRoutes
 from tests.factories import make_error_result
 from tests.utils import TEST_ORG_ID
 from tracker.api import dependencies as run_dependencies
@@ -25,6 +29,8 @@ from tracker.repositories.executor_release import ExecutorReleaseRepository
 from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSResources
+from tracker.aws import clients as aws_clients
+from tracker.executor import launcher
 from tracker.database.models import (
     DEFAULT_ORG_NAME,
     Benchmark,
@@ -129,6 +135,113 @@ def _benchmark(session: Session, response: httpx.Response) -> Benchmark:
     benchmark = session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert benchmark is not None
     return benchmark
+
+
+@pytest.mark.description(
+    "Committed starts return before ECS completes and failed background launches remain retryable."
+)
+@pytest.mark.parametrize("outcome", ["success", "throttled-success", "throttled-failure", "definitive", "denied"])
+@pytest.mark.usefixtures("ecs_runner_env")
+async def test_background_ecs_admission(
+    outcome: str,
+    local_tracker: TestClient,
+    control_postgres_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    session = control_postgres_session
+    release = session.get(ExecutorRelease, "local-release")
+    assert release is not None
+    release.task_definition_arn = "arn:aws:ecs:us-east-1:123456789012:task-definition/runner:1"
+    session.add(release)
+    session.commit()
+    entered, finish = threading.Event(), threading.Event()
+    tokens: list[str] = []
+
+    def run_task(**params: Any) -> dict[str, Any]:
+        tokens.append(params["clientToken"])
+        entered.set()
+        assert finish.wait(timeout=5)
+        if outcome == "throttled-failure" or outcome == "throttled-success" and len(tokens) == 1:
+            raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}}, "RunTask")
+        if outcome == "denied":
+            raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "Denied"}}, "RunTask")
+        if outcome == "definitive":
+            return {"tasks": [], "failures": [{"reason": "RESOURCE:CPU", "detail": "capacity unavailable"}]}
+        return {"tasks": [{"taskArn": "arn:task:background"}], "failures": []}
+
+    client = Mock(run_task=Mock(side_effect=run_task))
+    client.get_paginator.return_value.paginate.return_value = [{"serviceArns": []}]
+    client.generate_data_key.return_value = {"Plaintext": b"k" * 32, "CiphertextBlob": b"wrapped-key"}
+    getattr(aws_clients, "_ecs_client").cache_clear()
+    monkeypatch.setattr(aws_clients.boto3, "client", Mock(return_value=client))
+    monkeypatch.setattr(launcher, "engine", session.get_bind())
+    monkeypatch.setattr(launcher.random, "uniform", lambda _low, _high: 0)
+    monkeypatch.setattr(main_module, "launch_dispatch", launcher.launch_dispatch)
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
+    monkeypatch.delenv("EXECUTOR_PAYLOAD_LOCAL_KEY", raising=False)
+    monkeypatch.setenv("EXECUTOR_PAYLOAD_KMS_KEY_ID", "arn:aws:kms:us-east-1:123456789012:key/test")
+    body = StartBenchmarkRequest(
+        contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"),
+        benchmark_name="background",
+        sandbox_provider="daytona",
+    ).model_dump(mode="json")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=main_module.app), base_url=str(local_tracker.base_url)
+        ) as http:
+            response = await asyncio.wait_for(http.post("/start-benchmark", json=body), timeout=3)
+            run = _benchmark(session, response)
+            assert run.status == BenchmarkStatus.IN_PROGRESS
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert main_module._executor_launch_tasks
+            dispatch = session.exec(select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)).one()
+            assert dispatch.status == ExecutorDispatchStatus.QUEUED
+            assert dispatch.ecs_task_arn is None
+
+            finish.set()
+            await asyncio.wait_for(
+                asyncio.gather(*main_module._executor_launch_tasks, return_exceptions=True), timeout=5
+            )
+            session.expire_all()
+            assert set(tokens) == {str(dispatch.id)}
+            if outcome in {"success", "throttled-success"}:
+                assert run.status == BenchmarkStatus.IN_PROGRESS
+                assert dispatch.ecs_task_arn == "arn:task:background"
+                assert len(tokens) == (2 if outcome == "throttled-success" else 1)
+            else:
+                assert run.status == BenchmarkStatus.ERROR
+                assert dispatch.status == ExecutorDispatchStatus.FAILED
+                expected = {
+                    "throttled-failure": "ECS RunTask throttled for",
+                    "definitive": "RESOURCE:CPU",
+                    "denied": "AccessDeniedException",
+                }[outcome]
+                assert run.error_message is not None and expected in run.error_message
+                assert dispatch.failure_reason == run.error_message
+                client.run_task.side_effect = lambda **_params: {
+                    "tasks": [{"taskArn": "arn:task:retried"}],
+                    "failures": [],
+                }
+
+                retried = await http.post(f"/retry-or-resume-benchmark/{run.id}?retry=true", json={})
+                assert retried.status_code == 200, retried.text
+                await asyncio.wait_for(
+                    asyncio.gather(*main_module._executor_launch_tasks, return_exceptions=True), timeout=5
+                )
+                session.expire_all()
+                run = session.get(Benchmark, run.id)
+                assert run is not None
+                assert run.status == BenchmarkStatus.IN_PROGRESS
+                attempts = session.exec(select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)).all()
+                assert len(attempts) == 2
+                assert any(attempt.ecs_task_arn == "arn:task:retried" for attempt in attempts)
+    finally:
+        finish.set()
+        await asyncio.gather(*main_module._executor_launch_tasks, return_exceptions=True)
+        await asyncio.gather(*launcher._run_task_calls, return_exceptions=True)
+        getattr(aws_clients, "_ecs_client").cache_clear()
 
 
 @pytest.mark.description(
@@ -463,13 +576,16 @@ def _snapshot(session: Session, benchmark_id: UUID) -> list[dict[str, Any]]:
     "ones, forwards the service headers, and leaves the source run and its evaluation unchanged."
 )
 def test_regrade_copies_saved_states_into_a_new_run(
-    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    local_tracker: TestClient,
+    control_postgres_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_service: MockProjectRoutes,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
-    control_postgres_session.add(project)
-    control_postgres_session.flush()
+    project_service.seed(project)
     project_id = project.id
     control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project_id))
     control_postgres_session.commit()
@@ -554,13 +670,15 @@ def test_regrade_reads_the_project_service_before_the_admission_lock(
         return httpx.Response(200, json=row)
 
     service = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(answer)))
-    monkeypatch.setattr(project_repository_module, "project_service_reader", lambda: service)
+    monkeypatch.setattr(project_repository_module, "project_service", lambda: service)
     admission = ExecutorReleaseRepository.admission
 
-    def locked_admission(self: ExecutorReleaseRepository, *, for_update: bool = False) -> ExecutorAdmission | None:
-        if for_update:
+    def locked_admission(
+        self: ExecutorReleaseRepository, *, for_update: bool = False, for_share: bool = False
+    ) -> ExecutorAdmission | None:
+        if for_update or for_share:
             events.append("lock")
-        return admission(self, for_update=for_update)
+        return admission(self, for_update=for_update, for_share=for_share)
 
     monkeypatch.setattr(ExecutorReleaseRepository, "admission", locked_admission)
 
@@ -625,7 +743,7 @@ def test_regrade_of_a_run_whose_project_the_service_lost_creates_no_run(
     service = ProjectServiceClient(
         httpx.Client(base_url="http://projects", transport=httpx.MockTransport(lambda _request: httpx.Response(404)))
     )
-    monkeypatch.setattr(project_repository_module, "project_service_reader", lambda: service)
+    monkeypatch.setattr(project_repository_module, "project_service", lambda: service)
 
     async def verify_task_ids(
         _client: BenchmarkServiceClient, *, task_ids: list[str], slice_str: str | None, dataset: str | None
@@ -807,6 +925,7 @@ def test_regrade_refuses_without_creating_a_run(
     control_postgres_session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    project_service: MockProjectRoutes,
 ) -> None:
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     response = _start(local_tracker, "daytona")
@@ -823,8 +942,7 @@ def test_regrade_refuses_without_creating_a_run(
             spend_type=SpendType.INTERNAL,
             archived_at=datetime.now(UTC),
         )
-        control_postgres_session.add(project)
-        control_postgres_session.flush()
+        project_service.seed(project)
         control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
         control_postgres_session.commit()
 

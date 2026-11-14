@@ -28,12 +28,14 @@ from tracker.executor.control_store import (
     require_task_phase_owner,
 )
 from tracker.executor.control_tasks import (
+    BenchmarkState,
+    DirectAdmissionResponse,
     EgressGrantRequest,
     EgressGrantResponse,
     EgressRevokeRequest,
-    BenchmarkState,
-    DirectAdmissionResponse,
     NativeOutputRequest,
+    RemoteGraderGrantRequest,
+    RemoteGraderGrantResponse,
     SandboxCostRequest,
     SandboxLinkRequest,
     TaskAccountingRequest,
@@ -55,9 +57,12 @@ from tracker.executor.control_tasks import (
 )
 from tracker.executor.native_output import clear_native_output, publish_native_output
 from tracker.executor.release_control import MaintenanceModeError, share_executor_admission
+from tracker.secret_access import selected_project_gateway_reference
+from tracker.remote_grader import attempt_id_for, issue_remote_grader_grant
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.cost import CostRepository
 from tracker.repositories.egress_policy import EgressPolicyRepository
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.runtime.model_gateway import GATEWAY_TOKEN_TTL_SECONDS
 from tracker.search_cost import search_cost_source_id
 
@@ -239,6 +244,8 @@ def transition_task(
     )
     if not allowed:
         return complete_response(session, TaskDecision(accepted=False))
+    if body.to_status in (TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED):
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
     task.status = body.to_status
     if body.to_status in (TaskStatus.FINISHED, TaskStatus.ERROR):
         task.finished_at = datetime.now(UTC)
@@ -443,6 +450,7 @@ def finish_task_evaluation(
     task.finished_at = datetime.now(UTC)
     task.evaluation_phase_dispatch_id = None
     task.evaluation_phase_token = None
+    RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
     repository.save(task)
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))
@@ -497,6 +505,7 @@ def fail_task(
         if not retain_evaluation_phase:
             task.evaluation_phase_dispatch_id = None
             task.evaluation_phase_token = None
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
         repository.save(task)
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))
@@ -578,6 +587,45 @@ def record_cost(
     )
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))
+
+
+@router.post(
+    "/issue_remote_grader_grant",
+    response_model=RemoteGraderGrantResponse,
+    description="Issue a remote grading grant for an assigned task attempt in an owned dispatch.",
+)
+def issue_remote_grader_grant_control(
+    body: RemoteGraderGrantRequest,
+    invocation: Invocation = Depends(authenticated_invocation),
+    session: Session = Depends(get_session),
+) -> RemoteGraderGrantResponse:
+    benchmark, _, dispatch = _owned_dispatch(session, invocation, body.ref, live=True, admission=False)
+    if dispatch.assigned_task_ids is None or body.attempt.task_id not in dispatch.assigned_task_ids:
+        raise HTTPException(status_code=403)
+    task = _task(session, benchmark, body.attempt)
+    if body.ref.dispatch_id not in (task.build_phase_dispatch_id, task.evaluation_phase_dispatch_id):
+        raise HTTPException(status_code=403)
+    repository = RemoteGraderRepository(session)
+    org = repository.get_org(benchmark.org_id)
+    assert org is not None
+    gateway_secret_ref = selected_project_gateway_reference(
+        benchmark.arguments.contract.secrets,
+        org,
+        benchmark.arguments.selected_project_gateway_secret_ref,
+        benchmark.name,
+        benchmark.custom_benchmark_service,
+    )
+    if gateway_secret_ref is None:
+        raise HTTPException(status_code=409, detail="Remote grading project binding is ineligible")
+    token = issue_remote_grader_grant(
+        session,
+        benchmark_id=benchmark.id,
+        task_row_id=task.id,
+        attempt_id=attempt_id_for(task),
+        worker_service=body.worker_service,
+        gateway_secret_ref=gateway_secret_ref,
+    )
+    return complete_response(session, RemoteGraderGrantResponse(grant_token=token))
 
 
 @router.post(

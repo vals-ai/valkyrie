@@ -37,6 +37,11 @@ def test_openapi_declares_authentication() -> None:
             "in": "header",
             "name": "x-api-key",
         },
+        "RemoteGraderWorkerKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Remote-Grader-Worker-Key",
+        },
     }
     assert schema["security"] == [{"BearerAuth": []}, {"ApiKeyAuth": []}]
     assert schema["paths"]["/health"]["get"]["security"] == []

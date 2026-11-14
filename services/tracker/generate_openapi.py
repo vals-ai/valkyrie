@@ -8,6 +8,7 @@ from main import app
 OPENAPI_PATH = Path(__file__).with_name("openapi.json")
 BEARER_OR_API_KEY: list[dict[str, list[str]]] = [{"BearerAuth": []}, {"ApiKeyAuth": []}]
 BEARER_ONLY: list[dict[str, list[str]]] = [{"BearerAuth": []}]
+REMOTE_GRADER_WORKER_KEY: list[dict[str, list[str]]] = [{"RemoteGraderWorkerKeyAuth": []}]
 
 
 def build_openapi() -> dict[str, Any]:
@@ -23,6 +24,11 @@ def build_openapi() -> dict[str, Any]:
             "in": "header",
             "name": "x-api-key",
         },
+        "RemoteGraderWorkerKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Remote-Grader-Worker-Key",
+        },
     }
 
     schema["security"] = BEARER_OR_API_KEY
@@ -32,6 +38,12 @@ def build_openapi() -> dict[str, Any]:
         if path.startswith(("/orgs", "/access-keys")):
             for operation in methods.values():
                 operation["security"] = BEARER_ONLY
+    for path in (
+        "/remote-grader/registrations",
+        "/remote-grader/registrations/{registration_id}/lease",
+        "/remote-grader/registrations/{registration_id}/stop",
+    ):
+        schema["paths"][path]["post"]["security"] = REMOTE_GRADER_WORKER_KEY
     return schema
 
 

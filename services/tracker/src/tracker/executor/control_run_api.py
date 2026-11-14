@@ -45,6 +45,8 @@ from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.dataset_version import DatasetVersionRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.repositories.organization import OrganizationRepository
+from tracker.remote_grader import attempt_id_for
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.repositories.sandbox_build_reservation import SandboxBuildReservationRepository
 from tracker.repositories.service_demand import wake_recorded
 from tracker.services.datasets.ref import HostedDataset
@@ -380,6 +382,7 @@ def record_run_cancellation(
                 category=FailureCategory.CANCELLED,
             )
         )
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
         task.status = TaskStatus.ERROR
         task.finished_at = datetime.now(UTC)
         BenchmarkRepository(session).save(task)

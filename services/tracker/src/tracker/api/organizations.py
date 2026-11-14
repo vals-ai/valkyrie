@@ -142,8 +142,7 @@ def create_organization(
     if not config.SELF_SERVE_ORGS_ENABLED:
         raise HTTPException(
             status_code=403,
-            detail="Valkyrie doesn't create organizations on request. Ask Vals AI to add you, "
-            "or ask an organization admin to run `valkyrie org invite EMAIL`.",
+            detail="Organization creation is disabled. Ask an organization admin to run `valkyrie org invite EMAIL`.",
         )
     _verified_email(login)
     if _reserved(request.id) or organizations.get_by_name(request.id) is not None:

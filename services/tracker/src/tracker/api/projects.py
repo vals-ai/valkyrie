@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -59,6 +60,36 @@ def find_project(repository: ProjectRepository, org_id: UUID, handle: str) -> Pr
     )
 
 
+class PreliminaryProjectCache:
+    def __init__(self) -> None:
+        self._pending: dict[tuple[UUID, str], asyncio.Task[Project]] = {}
+
+    async def get(self, repository: ProjectRepository, org_id: UUID, handle: str) -> Project:
+        key = org_id, handle
+        task = self._pending.get(key)
+        if task is None:
+            task = asyncio.create_task(self._load(repository, key))
+            task.add_done_callback(self._observe)
+            self._pending[key] = task
+        project = await asyncio.shield(task)
+        return project.model_copy(deep=True)
+
+    @staticmethod
+    def _observe(task: asyncio.Task[Project]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _load(self, repository: ProjectRepository, key: tuple[UUID, str]) -> Project:
+        try:
+            project = await asyncio.to_thread(find_project, repository, *key)
+            return project
+        finally:
+            self._pending.pop(key, None)
+
+
+preliminary_projects = PreliminaryProjectCache()
+
+
 def _project_or_404(project: Project | None, handle: str | UUID) -> Project:
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{handle}' not found")
@@ -80,8 +111,9 @@ def create_project(
         return ProjectResponse.from_row(_insert_project(repository, identity, request))
     if request.budget is not None and request.budget_reason is not None:
         project = _insert_project(repository, identity, request)
-        project.gateway_request_id = request_project_gateway_key(project, request.budget, request.budget_reason)
-        repository.save(project)
+        repository.set_gateway_request(
+            project, request_project_gateway_key(project, request.budget, request.budget_reason)
+        )
         return ProjectResponse.from_row(project)
     raise HTTPException(
         status_code=422,
@@ -159,7 +191,7 @@ def archive_project(
     repository: ProjectRepositoryDependency,
     identity: RequestIdentity = Depends(get_current_starter),
 ) -> ProjectResponse:
-    project = _project_or_404(repository.get(identity.org.id, handle, "update"), handle)
+    project = _project_or_404(repository.get(identity.org.id, handle), handle)
     if project.archived_at is None:
         project.archived_at = datetime.now(UTC)
         repository.save(project)
@@ -177,7 +209,7 @@ def unarchive_project(
     repository: ProjectRepositoryDependency,
     identity: RequestIdentity = Depends(get_current_starter),
 ) -> ProjectResponse:
-    project = _project_or_404(repository.get(identity.org.id, handle, "update"), handle)
+    project = _project_or_404(repository.get(identity.org.id, handle), handle)
     if project.archived_at is not None:
         project.archived_at = None
         repository.save(project)

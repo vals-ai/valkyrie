@@ -1,6 +1,10 @@
+import json
+from typing import Any
+
 from sqlmodel import Session
 from tracker.services.results import fetch_average_task_breakdown
 from tracker.aws.s3 import S3_BENCHMARKS_PREFIX
+from tracker.exceptions import S3Error
 from tracker.database.models import (
     Benchmark,
     Org,
@@ -43,7 +47,32 @@ def final_view_s3_key(benchmark_row: Benchmark) -> str:
     return f"{S3_BENCHMARKS_PREFIX}/{benchmark_row.id}/{benchmark_row.name}.json"
 
 
+def _final_view_key(final_view: FinalViewResponse) -> str:
+    return f"{benchmark_prefix(str(final_view.benchmark_id))}{final_view.benchmark_name}.json"
+
+
+def _final_view_bytes(final_view: FinalViewResponse) -> bytes:
+    return final_view.model_dump_json(indent=4, exclude_none=True).encode()
+
+
+def _comparable(document: dict[str, Any]) -> str:
+    evaluation = document.get("final_evaluation")
+    if isinstance(evaluation, dict):
+        document = {**document, "final_evaluation": {k: v for k, v in evaluation.items() if k != "id"}}
+    return json.dumps(document, sort_keys=True)
+
+
+async def stored_final_view_key(final_view: FinalViewResponse, object_store: ObjectStore) -> str | None:
+    key = _final_view_key(final_view)
+    try:
+        stored = json.loads(await object_store.get_bytes(key))
+    except (S3Error, ValueError):
+        return None
+    current = json.loads(_final_view_bytes(final_view))
+    return key if _comparable(stored) == _comparable(current) else None
+
+
 async def upload_final_view(final_view: FinalViewResponse, object_store: ObjectStore) -> str:
-    key = f"{benchmark_prefix(str(final_view.benchmark_id))}{final_view.benchmark_name}.json"
-    await object_store.put_bytes(key, final_view.model_dump_json(indent=4, exclude_none=True).encode())
+    key = _final_view_key(final_view)
+    await object_store.put_bytes(key, _final_view_bytes(final_view))
     return key

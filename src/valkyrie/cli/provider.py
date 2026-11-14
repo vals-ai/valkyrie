@@ -16,7 +16,7 @@ def provider() -> None:
         "Replaces the secret the provider had. SECRET is the name or reference that `valkyrie secret set` printed.\n"
         "\n"
         "Example:\n"
-        "    valkyrie provider set daytona daytona"
+        "    valkyrie provider set daytona daytona-credentials"
     ),
 )
 @click.argument("name")

@@ -146,14 +146,13 @@ class SecretNotFoundError(SecretsError):
     pass
 
 
+class ProjectMigrationConflictError(TrackerServiceError):
+    pass
+
+
 class ProjectHandleTakenError(TrackerServiceError):
     def __init__(self, handle: str) -> None:
         super().__init__(f"Project '{handle}' already exists")
-
-
-class ProjectServiceUnavailableError(Exception):
-    def __init__(self) -> None:
-        super().__init__("The project service did not take this project change, so Tracker did not save it")
 
 
 class ProjectNameTakenError(TrackerServiceError):

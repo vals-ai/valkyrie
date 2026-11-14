@@ -24,6 +24,7 @@ from requests.exceptions import ReadTimeout
 from sqlmodel import Session
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from tracker import config
 from tracker.config import (
     AUTH_REQUIRED,
     DESCOPE_CLI_CLIENT_ID,
@@ -50,8 +51,7 @@ TENANT_HEADER = "x-valkyrie-tenant"
 NOT_A_MEMBER = "This login is not a member of the requested organization"
 SEVERAL_ORGANIZATIONS = "This login belongs to several organizations. Choose one with `valkyrie org use NAME`."
 NO_ORGANIZATION = (
-    "This login is not in an organization yet. Ask Vals AI to add you, "
-    "or ask an organization admin to run `valkyrie org invite EMAIL`."
+    "This login is not in an organization yet. Ask an organization admin to run `valkyrie org invite EMAIL`."
 )
 LOGIN_REQUIRED = "This needs a `valkyrie login` session; unset VALKYRIE_API_KEY if it is set."
 _ACCESS_KEY_CACHE_MAX_SIZE = 1024
@@ -326,7 +326,16 @@ def _chosen_organization(organizations: list[str], requested: str | None, claims
 
 def require_organization(organizations: Collection[str], chosen: str | None) -> str:
     if chosen is None:
-        raise HTTPException(status_code=400, detail=SEVERAL_ORGANIZATIONS if organizations else NO_ORGANIZATION)
+        if organizations:
+            detail = SEVERAL_ORGANIZATIONS
+        elif config.SELF_SERVE_ORGS_ENABLED:
+            detail = (
+                "This login is not in an organization yet. Run `valkyrie org create ORGANIZATION` to create one, "
+                "or ask an organization admin to run `valkyrie org invite EMAIL`."
+            )
+        else:
+            detail = NO_ORGANIZATION
+        raise HTTPException(status_code=400, detail=detail)
     if chosen not in organizations:
         raise HTTPException(status_code=403, detail=NOT_A_MEMBER)
     return chosen

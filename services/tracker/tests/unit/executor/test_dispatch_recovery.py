@@ -116,6 +116,7 @@ def test_recovery_loop_retries_after_a_failed_pass(monkeypatch: MonkeyPatch) -> 
 
     monkeypatch.setattr(dispatch_recovery, "report_unowned_pending_tasks", lambda: None)
     monkeypatch.setattr(PolicyStore, "revoke_finished", skip_policy_sweep)
+    monkeypatch.setattr(dispatch_recovery.RemoteGraderRepository, "clear_expired_child_tokens", lambda self: None)
     monkeypatch.setattr(dispatch_recovery, "_logger", logger)
 
     dispatch_recovery.run_dispatch_recovery_loop(stop_event, interval_seconds=0)
@@ -411,6 +412,7 @@ def test_recovery_relaunches_a_dispatch_whose_task_failed_to_start_once(
         ecs.run_task.return_value = {"tasks": [{"taskArn": run_task_outcome}], "failures": []}
     monkeypatch.setattr(dispatch_recovery.boto3, "client", lambda *_args, **_kwargs: ecs)
     monkeypatch.setattr(logging.getLogger(dispatch_recovery.__name__), "handlers", [caplog.handler])
+    monkeypatch.setattr(launcher, "ecs_client", Mock(return_value=ecs))
 
     recovered = dispatch_recovery.reconcile_dispatches_once()
 
@@ -496,6 +498,53 @@ def test_expired_launch_without_saved_arn_recovers_during_ecs_outage(
     assert lost_launch.status == ExecutorDispatchStatus.FAILED
     assert lost_launch.failure_reason == "CLAIM_DEADLINE_EXPIRED"
     assert other_launch.status == ExecutorDispatchStatus.QUEUED
+
+
+@pytest.mark.description("A committed launch orphaned by process death fails its run after the claim deadline.")
+@pytest.mark.parametrize("saved_arn", [None, _STOPPED_TASK_ARN])
+def test_process_death_expires_queued_launch(
+    saved_arn: str | None,
+    control_postgres_session: Session,
+    example_benchmark_object: Benchmark,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    session = control_postgres_session
+    benchmark = example_benchmark_object
+    release = ExecutorRelease(
+        id="orphaned-launch-release", artifact_uri="source:///local", artifact_digest="a" * 64, protocol_version="5"
+    )
+    register_release(session, release)
+    pin_benchmark_to_release(benchmark, release)
+    dispatch = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["orphaned-task"]
+    )
+    dispatch.ecs_task_arn = saved_arn
+    task = Task(
+        org_id=benchmark.org_id,
+        benchmark=benchmark.id,
+        task_id="orphaned-task",
+        status=TaskStatus.PENDING,
+        started_at=dispatch.created_at,
+    )
+    session.add_all([benchmark, dispatch, task])
+    session.commit()
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
+    monkeypatch.setattr(dispatch_recovery, "engine", session.get_bind())
+    monkeypatch.setattr(dispatch_recovery, "describe_executor_tasks", lambda _arns: {"tasks": [], "failures": []})
+
+    assert dispatch_recovery.reconcile_dispatches_once() == 0
+    dispatch.claim_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.add(dispatch)
+    session.commit()
+
+    assert dispatch_recovery.reconcile_dispatches_once() == 1
+    session.expire_all()
+    assert dispatch.status == ExecutorDispatchStatus.FAILED
+    assert dispatch.failure_reason == "CLAIM_DEADLINE_EXPIRED"
+    assert benchmark.status == BenchmarkStatus.ERROR
+    assert task.status == TaskStatus.ERROR
+    assert benchmark.error_message is not None
+    assert "deadline" in benchmark.error_message
 
 
 @pytest.mark.description(

@@ -463,6 +463,9 @@ INTERNAL_ROUTES = {
     ("/secrets/{name}", "delete"),
     ("/projects/by-id/{project_id}", "get"),
     ("/projects/by-id/{project_id}/gateway-key-eligibility", "get"),
+    ("/remote-grader/registrations", "post"),
+    ("/remote-grader/registrations/{registration_id}/lease", "post"),
+    ("/remote-grader/registrations/{registration_id}/stop", "post"),
 }
 
 

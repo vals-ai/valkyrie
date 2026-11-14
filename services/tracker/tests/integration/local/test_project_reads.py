@@ -6,8 +6,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from main import app
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
 from tracker.api.projects import find_project, reject_archived_project
@@ -69,8 +71,7 @@ class ReadService:
 def _repository(tracker_database: Session, monkeypatch: pytest.MonkeyPatch, service: ReadService) -> ProjectRepository:
     transport = httpx.MockTransport(service.handle)
     client = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=transport))
-    monkeypatch.setattr(project_repository, "project_service_reader", lambda: client, raising=False)
-    monkeypatch.setattr(project_repository, "project_service_writer", lambda: client)
+    monkeypatch.setattr(project_repository, "project_service", lambda: client)
     return ProjectRepository(tracker_database)
 
 
@@ -93,7 +94,7 @@ def _mirrored(tracker_database: Session, service: ReadService, handle: str) -> P
 
 
 class TestProjectReads:
-    @pytest.mark.description("With `PROJECT_SERVICE_READS` on, the project list comes from the project service.")
+    @pytest.mark.description("The project list comes from the project service.")
     def test_lists_from_the_service(self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> None:
         service = ReadService()
         _ = service.add("router-bench")
@@ -175,7 +176,7 @@ class TestProjectReads:
 
         assert repository.set_gateway_key(project, first) == first
         assert repository.set_gateway_key(project, second) == first
-        locked = repository.get_by_id(TEST_ORG_ID, project.id, lock="update")
+        locked = repository.get_by_id(TEST_ORG_ID, project.id)
         assert locked is not None and locked.gateway_key_id == first
 
     @pytest.mark.description(
@@ -228,12 +229,12 @@ class TestProjectReads:
 
         assert repository.get_for_run(benchmark.id, strict=True) is None
 
-    @pytest.mark.description("Turning reads on without writes fails at startup instead of serving stale projects.")
-    def test_reads_need_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("PROJECT_SERVICE_READS", "true")
-        monkeypatch.setenv("PROJECT_SERVICE_WRITES", "false")
-        project_client.project_service_reader.cache_clear()
+    @pytest.mark.description("Without the project service URL and token, Tracker fails before serving any project.")
+    def test_project_service_needs_configuration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("PROJECT_SERVICE_URL", raising=False)
+        monkeypatch.delenv("PROJECT_SERVICE_TOKEN", raising=False)
+        project_client.project_service.cache_clear()
 
-        with pytest.raises(ValueError, match="PROJECT_SERVICE_WRITES"):
-            _ = project_client.project_service_reader()
-        project_client.project_service_reader.cache_clear()
+        with pytest.raises(KeyError), TestClient(app):
+            pass
+        project_client.project_service.cache_clear()

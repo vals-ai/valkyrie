@@ -3,15 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import subprocess
 import sys
+from datetime import UTC, datetime
+from functools import partial
+from threading import BoundedSemaphore
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
-import boto3
-from botocore.config import Config
+from botocore.exceptions import ClientError
 from sqlmodel import Session
 
+from tracker.aws.clients import ECS_LAUNCH_DEADLINE, ecs_client
 from tracker.database.models import ExecutorDispatch
 from tracker.database.session import engine
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
@@ -19,7 +24,12 @@ from tracker.repositories.executor_release import ExecutorReleaseRepository
 
 logger = logging.getLogger(__name__)
 _ECS_RUNNER_PYTHON = "/app/.venv/bin/python"
-ECS_CONFIG = Config(connect_timeout=3, read_timeout=8, retries={"max_attempts": 1})
+_LAUNCH_TIMEOUT_SECONDS = 180
+_CLAIM_ALLOWANCE_SECONDS = 90
+_RUN_TASK_CONCURRENCY = 8
+_run_task_semaphore = asyncio.Semaphore(_RUN_TASK_CONCURRENCY)
+_run_task_slots = BoundedSemaphore(_RUN_TASK_CONCURRENCY)
+_run_task_calls: set[asyncio.Task[dict[str, Any]]] = set()
 
 
 class DefinitiveLaunchFailure(Exception):
@@ -82,8 +92,8 @@ def _run_task_params(dispatch: ExecutorDispatch, client_token: str) -> dict[str,
 
 
 def relaunch_dispatch(dispatch: ExecutorDispatch) -> str:
-    response = boto3.client("ecs", config=ECS_CONFIG).run_task(
-        **_run_task_params(dispatch, client_token=f"{dispatch.id}-relaunch")
+    response = _call_run_task(
+        ecs_client(recovery=True), _run_task_params(dispatch, client_token=f"{dispatch.id}-relaunch")
     )
     if len(response["tasks"]) != 1:
         raise RuntimeError(
@@ -91,6 +101,35 @@ def relaunch_dispatch(dispatch: ExecutorDispatch) -> str:
         )
 
     return response["tasks"][0]["taskArn"]
+
+
+def _run_task_finished(task: asyncio.Task[dict[str, Any]], semaphore: asyncio.Semaphore) -> None:
+    _run_task_calls.discard(task)
+    semaphore.release()
+    if not task.cancelled():
+        task.exception()
+
+
+def _call_run_task(ecs: Any, params: dict[str, Any]) -> dict[str, Any]:
+    with _run_task_slots:
+        return ecs.run_task(**params)
+
+
+async def _run_task(ecs: Any, params: dict[str, Any]) -> dict[str, Any]:
+    semaphore = _run_task_semaphore
+    await semaphore.acquire()
+    task = asyncio.create_task(asyncio.to_thread(_call_run_task, ecs, params))
+    _run_task_calls.add(task)
+    task.add_done_callback(partial(_run_task_finished, semaphore=semaphore))
+    return await asyncio.shield(task)
+
+
+def _launch_budget(dispatch: ExecutorDispatch) -> float:
+    if dispatch.claim_deadline_at is None:
+        return _LAUNCH_TIMEOUT_SECONDS
+    deadline = dispatch.claim_deadline_at.replace(tzinfo=UTC)
+    remaining = (deadline - datetime.now(UTC)).total_seconds() - _CLAIM_ALLOWANCE_SECONDS
+    return max(0, min(_LAUNCH_TIMEOUT_SECONDS, remaining))
 
 
 async def launch_dispatch(dispatch: ExecutorDispatch) -> None:
@@ -106,23 +145,62 @@ async def launch_dispatch(dispatch: ExecutorDispatch) -> None:
     if launcher != "ecs":
         raise ValueError("EXECUTOR_LAUNCHER must be ecs or local")
 
-    params = await asyncio.to_thread(_run_task_params, dispatch, dispatch_id)
-    ecs = boto3.client("ecs", config=ECS_CONFIG)
-    for attempt in range(3):
-        try:
-            response = await asyncio.to_thread(ecs.run_task, **params)
-            tasks = response["tasks"]
-            if response["failures"] and not tasks:
-                raise DefinitiveLaunchFailure(f"ECS rejected executor dispatch {dispatch_id}")
-            if len(tasks) != 1:
-                raise RuntimeError(f"Expected one ECS task for executor dispatch {dispatch_id}")
-            task_arn = tasks[0]["taskArn"]
-            logger.info("Launched executor dispatch %s as ECS task %s", dispatch_id, task_arn)
-            await _record_task_arn_after_launch(dispatch.id, task_arn)
-            return
-        except DefinitiveLaunchFailure:
-            raise
-        except Exception:
-            if attempt == 2:
-                raise
-            await asyncio.sleep(0.2 * (2**attempt))
+    budget = _launch_budget(dispatch)
+    started = monotonic()
+    last_throttle: ClientError | None = None
+    deadline_token = ECS_LAUNCH_DEADLINE.set(started + budget)
+    try:
+        async with asyncio.timeout(budget):
+            params = await asyncio.to_thread(_run_task_params, dispatch, dispatch_id)
+            ecs = await asyncio.to_thread(ecs_client)
+            attempt = 0
+            while True:
+                try:
+                    response = await _run_task(ecs, params)
+                    tasks = response["tasks"]
+                    if response["failures"] and not tasks:
+                        raise DefinitiveLaunchFailure(
+                            f"ECS rejected executor dispatch {dispatch_id}: {response['failures']}"
+                        )
+                    if len(tasks) != 1:
+                        raise RuntimeError(f"Expected one ECS task for executor dispatch {dispatch_id}")
+                    task_arn = tasks[0]["taskArn"]
+                    break
+                except DefinitiveLaunchFailure:
+                    raise
+                except Exception as error:
+                    throttled = isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in {
+                        "ThrottlingException",
+                        "Throttling",
+                        "RequestLimitExceeded",
+                        "TooManyRequestsException",
+                    }
+                    server_error = isinstance(error, ClientError) and (
+                        error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) >= 500
+                        or error.response.get("Error", {}).get("Code")
+                        in {"ServerException", "ServiceUnavailableException", "InternalFailure"}
+                    )
+                    if isinstance(error, ClientError) and not (throttled or server_error):
+                        raise
+                    if isinstance(error, ClientError) and throttled:
+                        last_throttle = error
+                    if attempt >= (19 if throttled else 2):
+                        if throttled:
+                            raise RuntimeError(
+                                f"ECS RunTask throttled for {monotonic() - started:.1f}s: {error}"
+                            ) from error
+                        raise
+                    await asyncio.sleep(random.uniform(0, min(8, 2**attempt)))
+                    attempt += 1
+    except TimeoutError as error:
+        cause = (
+            f"ECS RunTask throttled for {budget:g}s: {last_throttle}"
+            if last_throttle is not None
+            else f"ECS RunTask launch exceeded its {budget:g}s budget"
+        )
+        raise TimeoutError(cause) from error
+    finally:
+        ECS_LAUNCH_DEADLINE.reset(deadline_token)
+
+    logger.info("Launched executor dispatch %s as ECS task %s", dispatch_id, task_arn)
+    await _record_task_arn_after_launch(dispatch.id, task_arn)

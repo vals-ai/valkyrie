@@ -31,6 +31,7 @@ from benchmark_service import (
     SandboxRecoveryAttempt,
 )
 from benchmark_service.client import BenchmarkServiceError
+from benchmark_service.remote_grading import RemoteGradingAuthorization
 from benchmark_service.grading_spec import resolve_grading_spec
 from benchmark_service.schemas import EgressPolicy
 
@@ -56,13 +57,11 @@ from tracker.runtime.run_egress import (
     ScopedGateway,
 )
 from tracker.config import (
-    BenchmarkServiceDestination,
     ENVIRONMENT,
     EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS,
     EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN,
     EXTERNAL_SERVICE_GATEWAY_URL,
-    GATEWAY_KEY_ORGS,
-    classify_benchmark_service_destination,
+    VALKYRIE_STAGE,
 )
 from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, FailurePhase, TaskStatus
 from tracker.executor.control_protocol import AttemptRef, PhaseRef, TaskRef
@@ -115,6 +114,8 @@ from tracker.logging.events import LogEvent
 from tracker.observability import TaskOutcome, error_span, incr, record_task_outcome
 from tracker.observability.sentry import capture_exception, clear_sandbox_context, task_scope
 from tracker.observability.tracing import observability_span
+from tracker.secret_access import selected_project_gateway_reference
+from tracker.remote_grader_services import WORKER_SERVICE_FOR_BENCHMARK
 from tracker.sandbox import (
     DependencySetupMode,
     SandboxCreationState,
@@ -127,7 +128,6 @@ from tracker.sandbox import (
     sandbox_resolves,
     upload_agent_artifacts,
 )
-from tracker.secret_access import is_generated_project_gateway_secret_name, tenant_secret_prefix
 from tracker.search_cost import SearchCharge
 from tracker.scheduler.admission import SandboxQueueContext, enter_queued_sandbox
 from tracker.executor.control_queue import is_reserved_queue_pool_id
@@ -142,6 +142,7 @@ from tracker.services.failures import (
     classify_failure,
     decide,
     describe_failure,
+    is_rejected_request,
 )
 from tracker.services.tasks.steps import StepRun, run_steps
 from tracker.clients.benchmark_service import run_benchmark_service_websocket
@@ -159,24 +160,6 @@ logger = get_logger(__name__)
 _PTY_TASK_RETRY_LIMIT: int = 1
 _SANDBOX_RETRY_DELAY_SECONDS: float = 2
 _DIRECT_ADMISSION_POLL_SECONDS: float = 2
-
-
-def _saved_project_gateway_root(
-    request: StartBenchmarkRequest, org: OrgContext, selected_project_gateway_secret_ref: str | None
-) -> bool:
-    secret_names = request.contract.secrets
-    reference = secret_names.get("MODEL_GATEWAY_API_KEY")
-    prefix = tenant_secret_prefix(org.id)
-    return (
-        org.name in GATEWAY_KEY_ORGS
-        and classify_benchmark_service_destination(request.benchmark_name, request.custom_benchmark_service).value
-        == BenchmarkServiceDestination.HOSTED.value
-        and selected_project_gateway_secret_ref is not None
-        and reference == selected_project_gateway_secret_ref
-        and reference == secret_names.get("MODEL_GATEWAY_URL")
-        and reference.startswith(prefix)
-        and is_generated_project_gateway_secret_name(reference.removeprefix(prefix))
-    )
 
 
 @dataclass
@@ -868,11 +851,25 @@ async def _process_task_attempt(
         start_benchmark_request.contract.model if start_benchmark_request.contract.inference_settings_attested else None
     )
 
+    gateway_reference = selected_project_gateway_reference(
+        start_benchmark_request.contract.secrets,
+        org,
+        benchmark_row.selected_project_gateway_secret_ref,
+        start_benchmark_request.benchmark_name,
+        start_benchmark_request.custom_benchmark_service,
+    )
+    remote_grading_service: str | None = None
+
+    remote_grading_authorization: RemoteGradingAuthorization | None = None
+
+    async def issue_remote_grading_authorization(worker_service: str) -> None:
+        nonlocal remote_grading_authorization
+        grant = await control.issue_remote_grader_grant(task_row.ref, worker_service)
+        remote_grading_authorization = RemoteGradingAuthorization(issuer=VALKYRIE_STAGE, token=grant)
+
     @asynccontextmanager
     async def grading_credentials(secrets: dict[str, str] | None) -> AsyncGenerator[str | None]:
-        if not _saved_project_gateway_root(
-            start_benchmark_request, org, benchmark_row.selected_project_gateway_secret_ref
-        ):
+        if gateway_reference is None or remote_grading_authorization is not None:
             yield None
             return
         if secrets is None:
@@ -953,6 +950,7 @@ async def _process_task_attempt(
                             sandbox_provider=sandbox_provider_config,
                             child_egress=grants,
                             grading_token=grading_token,
+                            remote_grading_authorization=remote_grading_authorization,
                         )
                     )
                 )
@@ -1185,7 +1183,8 @@ async def _process_task_attempt(
 
     try:
         evaluation_resume_state = task_row.eval_resume_state
-        if task_row.status == TaskStatus.EVALUATING and evaluation_resume_state is not None:
+        resuming_evaluation = task_row.status == TaskStatus.EVALUATING and evaluation_resume_state is not None
+        if resuming_evaluation:
             phase = FailurePhase.EVALUATION
             claim = await control.evaluation(task_row.ref)
             if claim.phase is None or claim.resume_state is None:
@@ -1194,6 +1193,25 @@ async def _process_task_attempt(
             task_row.evaluation_phase = claim.phase
             control.track(task_row)
             evaluation_resume_state = claim.resume_state
+        if gateway_reference is not None and start_benchmark_request.benchmark_name in WORKER_SERVICE_FOR_BENCHMARK:
+            try:
+                requirements = await benchmark_service.grading_requirements_response(
+                    task_row.task_id, dataset=start_benchmark_request.dataset
+                )
+            except BenchmarkServiceError as exc:
+                if exc.status_code != 404:
+                    if resuming_evaluation and not is_rejected_request(exc.status_code):
+                        recovered = await recover_evaluation_stream_failure(_exception_message(exc))
+                        if recovered is not None:
+                            return recovered
+                    raise
+            else:
+                if requirements.remote_grader_service is not None:
+                    remote_grading_service = requirements.remote_grader_service
+        if resuming_evaluation:
+            if remote_grading_service is not None:
+                await issue_remote_grading_authorization(remote_grading_service)
+            assert evaluation_resume_state is not None
 
             try:
                 log_output("Resuming evaluation from durable benchmark state\n")
@@ -1437,6 +1455,8 @@ async def _process_task_attempt(
                     return {task_id: None}
                 task_row.status = TaskStatus.IN_PROGRESS
                 control.track(task_row)
+            if remote_grading_service is not None:
+                await issue_remote_grading_authorization(remote_grading_service)
             sandbox_id_for_recovery = sandbox.id
             phase = FailurePhase.SETUP
             if isinstance(benchmark_service, DatasetTaskService) and folder is not None and folder.cwd_from_image:
@@ -1550,6 +1570,7 @@ async def _process_task_attempt(
                         dataset=start_benchmark_request.dataset,
                         sandbox_provider=sandbox_provider_config,
                         child_egress=child_egress,
+                        remote_grading_authorization=remote_grading_authorization,
                     )
                 )
                 recovery_attempt.mark_replacement_ready()
@@ -1810,6 +1831,7 @@ async def _process_task_attempt(
                                         sandbox_provider=sandbox_provider_config,
                                         child_egress=child_egress,
                                         grading_token=grading_token,
+                                        remote_grading_authorization=remote_grading_authorization,
                                     )
                                 )
                             )

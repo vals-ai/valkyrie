@@ -4,7 +4,7 @@ import logging
 import re
 import tarfile
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +59,7 @@ from tracker.database.models import (
     UserDefaultProvider,
 )
 from tracker.database.models import FinalEvaluation, TaskBreakdown
+from tracker.database.session import get_session
 from executor_protocol import ExecutorDispatchStatus
 from tracker.types import LocalBenchmarkArguments, AgentContractRequest, AWSBenchmarkArguments
 from tracker.domain import (
@@ -2461,7 +2462,8 @@ class TestTrackerAPI:
             "- Unfinished tasks remain in the score input with a null result.\n"
             "- A configured Lambda receives the completion payload plus ``preview``.\n"
             "- A preview without a Lambda or an existing result can score an unfinished task subset.\n"
-            "- Unknown IDs reject the whole request before scoring, S3 writes, or callback invocation."
+            "- Unknown IDs reject the whole request before scoring, S3 writes, or callback invocation.\n"
+            "- The request releases its database connection before scoring and every S3 call."
         )
     )
     async def test_preview_results_archives_then_overwrites_canonical_result(
@@ -2496,24 +2498,40 @@ class TestTrackerAPI:
         )
         database_session.commit()
 
+        request_sessions: list[Session] = []
+
+        def _capture_request_session() -> Generator[Session, None, None]:
+            with Session(database_session.get_bind(), expire_on_commit=False) as request_session:
+                request_sessions.append(request_session)
+                yield request_session
+
+        monkeypatch.setitem(app.dependency_overrides, get_session, _capture_request_session)
+
+        def _assert_connection_released() -> None:
+            assert not request_sessions[-1].in_transaction()
+
         canonical_key = f"benchmarks/{benchmark_row.id}/{benchmark_row.name}.json"
         observed_results: dict[str, Any] = {}
         uploaded_keys: list[str] = []
         copied: list[tuple[str, str]] = []
         lambda_payloads: list[dict[str, Any]] = []
         canonical_exists = True
+        stored_view_unchanged = False
 
         async def _mock_final_score(_client: BenchmarkServiceClient, **kwargs: Any) -> FinalScoreResponse:
+            _assert_connection_released()
             observed_results.update(kwargs["evaluation_results"])
 
             return FinalScoreResponse(tasks_evaluated=list(observed_results), final_score=0.5, metadata={})
 
         async def _mock_s3_object_exists(s3_key: str, _aws_runtime: AWSRuntime) -> bool:
+            _assert_connection_released()
             assert s3_key == canonical_key
 
             return canonical_exists
 
         async def _mock_copy_s3_object(source_key: str, dest_key: str, _aws_runtime: AWSRuntime) -> str | None:
+            _assert_connection_released()
             copied.append((source_key, dest_key))
 
             return None
@@ -2522,9 +2540,18 @@ class TestTrackerAPI:
             _final_view: FinalViewResponse,
             _object_store: ObjectStore,
         ) -> str:
+            _assert_connection_released()
             uploaded_keys.append(canonical_key)
 
             return canonical_key
+
+        async def _mock_stored_final_view_key(
+            _final_view: FinalViewResponse,
+            _object_store: ObjectStore,
+        ) -> str | None:
+            _assert_connection_released()
+
+            return canonical_key if stored_view_unchanged else None
 
         async def _mock_create_presigned_url(
             s3_key: str,
@@ -2549,6 +2576,7 @@ class TestTrackerAPI:
         monkeypatch.setattr(main_module, "upload_final_view", _mock_upload_final_view)
         monkeypatch.setattr(main_module, "create_presigned_url", _mock_create_presigned_url)
         monkeypatch.setattr(main_module, "invoke_lambda", _mock_invoke_lambda)
+        monkeypatch.setattr(main_module, "stored_final_view_key", _mock_stored_final_view_key)
 
         for task_ids in [["unknown-task"], ["pending-task", "unknown-task"]]:
             invalid_response = client.get(
@@ -2588,6 +2616,17 @@ class TestTrackerAPI:
         assert "output_key" not in lambda_payloads[0]
         assert "contract" in lambda_payloads[0]
 
+        stored_view_unchanged = True
+        unchanged_response = client.get("/preview-results", params={"benchmark_id": str(benchmark_row.id)})
+
+        assert unchanged_response.status_code == 200
+        assert unchanged_response.json()["s3_url"] == f"s3://test-bucket/{canonical_key}"
+        assert uploaded_keys == [canonical_key]
+        assert len(copied) == 1
+        assert len(lambda_payloads) == 2
+        stored_view_unchanged = False
+        lambda_payloads.pop()
+
         benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"lambda_function": None})
         database_session.add(benchmark_row)
         database_session.commit()
@@ -2607,6 +2646,47 @@ class TestTrackerAPI:
         assert uploaded_keys == [canonical_key, canonical_key]
         assert len(copied) == 1
         assert len(lambda_payloads) == 1
+
+    @pytest.mark.description(
+        "S3 retrieval releases its database connection before uploading and presigning the final view."
+    )
+    async def test_retrieve_results_s3_releases_connection_before_upload(
+        self,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        example_benchmark_object: Benchmark,
+    ) -> None:
+        database_session.add(example_benchmark_object)
+        database_session.commit()
+        request_sessions: list[Session] = []
+        uploaded: list[str] = []
+
+        def _capture_request_session() -> Generator[Session, None, None]:
+            with Session(database_session.get_bind(), expire_on_commit=False) as request_session:
+                request_sessions.append(request_session)
+                yield request_session
+
+        async def _mock_upload_final_view(final_view: FinalViewResponse, _object_store: ObjectStore) -> str:
+            assert not request_sessions[-1].in_transaction()
+            uploaded.append(final_view.benchmark_name)
+
+            return "benchmarks/result.json"
+
+        async def _mock_create_presigned_url(s3_key: str, _aws_runtime: AWSRuntime, expiration: int = 86400) -> str:
+            assert not request_sessions[-1].in_transaction()
+
+            return f"https://download.example/{s3_key}?expires={expiration}"
+
+        monkeypatch.setitem(app.dependency_overrides, get_session, _capture_request_session)
+        monkeypatch.setattr(main_module, "upload_final_view", _mock_upload_final_view)
+        monkeypatch.setattr(main_module, "create_presigned_url", _mock_create_presigned_url)
+
+        response = client.get(
+            "/retrieve-results", params={"benchmark_id": str(example_benchmark_object.id), "s3": True}
+        )
+
+        assert response.status_code == 200, response.text
+        assert uploaded == [example_benchmark_object.name]
 
     @pytest.mark.description("Run results are blocked when a saved internal destination is reached from outside.")
     async def test_retrieve_results_blocks_external_persisted_internal_destination(

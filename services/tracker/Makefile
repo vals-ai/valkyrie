@@ -54,15 +54,16 @@ clean:
 logs:
 	@$(COMPOSE) logs -f tracker
 tracker-service: build run logs
+local-tracker: export PROJECT_SERVICE_TOKEN := $(or $(PROJECT_SERVICE_TOKEN),$(shell sed -n 's/^PROJECT_SERVICE_TOKEN=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"),local-project-token)
 local-tracker: venv-check
 	@: "$${EXECUTOR_BOOTSTRAP_KEY:?Set EXECUTOR_BOOTSTRAP_KEY for local control}"
-	@$(COMPOSE) up -d --wait postgres
+	@$(COMPOSE) up -d --wait postgres projects
 	@DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run alembic upgrade head
 	@set -e; \
 	  if [ -z "$${EXECUTOR_PAYLOAD_LOCAL_KEY+x}" ]; then \
 	    EXECUTOR_PAYLOAD_LOCAL_KEY="$$(uv run python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"; \
 	  fi; \
-	  export EXECUTOR_PAYLOAD_LOCAL_KEY EXECUTOR_LAUNCHER=local; \
+	  export EXECUTOR_PAYLOAD_LOCAL_KEY EXECUTOR_LAUNCHER=local PROJECT_SERVICE_URL=http://127.0.0.1:8010; \
 	  unset EXECUTOR_PAYLOAD_KMS_KEY_ID; \
 	  DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run uvicorn tracker.executor.control_app:app --host 127.0.0.1 --port 8002 & \
 	  control_pid=$$!; \

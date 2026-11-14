@@ -37,8 +37,11 @@ class SecretStore(Protocol):
 
 async def resolve_secrets(secrets: dict[str, str], secret_store: SecretStore) -> dict[str, str]:
     resolved: dict[str, str] = {}
+    fetched: dict[str, SecretValue] = {}
     for env_name, secret_name in secrets.items():
-        secret_value = await secret_store.get(secret_name)
+        if secret_name not in fetched:
+            fetched[secret_name] = await secret_store.get(secret_name)
+        secret_value = fetched[secret_name]
         if isinstance(secret_value, dict):
             if env_name not in secret_value:
                 raise SecretsError(f"Key '{env_name}' not found in JSON secret '{secret_display_name(secret_name)}'")

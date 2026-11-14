@@ -30,7 +30,6 @@ def setup_app_dependencies(
     tracker_database: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-
     def get_test_session() -> Generator[Session, None, None]:
         yield tracker_database
 
@@ -44,11 +43,9 @@ def local_app(
     monkeypatch: pytest.MonkeyPatch,
     database_session: Session,
 ) -> Generator[FastAPI, None, None]:
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
-    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_fake")
-
     monkeypatch.setattr(config_module, "AUTH_REQUIRED", True)
     monkeypatch.setattr(config_module, "DESCOPE_PROJECT_ID", "P_fake")
+
     importlib.reload(auth_module)
     importlib.reload(main_module)
 

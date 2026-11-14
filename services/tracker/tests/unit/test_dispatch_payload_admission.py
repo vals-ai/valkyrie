@@ -20,6 +20,7 @@ from sqlmodel import Session, select
 import main
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from main import app
+from tests.project_service import MockProjectRoutes
 from tests.conftest import TEST_ORG_ID
 from tracker import config
 from tracker.auth import RequestIdentity, get_current_runner, get_current_starter
@@ -250,6 +251,7 @@ def test_file_only_selected_project_keeps_manual_gateway_references(
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    project_service: MockProjectRoutes,
 ) -> None:
     from tracker import project_gateway
 
@@ -298,7 +300,7 @@ def test_file_only_selected_project_keeps_manual_gateway_references(
         json={"handle": "manual", "name": "Manual Gateway", "spend_type": "internal", "subcategory": "blog"},
     )
     assert created.status_code == 200, created.text
-    (project,) = database_session.exec(select(Project)).all()
+    (project,) = project_service.projects()
     assert (project.gateway_request_id, project.gateway_key_id) == (None, None)
     request = _start_request(
         contract.model_copy(
@@ -647,6 +649,7 @@ def test_exact_agent_selection_survives_alias_and_explicit_update(
     protected_gateway: bool,
     database_session: Session,
     monkeypatch: pytest.MonkeyPatch,
+    project_service: MockProjectRoutes,
 ) -> None:
 
     _configure_managed_runtime(monkeypatch)
@@ -748,6 +751,7 @@ def test_exact_agent_selection_survives_alias_and_explicit_update(
         )
         database_session.add(project)
         database_session.flush()
+        project_service.seed(project)
         database_session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id))
         database_session.commit()
         monkeypatch.setattr(main, "selects_project_gateway_key", lambda _org: True)

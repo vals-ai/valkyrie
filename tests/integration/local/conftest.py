@@ -13,8 +13,10 @@ from sqlalchemy import Engine
 from sqlmodel import Session, SQLModel, create_engine
 
 from services.tracker import main as tracker_main
+from services.tracker.tests.project_service import MockProjectRoutes
 from services.tracker.tests.utils import add_sqlite_btrim
 from tracker.auth import get_current_org
+from tracker.clients.projects import ProjectServiceClient
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from tracker.database.models import (
     DEFAULT_ORG_NAME,
@@ -28,6 +30,7 @@ from tracker.database.models import (
 )
 from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus, TaskStatus
 from tracker.database.session import get_session
+from tracker.repositories import project as project_repository
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest
 from valkyrie.sdk import ValkyrieClient
 
@@ -94,6 +97,13 @@ def local_tracker_app(
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "1")
     monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_ACCOUNT_ID", "123456789012")
     monkeypatch.setattr(tracker_main, "check_database_connection", lambda: True)
+    routes = MockProjectRoutes()
+    project_client = ProjectServiceClient(
+        httpx.Client(base_url="http://projects", transport=httpx.MockTransport(routes.handle))
+    )
+    monkeypatch.setenv("PROJECT_SERVICE_URL", "http://projects")
+    monkeypatch.setenv("PROJECT_SERVICE_TOKEN", "test-token")
+    monkeypatch.setattr(project_repository, "project_service", lambda: project_client)
 
     try:
         yield tracker_main.app

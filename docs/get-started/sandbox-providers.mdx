@@ -31,14 +31,14 @@ run in your organization's Daytona or Modal account.
 4. Upload the credentials and connect Daytona:
 
    ```bash
-   valkyrie secret set daytona < daytona.json
+   valkyrie secret set daytona-credentials < daytona.json
 
-   valkyrie provider set daytona daytona
+   valkyrie provider set daytona daytona-credentials
    ```
 
 ## Set up Modal
 
-1. [Create an API token](https://modal.com/docs/reference/modal.config#authentication)
+1. [Create an API token](https://modal.com/settings/tokens)
    under **Settings > Tokens > API tokens**, in the Modal workspace where you want the
    sandboxes to run. Modal shows the token once, as a command:
 
@@ -58,9 +58,9 @@ run in your organization's Daytona or Modal account.
 3. Upload the credentials and connect Modal:
 
    ```bash
-   valkyrie secret set modal < modal.json
+   valkyrie secret set modal-credentials < modal.json
 
-   valkyrie provider set modal modal
+   valkyrie provider set modal modal-credentials
    ```
 
 ## Choose the provider for a run
@@ -92,7 +92,7 @@ valkyrie provider list
 To replace credentials, save the new values under the same secret name:
 
 ```bash
-valkyrie secret set modal < modal.json
+valkyrie secret set modal-credentials < modal.json
 ```
 
 To disconnect a provider:

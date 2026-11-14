@@ -15,7 +15,9 @@ from sqlalchemy.pool import ConnectionPoolEntry
 from sqlmodel import Session, SQLModel, StaticPool, create_engine
 
 from tests.factories import make_benchmark
+from tests.project_service import MockProjectRoutes
 from tests.utils import TEST_ORG_ID, FakeAccessKeys, add_sqlite_btrim
+from tracker.api.projects import PreliminaryProjectCache
 from tracker.database.models import (
     Benchmark,
     DEFAULT_ORG_NAME,
@@ -29,6 +31,7 @@ from tracker.types import AgentContractRequest
 from tracker.domain import ExecutorDispatchKind
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.runtime import AWSResources, AWSRuntime
+from tracker.clients.projects import ProjectServiceClient
 from tracker.database.session import get_session
 from tracker.executor.control_app import app as control_app
 from tracker.executor.control_client import ControlClient
@@ -37,6 +40,7 @@ from tracker.executor.control_queue import QueueControl
 from tracker.executor.control_runs import RunControl
 from tracker.executor.control_store import invocation_digest
 from tracker.executor.control_tasks import TaskControl
+from tracker.repositories import project as project_repository
 
 if TYPE_CHECKING:
     from testcontainers.postgres import PostgresContainer
@@ -223,3 +227,16 @@ def keep_replaced_attempts(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     kept = AsyncMock()
     monkeypatch.setattr("tracker.services.tasks.execute.keep_replaced_attempts", kept)
     return kept
+
+
+@pytest.fixture(autouse=True)
+def project_service(monkeypatch: pytest.MonkeyPatch) -> MockProjectRoutes:
+    monkeypatch.setattr("main.preliminary_projects", PreliminaryProjectCache())
+    monkeypatch.setenv("PROJECT_SERVICE_URL", "http://projects")
+    monkeypatch.setenv("PROJECT_SERVICE_TOKEN", "test-token")
+    service = MockProjectRoutes()
+    client = ProjectServiceClient(
+        httpx.Client(base_url="http://projects", transport=httpx.MockTransport(service.handle))
+    )
+    monkeypatch.setattr(project_repository, "project_service", lambda: client)
+    return service

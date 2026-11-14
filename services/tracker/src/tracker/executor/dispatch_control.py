@@ -34,6 +34,8 @@ from tracker.executor.release_control import (
     resolve_current_execution_release,
     select_active_release,
 )
+from tracker.remote_grader import attempt_id_for
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.executor.control_queue import is_reserved_queue_pool_id, reserved_queue_pool_id
 
 DISPATCH_CLAIM_WINDOW = timedelta(seconds=DEFAULT_EXECUTOR_DISPATCH_CLAIM_TIMEOUT_SECONDS)
@@ -97,7 +99,7 @@ def admit_start_dispatch(
     task_ids: list[str] | None = None,
 ) -> ExecutorDispatch:
     with session.no_autoflush:
-        release = select_active_release(session, for_update=True)
+        release = select_active_release(session, for_share=True)
     _require_compatible_release(benchmark, release)
     queue_pool_id = benchmark.arguments.queue_pool_id
     if queue_pool_id is not None:
@@ -245,6 +247,7 @@ def _terminalize_dispatch_tasks(
         repository.save(ErrorResult(org_id=task.org_id, task=task.id, **asdict(error)))
         task.status = TaskStatus.ERROR
         task.finished_at = finished_at
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
     return bool(siblings)
 
 
@@ -308,6 +311,7 @@ def resolve_enqueue_failure(
     benchmark_id: UUID,
     dispatch_id: UUID,
     task_ids: list[str],
+    error_message: str = "Executor dispatch enqueue failed",
 ) -> EnqueueFailureResolution:
     benchmark = BenchmarkRepository(session).lock_by_id(benchmark_id)
     dispatch = ExecutorDispatchRepository(session).lock(dispatch_id, benchmark_id=benchmark_id)
@@ -322,7 +326,7 @@ def resolve_enqueue_failure(
 
     now = datetime.now(ZoneInfo("UTC"))
     error = _DispatchError(
-        "Executor dispatch enqueue failed",
+        error_message,
         "executor_dispatch",
         "enqueue",
         "ExecutorDispatchEnqueueError",
@@ -330,6 +334,7 @@ def resolve_enqueue_failure(
     )
     dispatch.status = ExecutorDispatchStatus.FAILED
     dispatch.finished_at = now
+    dispatch.failure_reason = error_message
     sibling_active = _terminalize_dispatch_tasks(
         session, benchmark=benchmark, dispatch=dispatch, task_ids=task_ids, error=error, finished_at=now
     )

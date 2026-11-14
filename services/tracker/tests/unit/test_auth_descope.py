@@ -854,6 +854,27 @@ class TestLoginSessions:
         request.headers = {"authorization": "Bearer session-token", **headers}
         return request
 
+    @pytest.mark.description("Empty login sessions see creation guidance only when organization creation is enabled.")
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_empty_login_organization_guidance(
+        self,
+        mock_descope: MagicMock,
+        empty_database_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        enabled: bool,
+    ) -> None:
+        monkeypatch.setattr("tracker.config.SELF_SERVE_ORGS_ENABLED", enabled)
+        mock_descope.validate_session.return_value = {"sub": "U-alice"}
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_current_identity(self._request(), empty_database_session)
+
+        assert exc_info.value.status_code == 400
+        assert ("valkyrie org create ORGANIZATION" in exc_info.value.detail) is enabled
+        assert "valkyrie org invite EMAIL" in exc_info.value.detail
+        assert "Vals AI" not in exc_info.value.detail
+        assert empty_database_session.exec(select(Org)).all() == []
+
     @pytest.mark.description("Invalid sessions and run keys are refused at login.")
     @pytest.mark.parametrize(
         "validate_session",

@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from uuid import UUID
 
-from sqlalchemy import JSON, case, literal, tuple_, type_coerce, union_all
+from sqlalchemy import JSON, case, literal, text, tuple_, type_coerce, union_all
 from sqlalchemy import select as sa_select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased, selectinload
@@ -13,6 +13,7 @@ from sqlmodel.sql.expression import Select, SelectOfScalar
 
 from tracker.database.session import get_session
 from tracker.repositories.cost import later_of
+from tracker.repositories.advisory_lock import advisory_lock_key
 from tracker.database.models import (
     AgentCausedExitReason,
     TaskBreakdown,
@@ -70,6 +71,13 @@ class BenchmarkRepository:
     def get(self, org_id: UUID, benchmark_id: UUID) -> Benchmark | None:
         benchmark = self._session.get(Benchmark, benchmark_id)
         return benchmark if benchmark is not None and benchmark.org_id == org_id else None
+
+    def lock_admission(self, benchmark_id: UUID) -> None:
+        if self._session.get_bind().dialect.name == "postgresql":
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": advisory_lock_key(f"run-admission:{benchmark_id}")},
+            )
 
     def get_by_id(self, benchmark_id: UUID, *, for_update: bool = False, for_share: bool = False) -> Benchmark | None:
         return self._session.get(

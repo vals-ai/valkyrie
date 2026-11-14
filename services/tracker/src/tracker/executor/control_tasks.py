@@ -117,6 +117,16 @@ class TaskEvaluationRequest(BaseModel):
     attempt: AttemptRef
 
 
+class RemoteGraderGrantRequest(BaseModel):
+    ref: DispatchRef
+    attempt: AttemptRef
+    worker_service: str
+
+
+class RemoteGraderGrantResponse(BaseModel):
+    grant_token: str
+
+
 class TaskEvaluationResponse(BaseModel):
     phase: PhaseRef | None
     resume_state: dict[str, Any] | None
@@ -283,6 +293,14 @@ class TaskControl:
         return await self.client.call(
             "admit_direct_task", TaskEvaluationRequest(ref=self.ref, attempt=attempt), DirectAdmissionResponse
         )
+
+    async def issue_remote_grader_grant(self, attempt: AttemptRef, worker_service: str) -> str:
+        response = await self.client.call(
+            "issue_remote_grader_grant",
+            RemoteGraderGrantRequest(ref=self.ref, attempt=attempt, worker_service=worker_service),
+            RemoteGraderGrantResponse,
+        )
+        return response.grant_token
 
     async def transition(self, request: TaskMutationRequest) -> bool:
         return (await self.client.call("transition_task", request, TaskDecision)).accepted

@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import time
 from decimal import Decimal
 from uuid import UUID
 
@@ -14,8 +13,8 @@ from tracker.aws.secrets import SecretsManagerStore
 from tracker.aws.tags import ORG_ID_TAG
 from tracker.config import (
     GATEWAY_KEY_ORGS,
-    VALKYRIE_STAGE,
     ProjectGatewayKeysMode,
+    VALKYRIE_STAGE,
     project_gateway_configuration,
     project_gateway_keys_mode,
 )
@@ -24,11 +23,14 @@ from tracker.exceptions import SecretNotFoundError
 from tracker.repositories.project import ProjectRepository
 from tracker.local import config as local_config
 from tracker.local.resources import reads_secrets_file
-from tracker.secret_access import GATEWAY_SECRET_NAME_PREFIX, tenant_secret_prefix
+from tracker.secret_access import (
+    GATEWAY_SECRET_NAME_PREFIX,
+    tenant_secret_prefix,
+)
 
 
 _GATEWAY_PATH = "admin/managed-auth/machine"
-_KEY_PUBLICATION_TIMEOUT_SECONDS = 90
+_KEY_PUBLICATION_TIMEOUT_SECONDS = 45
 _KEY_PUBLICATION_POLL_SECONDS = 5
 
 logger = logging.getLogger(__name__)
@@ -123,13 +125,12 @@ async def _collect_project_gateway_key(project: Project, org: Org, secret_store:
 
 
 async def _wait_for_gateway_to_accept(client: httpx.AsyncClient, secret: str, project: Project) -> None:
-    deadline = time.monotonic() + _KEY_PUBLICATION_TIMEOUT_SECONDS
     try:
-        while (await client.get("registry", headers={"Authorization": f"Bearer {secret}"})).status_code == 401:
-            if time.monotonic() >= deadline:
-                logger.warning("Gateway still rejects the new key for project %s; starting anyway", project.handle)
-                return
-            await asyncio.sleep(_KEY_PUBLICATION_POLL_SECONDS)
+        async with asyncio.timeout(_KEY_PUBLICATION_TIMEOUT_SECONDS):
+            while (await client.get("registry", headers={"Authorization": f"Bearer {secret}"})).status_code == 401:
+                await asyncio.sleep(_KEY_PUBLICATION_POLL_SECONDS)
+    except TimeoutError:
+        logger.warning("Gateway still rejects the new key for project %s; starting anyway", project.handle)
     except httpx.TransportError:
         logger.warning(
             "Could not reach the Gateway to check the new key for project %s; starting anyway", project.handle
@@ -137,10 +138,18 @@ async def _wait_for_gateway_to_accept(client: httpx.AsyncClient, secret: str, pr
 
 
 def _prepare_project_gateway_key(
-    bind: Engine | Connection, project_id: UUID, org: Org, secret_store: SecretsManagerStore
+    bind: Engine | Connection, project: Project, org: Org, secret_store: SecretsManagerStore
 ) -> dict[str, str]:
+    if project.org_id != org.id:
+        raise HTTPException(status_code=404, detail=f"Project {project.id} not found")
+    if project.gateway_key_id is not None:
+        reference = _gateway_secret_reference(org, project.gateway_key_id)
+        return {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}
     with Session(bind, expire_on_commit=False) as session:
-        project = ProjectRepository(session).get_by_id(org.id, project_id, lock="update")
+        repository = ProjectRepository(session)
+        repository.lock_gateway_key(project.id)
+        project_id = project.id
+        project = repository.get_by_id(org.id, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
         if project.gateway_key_id is None:
@@ -150,12 +159,12 @@ def _prepare_project_gateway_key(
                     detail=f"Project '{project.handle}' has no Gateway key request; configure its Gateway binding before starting a run",
                 )
             collected = asyncio.run(_collect_project_gateway_key(project, org, secret_store))
-            project.gateway_key_id = ProjectRepository(session).set_gateway_key(project, collected)
+            project.gateway_key_id = repository.set_gateway_key(project, collected)
         reference = _gateway_secret_reference(org, project.gateway_key_id)
         return {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}
 
 
 async def prepare_project_gateway_key(
-    bind: Engine | Connection, project_id: UUID, org: Org, secret_store: SecretsManagerStore
+    bind: Engine | Connection, project: Project, org: Org, secret_store: SecretsManagerStore
 ) -> dict[str, str]:
-    return await asyncio.to_thread(_prepare_project_gateway_key, bind, project_id, org, secret_store)
+    return await asyncio.to_thread(_prepare_project_gateway_key, bind, project, org, secret_store)

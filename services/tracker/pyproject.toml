@@ -25,6 +25,7 @@ dependencies = [
   "create-benchmark-service>=0.39.1",
   "aioboto3>=7.0.0",
   "aiobotocore>=3.4.0",
+  "anyio>=4.14.2",
   "modal>=1.6.4.dev2",
 ]
 
@@ -61,7 +62,7 @@ default-groups = ["dev", "database"]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/executor_protocol.py" }, { file = "src/metric_process.py" }]
 
 [tool.uv.sources]
-create-benchmark-service = { git = "https://github.com/vals-ai/create-benchmark-service.git", tag = "v0.73.1" }
+create-benchmark-service = { git = "https://github.com/vals-ai/create-benchmark-service.git", tag = "v0.74.0" }
 
 [tool.hatch.metadata]
 allow-direct-references = true

@@ -64,7 +64,7 @@ async def task_scoped_gateway_key(
 
     api_key = env_vars["MODEL_GATEWAY_API_KEY"]
     mint = partial(
-        _mint_lease,
+        mint_gateway_lease,
         url,
         api_key,
         run_id=run_id,
@@ -74,6 +74,7 @@ async def task_scoped_gateway_key(
         identity=identity,
         egress=egress,
         operations=None,
+        ttl_seconds=GATEWAY_TOKEN_TTL_SECONDS,
         allow_provider_tools=allow_provider_tools,
     )
     lease = await mint()
@@ -155,7 +156,7 @@ async def child_gateway_token(
 
 
 @dataclass(frozen=True)
-class _Lease:
+class GatewayLease:
     token: str = field(repr=False)
     lease_id: str
     expires_at: float
@@ -163,15 +164,15 @@ class _Lease:
 
 @dataclass
 class GatewayTokenRotation:
-    lease: _Lease | None = None
-    _mint: Callable[[], Awaitable[_Lease]] | None = None
-    _revoke: Callable[[_Lease], Awaitable[None]] | None = None
+    lease: GatewayLease | None = None
+    _mint: Callable[[], Awaitable[GatewayLease]] | None = None
+    _revoke: Callable[[GatewayLease], Awaitable[None]] | None = None
 
     def arm(
         self,
-        lease: _Lease,
-        mint: Callable[[], Awaitable[_Lease]],
-        revoke: Callable[[_Lease], Awaitable[None]],
+        lease: GatewayLease,
+        mint: Callable[[], Awaitable[GatewayLease]],
+        revoke: Callable[[GatewayLease], Awaitable[None]],
     ) -> None:
         self.lease, self._mint, self._revoke = lease, mint, revoke
 
@@ -234,7 +235,7 @@ async def _sandbox_command(sandbox: Sandbox, command: str) -> None:
         raise RuntimeError(f"Writing the gateway token failed ({result.exit_code}): {result.output[-500:]}")
 
 
-async def _mint_lease(
+async def mint_gateway_lease(
     url: str,
     api_key: str,
     *,
@@ -245,8 +246,9 @@ async def _mint_lease(
     identity: dict[str, str],
     egress: EgressPolicy,
     operations: list[str] | None,
+    ttl_seconds: int,
     allow_provider_tools: bool = False,
-) -> _Lease:
+) -> GatewayLease:
     response = await _client.post(
         f"{url}/service-auth",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -257,7 +259,7 @@ async def _mint_lease(
             "allowed_models": allowed_models,
             "identity": identity,
             "egress": egress,
-            "ttl_seconds": GATEWAY_TOKEN_TTL_SECONDS,
+            "ttl_seconds": ttl_seconds,
             **({"allowed_operations": operations} if operations is not None else {}),
             **({"allow_provider_tools": True} if allow_provider_tools else {}),
         },
@@ -265,7 +267,7 @@ async def _mint_lease(
     )
     response.raise_for_status()
     body = response.json()
-    lease = _Lease(body["token"], body["lease_id"], body["expires_at"])
+    lease = GatewayLease(body["token"], body["lease_id"], body["expires_at"])
     expires = datetime.fromtimestamp(lease.expires_at, UTC).isoformat()
     logger.info(
         "Scoped gateway credential to %s for task %s (lease %s, expires %s)",
@@ -277,15 +279,19 @@ async def _mint_lease(
     return lease
 
 
-async def _revoke_lease(url: str, api_key: str, lease: _Lease) -> None:
+async def revoke_gateway_lease(url: str, api_key: str, lease_id: str) -> None:
+    response = await _client.post(
+        f"{url}/service-auth/revoke",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"lease_id": lease_id},
+        timeout=5.0,
+    )
+    response.raise_for_status()
+
+
+async def _revoke_lease(url: str, api_key: str, lease: GatewayLease) -> None:
     try:
-        response = await _client.post(
-            f"{url}/service-auth/revoke",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"lease_id": lease.lease_id},
-            timeout=5.0,
-        )
-        response.raise_for_status()
+        await revoke_gateway_lease(url, api_key, lease.lease_id)
     except httpx.HTTPError as exc:
         logger.warning("Could not revoke gateway lease %s: %s: %s", lease.lease_id, type(exc).__name__, exc)
 
@@ -304,7 +310,7 @@ async def _gateway_lease(
     operations: list[str] | None,
     allow_provider_tools: bool = False,
 ) -> AsyncGenerator[str]:
-    lease = await _mint_lease(
+    lease = await mint_gateway_lease(
         url,
         api_key,
         run_id=run_id,
@@ -315,6 +321,7 @@ async def _gateway_lease(
         egress=egress,
         operations=operations,
         allow_provider_tools=allow_provider_tools,
+        ttl_seconds=GATEWAY_TOKEN_TTL_SECONDS,
     )
     try:
         yield lease.token

@@ -98,6 +98,7 @@ def live_api_client(
         yield tracker_database
 
     monkeypatch.setitem(app.dependency_overrides, get_session, get_test_session)
+    monkeypatch.setattr("tracker.database.session.engine", tracker_database.bind)
     monkeypatch.setitem(
         app.dependency_overrides,
         get_current_org,

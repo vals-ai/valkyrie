@@ -94,17 +94,32 @@ def test_exactly_one_of_the_running_loops_sweeps(sweeps: Sweeps, loops_running: 
     assert len(sweepers_while_running) == 1
 
 
-@pytest.mark.description("The lock holder sweeps sandbox costs about once per tick.")
-def test_a_leader_sweeps_once_per_tick(sweeps: Sweeps) -> None:
-    with running(2):
-        wait_until(lambda: len(sweeps.by_thread) >= 3)
-        started = time.monotonic()
-        count_at_start = len(sweeps.by_thread)
-        time.sleep(TICK_SECONDS * 10)
-        sweeps_since = len(sweeps.by_thread) - count_at_start
-        ticks_since = (time.monotonic() - started) / TICK_SECONDS
+@pytest.mark.description("The lock holder sweeps sandbox costs once per tick.")
+def test_a_leader_sweeps_once_per_tick(sweeps: Sweeps, monkeypatch: pytest.MonkeyPatch) -> None:
+    leader = Loop()
+    tick_reached = threading.Event()
+    next_tick = threading.Event()
 
-    assert ticks_since * 0.6 <= sweeps_since <= ticks_since + 1
+    def wait_for_tick(timeout: float | None = None) -> bool:
+        assert timeout == TICK_SECONDS
+        tick_reached.set()
+        assert next_tick.wait(WAIT_SECONDS)
+        next_tick.clear()
+        return leader.stop_event.is_set()
+
+    monkeypatch.setattr(leader.stop_event, "wait", wait_for_tick)
+    leader.thread.start()
+    try:
+        for expected_sweeps in range(1, 6):
+            assert tick_reached.wait(WAIT_SECONDS)
+            assert len(sweeps.by_thread) == expected_sweeps
+            tick_reached.clear()
+            if expected_sweeps < 5:
+                next_tick.set()
+    finally:
+        leader.stop_event.set()
+        next_tick.set()
+        leader.stop()
 
 
 @pytest.mark.description("A sweep that raises keeps its advisory lock, and only one worker keeps sweeping.")

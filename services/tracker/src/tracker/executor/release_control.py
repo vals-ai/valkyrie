@@ -145,8 +145,8 @@ def active_executor_release_work(session: Session) -> ActiveExecutorReleaseWork:
     )
 
 
-def _get_open_executor_admission(session: Session, *, for_update: bool) -> ExecutorAdmission:
-    admission = ExecutorReleaseRepository(session).admission(for_update=for_update)
+def _get_open_executor_admission(session: Session, *, for_update: bool, for_share: bool = False) -> ExecutorAdmission:
+    admission = ExecutorReleaseRepository(session).admission(for_update=for_update, for_share=for_share)
     if admission is None:
         raise ReleaseControlError("No active executor release is configured")
     if admission.maintenance_target_sha is not None:
@@ -158,12 +158,14 @@ def lock_executor_admission(session: Session) -> ExecutorAdmission:
     return _get_open_executor_admission(session, for_update=True)
 
 
-def select_active_release(session: Session, *, for_update: bool = False) -> ExecutorRelease:
-    admission = _get_open_executor_admission(session, for_update=for_update)
+def select_active_release(session: Session, *, for_update: bool = False, for_share: bool = False) -> ExecutorRelease:
+    if for_update and for_share:
+        raise ValueError("Select either an exclusive or a shared admission lock")
+    admission = _get_open_executor_admission(session, for_update=for_update, for_share=for_share)
     if admission.release_id is None:
         raise ReleaseControlError("No active executor release is configured")
 
-    release = ExecutorReleaseRepository(session).get(admission.release_id)
+    release = ExecutorReleaseRepository(session).get(admission.release_id, for_share=for_share)
     if release is None or release.status != ExecutorReleaseStatus.ACTIVE:
         raise ReleaseControlError("No active executor release is configured")
     return release

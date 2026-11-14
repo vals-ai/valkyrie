@@ -124,7 +124,7 @@ def requests(
     [
         ([{"id": "acme", "admin": True}, {"id": "beta", "admin": False}], [], "  acme (admin)\n  beta\n"),
         ([], ["acme"], "  acme (invited; run `valkyrie org accept acme`)\n"),
-        ([], [], "You're not in an organization yet. Ask Vals AI to add you"),
+        ([], [], "You're not in an organization yet. Run `valkyrie org create my-team` to create one"),
     ],
 )
 def test_login_saves_a_session_and_lists_the_organizations(requests: list[httpx.Request], listing: str) -> None:

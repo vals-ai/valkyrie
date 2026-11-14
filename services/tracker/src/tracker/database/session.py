@@ -1,7 +1,9 @@
 import asyncio
 from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
+import anyio.to_thread
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -14,8 +16,9 @@ logger = get_logger(__name__)
 _exposed_models: list[type[SQLModel]] = [Benchmark, EvaluationResult, Org, Task]
 
 engine = create_engine(build_database_url(), poolclass=NullPool)
-SERVER_POOL_SIZE = 10
-SERVER_POOL_OVERFLOW = 10
+SERVER_POOL_SIZE = 25
+SERVER_POOL_OVERFLOW = 25
+SERVER_THREADS = SERVER_POOL_SIZE + SERVER_POOL_OVERFLOW
 SERVER_POOL_RECYCLE_SECONDS = 1800
 server_engine = create_engine(
     build_database_url(),
@@ -25,6 +28,13 @@ server_engine = create_engine(
     pool_recycle=SERVER_POOL_RECYCLE_SECONDS,
 )
 _Result = TypeVar("_Result")
+
+
+def configure_server_threads() -> None:
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=SERVER_THREADS, thread_name_prefix="tracker-database")
+    )
+    anyio.to_thread.current_default_thread_limiter().total_tokens = SERVER_THREADS
 
 
 def get_session() -> Generator[Session, Any, None]:

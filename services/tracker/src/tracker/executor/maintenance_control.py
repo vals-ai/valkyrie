@@ -8,6 +8,8 @@ from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.executor.release_control import ReleaseControlError, get_executor_admission
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
+from tracker.remote_grader import attempt_id_for
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.repositories.executor_release import ExecutorReleaseRepository
 
 
@@ -44,6 +46,7 @@ def begin_maintenance(session: Session, *, target_sha: str) -> MaintenanceStopSu
     )
     for task in tasks:
         task.status = TaskStatus.STOPPED
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
         benchmark_repository.save(task)
     dispatches = ExecutorDispatchRepository(session).lock_active()
     for dispatch in dispatches:

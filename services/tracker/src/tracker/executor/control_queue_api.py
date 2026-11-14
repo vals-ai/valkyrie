@@ -43,6 +43,8 @@ from tracker.executor.control_store import (
 from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.executor.release_control import share_executor_admission
 from tracker.repositories.advisory_lock import QueuePoolAdvisoryLock
+from tracker.remote_grader import attempt_id_for
+from tracker.repositories.remote_grader import RemoteGraderRepository
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.repositories.sandbox_build_reservation import SandboxBuildReservationRepository
@@ -406,8 +408,11 @@ def _build(body: QueueBuildRequest, request: Request, session: Session, *, finis
         reservation.phase_token = None
         SandboxBuildReservationRepository(session).save(reservation)
         SchedulerRepository(session).release_reservation(task.id, body.attempt.started_at)
+        if started:
+            task.build_phase_dispatch_id = body.ref.dispatch_id
+            BenchmarkRepository(session).save(task)
     else:
-        task.build_phase_dispatch_id = None
+        task.build_phase_dispatch_id = body.ref.dispatch_id if finish else None
         task.build_phase_token = None
         if finish:
             task.status = TaskStatus.IN_PROGRESS
@@ -628,6 +633,7 @@ def reconcile(
         and task.status == TaskStatus.BUILDING
         and owner_benchmark.status == BenchmarkStatus.IN_PROGRESS
     ):
+        RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
         task.status = TaskStatus.PENDING
         task.started_at = max(task.started_at + timedelta(microseconds=1), now)
     if not stale_attempt:

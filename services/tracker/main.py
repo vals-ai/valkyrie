@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Buffer, Mapping, Sequ
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import json
+import os
 from datetime import UTC, datetime
 from typing import Annotated, Any, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
@@ -16,6 +17,7 @@ from benchmark_service import BenchmarkServiceClient
 from benchmark_service.client import BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from benchmark_service.schemas import ResolveDatasetResponse, VerifyTaskIdsResponse
 from benchmark_service.schemas import DatasetVersion as BenchmarkDatasetVersion
+from tracker.clients.projects import ProjectServiceUnavailableError
 from botocore.config import Config
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -44,6 +46,7 @@ from tracker.api.single_task import router as single_task_router
 from tracker.api.run_artifacts import router as run_artifacts_router
 from tracker.api.providers import router as providers_router
 from tracker.repositories.provider_secret import ProviderSecretRepository
+from tracker.api.remote_grader import router as remote_grader_router
 from tracker.api.run_settings import router as run_settings_router, user_run_settings
 from tracker.api.benchmark_definitions import router as benchmark_definitions_router
 from tracker.api.dataset_versions import router as dataset_versions_router
@@ -56,6 +59,7 @@ from tracker.repositories.run_settings import RunSettingsRepository
 from tracker.repositories.scheduler import SchedulerRepository
 from tracker.api.projects import (
     find_project,
+    preliminary_projects,
     reject_archived_project,
     reject_missing_project,
     router as projects_router,
@@ -132,12 +136,13 @@ from tracker.executor.dispatch_control import (
 )
 from tracker.executor.dispatch_payload import PayloadKey, generate_payload_key, seal_payload
 from tracker.executor.launcher import launch_dispatch
-from tracker.database.session import check_database_connection, database_call, get_session
+from tracker.database.session import check_database_connection, configure_server_threads, database_call, get_session
+from tracker.services.projects import migrate_projects
 from tracker.services.datasets.oracle import ORACLE_AGENT, ORACLE_CONTRACT
 from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDataset
 from tracker.services.datasets.scoring import scorer_for
 from tracker.clients.dataset_tasks import TaskSelectionError, dataset_service
-from tracker.clients.projects import project_service_reader
+from tracker.clients.projects import project_service
 from tracker.services.datasets.version_ref import parse_version_ref
 from tracker.services.datasets.versions import UnresolvedDatasetError, dataset_tasks
 from tracker.docent_analysis import (
@@ -147,12 +152,10 @@ from tracker.exceptions import (
     AmbiguousDigestError,
     InvalidSandboxConfigurationError,
     LambdaError,
-    ProjectServiceUnavailableError,
     RunLimitExceededError,
     SecretNotFoundError,
     TrackerServiceError,
 )
-from tracker.clients.projects import project_service_writer
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.local.runtime import LocalRuntimeFactory
@@ -168,7 +171,12 @@ from tracker.executor.dispatch_recovery import AutomaticDispatchRecovery
 from tracker.scheduler.coordinator import SharedPoolScheduler
 from tracker.scheduler.service_capacity import API_WAKE_SECONDS, ServiceCapacityScheduler, wake_benchmark_service
 from tracker.executor.release_retirement import AutomaticReleaseRetirement
-from tracker.middleware import LocalTrustedHostMiddleware, RequestContextMiddleware, RunRequestSizeLimitMiddleware
+from tracker.middleware import (
+    LocalTrustedHostMiddleware,
+    RequestConcurrencyLimitMiddleware,
+    RequestContextMiddleware,
+    RunRequestSizeLimitMiddleware,
+)
 from tracker.observability import configure_observability
 from tracker.secret_access import may_use_shared_secrets, resolve_secret_name, validate_secret_names
 from tracker.run_access_keys import IssuedKeys, IssuedRunKey, run_service_key
@@ -227,7 +235,12 @@ from tracker.services.results import (
     stream_benchmark_results,
 )
 from tracker.services.failures import is_rejected_request
-from tracker.services.final_views import create_final_view, final_view_s3_key, upload_final_view
+from tracker.services.final_views import (
+    create_final_view,
+    final_view_s3_key,
+    stored_final_view_key,
+    upload_final_view,
+)
 from tracker.api.storage_errors import storage_errors
 from tracker.services.runs.attempts import record_prior_attempts
 from tracker.services.runs.limits import RUN_LIMIT_RETRY_AFTER_SECONDS, AutomaticRunLimitsRefresh, ensure_run_capacity
@@ -238,7 +251,7 @@ from tracker.services.runs.retry import (
     regrade_rerun_error,
     reset_to_in_progress_status,
 )
-from tracker.services.runs.stop import apply_shed_benchmark, initiate_stop_benchmark
+from tracker.services.runs.stop import apply_shed_benchmark, commit_stop_benchmark, stop_executor_tasks
 from tracker.services.sandboxes import ForceStopError, capture_stop_sandboxes, force_stop_sandboxes, sandbox_generator
 from tracker.services.tasks.execute import task_attempt_id
 
@@ -250,6 +263,7 @@ logger = get_logger(__name__)
 _COMPLETION_CALLBACK_CONFIG = Config(read_timeout=60, retries={"total_max_attempts": 1})
 
 _TaskResult = TypeVar("_TaskResult")
+_executor_launch_tasks: set[asyncio.Task[None]] = set()
 
 
 def _operation_id(route: APIRoute) -> str:
@@ -258,8 +272,9 @@ def _operation_id(route: APIRoute) -> str:
 
 @asynccontextmanager
 async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-    _ = project_service_reader()
-    _ = project_service_writer()
+    configure_server_threads()
+    _ = project_service()
+    await database_call(migrate_projects)
     retirement = AutomaticReleaseRetirement()
     dispatch_recovery = AutomaticDispatchRecovery()
     sandbox_cost = AutomaticSandboxCost()
@@ -288,6 +303,7 @@ app = FastAPI(generate_unique_id_function=_operation_id, redirect_slashes=False,
 logfire.instrument_fastapi(app, excluded_urls="/health$")
 
 app.add_middleware(RunRequestSizeLimitMiddleware)
+app.add_middleware(RequestConcurrencyLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(LocalTrustedHostMiddleware)
 
@@ -307,6 +323,7 @@ app.include_router(run_artifacts_router)
 app.include_router(providers_router)
 app.include_router(run_settings_router)
 app.include_router(secrets_router)
+app.include_router(remote_grader_router)
 app.include_router(projects_router)
 v1 = APIRouter(prefix="/v1")
 v1.include_router(benchmark_definitions_router)
@@ -378,9 +395,12 @@ def _resolve_enqueue_failure(
     benchmark_id: UUID,
     dispatch_id: UUID,
     task_ids: list[str],
+    error_message: str = "Executor dispatch enqueue failed",
 ) -> EnqueueFailureResolution:
     with Session(bind) as session:
-        return resolve_enqueue_failure(session, benchmark_id=benchmark_id, dispatch_id=dispatch_id, task_ids=task_ids)
+        return resolve_enqueue_failure(
+            session, benchmark_id=benchmark_id, dispatch_id=dispatch_id, task_ids=task_ids, error_message=error_message
+        )
 
 
 class _TaskFailedAfterCancellation(Exception):
@@ -430,6 +450,7 @@ async def _launch_executor_dispatch(
             dispatch.benchmark_id,
             dispatch.id,
             verified_task_ids,
+            f"Executor launch failed: {str(exc) or type(exc).__name__}",
         )
         if resolution == EnqueueFailureResolution.DELIVERED:
             return
@@ -443,6 +464,48 @@ async def _launch_executor_dispatch(
                 "executor_dispatch_id": str(dispatch.id),
             },
         ) from exc
+
+
+def _executor_launch_finished(task: asyncio.Task[None]) -> None:
+    _executor_launch_tasks.discard(task)
+    if task.cancelled():
+        logger.warning("Background executor launch cancelled before completion")
+        return
+    if error := task.exception():
+        logger.error("Background executor launch failed", exc_info=error)
+
+
+async def _background_executor_launch(
+    dispatch: ExecutorDispatch, bind: Engine | Connection, verified_task_ids: list[str]
+) -> None:
+    with Session(bind) as session:
+        await _launch_executor_dispatch(dispatch, session=session, verified_task_ids=verified_task_ids)
+
+
+async def _enqueue_executor_dispatch(
+    dispatch: ExecutorDispatch,
+    *,
+    session: Session,
+    verified_task_ids: list[str],
+    cancellation: asyncio.CancelledError | None,
+) -> asyncio.CancelledError | None:
+    if os.environ.get("EXECUTOR_LAUNCHER") == "ecs":
+        task = asyncio.create_task(
+            _background_executor_launch(
+                ExecutorDispatch.model_validate(dispatch.model_dump()), session.get_bind(), list(verified_task_ids)
+            )
+        )
+        _executor_launch_tasks.add(task)
+        task.add_done_callback(_executor_launch_finished)
+        return cancellation
+    task = asyncio.create_task(
+        _launch_executor_dispatch(dispatch, session=session, verified_task_ids=verified_task_ids)
+    )
+    try:
+        _, cancellation = await _await_before_cancellation(task, cancellation)
+    except _TaskFailedAfterCancellation as failure:
+        raise failure.cancellation from failure.task_error
+    return cancellation
 
 
 async def _delete_uncommitted_agent_copy(
@@ -529,15 +592,17 @@ async def tracker_service_error_handler(request: Request, exc: TrackerServiceErr
     return JSONResponse(status_code=500, content={"detail": "Tracker service operation failed"})
 
 
-@app.exception_handler(ProjectServiceUnavailableError)
-async def project_service_unavailable_handler(_request: Request, exc: ProjectServiceUnavailableError):
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
-
-
 @app.exception_handler(BenchmarkServiceUnauthenticatedError)
 async def benchmark_service_unauth_error_handler(_request: Request, exc: BenchmarkServiceUnauthenticatedError):
     logger.warning("Benchmark service authentication failed: %s", exc)
     raise HTTPException(status_code=502, detail="Benchmark service authentication failed") from exc
+
+
+@app.exception_handler(ProjectServiceUnavailableError)
+async def project_service_unavailable_handler(request: Request, exc: ProjectServiceUnavailableError):
+    logger.warning("Project service unavailable on %s %s: %s", request.method, request.url.path, exc)
+    sentry_sdk.capture_exception(exc)
+    return JSONResponse(status_code=503, content={"detail": "Project service unavailable, try again."})
 
 
 @app.exception_handler(BenchmarkServiceError)
@@ -659,9 +724,9 @@ def _authorize_secret_names(request: StartBenchmarkRequest, org: Org) -> StartBe
 
 
 async def _with_project_gateway_secrets(
-    request: StartBenchmarkRequest, project_id: UUID, org: Org, bind: Engine | Connection
+    request: StartBenchmarkRequest, project: Project, org: Org, bind: Engine | Connection
 ) -> StartBenchmarkRequest:
-    references = await prepare_project_gateway_key(bind, project_id, org, secret_store(org))
+    references = await prepare_project_gateway_key(bind, project, org, secret_store(org))
     return request.model_copy(
         update={"contract": request.contract.model_copy(update={"secrets": request.contract.secrets | references})}
     )
@@ -749,19 +814,16 @@ def _commit_start(
             repository = BenchmarkRepository(session)
             projects = ProjectRepository(session)
             linked = None
-            if project_id is not None and projects.reads_from_service:
+            if project_id is not None:
                 linked = projects.get_for_link(benchmark.org_id, project_id)
             if request.admission_id is not None:
-                lock_executor_admission(session)
+                repository.lock_admission(benchmark.id)
                 if repository.get_by_id(benchmark.id) is not None:
                     raise RepeatedAdmissionError(str(benchmark.id))
             if project_id is not None:
                 reject_archived_project(linked or projects.get_for_link(benchmark.org_id, project_id))
             repository.add_tasks(benchmark.org_id, benchmark.id, task_ids)
-            dispatch = admit_start_dispatch(session, benchmark=benchmark, dispatch_id=dispatch_id, task_ids=task_ids)
-            _ensure_run_capacity(session, benchmark.org_id, benchmark.id)
             payload = _process_benchmark_kwargs(benchmark, request, task_ids)
-            _persist_dispatch_payload(session, dispatch, payload, telemetry_context, payload_key)
             repository.save(*(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark.id) for key in issued_keys))
             if project_id is not None:
                 repository.save(
@@ -771,6 +833,9 @@ def _commit_start(
                         created_by_email=benchmark.started_by_email,
                     )
                 )
+            dispatch = admit_start_dispatch(session, benchmark=benchmark, dispatch_id=dispatch_id, task_ids=task_ids)
+            _ensure_run_capacity(session, benchmark.org_id, benchmark.id)
+            _persist_dispatch_payload(session, dispatch, payload, telemetry_context, payload_key)
             session.commit()
             return benchmark.model_dump_json(), _admission_result(dispatch, task_ids)
         except Exception as exc:
@@ -942,7 +1007,7 @@ async def start_benchmark(
         request = request.model_copy(update={"contract": ORACLE_CONTRACT})
     projects = ProjectRepository(session)
     named_project = (
-        await asyncio.to_thread(find_project, projects, run_starter.org.id, request.project)
+        await preliminary_projects.get(projects, run_starter.org.id, request.project)
         if request.project is not None
         else None
     )
@@ -968,7 +1033,7 @@ async def start_benchmark(
             raise HTTPException(status_code=400, detail=str(error)) from error
         if not reads_secrets_file(local_config.resources):
             if named_project is not None and selects_project_gateway_key(run_starter.org):
-                request = await _with_project_gateway_secrets(request, named_project.id, run_starter.org, bind)
+                request = await _with_project_gateway_secrets(request, named_project, run_starter.org, bind)
                 selected_project_gateway_root = True
             request = _authorize_secret_names(request, run_starter.org)
         runtime = LocalRuntimeFactory.create_runtime(
@@ -1006,7 +1071,7 @@ async def start_benchmark(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if named_project is not None and selects_project_gateway_key(run_starter.org):
-            request = await _with_project_gateway_secrets(request, named_project.id, run_starter.org, bind)
+            request = await _with_project_gateway_secrets(request, named_project, run_starter.org, bind)
             selected_project_gateway_root = True
         request = _authorize_secret_names(request, run_starter.org)
 
@@ -1195,7 +1260,7 @@ async def start_benchmark(
             raise cancellation_after_failure from exc
         if isinstance(exc, ReleaseControlError):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        if isinstance(exc, HTTPException):
+        if isinstance(exc, HTTPException | ProjectServiceUnavailableError):
             raise exc
         raise TrackerServiceError("Failed to admit benchmark execution") from exc
     bind_failure: Exception | None = None
@@ -1216,17 +1281,12 @@ async def start_benchmark(
             run_starter.access_key_id,
         )
 
-    launch_task = asyncio.create_task(
-        _launch_executor_dispatch(
-            executor_dispatch,
-            session=session,
-            verified_task_ids=verify_response.task_ids,
-        )
+    cancellation = await _enqueue_executor_dispatch(
+        executor_dispatch,
+        session=session,
+        verified_task_ids=verify_response.task_ids,
+        cancellation=cancellation,
     )
-    try:
-        _, cancellation = await _await_before_cancellation(launch_task, cancellation)
-    except _TaskFailedAfterCancellation as failure:
-        raise failure.cancellation from failure.task_error
     if cancellation is not None:
         if bind_failure is not None:
             raise cancellation from bind_failure
@@ -1415,10 +1475,12 @@ async def analyze_benchmark(
         "s3_bucket": aws_runtime.resources.s3_bucket,
         "contract": {"name": benchmark_row.arguments.contract.name},
     }
+    benchmark_id = benchmark_row.id
+    session.close()
 
     return StreamingResponse(
         analyze_event_stream(
-            benchmark_id=benchmark_row.id,
+            benchmark_id=benchmark_id,
             lambda_function=body.lambda_function,
             payload=payload,
             clients=aws_runtime.clients,
@@ -1453,13 +1515,15 @@ async def _recompute_final_evaluation(
     if task_ids is not None:
         scored_results = {task_id: result for task_id, result in scored_results.items() if task_id in task_ids}
 
-    if benchmark_row.arguments.dataset_ref is not None:
-        ref = benchmark_row.arguments.dataset_ref
-        script_digest = (
-            DatasetVersionRepository(session).metric_digest(ref.dataset_id, ref.revision)
-            if isinstance(ref, HostedDataset) and ref.dataset_id is not None and ref.revision is not None
-            else None
-        )
+    ref = benchmark_row.arguments.dataset_ref
+    script_digest = (
+        DatasetVersionRepository(session).metric_digest(ref.dataset_id, ref.revision)
+        if isinstance(ref, HostedDataset) and ref.dataset_id is not None and ref.revision is not None
+        else None
+    )
+    session.commit()
+
+    if ref is not None:
         scorer = await scorer_for(ref, org.id, script_digest, get_agent_library_runtime(org).objects)
         scored = await scorer.score(scored_results)
         return FinalEvaluation(
@@ -1575,6 +1639,7 @@ async def _retrieve_results(
     if not s3:
         return final_view
 
+    session.commit()
     if isinstance(benchmark_row.arguments.properties, LocalResources):
         raise HTTPException(status_code=400, detail="S3 export requires S3 storage")
     aws_runtime = resolve_run_aws_runtime(
@@ -1582,9 +1647,12 @@ async def _retrieve_results(
         org=_org_context(org),
     )
 
-    if preview:
-        await _archive_final_view(benchmark_row, aws_runtime)
-    s3_key = await upload_final_view(final_view, S3ObjectStore(aws_runtime))
+    object_store = S3ObjectStore(aws_runtime)
+    s3_key = await stored_final_view_key(final_view, object_store) if preview else None
+    if s3_key is None:
+        if preview:
+            await _archive_final_view(benchmark_row, aws_runtime)
+        s3_key = await upload_final_view(final_view, object_store)
     if preview:
         await _invoke_preview_lambda(benchmark_row, aws_runtime)
     return await _s3_results_response(s3_key, aws_runtime)
@@ -1767,8 +1835,6 @@ async def stop_benchmark(
         if any(not attempt.strip() for attempt in expected_attempt_ids.values()):
             raise HTTPException(status_code=422, detail="expected_attempt_ids values must not be blank")
 
-    get_executor_admission(session, for_update=True)
-
     valid_stop_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPING]
     if force and expected_attempt_ids is not None:
         valid_stop_states.append(BenchmarkStatus.STOPPED)
@@ -1785,17 +1851,10 @@ async def stop_benchmark(
 
     runtime = _force_stop_runtime(benchmark_row, org) if force else None
 
-    benchmark_row = await database_call(lambda: fetch_benchmark_row(benchmark_id, session, org, for_update=True))
-    if benchmark_row.status not in valid_stop_states:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state. Can only pause an in progress or error run.",
-        )
-
     captured_sandboxes = None
     if expected_attempt_ids is not None:
         tasks = await database_call(
-            lambda: BenchmarkRepository(session).lock_tasks(org.id, benchmark_id, task_ids=selected_task_ids or [])
+            lambda: BenchmarkRepository(session).list_tasks(org.id, benchmark_id, task_ids=selected_task_ids or [])
         )
         if len(tasks) != len(expected_attempt_ids) or any(
             task_attempt_id(task.id, task.started_at) != expected_attempt_ids[task.task_id] for task in tasks
@@ -1811,7 +1870,10 @@ async def stop_benchmark(
                     status_code=503, detail="Unable to capture force-stop targets; retry the request"
                 ) from None
 
-    await initiate_stop_benchmark(benchmark_row, session, force, org, task_ids=selected_task_ids)
+    benchmark_row, task_arns = await database_call(
+        lambda: _commit_stop(benchmark_id, session, force, org, selected_task_ids, expected_attempt_ids)
+    )
+    await stop_executor_tasks(task_arns)
 
     if runtime is not None:
         if expected_attempt_ids is None:
@@ -1827,6 +1889,34 @@ async def stop_benchmark(
                 ) from None
 
     return StopBenchmarkResponse(status="success")
+
+
+def _commit_stop(
+    benchmark_id: UUID,
+    session: Session,
+    force: bool,
+    org: Org,
+    task_ids: list[str] | None,
+    expected_attempt_ids: dict[str, str] | None,
+) -> tuple[Benchmark, list[str]]:
+    get_executor_admission(session, for_update=True)
+    benchmark_row = fetch_benchmark_row(benchmark_id, session, org, for_update=True)
+    valid_stop_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPING]
+    if force and expected_attempt_ids is not None:
+        valid_stop_states.append(BenchmarkStatus.STOPPED)
+    if benchmark_row.status not in valid_stop_states:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {benchmark_id} is currently in the {benchmark_row.status.value} state. Can only pause an in progress or error run.",
+        )
+    if expected_attempt_ids is not None:
+        tasks = BenchmarkRepository(session).lock_tasks(org.id, benchmark_id, task_ids=task_ids or [])
+        if len(tasks) != len(expected_attempt_ids) or any(
+            task_attempt_id(task.id, task.started_at) != expected_attempt_ids[task.task_id] for task in tasks
+        ):
+            raise HTTPException(status_code=409, detail="Task attempt has changed")
+    task_arns = commit_stop_benchmark(benchmark_row, session, force, org, task_ids)
+    return benchmark_row, task_arns
 
 
 def _update_benchmark_concurrency(
@@ -1962,7 +2052,8 @@ def retag_benchmark(
     identity: RequestIdentity = Depends(get_current_starter),
 ) -> ProjectResponse:
     benchmark_row = assert_org(BenchmarkRepository(session).get(identity.org.id, benchmark_id), identity.org)
-    project = find_project(ProjectRepository(session), identity.org.id, request.project)
+    projects = ProjectRepository(session)
+    project = projects.get_for_link(identity.org.id, find_project(projects, identity.org.id, request.project).id)
     BenchmarkRepository(session).save(
         RunProject(benchmark_id=benchmark_row.id, project_id=project.id, created_by_email=identity.email)
     )
@@ -2367,17 +2458,12 @@ async def retry_or_resume_benchmark(
                 _, cancellation = await _await_before_cancellation(refresh_task, cancellation)
             except _TaskFailedAfterCancellation as failure:
                 raise failure.cancellation from failure.task_error
-        launch_task = asyncio.create_task(
-            _launch_executor_dispatch(
-                ExecutorDispatch.model_validate(json.loads(result.dispatch_json)),
-                session=session,
-                verified_task_ids=list(result.verified_task_ids),
-            )
+        cancellation = await _enqueue_executor_dispatch(
+            ExecutorDispatch.model_validate(json.loads(result.dispatch_json)),
+            session=session,
+            verified_task_ids=list(result.verified_task_ids),
+            cancellation=cancellation,
         )
-        try:
-            _, cancellation = await _await_before_cancellation(launch_task, cancellation)
-        except _TaskFailedAfterCancellation as failure:
-            raise failure.cancellation from failure.task_error
     if cancellation is not None:
         raise cancellation
     return RetryOrResumeBenchmarkResponse(status="success")
@@ -2429,15 +2515,13 @@ def _commit_regrade(
         )
         try:
             projects = ProjectRepository(session)
-            project = _linked_project(projects, source_id) if projects.reads_from_service else None
+            project = _linked_project(projects, source_id)
             if _regrade_source(session, org, source_id, for_update=True).tasks != tasks:
                 raise HTTPException(status_code=409, detail="Source run changed during regrade; retry the request.")
             dispatch = admit_start_dispatch(session, benchmark=run, dispatch_id=dispatch_id, task_ids=tasks.task_ids)
             _ensure_run_capacity(session, run.org_id, run.id)
             repository = BenchmarkRepository(session)
             repository.add_tasks_with_errors(*regrade_task_rows(run, tasks, dispatch.created_at))
-            if not projects.reads_from_service:
-                project = _linked_project(projects, source_id)
             if project is not None:
                 repository.save(
                     RunProject(benchmark_id=run.id, project_id=project.id, created_by_email=run.started_by_email)
@@ -2563,17 +2647,12 @@ async def regrade_benchmark(
         result, cancellation = await _await_before_cancellation(commit_task)
     except _TaskFailedAfterCancellation as failure:
         raise failure.cancellation from failure.task_error
-    launch_task = asyncio.create_task(
-        _launch_executor_dispatch(
-            ExecutorDispatch.model_validate(json.loads(result.dispatch_json)),
-            session=session,
-            verified_task_ids=list(result.verified_task_ids),
-        )
+    cancellation = await _enqueue_executor_dispatch(
+        ExecutorDispatch.model_validate(json.loads(result.dispatch_json)),
+        session=session,
+        verified_task_ids=list(result.verified_task_ids),
+        cancellation=cancellation,
     )
-    try:
-        _, cancellation = await _await_before_cancellation(launch_task, cancellation)
-    except _TaskFailedAfterCancellation as failure:
-        raise failure.cancellation from failure.task_error
     if cancellation is not None:
         raise cancellation
     return RegradeBenchmarkResponse(
@@ -2611,11 +2690,9 @@ def _apply_recovery(
     update_agent: bool = False,
 ) -> AdmissionResult | None:
     projects = ProjectRepository(session)
-    current_project = _linked_project(projects, benchmark_id) if projects.reads_from_service else None
+    current_project = _linked_project(projects, benchmark_id)
     get_executor_admission(session, for_update=True)
     benchmark_row = assert_org(BenchmarkRepository(session).get(org.id, benchmark_id), org)
-    if not projects.reads_from_service:
-        current_project = _linked_project(projects, benchmark_row.id)
     if selects_project_gateway_key(org) and not reads_secrets_file(benchmark_row.arguments.properties):
         if current_project is not None:
             secrets = {

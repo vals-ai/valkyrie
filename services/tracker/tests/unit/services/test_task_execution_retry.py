@@ -23,6 +23,7 @@ from benchmark_service.sandbox.local.docker import DockerSandbox
 from benchmark_service.schemas import (
     AgentInstallOrder,
     BenchmarkEgressPlan,
+    GradingRequirementsResponse,
     RetrieveTaskResponse,
     SetupTaskResponse,
     VolumeMount,
@@ -66,6 +67,96 @@ import tracker.services.tasks.execute as task_execution_module
 
 @pytest.mark.description("Task execution retries, callbacks, and transition spans.")
 class TestTaskExecutionRetry:
+    @pytest.mark.description(
+        "A discovery outage while resuming evaluation preserves the saved evaluation without restarting generation."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize("status_code", [503, 408, 429])
+    async def test_resumed_evaluation_survives_discovery_outage(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        status_code: int,
+    ) -> None:
+        contract = contract.model_copy(
+            update={"secrets": {"MODEL_GATEWAY_URL": "gateway", "MODEL_GATEWAY_API_KEY": "gateway"}}
+        )
+        request, task, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        saved_state = {"artifact_prefix": "s3://bucket/run"}
+        task.status = TaskStatus.EVALUATING
+        task.eval_resume_state = saved_state
+        control_postgres_session.add(task)
+        control_postgres_session.commit()
+        discovery = AsyncMock(side_effect=BenchmarkServiceError("discovery unavailable", status_code=status_code))
+        resume = AsyncMock(side_effect=asyncio.CancelledError)
+        retrieve = AsyncMock()
+        create = Mock()
+        monkeypatch.setattr(task_execution_module, "selected_project_gateway_reference", lambda *_args: "gateway")
+        monkeypatch.setitem(task_execution_module.WORKER_SERVICE_FOR_BENCHMARK, request.benchmark_name, "vcb")
+        monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements_response", discovery)
+        monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume)
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve)
+        monkeypatch.setattr(task_execution_module, "create_sandbox", create)
+        monkeypatch.setattr(task_execution_module, "EGRESS_PROXY", None)
+        monkeypatch.setattr(task_execution_module, "resolve_secrets", AsyncMock(return_value={}))
+        monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements", AsyncMock(return_value=[]))
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_process_task(request, task, benchmark_id, runtime_services, control)
+
+        control_postgres_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert task.eval_resume_state == saved_state
+        resume.assert_awaited_once()
+        assert resume.await_args.kwargs["eval_resume_state"] == saved_state
+        assert task.evaluation_phase_token is not None
+        retrieve.assert_not_awaited()
+        create.assert_not_called()
+        assert control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).all() == []
+
+    @pytest.mark.description(
+        "Remote grading discovery retries a transient pre-agent outage and ignores missing capabilities."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize("status_code", [503, 404])
+    async def test_remote_grading_discovery_recovers_before_agent_execution(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        status_code: int,
+    ) -> None:
+        request, task, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        discovery = AsyncMock(
+            side_effect=[
+                BenchmarkServiceError("grading discovery unavailable", status_code=status_code),
+                GradingRequirementsResponse(models=[]),
+            ]
+        )
+        monkeypatch.setattr(task_execution_module, "selected_project_gateway_reference", lambda *_args: "gateway")
+        monkeypatch.setitem(task_execution_module.WORKER_SERVICE_FOR_BENCHMARK, request.benchmark_name, "vcb")
+        monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements_response", discovery)
+        monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements", AsyncMock(return_value=[]))
+
+        result = await run_process_task(request, task, benchmark_id, runtime_services, control)
+
+        assert result == {task.task_id: {"status": "success", "score": 1.0}}
+        control_postgres_session.refresh(task)
+        assert task.status == TaskStatus.FINISHED
+        failures = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task.id)).all()
+        assert len(failures) == (1 if status_code == 503 else 0)
+        assert all(failure.retry_scheduled for failure in failures)
+        assert discovery.await_count == (2 if status_code == 503 else 1)
+
     @pytest.mark.description(
         "Agent output does not affect a cancel. The task ends `STOPPED` only when stopped and records no error."
     )

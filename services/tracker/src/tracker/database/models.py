@@ -558,12 +558,35 @@ class Project(SQLModel, table=True):
     archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
 
 
+class ProjectBackfill(SQLModel, table=True):
+    __tablename__ = "project_backfill"
+
+    project_id: UUID = Field(primary_key=True)
+    org_id: UUID
+    source_hash: str = Field(max_length=64)
+    confirmed: bool = False
+    copied_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class ProjectCutover(SQLModel, table=True):
+    __tablename__ = "project_cutover"
+
+    id: int = Field(default=1, primary_key=True)
+    completed_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
 class RunProject(SQLModel, table=True):
     __tablename__ = "run_project"
 
     id: int | None = Field(default=None, sa_column=Column(Integer, Identity(), primary_key=True))
     benchmark_id: UUID = Field(foreign_key="benchmark.id", index=True)
-    project_id: UUID = Field(foreign_key="project.id")
+    project_id: UUID
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(ZoneInfo("UTC")),
         sa_column=Column(DateTime(timezone=True), nullable=False),
@@ -716,6 +739,46 @@ def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Conne
 
     if status_changed and target.status in finished_states:
         target.finished_at = datetime.now(ZoneInfo("UTC"))
+
+
+class RemoteGraderGrant(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("task_row_id", "attempt_id", "worker_service", name="uq_remote_grader_grant_attempt_service"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token_digest: str = Field(unique=True)
+    token_ciphertext: bytes | None = Field(default=None, repr=False, sa_column=Column(LargeBinary, nullable=True))
+    org_id: UUID = Field(foreign_key="org.id")
+    task_row_id: UUID = Field(foreign_key="task.id")
+    attempt_id: str
+    worker_service: str
+    gateway_secret_ref: str
+    identity: dict[str, str] = Field(sa_column=Column(JSON, nullable=False))
+    closed_at: datetime | None = None
+
+
+class RemoteGraderRegistration(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint(
+            "worker_service", "job_id", "task_id", "attempt_id", name="uq_remote_grader_registration_remote_attempt"
+        ),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    grant_id: UUID = Field(foreign_key="remotegradergrant.id")
+    worker_service: str
+    job_id: str
+    task_id: str
+    attempt_id: str
+    allowed_models: list[str] = Field(sa_column=Column(JSON, nullable=False))
+    first_pickup_deadline: float
+    gateway_url: str | None = None
+    gateway_lease_id: str | None = None
+    token_ciphertext: bytes | None = Field(default=None, repr=False, sa_column=Column(LargeBinary, nullable=True))
+    expires_at: float | None = None
+    stopped_at: datetime | None = None
+    revoked_at: datetime | None = None
 
 
 class TaskBreakdown(SQLModel, table=True):

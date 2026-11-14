@@ -22,6 +22,7 @@ from sqlmodel import Session, col, select
 import main as main_module
 from main import app
 from executor_protocol import ExecutorDispatchStatus, SUPPORTED_PROTOCOL_VERSION
+from tests.project_service import MockProjectRoutes
 from tests.factories import make_benchmark, make_error_result, make_evaluation_result
 from tests.unit.services.task_execution_support import (
     MockLauncher,
@@ -2143,6 +2144,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_launcher: MockLauncher,
+        project_service: MockProjectRoutes,
     ) -> None:
         monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
         org = database_session.get(Org, TEST_ORG_ID)
@@ -2159,7 +2161,8 @@ class TestRunRecovery:
         benchmark.arguments.contract.secrets = saved_secrets
         original_project = Project(org_id=org.id, handle="original", name="Original", spend_type=SpendType.INTERNAL)
         current_project = Project(org_id=org.id, handle="retagged", name="Retagged", spend_type=SpendType.INTERNAL)
-        database_session.add_all([org, benchmark, original_project, current_project])
+        project_service.seed(original_project, current_project)
+        database_session.add_all([org, benchmark])
         database_session.flush()
         database_session.add_all(
             [
@@ -4290,11 +4293,11 @@ def test_stop_rejects_malformed_attempt_guards(
     benchmark.status = BenchmarkStatus.IN_PROGRESS
     database_session.add(benchmark)
     database_session.commit()
-    dispatch = AsyncMock()
-    monkeypatch.setattr(main_module, "initiate_stop_benchmark", dispatch)
+    dispatch = Mock()
+    monkeypatch.setattr(main_module, "commit_stop_benchmark", dispatch)
     response = client.post(f"/stop-benchmark/{benchmark.id}?force=true", json=body)
     assert response.status_code == 422
-    dispatch.assert_not_awaited()
+    dispatch.assert_not_called()
 
 
 @pytest.mark.description("A guarded force stop keeps a replacement sandbox.")

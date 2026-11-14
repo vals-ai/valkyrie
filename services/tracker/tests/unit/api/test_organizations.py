@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from descope.exceptions import AuthException
 from fastapi.testclient import TestClient
+from httpx import Response
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
@@ -190,7 +191,13 @@ def test_organizations_are_created_only_by_verified_logins_on_self_serve_tracker
     monkeypatch.setattr("tracker.config.SELF_SERVE_ORGS_ENABLED", enabled)
     _as(monkeypatch, {}, None, verified=verified)
 
-    assert _client.post("/orgs", json={"id": "acme"}).status_code == 403
+    response = cast(Response, _client.post("/orgs", json={"id": "acme"}))
+
+    assert response.status_code == 403
+    if not enabled:
+        assert response.json()["detail"] == (
+            "Organization creation is disabled. Ask an organization admin to run `valkyrie org invite EMAIL`."
+        )
     assert descope.tenant.tenants == {}
 
 

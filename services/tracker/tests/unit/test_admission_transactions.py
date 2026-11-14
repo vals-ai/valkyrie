@@ -176,12 +176,14 @@ async def test_blocking_admission_wait_does_not_block_health(
     loop_thread = threading.get_ident()
     get_admission = ExecutorReleaseRepository.admission
 
-    def blocked_lock(repository: ExecutorReleaseRepository, *, for_update: bool = False) -> Any:
-        if for_update:
+    def blocked_lock(
+        repository: ExecutorReleaseRepository, *, for_update: bool = False, for_share: bool = False
+    ) -> Any:
+        if for_update or for_share:
             lock_threads.append(threading.get_ident())
             entered.set()
             assert release.wait(timeout=5), "admission blocked the request event loop"
-        return get_admission(repository, for_update=for_update)
+        return get_admission(repository, for_update=for_update, for_share=for_share)
 
     async def verify(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
         return VerifyTaskIdsResponse(task_ids=["task_0"])

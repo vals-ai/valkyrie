@@ -39,6 +39,7 @@ RETRYABLE_OPERATIONS = frozenset(
         "clear_native_output",
         "ensure_task_deadline",
         "finish_dispatch",
+        "issue_remote_grader_grant",
         "monitor_tasks",
         "publish_native_output",
         "queue-abandon",

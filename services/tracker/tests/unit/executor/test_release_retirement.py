@@ -130,9 +130,12 @@ def test_automatic_retirement_starts_and_stops_owned_thread(monkeypatch: MonkeyP
 )
 async def test_tracker_lifespan_starts_and_stops_automatic_retirement(monkeypatch: MonkeyPatch) -> None:
     events: list[str] = []
+    migration = Mock(return_value=None)
+    monkeypatch.setattr(main_module, "migrate_projects", migration)
 
     class FakeAutomaticReleaseRetirement:
         def start(self) -> None:
+            migration.assert_called_once_with()
             events.append("started")
 
         def stop(self) -> None:
