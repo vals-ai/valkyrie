@@ -20,7 +20,9 @@ import sentry_sdk
 from botocore.exceptions import ClientError
 from pythonjsonlogger.json import JsonFormatter
 from fastapi.testclient import TestClient
-from benchmark_service import ExecResult, SandboxCreatedData
+from benchmark_service import ComposeSource, ExecResult, ImageSource, SandboxCreatedData, UnsupportedSandboxConfigError
+from benchmark_service.sandbox import DockerProviderConfig, ModalProviderConfig
+from benchmark_service.sandbox import SandboxError as ProviderSandboxError
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
@@ -70,6 +72,10 @@ from tracker.logging.config import DevFormatter
 from tracker.types import ManagedExecutionContext, RunExecutionRequest
 from tracker.services.benchmarks import fetch_benchmark_row
 from tracker.services.runs.start import process_benchmark
+from tracker.services.datasets.grading import VerifierResultError
+from tracker.services.datasets.compose import ComposeRuntime
+from tracker.services.datasets.retrieve_task import TaskFolderResponse
+from tracker.exceptions import InvalidSandboxConfigurationError, SandboxError
 
 _GET_SECRET = SecretsManagerStore.get
 task_api_client = task_execution_support.task_api_client
@@ -86,6 +92,171 @@ def _context(request: Any, benchmark_id: Any, task_ids: list[str]) -> dict[str, 
 
 @pytest.mark.description("Benchmark service disconnect, validation, and task error handling.")
 class TestBenchmarkServiceFailures:
+    @pytest.mark.description(
+        "Verifier failures keep their task errors without Sentry capture, while platform failures are captured."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize(
+        "error",
+        [
+            VerifierResultError("The verifier failed with exit code 127: missing interpreter"),
+            VerifierResultError("The verifier wrote no reward file"),
+            VerifierResultError("The reward file is empty: /logs/verifier/reward.txt"),
+            VerifierResultError("The reward file must hold an object of numbers: /logs/verifier/reward.json"),
+            SandboxError("Grading sandbox unavailable"),
+            ProviderSandboxError("Provider unavailable"),
+            UnsupportedSandboxConfigError("Use the daytona provider or Modal VM for Docker-in-Docker"),
+            InvalidSandboxConfigurationError("Missing deployment egress proxy"),
+        ],
+    )
+    async def test_grading_failure_sentry_capture(
+        self,
+        error: Exception,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        monkeypatch.setattr(BenchmarkServiceClient, "evaluate_instance", AsyncMock(side_effect=error))
+        capture = Mock()
+        monkeypatch.setattr(utils_module, "capture_exception", capture)
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": None}
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.ERROR
+        expected = (
+            str(error) if isinstance(error, UnsupportedSandboxConfigError) else f"{type(error).__name__}: {error}"
+        )
+        assert self._latest_task_error(control_postgres_session, task_row) == expected
+        if isinstance(error, (VerifierResultError, UnsupportedSandboxConfigError)):
+            capture.assert_not_called()
+        else:
+            capture.assert_called_once_with(error)
+
+    @pytest.mark.description(
+        "A provider rejects a compose task terminally without Sentry capture or a second creation attempt."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    async def test_compose_provider_mismatch_before_sandbox_creation(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        source = ComposeSource(outer=ImageSource(image="docker:dind"), compose_command="docker compose")
+        response = TaskFolderResponse(
+            **make_retrieve_task_response().model_copy(update={"source": source}).model_dump(),
+            compose=ComposeRuntime(environment_dir="/environment", overlays={}, build_timeout_sec=900),
+        )
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=response))
+        monkeypatch.setattr(
+            runtime_services, "get_sandbox_provider_config", AsyncMock(return_value=DockerProviderConfig())
+        )
+        error = UnsupportedSandboxConfigError("Use the daytona provider or Modal VM for Docker-in-Docker")
+        create = AsyncMock(side_effect=error)
+        provider = AsyncMock()
+        provider.__aenter__.return_value = provider
+        provider.create_sandbox = create
+        monkeypatch.setattr(DockerProviderConfig, "create_provider", lambda _self: provider)
+        monkeypatch.setattr(utils_module, "create_sandbox", sandbox_module.create_sandbox)
+        capture = Mock()
+        monkeypatch.setattr(utils_module, "capture_exception", capture)
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": None}
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.ERROR
+        assert self._latest_task_error(control_postgres_session, task_row) == str(error)
+        assert self._latest_task_error_result(control_postgres_session, task_row).transient is False
+        create.assert_awaited_once()
+        assert create.await_args is not None
+        assert create.await_args.args[0].requires_nested_docker is True
+        capture.assert_not_called()
+
+    @pytest.mark.description("Benchmark-service compose tasks reach Modal gVisor without requiring nested Docker.")
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize("task_folder", [False, True])
+    async def test_service_compose_does_not_require_nested_docker(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        task_folder: bool,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        source = ComposeSource(outer=ImageSource(image="service-image"), compose_command="docker compose")
+        response = make_retrieve_task_response().model_copy(update={"source": source})
+        if task_folder:
+            response = TaskFolderResponse(**response.model_dump())
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=response))
+        config = ModalProviderConfig(runtime="gvisor", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
+        monkeypatch.setattr(runtime_services, "get_sandbox_provider_config", AsyncMock(return_value=config))
+        sandbox = AsyncMock()
+        sandbox.id = "service-sandbox"
+        sandbox.name = "service-sandbox"
+        sandbox.state = "started"
+        sandbox.labels = {}
+        provider = AsyncMock()
+        provider.__aenter__.return_value = provider
+        provider.create_sandbox.return_value = sandbox
+        monkeypatch.setattr(ModalProviderConfig, "create_provider", lambda _self: provider)
+        monkeypatch.setattr(utils_module, "create_sandbox", sandbox_module.create_sandbox)
+
+        await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        provider.create_sandbox.assert_awaited_once()
+        assert provider.create_sandbox.await_args.args[0].requires_nested_docker is False
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.FINISHED
+
+    @pytest.mark.description(
+        "Unsupported verifier configuration stops setup without an agent rollout or Sentry capture."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    async def test_unsupported_verifier_setup_stops_rollout(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        error = UnsupportedSandboxConfigError("Use the daytona provider or Modal VM for Docker-in-Docker")
+        monkeypatch.setattr(BenchmarkServiceClient, "setup_task", AsyncMock(side_effect=error))
+        run_agent = AsyncMock()
+        monkeypatch.setattr(utils_module, "run_agent", run_agent)
+        capture = Mock()
+        monkeypatch.setattr(utils_module, "capture_exception", capture)
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": None}
+        control_postgres_session.refresh(task_row)
+        assert task_row.status == TaskStatus.ERROR
+        assert self._latest_task_error(control_postgres_session, task_row) == str(error)
+        assert self._latest_task_error_result(control_postgres_session, task_row).transient is False
+        run_agent.assert_not_awaited()
+        capture.assert_not_called()
+
     @pytest.mark.description("Attempts record implicit allow-all before enforcement, including when enforcement fails.")
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize(

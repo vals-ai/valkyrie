@@ -18,10 +18,12 @@ from benchmark_service import (
     ComposeSource,
     DockerfileSource,
     ImageSource,
+    Resources,
     Sandbox,
     SandboxCreateRequest,
     SandboxError,
     SandboxProvider,
+    UnsupportedSandboxConfigError,
 )
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_created_scope
 from benchmark_service.sandbox.types import SandboxSource
@@ -33,7 +35,7 @@ from tracker.services.datasets.config import MAIN_SERVICE, EnvironmentConfig, Ta
 from tracker.services.datasets.folder import COMPOSE_FILE, DOCKERFILE
 from tracker.services.datasets.grading import ARTIFACTS_DIR, OPEN_LOG_DIRS, VERIFIER_DIR, grade_task, keep
 from tracker.services.datasets.retrieve_task import sandbox_resources, stage_egress
-from tracker.services.datasets.steps import step_layers, step_verifier
+from tracker.services.datasets.steps import step_config, step_layers
 from tracker.sandbox import apply_egress_policy, runtime_sandbox
 from tracker.egress import select_policy
 
@@ -127,15 +129,17 @@ def verifier_environment(
     return VerifierEnvironment(agent_source, True, agent_compose)
 
 
-def verifier_runs_compose(config: TaskConfig, task_dir: Path) -> bool:
-    if not config.steps:
-        layers = [(config.verifier.environment, task_dir / "tests")]
-        return config.verifier.is_separate and verifier_kind(layers) == VerifierKind.COMPOSE
-    return any(
-        step_verifier(config, step).is_separate
-        and verifier_kind(step_layers(config, step, task_dir)) == VerifierKind.COMPOSE
-        for step in config.steps
+def compose_verifier_resources(config: TaskConfig, task_dir: Path) -> list[Resources]:
+    verifiers = (
+        [(step_config(config, step), step_layers(config, step, task_dir)) for step in config.steps]
+        if config.steps
+        else [(config, [(config.verifier.environment, task_dir / "tests")])]
     )
+    return [
+        sandbox_resources(own.verifier.environment or own.environment, own.environment)
+        for own, layers in verifiers
+        if own.verifier.is_separate and verifier_kind(layers) == VerifierKind.COMPOSE
+    ]
 
 
 def _sandbox_name(task_id: str) -> str:
@@ -173,6 +177,7 @@ async def _create_sandbox(
             return await provider.create_sandbox(
                 SandboxCreateRequest(
                     source=source.outer if isinstance(source, ComposeSource) else source,
+                    requires_nested_docker=isinstance(source, ComposeSource),
                     resources=sandbox_resources(environment, config.environment),
                     name=_sandbox_name(task_id),
                     labels=labels,
@@ -182,6 +187,8 @@ async def _create_sandbox(
                     network_block_all=block_network,
                 )
             )
+        except UnsupportedSandboxConfigError:
+            raise
         except SandboxError as error:
             if attempt == CREATE_ATTEMPTS or not any(
                 message in str(error).lower() for message in RETRYABLE_CREATE_MESSAGES

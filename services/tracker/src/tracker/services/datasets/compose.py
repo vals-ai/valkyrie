@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from benchmark_service import ComposeSource, ImageSource, Sandbox
-from benchmark_service.sandbox import SandboxProviderConfig
 from pydantic import BaseModel
 
 from tracker.services.datasets.config import MAIN_SERVICE, NetworkMode, TaskConfig
@@ -55,12 +54,6 @@ def _dotenv(env: Mapping[str, str]) -> str:
         return f'"{escaped}"'
 
     return "".join(f"{name}={quoted(value)}\n" for name, value in env.items())
-
-
-def runs_compose(provider: SandboxProviderConfig | None) -> bool:
-    if provider is None:
-        return False
-    return provider.type == "daytona" or (provider.type == "modal" and provider.runtime == "vm")
 
 
 class ComposeRuntime(BaseModel):

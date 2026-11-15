@@ -9,6 +9,7 @@ from benchmark_service import (
     ComposeSource,
     DockerfileSource,
     ImageSource,
+    Resources,
     SandboxProvider,
     SandboxProviders,
     SandboxRecoveryAttempt,
@@ -29,7 +30,7 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
 )
 
-from tracker.services.datasets.compose import runs_compose, start_compose_runtime
+from tracker.services.datasets.compose import start_compose_runtime
 from tracker.services.datasets.config import MAIN_SERVICE, StepConfig, TaskConfig, VerifierConfig
 from tracker.services.datasets.artifacts import (
     CONVENTION_ARTIFACT,
@@ -54,7 +55,7 @@ from tracker.services.datasets.oracle import SOLUTION_DIR, SOLUTION_REMOTE, SOLV
 from tracker.services.datasets.ref import DatasetRef, LocalDataset
 from tracker.services.datasets.retrieve_task import TaskFolderResponse, retrieve_task_response
 from tracker.services.datasets.rewards import extract_rewards
-from tracker.services.datasets.separate_verifier import Layers, grade_separately, verifier_runs_compose
+from tracker.services.datasets.separate_verifier import Layers, compose_verifier_resources, grade_separately
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, TaskSource
 from tracker.services.datasets.steps import (
     STEP_TESTS,
@@ -103,7 +104,7 @@ class ResolvedTask(NamedTuple):
     verifier_env: dict[str, str]
     verifier_sandbox_env: dict[str, str]
     secret_values: list[str]
-    compose_verifier: bool
+    compose_verifier_resources: list[Resources]
     steps: dict[str, ResolvedStep]
 
 
@@ -178,7 +179,7 @@ class DatasetTaskService:
                         verifier_env,
                         sandbox_env,
                         secret_values,
-                        verifier_runs_compose(report.config, task_dir),
+                        compose_verifier_resources(report.config, task_dir),
                         steps,
                     )
                     self._build_contexts.push_async_exit(pending.pop_all())
@@ -253,14 +254,9 @@ class DatasetTaskService:
         remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> SetupTaskResponse:
         task = await self._task(task_id)
+        for resources in task.compose_verifier_resources:
+            self._provider(sandbox_provider).validate_sandbox_config(requires_nested_docker=True, resources=resources)
         outer = await self._sandbox(instance_id, sandbox_provider)
-        agent_compose = isinstance(task.response.source, ComposeSource) and task.response.compose is not None
-        if (agent_compose or task.compose_verifier) and not runs_compose(sandbox_provider):
-            subject = "brings a compose file" if agent_compose else "grades in a compose file"
-            raise InvalidSandboxConfigurationError(
-                f"Task {task_id!r} {subject}, which needs Docker-in-Docker; "
-                "only the daytona sandbox provider and the modal sandbox provider on its vm runtime run it"
-            )
         if isinstance(task.response.source, ComposeSource) and task.response.compose is not None:
             await start_compose_runtime(outer, task.response.source, task.response.compose, task.response.env)
         sandbox = runtime_sandbox(outer, task.response.source)

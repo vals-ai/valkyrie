@@ -51,9 +51,12 @@ run in your organization's Daytona or Modal account.
    ```json
    {
      "MODAL_TOKEN_ID": "ak-...",
-     "MODAL_TOKEN_SECRET": "as-..."
+     "MODAL_TOKEN_SECRET": "as-...",
+     "runtime": "vm"
    }
    ```
+
+   - Compose tasks use Docker-in-Docker and need `"runtime": "vm"`.
 
 3. Upload the credentials and connect Modal:
 

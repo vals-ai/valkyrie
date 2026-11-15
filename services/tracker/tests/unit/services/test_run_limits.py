@@ -32,6 +32,7 @@ def test_deployed_org_run_limits_file_is_valid() -> None:
     assert limits.for_org("vals.ai") is None
     assert limits.for_org("vals-smith-research") is None
     assert limits.for_org("smith-research") is None
+    assert limits.for_org("hackathon-bool-7f9adbb0f9") == 50
 
 
 @pytest.mark.description("An org whose whole name matches an exempt pattern has no limit.")

@@ -29,6 +29,7 @@ from benchmark_service import (
     SandboxProvider,
     SandboxProviderConfig,
     SandboxRecoveryAttempt,
+    UnsupportedSandboxConfigError,
 )
 from benchmark_service.client import BenchmarkServiceError
 from benchmark_service.remote_grading import RemoteGradingAuthorization
@@ -132,6 +133,7 @@ from tracker.search_cost import SearchCharge
 from tracker.scheduler.admission import SandboxQueueContext, enter_queued_sandbox
 from tracker.executor.control_queue import is_reserved_queue_pool_id
 from tracker.services.tasks.attempts import keep_replaced_attempts
+from tracker.services.datasets.grading import VerifierResultError
 from tracker.types import ActiveNativeOutput, AgentContractRequest, OrgContext, StartBenchmarkRequest
 
 from tracker.services.failures import (
@@ -218,6 +220,8 @@ async def _child_egress_grants(
 
 
 def _exception_message(exc: BaseException) -> str:
+    if isinstance(exc, UnsupportedSandboxConfigError):
+        return str(exc)
 
     def describe(error: BaseException) -> str:
         detail = str(error).strip()
@@ -1020,7 +1024,7 @@ async def _process_task_attempt(
                     "transient": failure.transient,
                 },
             )
-            if not is_agent_outcome(exc):
+            if not is_agent_outcome(exc) and not isinstance(exc, (VerifierResultError, UnsupportedSandboxConfigError)):
                 with sentry_sdk.new_scope() as scope:
                     scope.set_tag("failure_category", failure.category.value)
                     scope.set_tag("failure_phase", phase.value)
@@ -1397,6 +1401,11 @@ async def _process_task_attempt(
                     provider=sandbox_provider,
                     sandbox_name=sandbox_name,
                     source=task_data.source,
+                    requires_nested_docker=(
+                        folder is not None
+                        and folder.compose is not None
+                        and isinstance(task_data.source, ComposeSource)
+                    ),
                     labels=labels,
                     env_vars=sandbox_environment.env_vars,
                     sandbox_secrets=sandbox_environment.secrets,

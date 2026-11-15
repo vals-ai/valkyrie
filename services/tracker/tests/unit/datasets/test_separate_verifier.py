@@ -15,6 +15,7 @@ from benchmark_service import (
     Sandbox,
     SandboxCreateRequest,
     SandboxError,
+    UnsupportedSandboxConfigError,
 )
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider, notify_sandbox_created
 from benchmark_service.schemas import SandboxCreatedData
@@ -271,6 +272,10 @@ class TestGradeSeparately:
         assert result["rewards"] == {"reward": 1.0}
         assert provider.requests[0].network_block_all is False
         assert provider.requests[0].source == ImageSource(image="docker:28.3.3-dind")
+        assert provider.requests[0].requires_nested_docker is True
+        assert separate_verifier.compose_verifier_resources(config, tests_dir.parent) == [
+            provider.requests[0].resources
+        ]
         assert any(command.endswith("up --detach --wait") for command in outer.commands)
         assert applied == [("verifier-1", [])]
         assert provider.deleted == ["verifier-1"]
@@ -295,6 +300,7 @@ class TestGradeSeparately:
 
         assert any(command.endswith("docker compose -p agent up --detach --wait") for command in outer.commands)
         assert provider.requests[0].source == COMPOSE_AGENT.outer
+        assert provider.requests[0].requires_nested_docker is True
         assert provider.deleted == ["verifier-1"]
 
     @pytest.mark.description("The tests run in the verifiers workdir and otherwise the environments.")
@@ -336,6 +342,7 @@ class TestGradeSeparately:
         await grade(config, provider, tests_dir)
 
         assert provider.requests[0].network_block_all is True
+        assert provider.requests[0].requires_nested_docker is False
 
     @pytest.mark.description("An allowlist is applied to the new sandbox.")
     async def test_an_allowlist_is_applied_to_the_new_sandbox(
@@ -366,10 +373,13 @@ class TestGradeSeparately:
         assert len({request.name for request in provider.requests}) == 2
 
     @pytest.mark.description("A create that cannot work is not retried.")
-    async def test_a_create_that_cannot_work_is_not_retried(self, tests_dir: Path) -> None:
-        provider = FakeProvider([SandboxError("image not found")])
+    @pytest.mark.parametrize(
+        "error", [SandboxError("image not found"), UnsupportedSandboxConfigError("entered error state")]
+    )
+    async def test_a_create_that_cannot_work_is_not_retried(self, tests_dir: Path, error: SandboxError) -> None:
+        provider = FakeProvider([error])
 
-        with pytest.raises(SandboxError, match="image not found"):
+        with pytest.raises(type(error), match=str(error)):
             await grade(TaskConfig.parse("[verifier]\nenvironment_mode = 'separate'"), provider, tests_dir)
 
         assert len(provider.requests) == 1

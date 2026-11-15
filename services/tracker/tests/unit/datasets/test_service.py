@@ -5,9 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
+from unittest.mock import AsyncMock, Mock
 
 import pytest
-from benchmark_service import DockerfileSource, ImageSource, Resources
+from benchmark_service import DockerfileSource, ImageSource, Resources, UnsupportedSandboxConfigError
 from benchmark_service.sandbox import DockerProviderConfig, ModalProviderConfig, SandboxProviderConfig
 from benchmark_service.remote_grading import RemoteGradingAuthorization
 
@@ -20,7 +21,7 @@ from tracker.services.datasets.config import MultiStepRewardStrategy
 from tracker.services.datasets.retrieve_task import TaskFolderResponse
 from tracker.clients.dataset_tasks import DatasetTaskService, InvalidTaskError, TaskSelectionError
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, TaskSource
-from tracker.exceptions import InvalidSandboxConfigurationError, SecretsError
+from tracker.exceptions import SecretsError
 from tracker.local.storage import FilesystemObjectStore
 
 TASK_TOML = """
@@ -39,7 +40,6 @@ workdir = "/app"
 PROVIDER = DockerProviderConfig(type="docker")
 DAYTONA = cast(SandboxProviderConfig, SimpleNamespace(type="daytona"))
 MODAL_VM = ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
-MODAL_GVISOR = ModalProviderConfig(runtime="gvisor", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 DOCKERFILE_TOML = "[environment]\ncpus = 1\nworkdir = '/app'"
 
 
@@ -270,6 +270,56 @@ class TestWorkingDirectoryOwner:
 
 @pytest.mark.description("Putting the instruction in the sandbox.")
 class TestSetupTask:
+    @pytest.mark.description("Compose verifiers are validated before agent setup with their own sandbox resources.")
+    @pytest.mark.parametrize("stepped", [False, True])
+    @pytest.mark.parametrize(
+        "config",
+        [PROVIDER, ModalProviderConfig(runtime="gvisor", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"), MODAL_VM],
+    )
+    async def test_compose_verifier_preflight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: SandboxProviderConfig, stepped: bool
+    ) -> None:
+        if stepped:
+            task = (
+                write_steps_task(tmp_path, STEPS_TOML + "\n[steps.verifier.environment]\ncpus = 3\nmemory_mb = 2048")
+                / "task-s"
+            )
+            task_id = "task-s"
+            tests = task / "steps" / "two" / "tests"
+        else:
+            toml = TASK_TOML.replace("[verifier]", "[verifier]\nenvironment_mode = 'separate'")
+            task = write_task(tmp_path, "task-a", toml + "\n[verifier.environment]\ncpus = 3\nmemory_mb = 2048")
+            task_id = "task-a"
+            tests = task / "tests"
+        tests.mkdir(exist_ok=True)
+        (tests / "docker-compose.yaml").write_text("services:\n  main: {}\n")
+        sandbox = FakeSandbox()
+        reach_sandbox = AsyncMock(return_value=sandbox)
+
+        async with config.create_provider() as provider, DatasetTaskService(LocalFolderSource(tmp_path)) as service:
+            validate = Mock(wraps=provider.validate_sandbox_config)
+            create = AsyncMock()
+            monkeypatch.setattr(provider, "validate_sandbox_config", validate)
+            monkeypatch.setattr(provider, "create_sandbox", create)
+            monkeypatch.setattr(service, "get_sandbox_provider", lambda _config: provider)
+            monkeypatch.setattr(service, "_sandbox", reach_sandbox)
+
+            if config == MODAL_VM:
+                await service.setup_task(task_id, "agent-sandbox", config)
+                reach_sandbox.assert_awaited_once()
+            else:
+                with pytest.raises(UnsupportedSandboxConfigError, match="Docker-in-Docker"):
+                    await service.setup_task(task_id, "agent-sandbox", config)
+                reach_sandbox.assert_not_awaited()
+                assert sandbox.commands == []
+
+            validate.assert_called_once()
+            assert validate.call_args.kwargs["requires_nested_docker"] is True
+            resources = validate.call_args.kwargs["resources"]
+            assert resources.vcpu == 3
+            assert resources.memory == 2
+            create.assert_not_awaited()
+
     @pytest.mark.description("The instruction is uploaded to the problem path.")
     @pytest.mark.parametrize("authorization", [None, RemoteGradingAuthorization(issuer="dev", token="test-grant")])
     async def test_the_instruction_is_uploaded_to_the_problem_path(
@@ -338,47 +388,6 @@ class TestSetupTask:
         )
         assert started < uploaded
         assert b"Instruction for task-a." in outer.files.values()
-
-    @pytest.mark.description("A compose task is refused on a provider that cannot run docker in docker.")
-    @pytest.mark.parametrize("provider", [PROVIDER, MODAL_GVISOR])
-    async def test_a_compose_task_is_refused_on_a_provider_that_cannot_run_docker_in_docker(
-        self, dataset: Path, monkeypatch: pytest.MonkeyPatch, provider: SandboxProviderConfig
-    ) -> None:
-        (dataset / "task-a" / "environment").mkdir()
-        (dataset / "task-a" / "environment" / "docker-compose.yaml").write_text("services:\n  main: {}\n")
-        outer = OuterSandbox()
-
-        with pytest.raises(
-            InvalidSandboxConfigurationError,
-            match="needs Docker-in-Docker; only the daytona sandbox provider and the modal sandbox provider on its vm runtime",
-        ):
-            await service_for(LocalFolderSource(dataset), outer, monkeypatch).setup_task(
-                "task-a", "sandbox-1", provider
-            )
-
-        assert outer.commands == []
-
-    @pytest.mark.description(
-        "A task that grades in a compose verifier is refused before its agent runs on such a provider."
-    )
-    @pytest.mark.parametrize("provider", [PROVIDER, MODAL_GVISOR])
-    async def test_a_task_that_grades_in_a_compose_verifier_is_refused_before_its_agent_runs_on_such_a_provider(
-        self, dataset: Path, monkeypatch: pytest.MonkeyPatch, provider: SandboxProviderConfig
-    ) -> None:
-        (dataset / "task-a" / "tests" / "docker-compose.yaml").write_text("services:\n  main: {}\n")
-        (dataset / "task-a" / "task.toml").write_text(
-            TASK_TOML.replace("[verifier]\n", "[verifier]\nenvironment_mode = 'separate'\n")
-        )
-        outer = OuterSandbox()
-
-        with pytest.raises(
-            InvalidSandboxConfigurationError, match="grades in a compose file, which needs Docker-in-Docker"
-        ):
-            await service_for(LocalFolderSource(dataset), outer, monkeypatch).setup_task(
-                "task-a", "sandbox-1", provider
-            )
-
-        assert outer.commands == []
 
     @pytest.mark.description("A stray compose file in the tests of a shared verifier asks nothing of the provider.")
     async def test_a_stray_compose_file_in_the_tests_of_a_shared_verifier_asks_nothing_of_the_provider(

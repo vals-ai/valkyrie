@@ -474,8 +474,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.74.0"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.74.0#f781507280b6791a28b7af3e88fbdaf727c37597" }
+version = "0.76.1"
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.76.1#8b40ee57ce06bedbbc25bd68d4319c1782a19252" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -2393,7 +2393,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.42.20" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.74.0" },
+    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.76.1" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },

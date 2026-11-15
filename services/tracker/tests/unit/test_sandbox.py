@@ -4505,8 +4505,9 @@ class TestSandboxLifecycle:
     @pytest.mark.description(
         "Sandbox creation sends the volumes, auto stop interval, and create timeout to the provider."
     )
+    @pytest.mark.parametrize("compose", [False, True])
     async def test_create_sandbox_passes_request_and_records_returned_identity(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, compose: bool
     ) -> None:
         span_calls: list[tuple[str, str, int]] = []
 
@@ -4541,11 +4542,14 @@ class TestSandboxLifecycle:
         sandbox = await _create_sandbox(
             provider,
             "task-alias",
-            ImageSource(image="ghcr.io/vals/swebench:latest"),
+            ComposeSource(outer=ImageSource(image="ghcr.io/vals/swebench:latest"))
+            if compose
+            else ImageSource(image="ghcr.io/vals/swebench:latest"),
             resources,
             labels={"run-id": "run-123"},
             sandbox_secrets=sandbox_secrets,
             volumes=volumes,
+            requires_nested_docker=compose,
         )
 
         assert sandbox is mock_sandbox
@@ -4556,6 +4560,7 @@ class TestSandboxLifecycle:
             "valkyrie.sandbox_state": "started",
         }
         request = provider.create_sandbox.await_args.args[0]
+        assert request.requires_nested_docker is compose
         assert request.name == "task-alias"
         assert request.resources == resources
         assert request.labels == {"run-id": "run-123"}

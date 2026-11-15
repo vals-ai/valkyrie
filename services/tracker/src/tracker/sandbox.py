@@ -44,6 +44,7 @@ from benchmark_service import (
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_created_scope
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import UnsupportedSandboxConfigError
 from opentelemetry import trace
 from tenacity import (
     retry,
@@ -403,12 +404,14 @@ async def _create_sandbox(
     env_vars: dict[str, str] | None = None,
     volumes: list[VolumeMount] | None = None,
     sandbox_secrets: dict[str, str] | None = None,
+    requires_nested_docker: bool = False,
 ) -> Sandbox:
     _reject_plaintext_secret_collisions(env_vars, sandbox_secrets)
     provider_source = _provider_source(source)
     _set_sandbox_create_span_attributes(sandbox_name, provider_source, resources)
     request = SandboxCreateRequest(
         source=provider_source,
+        requires_nested_docker=requires_nested_docker,
         resources=resources,
         name=sandbox_name,
         labels=labels or {},
@@ -454,6 +457,7 @@ async def create_sandbox(
     sandbox_secrets: dict[str, str] | None = None,
     *,
     creation_state: SandboxCreationState,
+    requires_nested_docker: bool = False,
     unique_name: bool = True,
     sandbox_link: SandboxLink | None = None,
     record_sandbox: Callable[[SandboxLink, str], Awaitable[None]],
@@ -484,6 +488,7 @@ async def create_sandbox(
                         env_vars=env_vars,
                         volumes=volumes,
                         sandbox_secrets=sandbox_secrets,
+                        requires_nested_docker=requires_nested_docker,
                     )
                 )
             try:
@@ -499,7 +504,7 @@ async def create_sandbox(
 
                 await finish_cleanup(asyncio.create_task(settle_creation()))
                 raise
-            except SandboxNotFoundError:
+            except (SandboxNotFoundError, UnsupportedSandboxConfigError):
                 raise
             except ProviderSandboxError as e:
                 if isinstance(e, SandboxBuildError) and isinstance(_provider_source(source), DockerfileSource):

@@ -9,6 +9,7 @@ from benchmark_service.client import (
     BenchmarkServiceUnauthenticatedError,
 )
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import UnsupportedSandboxConfigError
 from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
@@ -103,6 +104,7 @@ class _Labels(NamedTuple):
 
 
 _LABELS: dict[type[BaseException], _Labels] = {
+    UnsupportedSandboxConfigError: _Labels("sandbox_provider", "setup", transient=False),
     SandboxSetupError: _Labels("sandbox_provider", "setup", transient=True),
     SandboxDNSResolutionError: _Labels("sandbox_provider", "dns", transient=True, cause_code="sandbox_dns_resolution"),
     SandboxImageBuildError: _Labels("sandbox_provider", "build", cause_code="sandbox_image_build"),
