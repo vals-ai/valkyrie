@@ -23,12 +23,12 @@ def test_org_run_limits_resolve_by_org_name() -> None:
     assert OrgRunLimits().for_org("other-co") is None
 
 
-@pytest.mark.description("The limits file that deploys write to SSM is valid and caps orgs at 50 by default.")
+@pytest.mark.description("The limits file that deploys write to SSM is valid and caps orgs at 200 by default.")
 def test_deployed_org_run_limits_file_is_valid() -> None:
     limits_file = Path(__file__).resolve().parents[5] / "infra" / "org_run_limits.yaml"
     limits = OrgRunLimits.model_validate(yaml.safe_load(limits_file.read_text(encoding="utf-8")))
 
-    assert limits.for_org("acme") == 50
+    assert limits.for_org("acme") == 200
     assert limits.for_org("vals.ai") is None
     assert limits.for_org("vals-smith-research") is None
     assert limits.for_org("smith-research") is None
