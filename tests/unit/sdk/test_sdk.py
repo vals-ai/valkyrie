@@ -124,6 +124,24 @@ async def test_start_uses_the_start_route(make_client) -> None:
     assert [request.url.path for request in requests] == ["/start-benchmark"]
 
 
+@pytest.mark.description("`runs.filter_options` sends `project` only when it is given.")
+async def test_filter_options_sends_project_only_when_given(make_client) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"benchmark_names": [], "agent_names": [], "models": [], "datasets": [], "started_by_emails": []},
+        )
+
+    async with make_client(handler) as client:
+        await client.runs.filter_options()
+        await client.runs.filter_options(project="alpha")
+
+    assert [dict(request.url.params) for request in requests] == [{}, {"project": "alpha"}]
+
+
 @pytest.mark.description("Start can leave out optional run configuration.")
 async def test_start_can_omit_optional_run_configuration(make_client) -> None:
     captured_body: dict[str, object] = {}
@@ -668,8 +686,8 @@ async def test_projects_create_sends_the_budget_and_its_reason(make_client) -> N
     }
 
 
-@pytest.mark.description("Project update and delete use the project contract.")
-async def test_projects_update_and_delete_use_the_project_contract(make_client) -> None:
+@pytest.mark.description("Project get, update and delete use the project contract.")
+async def test_projects_get_update_and_delete_use_the_project_contract(make_client) -> None:
     requests: list[httpx.Request] = []
     project = {
         "id": "22222222-2222-4222-8222-222222222222",
@@ -688,6 +706,7 @@ async def test_projects_update_and_delete_use_the_project_contract(make_client) 
         return httpx.Response(200, json=project)
 
     async with make_client(handler) as client:
+        fetched = await client.projects.get("router-bench")
         updated = await client.projects.update(
             "router-bench",
             name="Router Bench Updated",
@@ -698,12 +717,13 @@ async def test_projects_update_and_delete_use_the_project_contract(make_client) 
         )
         deleted = await client.projects.delete("router-bench")
 
-    assert (updated.handle, deleted.handle) == ("router-bench", "router-bench")
+    assert (fetched.handle, updated.handle, deleted.handle) == ("router-bench", "router-bench", "router-bench")
     assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/projects/router-bench"),
         ("PUT", "/projects/router-bench"),
         ("DELETE", "/projects/router-bench"),
     ]
-    assert json.loads(requests[0].content) == {
+    assert json.loads(requests[1].content) == {
         "handle": "router-bench",
         "name": "Router Bench Updated",
         "spend_type": "development",
@@ -711,7 +731,7 @@ async def test_projects_update_and_delete_use_the_project_contract(make_client) 
         "customer": None,
         "extra_tags": {"owner": "research"},
     }
-    assert requests[1].content == b""
+    assert requests[0].content == requests[2].content == b""
 
 
 @pytest.mark.description("Project methods raise for an empty, `.`, or `..` handle and send nothing.")
@@ -724,6 +744,8 @@ async def test_projects_reject_normalized_path_segments_before_request(make_clie
         return httpx.Response(500)
 
     async with make_client(handler) as client:
+        with pytest.raises(ValueError, match="Invalid project handle"):
+            await client.projects.get(handle)
         with pytest.raises(ValueError, match="Invalid project handle"):
             await client.projects.update(
                 handle,

@@ -120,9 +120,17 @@ class RunsResource:
             params={"benchmark_id": str(run_id)},
         )
 
-    async def filter_options(self) -> FilterOptionsResponse:
-        """Discover valid run-filter values from this organization's run history."""
-        return await self._sdk.request_model("GET", "/benchmarks/filter-options", FilterOptionsResponse)
+    async def filter_options(self, *, project: str | None = None) -> FilterOptionsResponse:
+        """Discover valid run-filter values from this organization's run history.
+
+        `project` narrows the values to runs in that project, given by its handle.
+        """
+        return await self._sdk.request_model(
+            "GET",
+            "/benchmarks/filter-options",
+            FilterOptionsResponse,
+            params=None if project is None else {"project": project},
+        )
 
     async def list(self, request: FetchBenchmarksRequest | None = None) -> FetchBenchmarksResponse:
         """List runs using typed filters and pagination."""

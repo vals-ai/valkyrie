@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -26,7 +25,6 @@ ARCHIVED_AT = datetime(2026, 11, 2, 12, tzinfo=UTC)
 class ReadService:
     def __init__(self) -> None:
         self.rows: dict[UUID, dict[str, Any]] = {}
-        self.writes = 0
 
     def add(self, handle: str, **fields: Any) -> UUID:
         project_id = uuid4()
@@ -49,13 +47,6 @@ class ReadService:
     def handle(self, request: httpx.Request) -> httpx.Response:
         parts = request.url.path.split("/")
         assert parts[2] == str(TEST_ORG_ID)
-        if request.method == "PUT":
-            self.writes += 1
-            return httpx.Response(200, json={"projects": []})
-        if request.method == "POST":
-            row = self.rows[UUID(parts[4])]
-            row["gateway_key_id"] = row["gateway_key_id"] or json.loads(request.content)["gateway_key_id"]
-            return httpx.Response(200, json=row)
         if len(parts) == 5:
             row = self.rows.get(UUID(parts[4]))
             return httpx.Response(404) if row is None else httpx.Response(200, json=row)
@@ -87,8 +78,6 @@ def _link(tracker_database: Session, project_id: UUID, benchmark_id: UUID | None
 
 def _mirrored(tracker_database: Session, service: ReadService, handle: str) -> Project:
     project = Project(org_id=TEST_ORG_ID, handle=handle, name=f"Stale {handle}", spend_type=SpendType.DEVELOPMENT)
-    tracker_database.add(project)
-    tracker_database.commit()
     service.rows[project.id] = service.rows.pop(service.add(handle, id=str(project.id)))
     return project
 
@@ -164,20 +153,6 @@ class TestProjectReads:
         links = tracker_database.exec(select(RunProject).where(RunProject.benchmark_id == benchmark_id)).all()
         assert [link.project_id for link in links] == [project.id]
         assert repository.get_for_link(TEST_ORG_ID, project.id).archived_at == ARCHIVED_AT
-
-    @pytest.mark.description(
-        "With reads on, the service keeps the first Gateway key set for a project, and reads return that key."
-    )
-    def test_gateway_key_first_wins(self, tracker_database: Session, monkeypatch: pytest.MonkeyPatch) -> None:
-        service = ReadService()
-        project = _mirrored(tracker_database, service, "router-bench")
-        repository = _repository(tracker_database, monkeypatch, service)
-        first, second = uuid4(), uuid4()
-
-        assert repository.set_gateway_key(project, first) == first
-        assert repository.set_gateway_key(project, second) == first
-        locked = repository.get_by_id(TEST_ORG_ID, project.id)
-        assert locked is not None and locked.gateway_key_id == first
 
     @pytest.mark.description(
         "A run linked to a project the service answers 404 for raises LookupError, which the run routes return as a 500."

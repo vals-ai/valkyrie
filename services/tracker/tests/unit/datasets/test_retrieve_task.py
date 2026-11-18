@@ -3,7 +3,7 @@ import shlex
 from pathlib import Path
 
 import pytest
-from benchmark_service import ComposeSource, DockerfileSource, ImageSource, Resources
+from benchmark_service import ComposeSource, DockerfileSource, ImageSource, MCPServer, Resources
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 
 from tracker.services.datasets.config import TaskConfig
@@ -73,13 +73,13 @@ class TestSandboxContract:
         response = mapped(tmp_path, toml)
 
         assert response.env == {"MODE": "fast"}
-        assert response.mcp_servers == {"web": {"type": "sse", "url": "https://x"}}
+        assert response.mcp_servers == [MCPServer(name="web", url="https://x")]
         assert response.skills_dir == "/skills"
         assert response.agent_user == "1000"
         assert response.healthcheck is not None and response.healthcheck.command == "ready"
 
-    @pytest.mark.description("Mcp servers take the mcp config shape with header references unresolved.")
-    def test_mcp_servers_take_the_mcp_config_shape_with_header_references_unresolved(self, tmp_path: Path) -> None:
+    @pytest.mark.description("Mcp servers keep the fields of the task with header references unresolved.")
+    def test_mcp_servers_keep_the_fields_of_the_task_with_header_references_unresolved(self, tmp_path: Path) -> None:
         toml = (
             "[environment]\ndocker_image = 'x'\n"
             "[[environment.mcp_servers]]\nname = 'web'\ntransport = 'streamable-http'\nurl = 'https://x'\n"
@@ -87,10 +87,15 @@ class TestSandboxContract:
             "[[environment.mcp_servers]]\nname = 'files'\ntransport = 'stdio'\ncommand = 'fs-mcp'\nargs = ['/data']"
         )
 
-        assert mapped(tmp_path, toml).mcp_servers == {
-            "web": {"type": "http", "url": "https://x", "headers": {"Authorization": "Bearer ${TOKEN}"}},
-            "files": {"type": "stdio", "command": "fs-mcp", "args": ["/data"]},
-        }
+        assert mapped(tmp_path, toml).mcp_servers == [
+            MCPServer(
+                name="web",
+                transport="streamable-http",
+                url="https://x",
+                headers={"Authorization": "Bearer ${TOKEN}"},
+            ),
+            MCPServer(name="files", transport="stdio", command="fs-mcp", args=["/data"]),
+        ]
 
     @pytest.mark.description("A gpu request names its acceptable types in order.")
     def test_a_gpu_request_names_its_acceptable_types_in_order(self, tmp_path: Path) -> None:

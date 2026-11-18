@@ -133,7 +133,8 @@ _EXPECTED_RESOURCES = {
     "LogsResource": ("page_task", "fetch_task", "page_run", "fetch_run", "stream_task"),
     "SchedulerResource": ("overview",),
     "SecretsResource": ("list", "set", "remove"),
-    "ProjectsResource": ("create", "list", "update", "delete"),
+    "ProjectsResource": ("create", "list", "get", "update", "delete"),
+    "CostsResource": ("by_project", "project_model"),
     "ProvidersResource": ("list", "set", "remove"),
     "SettingsResource": ("get", "set_default_provider", "set_benchmark_service", "remove_benchmark_service"),
     "AccountResource": (
@@ -219,6 +220,7 @@ _EXPECTED_TYPES = {
         "SchedulerActiveStatus",
     ),
     "Projects": ("NewProjectRequest", "ProjectCreateRequest", "ProjectResponse", "ProjectsResponse", "SpendType"),
+    "Costs": ("MonthModelCost", "CostsByProjectResponse", "ProjectCostRow", "ProjectModelCosts", "ProjectRun"),
     "Secrets": ("SecretEntry", "SecretsResponse"),
     "Settings": ("ProvidersResponse", "RunSettingsResponse", "SavedBenchmarkService"),
     "Account": (

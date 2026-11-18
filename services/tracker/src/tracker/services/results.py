@@ -10,9 +10,11 @@ from functools import partial
 from typing import Any, Sequence
 from uuid import UUID
 
+import httpx
 from sqlalchemy.engine import Connection, Engine
 from sqlmodel import Session
 
+from tracker.clients.projects import ProjectServiceUnavailableError
 from tracker.database.models import (
     FINISHED_BENCHMARK_STATUSES,
     Benchmark,
@@ -21,8 +23,10 @@ from tracker.database.models import (
 from tracker.domain import BenchmarkStatus, TaskStatus
 from tracker.database.session import database_call
 from tracker.repositories.benchmark import BenchmarkRepository, FinishedEvaluationRow
+from tracker.repositories.project import ProjectRepository
 from tracker.logging import get_logger
 from tracker.observability.sentry import capture_exception
+from tracker.services.datasets.ref import HostedDataset
 from tracker.types import (
     AverageTaskBreakdown,
     BenchmarkDetails,
@@ -32,6 +36,7 @@ from tracker.types import (
 )
 
 logger = get_logger(__name__)
+PROJECT_HANDLE_TIMEOUT = httpx.Timeout(2)
 
 
 _FINISHED_STATUSES = (TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED)
@@ -285,9 +290,12 @@ def fetch_filtered_benchmark_rows(
 ) -> tuple[Sequence[Benchmark], int | None, str | None]:
 
     repository = BenchmarkRepository(session)
+    project_id = None if request.project is None else ProjectRepository(session).resolve(org.id, request.project).id
     if request.cursor is not None:
         after = decode_cursor(request.cursor) if request.cursor else None
-        benchmark_rows = repository.list_filtered(request, org.id, limit=request.limit + 1, after=after)
+        benchmark_rows = repository.list_filtered(
+            request, org.id, limit=request.limit + 1, after=after, project_id=project_id
+        )
 
         next_cursor: str | None = None
         if len(benchmark_rows) > request.limit:
@@ -297,25 +305,63 @@ def fetch_filtered_benchmark_rows(
 
         return benchmark_rows, None, next_cursor
 
-    total_count = repository.count_filtered(request, org.id)
+    total_count = repository.count_filtered(request, org.id, project_id=project_id)
 
     if not total_count:
         return [], 0, None
 
-    benchmark_rows = repository.list_filtered(request, org.id, limit=request.limit, offset=request.offset)
+    benchmark_rows = repository.list_filtered(
+        request, org.id, limit=request.limit, offset=request.offset, project_id=project_id
+    )
 
     return benchmark_rows, total_count, None
 
 
-def build_benchmark_table_rows(benchmarks: Sequence[Benchmark], session: Session) -> list[BenchmarkTableRow]:
+def _task_subsets(repository: BenchmarkRepository, org_id: UUID, benchmarks: Sequence[Benchmark]) -> dict[UUID, bool]:
+    arguments = {b.id: b.arguments for b in benchmarks}
+    found = arguments
+    while (
+        wanted := {
+            source
+            for args in found.values()
+            if (source := args.regraded_from_run_id) is not None and not args.regrade_skipped_task_ids
+        }
+        - arguments.keys()
+    ):
+        found = {b.id: b.arguments for b in repository.list_by_ids(org_id, list(wanted))}
+        arguments.update(found)
+
+    def subset(run_id: UUID) -> bool:
+        args = arguments.get(run_id)
+        if args is None:
+            return False
+        if args.regraded_from_run_id is None:
+            return bool(args.task_ids or args.slice_str)
+        return bool(args.regrade_skipped_task_ids) or subset(args.regraded_from_run_id)
+
+    return {b.id: subset(b.id) for b in benchmarks}
+
+
+def build_benchmark_table_rows(
+    benchmarks: Sequence[Benchmark], session: Session, org_id: UUID
+) -> list[BenchmarkTableRow]:
     if not benchmarks:
         return []
 
-    counts_by_bench = BenchmarkRepository(session).task_state_counts([b.id for b in benchmarks])
+    repository = BenchmarkRepository(session)
+    benchmark_ids = [b.id for b in benchmarks]
+    counts_by_bench = repository.task_state_counts(benchmark_ids)
+    project_ids = repository.newest_project_ids(org_id, benchmark_ids)
+    subsets = _task_subsets(repository, org_id, benchmarks)
 
     rows: list[BenchmarkTableRow] = []
     for b in benchmarks:
         counts = counts_by_bench.get(b.id, {})
+        arguments = b.arguments.with_hosted_dataset()
+        ref = b.arguments.dataset_ref
+        dataset_version = (
+            arguments.dataset_version if isinstance(ref, HostedDataset) and ref.revision is not None else None
+        )
         rows.append(
             BenchmarkTableRow(
                 id=b.id,
@@ -323,7 +369,9 @@ def build_benchmark_table_rows(benchmarks: Sequence[Benchmark], session: Session
                 agent_name=b.arguments.contract.name,
                 label=b.label,
                 model=b.arguments.contract.model,
-                dataset=b.arguments.with_hosted_dataset().dataset or "default",
+                dataset=arguments.dataset or "default",
+                dataset_version=dataset_version.id if dataset_version is not None else None,
+                task_subset=subsets[b.id],
                 executor_release_id=b.executor_release_id,
                 current_execution_release_id=b.current_execution_release_id,
                 executor_artifact_digest=b.executor_artifact_digest,
@@ -339,4 +387,16 @@ def build_benchmark_table_rows(benchmarks: Sequence[Benchmark], session: Session
                 final_score=b.final_evaluation.final_score if b.final_evaluation else None,
             )
         )
+    if not project_ids:
+        return rows
+    session.rollback()
+    try:
+        projects = ProjectRepository(session).list_all(org_id, True, True, timeout=PROJECT_HANDLE_TIMEOUT)
+    except (ProjectServiceUnavailableError, httpx.HTTPError) as error:
+        logger.warning("Project handle lookup failed: %s", type(error).__name__)
+        return rows
+    handles = {project.id: project.handle for project in projects}
+    for row in rows:
+        if row.id in project_ids:
+            row.project_handle = handles.get(project_ids[row.id])
     return rows

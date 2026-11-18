@@ -1,19 +1,28 @@
 import json
+import re
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from tracker.aws.clients import AWSClientProvider
-from tracker.exceptions import SecretNotFoundError, SecretsError
-from tracker.runtime.secrets import SecretValue, secret_display_name
+from tracker.exceptions import (
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
+    SecretNotFoundError,
+    SecretRegionError,
+    SecretsError,
+)
+from tracker.runtime.secrets import SecretValue, secret_display_name, secret_set_instruction
 
 
 def _error_code(error: ClientError) -> str:
     return error.response.get("Error", {}).get("Code", "")
 
 
-class SecretBeingDeletedError(SecretsError):
-    pass
+class SecretBeingDeletedError(SecretConfigurationError):
+    status_code = 409
+    cause_code = "secret_being_deleted"
 
 
 class SecretsManagerStore:
@@ -21,6 +30,16 @@ class SecretsManagerStore:
         self._clients = clients
 
     async def get(self, name: str) -> SecretValue:
+        display = secret_display_name(name)
+        set_instruction = secret_set_instruction(name)
+        region = self._clients.region
+        arn = name.split(":", 6)
+        if len(arn) == 7 and arn[0] == "arn" and arn[2] == "secretsmanager" and arn[3] != region:
+            display = secret_display_name(re.sub(r"-[A-Za-z0-9]{6}$", "", arn[6]))
+            raise SecretRegionError(
+                f"Secret '{display}' is in region '{arn[3]}', but the Tracker reads region '{region}'. "
+                f"Use a Tracker in region '{arn[3]}'."
+            )
         async with self._clients.secretsmanager_async_client() as client:
             try:
                 response: dict[str, Any] = await client.get_secret_value(  # pyright: ignore[reportUnknownMemberType]
@@ -28,8 +47,35 @@ class SecretsManagerStore:
                 )
             except ClientError as error:
                 error_code = _error_code(error)
-                if error_code in {"ResourceNotFoundException", "AccessDeniedException"}:
-                    raise SecretNotFoundError(f"Secret '{secret_display_name(name)}' does not exist") from error
+                if error_code == "ResourceNotFoundException":
+                    raise SecretNotFoundError(
+                        f"Secret '{display}' is not set for your organization. {set_instruction}"
+                    ) from error
+                if error_code in {"DecryptionFailure", "DecryptionFailureException", "KMSAccessDeniedException"} or (
+                    error_code in {"AccessDenied", "AccessDeniedException"}
+                    and any(
+                        marker in error.response.get("Error", {}).get("Message", "").lower()
+                        for marker in ("kms:decrypt", "kms key", "access to kms", "kms access")
+                    )
+                ):
+                    raise SecretDecryptionError(
+                        f"Valkyrie can't decrypt secret '{display}': decryption failed. "
+                        "This is a Valkyrie problem, not your configuration, and has been reported."
+                    ) from error
+                if error_code in {"AccessDenied", "AccessDeniedException"}:
+                    raise SecretAccessDeniedError(
+                        f"Valkyrie can't read secret '{display}': it isn't set for your organization or access to it was denied. "
+                        f"If it isn't set, {set_instruction[0].lower()}{set_instruction[1:]} "
+                        "Otherwise this is a Valkyrie problem and has been reported."
+                    ) from error
+                if error_code == "InvalidRequestException" and any(
+                    state in error.response.get("Error", {}).get("Message", "").lower()
+                    for state in ("scheduled for deletion", "being deleted")
+                ):
+                    raise SecretBeingDeletedError(
+                        f"Secret '{display}' is being deleted. Wait for the deletion to finish, then "
+                        f"{set_instruction[0].lower()}{set_instruction[1:]}"
+                    ) from error
                 raise SecretsError(f"Failed to retrieve secret '{secret_display_name(name)}' ({error_code})") from error
 
         secret_string = str(response["SecretString"])  # pyright: ignore[reportUnknownArgumentType]

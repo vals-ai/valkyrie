@@ -749,8 +749,6 @@ def test_exact_agent_selection_survives_alias_and_explicit_update(
         project = Project(
             org_id=TEST_ORG_ID, handle="exact-release", name="Exact release", spend_type=SpendType.INTERNAL
         )
-        database_session.add(project)
-        database_session.flush()
         project_service.seed(project)
         database_session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id))
         database_session.commit()

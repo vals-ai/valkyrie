@@ -246,6 +246,15 @@ class RunCost(SQLModel, table=True):
             postgresql_where=text("cost_type = 'sandbox'"),
             sqlite_where=text("cost_type = 'sandbox'"),
         ),
+        Index(
+            "uq_run_cost_search_benchmark_provider_source_id",
+            "benchmark_id",
+            "provider",
+            "source_id",
+            unique=True,
+            postgresql_where=text("cost_type = 'search'"),
+            sqlite_where=text("cost_type = 'search'"),
+        ),
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -542,51 +551,20 @@ class Benchmark(SQLModel, table=True):
         )
 
 
-class Project(SQLModel, table=True):
-    __table_args__ = (
-        UniqueConstraint("org_id", "handle", name="unique_project_handle_per_org"),
-        Index("uq_project_org_name", "org_id", text("lower(btrim(name))"), unique=True),
-    )
-
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    org_id: UUID = Field(foreign_key="org.id")
+class Project(SQLModel):
+    id: UUID = Field(default_factory=uuid4)
+    org_id: UUID
     handle: str
     name: str
     spend_type: SpendType
     subcategory: str | None = None
     customer: str | None = None
-    extra_tags: dict[str, str] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    extra_tags: dict[str, str] = Field(default_factory=dict)
     gateway_request_id: UUID | None = None
     gateway_key_id: UUID | None = None
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
-        sa_column=Column(DateTime(timezone=True), nullable=False),
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     created_by_email: str | None = None
-    archived_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
-
-
-class ProjectBackfill(SQLModel, table=True):
-    __tablename__ = "project_backfill"
-
-    project_id: UUID = Field(primary_key=True)
-    org_id: UUID
-    source_hash: str = Field(max_length=64)
-    confirmed: bool = False
-    copied_at: datetime = Field(
-        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
-        sa_column=Column(DateTime(timezone=True), nullable=False),
-    )
-
-
-class ProjectCutover(SQLModel, table=True):
-    __tablename__ = "project_cutover"
-
-    id: int = Field(default=1, primary_key=True)
-    completed_at: datetime = Field(
-        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
-        sa_column=Column(DateTime(timezone=True), nullable=False),
-    )
+    archived_at: datetime | None = None
 
 
 class RunProject(SQLModel, table=True):

@@ -17,6 +17,7 @@ from valkyrie.sdk.resources.account import AccountResource
 from valkyrie.sdk.resources.agents import AgentsResource
 from valkyrie.sdk.resources.artifacts import ArtifactsResource
 from valkyrie.sdk.resources.benchmarks import BenchmarksResource
+from valkyrie.sdk.resources.costs import CostsResource
 from valkyrie.sdk.resources.datasets import BenchmarkDefinitionsResource, DatasetsResource
 from valkyrie.sdk.resources.logs import LogsResource
 from valkyrie.sdk.resources.projects import ProjectsResource
@@ -63,6 +64,7 @@ class ValkyrieClient:
         self.providers = ProvidersResource(self)
         self.settings = SettingsResource(self)
         self.projects = ProjectsResource(self)
+        self.costs = CostsResource(self)
         self.benchmark_definitions = BenchmarkDefinitionsResource(self)
         self.datasets = DatasetsResource(self)
         self.account = AccountResource(self)

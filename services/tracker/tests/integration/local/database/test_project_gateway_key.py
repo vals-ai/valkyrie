@@ -28,7 +28,9 @@ async def _second_run_waits(engine: Engine) -> None:
     pytest.fail("The second run never waited on the Gateway key lock")
 
 
-@pytest.mark.description("Two first runs of a project collect its Gateway key once and both start on that key.")
+@pytest.mark.description(
+    "Two first runs of a project mint its Gateway key once, and the second starts on the key the first stored."
+)
 def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     routes = MockProjectRoutes()
     reads: list[str | None] = []
@@ -55,14 +57,13 @@ def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: 
     )
     routes.seed(project)
     key_id = uuid4()
-    collects: list[UUID] = []
+    seen: list[UUID | None] = []
 
-    async def collect(*_: object) -> UUID:
-        collects.append(key_id)
-        if len(collects) > 1:
-            response = httpx.Response(409, request=httpx.Request("POST", "http://gateway/collect"))
-            raise httpx.HTTPStatusError("Key state or revision changed", request=response.request, response=response)
-        await _second_run_waits(postgres_engine)
+    async def mint(minting: Project, *_: object) -> UUID:
+        seen.append(minting.gateway_key_id)
+        if len(seen) == 1:
+            await _second_run_waits(postgres_engine)
+        routes.rows[str(minting.id)]["gateway_key_id"] = str(key_id)
         return key_id
 
     def start(_: int) -> dict[str, str]:
@@ -70,13 +71,13 @@ def test_first_runs_share_one_gateway_key(postgres_engine: Engine, monkeypatch: 
             postgres_engine, project, org, MagicMock()
         )
 
-    monkeypatch.setattr(project_gateway, "_collect_project_gateway_key", collect)
+    monkeypatch.setattr(project_gateway, "_project_service_gateway_key", mint)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first, second = pool.map(start, range(2))
 
     assert first == second
     assert str(key_id) in first["MODEL_GATEWAY_API_KEY"]
-    assert collects == [key_id]
+    assert seen == [None, key_id]
     assert routes.rows[str(project.id)]["gateway_key_id"] == str(key_id)
     assert reads == [None, str(key_id)]
     client._client.close()

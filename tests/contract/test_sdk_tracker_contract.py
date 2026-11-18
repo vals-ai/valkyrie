@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, cast
@@ -8,9 +9,10 @@ from typing import Any, cast
 import httpx
 import pytest
 from benchmark_service.schemas import VerifyTaskIdsResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from services.tracker.main import app
 from tracker.agent.schemas import AgentContract, Parameter
+from tracker.api.costs import CostsByProjectResponse, ProjectCostRow, ProjectRun, WindowBound
 from tracker.api.filter_options import FilterOptionsResponse
 from tracker.api.login import AccessKeyResponse, IdentityResponse
 from tracker.api.organizations import (
@@ -21,6 +23,7 @@ from tracker.api.organizations import (
     OrganizationResponse,
     OrganizationsResponse,
 )
+from tracker.services.costs import MonthModelCost, ProjectModelCosts
 from tracker.types import FinalEvaluation
 from tracker.types import (
     AWSBenchmarkArguments,
@@ -97,6 +100,13 @@ from tracker.types import (
     TaskSummary,
 )
 from valkyrie.sdk import ValkyrieClient, ValkyrieConfig
+from valkyrie.sdk.models.costs import (
+    CostsByProjectResponse as SDKCostsByProjectResponse,
+    MonthModelCost as SDKMonthModelCost,
+    ProjectCostRow as SDKProjectCostRow,
+    ProjectModelCosts as SDKProjectModelCosts,
+    ProjectRun as SDKProjectRun,
+)
 from valkyrie.sdk.models import (
     AccessKeyResponse as SDKAccessKeyResponse,
     IdentityResponse as SDKIdentityResponse,
@@ -187,12 +197,13 @@ from valkyrie.sdk.models import (
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "sdk_api"
 ROUTES = (
-    ("/benchmarks/filter-options", "get", ""),
+    ("/benchmarks/filter-options", "get", "project"),
     ("/benchmarks/{benchmark_id}/concurrency", "patch", "benchmark_id"),
     ("/benchmarks/{benchmark_id}/shed", "post", "benchmark_id"),
     ("/benchmarks/{benchmark_id}/project", "post", "benchmark_id"),
     ("/projects", "post", ""),
     ("/projects", "get", "include_archived"),
+    ("/projects/{handle}", "get", "handle"),
     ("/projects/{handle}", "put", "handle"),
     ("/projects/{handle}", "delete", "handle"),
     ("/v1/benchmarks", "post", ""),
@@ -228,7 +239,7 @@ ROUTES = (
     (
         "/fetch-benchmarks",
         "get",
-        "agent_name benchmark_name model dataset label status started_by started_after started_before order_by cursor limit offset",
+        "agent_name benchmark_name model dataset label status started_by started_after started_before project order_by cursor limit offset",
     ),
     ("/retrieve-results", "get", "benchmark_id s3 task_ids"),
     ("/preview-results", "get", "benchmark_id task_ids"),
@@ -256,6 +267,8 @@ ROUTES = (
         "get",
         "benchmark_id task_id query start_time end_time",
     ),
+    ("/costs/by-project", "get", "start end"),
+    ("/costs/project-model", "get", "project start end"),
     ("/agents", "get", ""),
     ("/agents/{name}/download-url", "get", "name download"),
     ("/agents/{name}", "put", "name overwrite"),
@@ -329,7 +342,10 @@ RESPONSE_MODELS = {
     ("/benchmarks/{benchmark_id}/project", "post"): "ProjectResponse",
     ("/projects", "post"): "ProjectResponse",
     ("/projects", "get"): "ProjectsResponse",
+    ("/projects/{handle}", "get"): "ProjectResponse",
     ("/projects/{handle}", "put"): "ProjectResponse",
+    ("/costs/by-project", "get"): "CostsByProjectResponse",
+    ("/costs/project-model", "get"): "ProjectModelCosts",
     ("/projects/{handle}", "delete"): "ProjectResponse",
     ("/v1/benchmarks", "get"): "BenchmarkDefinitionsResponse",
     ("/v1/benchmarks/{benchmark}", "get"): "BenchmarkDefinitionResponse",
@@ -395,6 +411,11 @@ MODEL_PAIRS = (
     (NewProjectRequest, SDKNewProjectRequest),
     (ProjectResponse, SDKProjectResponse),
     (ProjectsResponse, SDKProjectsResponse),
+    (ProjectCostRow, SDKProjectCostRow),
+    (ProjectRun, SDKProjectRun),
+    (CostsByProjectResponse, SDKCostsByProjectResponse),
+    (MonthModelCost, SDKMonthModelCost),
+    (ProjectModelCosts, SDKProjectModelCosts),
     (BenchmarkDefinitionResponse, SDKBenchmarkDefinitionResponse),
     (BenchmarkDefinitionsResponse, SDKBenchmarkDefinitionsResponse),
     (DatasetResponse, SDKDatasetResponse),
@@ -448,7 +469,6 @@ INTERNAL_ROUTES = {
     ("/benchmarks/{benchmark_id}/tasks/{task_id}/native-output/files", "get"),
     ("/benchmarks/{benchmark_id}/tasks/{task_id}/native-output/file", "get"),
     ("/costs/by-email", "get"),
-    ("/costs/by-project", "get"),
     ("/costs/project-daytona", "get"),
     ("/costs/daytona-unmatched", "get"),
     ("/costs/sandbox-rows", "get"),
@@ -462,6 +482,11 @@ INTERNAL_ROUTES = {
     ("/secrets/{name}", "put"),
     ("/secrets/{name}", "delete"),
     ("/projects/by-id/{project_id}", "get"),
+    ("/limit-requests", "get"),
+    ("/projects/by-id/{project_id}/limit", "put"),
+    ("/projects/by-id/{project_id}/limit-requests", "post"),
+    ("/projects/by-id/{project_id}/limit-requests", "get"),
+    ("/projects/by-id/{project_id}/limit-requests/{request_id}/{decision}", "post"),
     ("/projects/by-id/{project_id}/gateway-key-eligibility", "get"),
     ("/remote-grader/registrations", "post"),
     ("/remote-grader/registrations/{registration_id}/lease", "post"),
@@ -617,6 +642,33 @@ async def test_sdk_start_matches_tracker_api_key_contract() -> None:
         transport=httpx.MockTransport(handler),
     ) as client:
         await client.runs.start("sweagent", "swebench")
+
+
+@pytest.mark.description("`client.costs` sends a date and a datetime as bounds the Tracker cost window accepts.")
+async def test_sdk_costs_send_bounds_the_tracker_accepts() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        window = {"start": "2026-06-01T00:00:00Z", "end": "2026-12-01T00:00:00Z"}
+        if request.url.path == "/costs/by-project":
+            return httpx.Response(200, json={**window, "rows": [], "runs": []})
+        return httpx.Response(
+            200, json={**window, "months": [], "unattributed_usd": 0.0, "through": "2026-11-16T09:30:00Z"}
+        )
+
+    async with ValkyrieClient(
+        ValkyrieConfig(url="https://tracker.test"), transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.costs.by_project(date(2026, 6, 1), datetime(2026, 12, 1, tzinfo=UTC))
+        await client.costs.project_model("alpha", date(2026, 6, 1), datetime(2026, 12, 1, tzinfo=UTC))
+
+    bound = TypeAdapter(WindowBound)
+    assert [request.url.path for request in requests] == ["/costs/by-project", "/costs/project-model"]
+    for request in requests:
+        assert bound.validate_python(request.url.params["start"]) == date(2026, 6, 1)
+        assert bound.validate_python(request.url.params["end"]) == datetime(2026, 12, 1, tzinfo=UTC)
+    assert requests[1].url.params["project"] == "alpha"
 
 
 def _normalized_wire_schema(value: Any) -> Any:

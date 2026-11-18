@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from tests.factories import make_benchmark
 from tests.project_service import MockProjectRoutes
@@ -18,10 +18,6 @@ from tracker.types import NewProjectRequest
 
 def _project(handle: str, name: str | None = None) -> Project:
     return Project(org_id=TEST_ORG_ID, handle=handle, name=name or handle.title(), spend_type=SpendType.DEVELOPMENT)
-
-
-def _tracker_rows(tracker_database: Session) -> list[Project]:
-    return list(tracker_database.exec(select(Project)).all())
 
 
 class TestProjectServiceWrites:
@@ -49,7 +45,6 @@ class TestProjectServiceWrites:
         assert [row["handle"] for row in project_service.rows.values() if row.get("deleted_at") is None] == ["default"]
         assert project_service.rows[str(router.id)]["deleted_at"] is not None
         assert repository.create(_project("router-bench", "Renamed elsewhere")).id != router.id
-        assert _tracker_rows(tracker_database) == []
 
     @pytest.mark.description("A create that reuses a handle or a name is rejected with the matching error.")
     def test_taken_handle_and_name(self, tracker_database: Session, project_service: MockProjectRoutes) -> None:
@@ -61,7 +56,6 @@ class TestProjectServiceWrites:
         with pytest.raises(ProjectNameTakenError):
             _ = repository.create(_project("other-bench", " router-BENCH "))
         assert len(project_service.rows) == 1
-        assert _tracker_rows(tracker_database) == []
 
     @pytest.mark.description("A delete leaves a project with a linked run in the service.")
     def test_delete_keeps_a_linked_project(self, tracker_database: Session, project_service: MockProjectRoutes) -> None:
@@ -122,4 +116,3 @@ class TestProjectServiceWrites:
         created = projects_api.create_project(request, ProjectRepository(tracker_database), identity)
 
         assert project_service.rows[str(created.id)]["gateway_request_id"] == str(request_id)
-        assert _tracker_rows(tracker_database) == []

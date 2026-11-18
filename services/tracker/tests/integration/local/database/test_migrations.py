@@ -8,14 +8,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic, sleep
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.engine import Connection, Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlmodel import Session, SQLModel, create_engine
 from testcontainers.postgres import PostgresContainer
@@ -29,7 +29,6 @@ from tracker.database.models import (
     ExecutorDispatch,
     ExecutorRelease,
     Project,
-    ProjectCutover,
     RunProject,
     Task,
 )
@@ -67,6 +66,9 @@ _DROP_AWS_MANAGED_REVISION = "c4d5e6f7a8b9"
 _PROJECT_PREDECESSOR = "b7e4c1a9d2f0"
 _UNIQUE_PROJECT_NAME_REVISION = "4c9d2e7f1a3b"
 _UNIQUE_PROJECT_NAME_PREDECESSOR = "3222f9e0a6ce"
+_DROP_PROJECT_REVISION = "f1d3b5a7c9e2"
+_DROP_PROJECT_PREDECESSOR = "d3e4f5a6b7c8"
+_PRE_PROJECT_COPY_REVISION = "a4c70e9d133f"
 
 
 @pytest.mark.description("The project cutover marker upgrades, persists completion, downgrades and upgrades again.")
@@ -78,13 +80,12 @@ def test_project_cutover_round_trip(migration_database_url: str) -> None:
 
     upgrade = _run_alembic(migration_database_url, "upgrade", "c9e2f4a6b803")
     assert upgrade.returncode == 0, upgrade.stderr
-    with Session(engine) as session:
-        assert session.get(ProjectCutover, 1) is None
-        session.add(ProjectCutover())
-        session.commit()
-    with Session(engine) as session:
-        marker = session.get(ProjectCutover, 1)
-        assert marker is not None and marker.completed_at.utcoffset() == timedelta(0)
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT count(*) FROM project_cutover")).scalar_one() == 0
+        _ = connection.execute(text("INSERT INTO project_cutover (id, completed_at) VALUES (1, now())"))
+    with engine.connect() as connection:
+        completed_at = connection.execute(text("SELECT completed_at FROM project_cutover WHERE id = 1")).scalar_one()
+        assert completed_at.utcoffset() == timedelta(0)
 
     downgrade = _run_alembic(migration_database_url, "downgrade", "b6d8e1c3f902")
     assert downgrade.returncode == 0, downgrade.stderr
@@ -92,8 +93,8 @@ def test_project_cutover_round_trip(migration_database_url: str) -> None:
 
     upgrade = _run_alembic(migration_database_url, "upgrade", "c9e2f4a6b803")
     assert upgrade.returncode == 0, upgrade.stderr
-    with Session(engine) as session:
-        assert session.get(ProjectCutover, 1) is None
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM project_cutover")).scalar_one() == 0
     engine.dispose()
 
 
@@ -1513,7 +1514,7 @@ def test_dropping_aws_managed_downgrades_with_every_aws_run_marked_managed(migra
 
 
 @pytest.mark.description(
-    "Project handles are unique per org while names may repeat, a run's last-appended link is its project even when link timestamps tie, and downgrade removes both tables."
+    "A run's last-appended link is its project even when link timestamps tie, and downgrade removes `run_project`."
 )
 def test_project_migration_matches_the_models_and_downgrades(
     migration_database_url: str, project_service: MockProjectRoutes
@@ -1522,20 +1523,12 @@ def test_project_migration_matches_the_models_and_downgrades(
     assert upgrade.returncode == 0, upgrade.stderr
     engine = create_engine(migration_database_url)
     inspector = inspect(engine)
-    for table in ("project", "run_project"):
-        assert {column["name"]: column["nullable"] for column in inspector.get_columns(table)} == {
-            column.name: column.nullable for column in SQLModel.metadata.tables[table].columns
-        }
-    assert [
-        (constraint["name"], constraint["column_names"]) for constraint in inspector.get_unique_constraints("project")
-    ] == [("unique_project_handle_per_org", ["org_id", "handle"])]
+    assert {column["name"]: column["nullable"] for column in inspector.get_columns("run_project")} == {
+        column.name: column.nullable for column in SQLModel.metadata.tables["run_project"].columns
+    }
     assert [(index["name"], index["column_names"]) for index in inspector.get_indexes("run_project")] == [
         ("ix_run_project_benchmark_id", ["benchmark_id"])
     ]
-    assert [
-        (foreign_key["constrained_columns"], foreign_key["referred_table"], foreign_key["referred_columns"])
-        for foreign_key in inspector.get_foreign_keys("project")
-    ] == [(["org_id"], "org", ["id"])]
     assert sorted(
         (foreign_key["constrained_columns"], foreign_key["referred_table"], foreign_key["referred_columns"])
         for foreign_key in inspector.get_foreign_keys("run_project")
@@ -1590,8 +1583,6 @@ def test_project_migration_matches_the_models_and_downgrades(
             extra_tags={"engagement": "q4"},
         )
         project_service.seed(router_bench, google_report)
-        session.add_all([router_bench, google_report])
-        session.flush()
         moved_at = datetime.now(UTC)
         session.add_all(
             [
@@ -1613,27 +1604,6 @@ def test_project_migration_matches_the_models_and_downgrades(
             SpendType.CUSTOMER,
             {"engagement": "q4"},
         )
-        session.add(
-            Project(
-                org_id=org_id,
-                handle="router-bench-2",
-                name="Router Bench 2",
-                spend_type=SpendType.INTERNAL,
-                subcategory="blog",
-            )
-        )
-        session.commit()
-        session.add(
-            Project(
-                org_id=org_id,
-                handle="router-bench",
-                name="Another name",
-                spend_type=SpendType.INTERNAL,
-                subcategory="blog",
-            )
-        )
-        with pytest.raises(IntegrityError):
-            session.commit()
 
     downgrade = _run_alembic(migration_database_url, "downgrade", _PROJECT_PREDECESSOR)
     assert downgrade.returncode == 0, downgrade.stderr
@@ -1829,3 +1799,188 @@ def test_run_project_drops_project_foreign_key(migration_database_url: str) -> N
     downgrade = _run_alembic(migration_database_url, "downgrade", "83a507dd5eaf")
     assert downgrade.returncode == 0, downgrade.stderr
     assert referred() == {"benchmark", "project"}
+
+
+@pytest.mark.description(
+    "At head, Tracker has no `project`, `project_backfill` or `project_cutover` table and every `run_project` link keeps its ID and project ID. "
+    "A downgrade restores an empty `project` table."
+)
+def test_project_table_drop_keeps_run_links_and_downgrades(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "e4b8a1c7d2f9")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    org_id, run_id, project_id = uuid4(), uuid4(), uuid4()
+    arguments = AWSBenchmarkArguments(
+        contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"), concurrency=1
+    )
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO org (id, name) VALUES (:id, 'org')"), {"id": org_id})
+        connection.execute(
+            text(
+                "INSERT INTO benchmark (id, org_id, name, started_at, status, arguments) VALUES "
+                "(:id, :org_id, 'run', now(), CAST(:status AS benchmarkstatus), CAST(:arguments AS json))"
+            ),
+            {
+                "id": run_id,
+                "org_id": org_id,
+                "status": BenchmarkStatus.IN_PROGRESS.value,
+                "arguments": arguments.model_dump_json(),
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO project (id, org_id, handle, name, spend_type, extra_tags, created_at) "
+                "VALUES (:id, :org_id, 'router-bench', 'Router Bench', 'DEVELOPMENT', '{}', now())"
+            ),
+            {"id": project_id, "org_id": org_id},
+        )
+        links = [
+            tuple(row)
+            for row in connection.execute(
+                text(
+                    "INSERT INTO run_project (benchmark_id, project_id, created_at) "
+                    "VALUES (:run_id, :project_id, now()), (:run_id, :other_id, now()) RETURNING id, benchmark_id, project_id"
+                ),
+                {"run_id": run_id, "project_id": project_id, "other_id": uuid4()},
+            )
+        ]
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", _DROP_PROJECT_PREDECESSOR)
+    assert upgrade.returncode == 0, upgrade.stderr
+    with engine.begin() as connection:
+        _record_project_copy(connection, project_id, org_id, confirmed=True, cutovers=1)
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "head")
+    assert upgrade.returncode == 0, upgrade.stderr
+    assert not {"project", "project_backfill", "project_cutover"} & set(inspect(engine).get_table_names())
+    with engine.connect() as connection:
+        assert [
+            tuple(row)
+            for row in connection.execute(text("SELECT id, benchmark_id, project_id FROM run_project ORDER BY id"))
+        ] == links
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "e4b8a1c7d2f9")
+    assert downgrade.returncode == 0, downgrade.stderr
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM project")).scalar_one() == 0
+    engine.dispose()
+
+
+def _record_project_copy(
+    connection: Connection, project_id: UUID, org_id: UUID, *, confirmed: bool | None, cutovers: int
+) -> None:
+    if confirmed is not None:
+        connection.execute(
+            text(
+                "INSERT INTO project_backfill (project_id, org_id, source_hash, confirmed, copied_at) "
+                "VALUES (:project_id, :org_id, :source_hash, :confirmed, now())"
+            ),
+            {"project_id": project_id, "org_id": org_id, "source_hash": "a" * 64, "confirmed": confirmed},
+        )
+    for cutover_id in range(1, cutovers + 1):
+        connection.execute(
+            text("INSERT INTO project_cutover (id, completed_at) VALUES (:id, now())"), {"id": cutover_id}
+        )
+
+
+@pytest.mark.description(
+    "The project table drop refuses and drops nothing unless every project has a confirmed copy and one cutover row."
+)
+@pytest.mark.parametrize(
+    ("start", "destination", "projects", "confirmed", "cutovers", "counts"),
+    [
+        (
+            _DROP_PROJECT_PREDECESSOR,
+            _DROP_PROJECT_REVISION,
+            1,
+            None,
+            1,
+            "project=1 confirmed_copies=0 project_cutover=1",
+        ),
+        (
+            _DROP_PROJECT_PREDECESSOR,
+            _DROP_PROJECT_REVISION,
+            1,
+            False,
+            1,
+            "project=1 confirmed_copies=0 project_cutover=1",
+        ),
+        (
+            _DROP_PROJECT_PREDECESSOR,
+            _DROP_PROJECT_REVISION,
+            1,
+            True,
+            0,
+            "project=1 confirmed_copies=1 project_cutover=0",
+        ),
+        (
+            _DROP_PROJECT_PREDECESSOR,
+            _DROP_PROJECT_REVISION,
+            1,
+            True,
+            2,
+            "project=1 confirmed_copies=1 project_cutover=2",
+        ),
+        (
+            _DROP_PROJECT_PREDECESSOR,
+            _DROP_PROJECT_REVISION,
+            2,
+            True,
+            1,
+            "project=2 confirmed_copies=1 project_cutover=1",
+        ),
+        (_DROP_PROJECT_PREDECESSOR, "+1", 1, None, 0, "project=1 confirmed_copies=0 project_cutover=0"),
+        (_PRE_PROJECT_COPY_REVISION, "head", 1, None, 0, "project=1 confirmed_copies=0 project_cutover=0"),
+    ],
+    ids=[
+        "no-copy",
+        "unconfirmed-copy",
+        "no-cutover",
+        "two-cutovers",
+        "one-of-two-copied",
+        "relative-upgrade",
+        "before-copy-tables",
+    ],
+)
+def test_project_table_drop_refuses_incomplete_copy(
+    migration_database_url: str,
+    start: str,
+    destination: str,
+    projects: int,
+    confirmed: bool | None,
+    cutovers: int,
+    counts: str,
+) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", start)
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    org_id, project_ids = uuid4(), [uuid4() for _ in range(projects)]
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO org (id, name) VALUES (:id, 'org')"), {"id": org_id})
+        connection.execute(
+            text(
+                "INSERT INTO project (id, org_id, handle, name, spend_type, extra_tags, created_at) "
+                "VALUES (:id, :org_id, :handle, :handle, 'DEVELOPMENT', '{}', now())"
+            ),
+            [
+                {"id": project_id, "org_id": org_id, "handle": f"router-bench-{project_id}"}
+                for project_id in project_ids
+            ],
+        )
+        _record_project_copy(connection, project_ids[0], org_id, confirmed=confirmed, cutovers=cutovers)
+    tables = set(inspect(engine).get_table_names())
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", destination)
+
+    assert upgrade.returncode != 0
+    assert "Refusing to drop project tables" in upgrade.stderr and counts in upgrade.stderr
+    uncopied = project_ids[1:] if confirmed else project_ids
+    listed = ", ".join(f"{org_id}/{project_id}" for project_id in sorted(uncopied)) or "none"
+    assert f"uncopied_org_id/id (first 20): {listed}" in upgrade.stderr
+    assert set(inspect(engine).get_table_names()) == tables
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == start
+        assert set(connection.execute(text("SELECT id FROM project")).scalars()) == set(project_ids)
+    current = _run_alembic(migration_database_url, "current", "")
+    assert current.returncode == 0, current.stderr
+    engine.dispose()

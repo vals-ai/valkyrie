@@ -17,6 +17,7 @@ import pytest
 from benchmark_service import (
     CreditedGeneration,
     DaytonaProviderConfig,
+    MCPServer,
     SandboxCreateRequest,
     SandboxSource,
     TargetedSnapshotSource,
@@ -811,6 +812,57 @@ class TestProcessTaskEnvironment:
         else:
             remaining = (task_row.credited_wall_deadline_at.replace(tzinfo=UTC) - datetime.now(UTC)).total_seconds()
             assert 165 * 3600 < remaining <= 166 * 3600
+
+    @pytest.mark.description(
+        "A benchmark service task hands its MCP servers, skills folder and task folder to the agent."
+    )
+    @pytest.mark.parametrize(
+        ("tools", "handed"),
+        [
+            ({}, ([], None, None)),
+            (
+                {"mcp_servers": [MCPServer(name="web", transport="streamable-http", url="https://x")]},
+                ([MCPServer(name="web", transport="streamable-http", url="https://x")], None, None),
+            ),
+            ({"skills_dir": "/skills"}, ([], "/skills", None)),
+            ({"task_dir": "/task"}, ([], None, "/task")),
+        ],
+        ids=["no tools", "mcp server", "skills folder", "task folder"],
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    async def test_a_service_task_hands_its_tools_to_the_agent(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        tools: dict[str, Any],
+        handed: tuple[list[MCPServer], str | None, str | None],
+    ) -> None:
+        contract = contract.model_copy(update={"model": None, "inference_settings_attested": False})
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        task_response = make_retrieve_task_response().model_copy(update=tools)
+        observed: list[tuple[list[MCPServer], str | None, str | None]] = []
+
+        async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
+            return task_response
+
+        async def capture_run_agent(*_args: Any, **kwargs: Any) -> tuple[None, float]:
+            observed.append((kwargs["mcp_servers"], kwargs["skills_dir"], kwargs["task_dir"]))
+            return await _complete_base_only_agent(**kwargs)
+
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
+        monkeypatch.setattr(utils_module, "run_agent", capture_run_agent)
+        monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
+        monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", None)
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": {"status": "success", "score": 1.0}}
+        assert observed == [handed]
 
     @pytest.mark.parametrize("native_key", [False, True], ids=["without-token", "with-token"])
     @pytest.mark.usefixtures("process_benchmark_env")

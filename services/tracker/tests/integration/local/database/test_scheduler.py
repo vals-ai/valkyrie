@@ -66,6 +66,7 @@ from sqlmodel import Session, col, func, select
 from testcontainers.core.container import DockerContainer
 import uvicorn
 
+from tests.project_service import MockProjectRoutes
 from tests.factories import make_task
 from tests.unit.services.task_execution_support import finalize_agent_generation
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
@@ -1640,6 +1641,7 @@ async def test_two_recovery_handoffs_leave_one_evaluation_owner(
 @pytest.mark.usefixtures("kms_grader_tokens")
 @pytest.mark.parametrize("grading_path", ["nonproject", "project", "remote-project"])
 async def test_resumed_evaluation_persists_callback_before_result(
+    project_service: MockProjectRoutes,
     postgres_engine: Engine,
     postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -1659,8 +1661,7 @@ async def test_resumed_evaluation_persists_callback_before_result(
             benchmark.name = "vcb"
         project = Project(org_id=org.id, handle="selected", name="Selected", spend_type=SpendType.INTERNAL)
         project.gateway_key_id = uuid4()
-        postgres_session.add(project)
-        postgres_session.flush()
+        project_service.seed(project)
         postgres_session.add(RunProject(benchmark_id=benchmark.id, project_id=project.id))
         reference = f"{tenant_secret_prefix(org.id)}model-gateway-{project.gateway_key_id}"
         benchmark.arguments = benchmark.arguments.model_copy(
@@ -3964,6 +3965,7 @@ async def runtime_services(aws_runtime: AWSRuntime) -> AsyncGenerator[RuntimeSer
 )
 @pytest.mark.usefixtures("kms_grader_tokens")
 async def test_control_remote_grader_grant_assignment_and_project(
+    project_service: MockProjectRoutes,
     postgres_engine: Engine,
     postgres_session: Session,
     bound_controls: Callable[..., dict[str, object]],
@@ -3980,8 +3982,7 @@ async def test_control_remote_grader_grant_assignment_and_project(
     benchmark.name = "vcb"
     project = Project(org_id=org.id, handle="selected", name="Selected", spend_type=SpendType.INTERNAL)
     project.gateway_key_id = uuid4()
-    postgres_session.add(project)
-    postgres_session.flush()
+    project_service.seed(project)
     postgres_session.add(RunProject(benchmark_id=benchmark.id, project_id=project.id))
     reference = f"{tenant_secret_prefix(org.id)}model-gateway-{project.gateway_key_id}"
     benchmark.arguments = benchmark.arguments.model_copy(
@@ -4094,6 +4095,7 @@ async def test_control_remote_grader_grant_assignment_and_project(
     ],
 )
 async def test_evaluation_uses_saved_project_grading_root(
+    project_service: MockProjectRoutes,
     postgres_engine: Engine,
     postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -4114,8 +4116,7 @@ async def test_evaluation_uses_saved_project_grading_root(
     current_project = Project(org_id=org.id, handle="retagged", name="Retagged", spend_type=SpendType.INTERNAL)
     saved_project.gateway_key_id = uuid4()
     current_project.gateway_key_id = uuid4()
-    postgres_session.add_all([saved_project, current_project])
-    postgres_session.flush()
+    project_service.seed(saved_project, current_project)
     postgres_session.add_all(
         [
             RunProject(
@@ -4334,6 +4335,7 @@ async def test_evaluation_uses_saved_project_grading_root(
     )
 )
 async def test_saved_project_grader_records_real_gateway_ledger(
+    project_service: MockProjectRoutes,
     postgres_engine: Engine,
     postgres_session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -4521,7 +4523,8 @@ async def test_saved_project_grader_records_real_gateway_ledger(
                             spend_type=SpendType.INTERNAL,
                         )
                         project.gateway_key_id = UUID(proof["key_id"])
-                        postgres_session.add_all([org, project])
+                        postgres_session.add(org)
+                        project_service.seed(project)
                         assert seed.current_execution_release_id is not None
                         promote_release(postgres_session, seed.current_execution_release_id)
                         postgres_session.commit()

@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish the release notes from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/contents/CHANGELOG.md?ref=$TAG" -H "Accept: application/vnd.github.raw" \
+            | awk -v heading="## $TAG" '/^## / { found = $0 == heading; next } found' \
+            > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $TAG"
+            exit 1
+          fi
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag --latest

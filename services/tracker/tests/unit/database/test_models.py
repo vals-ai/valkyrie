@@ -191,7 +191,7 @@ def test_benchmark_table_row_counts_stopped_tasks_as_finished(database_session: 
         database_session.add(Task(org_id=TEST_ORG_ID, benchmark=benchmark.id, task_id=task_id, status=status))
     database_session.commit()
 
-    [row] = build_benchmark_table_rows([benchmark], database_session)
+    [row] = build_benchmark_table_rows([benchmark], database_session, TEST_ORG_ID)
 
     assert row.total_tasks == 4
     assert row.finished_tasks == 3

@@ -14,6 +14,7 @@ from tests.utils import TEST_ORG_ID
 from tracker.auth import LOGIN_REQUIRED, LoginIdentity, get_current_org
 import tracker.auth as auth
 from tracker.database.models import Org
+from tracker.exceptions import SecretAccessDeniedError, SecretDecryptionError, SecretNotFoundError, SecretsError
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
 
@@ -68,6 +69,36 @@ def store(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     monkeypatch.setattr(secrets_api, "resolve_org_aws_runtime", lambda _org: MagicMock())
     monkeypatch.setattr(secrets_api, "SecretsManagerStore", lambda _clients: secret_store)
     return secret_store
+
+
+@pytest.mark.description(
+    "Secret ownership checks preserve missing and denied behavior while decryption faults propagate."
+)
+@pytest.mark.parametrize(
+    "error", [None, SecretNotFoundError("missing"), SecretAccessDeniedError("denied"), SecretDecryptionError("decrypt")]
+)
+async def test_require_own_secret_lookup_errors(
+    store: MagicMock, monkeypatch: pytest.MonkeyPatch, error: SecretsError | None
+) -> None:
+    monkeypatch.setattr(secrets_api, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "")
+    store.get.side_effect = error
+    org = Org(id=TEST_ORG_ID, name="acme.example", storage_key="test-bucket")
+    if isinstance(error, SecretDecryptionError):
+        with pytest.raises(SecretDecryptionError) as captured:
+            await secrets_api.require_own_secret("daytona", org)
+        assert captured.value is error
+    elif error is not None:
+        with pytest.raises(HTTPException) as captured_http:
+            await secrets_api.require_own_secret("daytona", org)
+        assert captured_http.value.status_code == 404
+        assert (
+            captured_http.value.detail
+            == "Secret 'daytona' does not exist; create it with `valkyrie secret set daytona`"
+        )
+    else:
+        await secrets_api.require_own_secret("daytona", org)
+    store.get.assert_awaited_once_with(f"{_PREFIX}daytona")
 
 
 @pytest.mark.description("Setting a secret stores it under the org prefix with its tags.")

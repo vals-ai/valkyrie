@@ -57,37 +57,52 @@ def test_tagged_services_are_read_from_their_own_tags() -> None:
         ),
         ecs_service("valsmith", 1),
         ecs_service("emb", 0, TRACKER_TAG, {"key": "vals:min-tasks", "value": "x"}),
+        ecs_service(
+            "web",
+            0,
+            TRACKER_TAG,
+            {"key": "vals:min-tasks", "value": "2"},
+            {"key": "vals:warm-tasks", "value": "5"},
+        ),
     )
 
     assert service_capacity.read_scaled_services(ecs, "cluster") == [
         ScaledService("a2j", "a2j-r2", min_tasks=2, desired=0, deploying=True),
         ScaledService("emb", "emb", min_tasks=1, desired=0),
+        ScaledService("web", "web", min_tasks=2, desired=0, warm_tasks=2),
     ]
     ecs.describe_services.assert_called_once_with(
-        cluster="cluster", services=["a2j-r2", "valsmith", "emb"], include=["TAGS"]
+        cluster="cluster", services=["a2j-r2", "valsmith", "emb", "web"], include=["TAGS"]
     )
 
 
 @pytest.mark.description(
-    "A service keeps its count while it has demand or is deploying and drops to 0 after 30 idle minutes."
+    "A service keeps its count while it has demand or is deploying and drops to its warm floor after 30 idle minutes."
 )
 @pytest.mark.parametrize(
-    ("desired", "demand", "deploying", "min_tasks", "target"),
+    ("desired", "demand", "deploying", "min_tasks", "target", "warm_tasks"),
     [
-        (0, ServiceDemand(active_runs=1), False, 1, 1),
-        (0, ServiceDemand(last_active=NOW), False, 1, 1),
-        (0, ServiceDemand(active_tasks=9), False, 1, 1),
-        (3, ServiceDemand(active_tasks=1), False, 1, 3),
-        (0, ServiceDemand(active_runs=1), False, 2, 2),
-        (0, ServiceDemand(active_runs=1), True, 1, 1),
-        (2, ServiceDemand(last_active=NOW - timedelta(minutes=29)), False, 1, 2),
-        (2, ServiceDemand(last_active=NOW - timedelta(minutes=30)), False, 1, 0),
-        (2, ServiceDemand(), True, 1, 2),
-        (2, ServiceDemand(), False, 1, 0),
+        (0, ServiceDemand(active_runs=1), False, 1, 1, 0),
+        (0, ServiceDemand(last_active=NOW), False, 1, 1, 0),
+        (0, ServiceDemand(active_tasks=9), False, 1, 1, 0),
+        (3, ServiceDemand(active_tasks=1), False, 1, 3, 0),
+        (0, ServiceDemand(active_runs=1), False, 2, 2, 0),
+        (0, ServiceDemand(active_runs=1), True, 1, 1, 0),
+        (2, ServiceDemand(last_active=NOW - timedelta(minutes=29)), False, 1, 2, 0),
+        (2, ServiceDemand(last_active=NOW - timedelta(minutes=30)), False, 1, 0, 0),
+        (2, ServiceDemand(), True, 1, 2, 0),
+        (2, ServiceDemand(), False, 1, 0, 0),
+        (3, ServiceDemand(), False, 2, 1, 1),
+        (0, ServiceDemand(), False, 2, 1, 1),
+        (0, ServiceDemand(active_runs=1), False, 2, 2, 1),
     ],
 )
-def test_target_count(desired: int, demand: ServiceDemand, deploying: bool, min_tasks: int, target: int) -> None:
-    service = ScaledService("a2j", "a2j", min_tasks=min_tasks, desired=desired, deploying=deploying)
+def test_target_count(
+    desired: int, demand: ServiceDemand, deploying: bool, min_tasks: int, target: int, warm_tasks: int
+) -> None:
+    service = ScaledService(
+        "a2j", "a2j", min_tasks=min_tasks, desired=desired, deploying=deploying, warm_tasks=warm_tasks
+    )
     assert service.target(demand, NOW) == target
 
 
@@ -108,11 +123,89 @@ def test_reconcile_skips_untagged_services_and_continues_after_update_error(
     )
     monkeypatch.setattr(service_capacity, "logger", logger)
 
-    service_capacity.reconcile(ecs, cast(Engine, Mock()), "cluster", {})
+    service_capacity.reconcile(ecs, Mock(), cast(Engine, Mock()), "cluster", {}, {})
 
     assert [call.kwargs["service"] for call in ecs.update_service.call_args_list] == ["first", "second"]
     assert logger.warning.call_args.args[0] == "Could not describe benchmark ECS service"
     assert logger.exception.call_args.args[0] == "Could not reconcile benchmark service"
+
+
+CLUSTER_ARN = "arn:aws:ecs:us-west-2:111111111111:cluster/cluster"
+
+
+@pytest.mark.description(
+    "Reconcile raises the autoscaling floor to `min-tasks` under demand, lowers it to `warm-tasks` when idle, "
+    "and sets it again when it changes, after a rollout, or after 5 minutes."
+)
+def test_reconcile_sets_the_autoscaling_floor_from_demand(monkeypatch: pytest.MonkeyPatch) -> None:
+    min_three = {"key": "vals:min-tasks", "value": "3"}
+    ecs = ecs_cluster(
+        ecs_service("busy", 0, TRACKER_TAG, min_three),
+        ecs_service("idle", 4, TRACKER_TAG, min_three, {"key": "vals:warm-tasks", "value": "1"}),
+        ecs_service("settled", 3, TRACKER_TAG, min_three),
+        ecs_service("deploying", 2, TRACKER_TAG, deployments=[{"rolloutState": "IN_PROGRESS"}]),
+    )
+    autoscaling = Mock()
+    demand = {name: ServiceDemand(active_runs=1) for name in ("busy", "settled", "deploying")}
+    monkeypatch.setattr(service_capacity, "read_demand", lambda *_args: demand)
+    monkeypatch.setattr(service_capacity, "datetime", Mock(now=Mock(return_value=NOW)))
+    floors = {"settled": (3, NOW), "deploying": (1, NOW), "gone": (1, NOW)}
+
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), CLUSTER_ARN, {}, floors)
+
+    assert [
+        (call.kwargs["ResourceId"], call.kwargs["MinCapacity"], call.kwargs["ScalableDimension"])
+        for call in autoscaling.register_scalable_target.call_args_list
+    ] == [
+        ("service/cluster/busy", 3, "ecs:service:DesiredCount"),
+        ("service/cluster/idle", 1, "ecs:service:DesiredCount"),
+    ]
+    assert [(call.kwargs["service"], call.kwargs["desiredCount"]) for call in ecs.update_service.call_args_list] == [
+        ("busy", 3),
+        ("idle", 1),
+    ]
+    assert floors == {"busy": (3, NOW), "idle": (1, NOW), "settled": (3, NOW)}
+
+    autoscaling.reset_mock()
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), "cluster", {}, floors)
+    assert [call.kwargs["ResourceId"] for call in autoscaling.register_scalable_target.call_args_list] == []
+
+
+@pytest.mark.description(
+    "A floor is set again 5 minutes after it was last set, so a CloudFormation reset of `MinCapacity` is undone."
+)
+def test_reconcile_refreshes_an_unchanged_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    ecs = ecs_cluster(ecs_service("busy", 3, TRACKER_TAG, {"key": "vals:min-tasks", "value": "3"}))
+    autoscaling = Mock()
+    monkeypatch.setattr(service_capacity, "read_demand", lambda *_args: {"busy": ServiceDemand(active_runs=1)})
+    clock = Mock(return_value=NOW)
+    monkeypatch.setattr(service_capacity, "datetime", Mock(now=clock))
+    floors = {"busy": (3, NOW - timedelta(minutes=4))}
+
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), "cluster", {}, floors)
+    assert autoscaling.register_scalable_target.call_count == 0
+
+    clock.return_value = NOW + timedelta(minutes=1)
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), "cluster", {}, floors)
+    assert autoscaling.register_scalable_target.call_args.kwargs["MinCapacity"] == 3
+    assert floors == {"busy": (3, NOW + timedelta(minutes=1))}
+
+
+@pytest.mark.description("A floor that fails to register is set again on the next pass.")
+def test_reconcile_retries_a_failed_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    ecs = ecs_cluster(ecs_service("a2j", 1, TRACKER_TAG))
+    autoscaling = Mock()
+    autoscaling.register_scalable_target.side_effect = ClientError(
+        {"Error": {"Code": "ValidationException"}}, "RegisterScalableTarget"
+    )
+    monkeypatch.setattr(service_capacity, "read_demand", lambda *_args: {"a2j": ServiceDemand(active_runs=1)})
+    floors: dict[str, tuple[int, datetime]] = {}
+
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), "cluster", {}, floors)
+    service_capacity.reconcile(ecs, autoscaling, cast(Engine, Mock()), "cluster", {}, floors)
+
+    assert autoscaling.register_scalable_target.call_count == 2
+    assert floors == {}
 
 
 @pytest.mark.description("A service with demand and no running task is reported to Sentry after 10 minutes.")
@@ -123,15 +216,15 @@ def test_reconcile_reports_a_needed_service_that_stays_down(monkeypatch: pytest.
     monkeypatch.setattr(service_capacity, "read_demand", lambda *_args: {"a2j": ServiceDemand(active_runs=1)})
     down_since: dict[str, datetime] = {}
 
-    service_capacity.reconcile(ecs, cast(Engine, Mock()), "cluster", down_since)
+    service_capacity.reconcile(ecs, Mock(), cast(Engine, Mock()), "cluster", down_since, {})
     capture.assert_not_called()
 
     down_since["a2j"] -= timedelta(minutes=10)
-    service_capacity.reconcile(ecs, cast(Engine, Mock()), "cluster", down_since)
+    service_capacity.reconcile(ecs, Mock(), cast(Engine, Mock()), "cluster", down_since, {})
     capture.assert_called_once()
 
     ecs.describe_services.return_value = {"services": [ecs_service("a2j", 1, TRACKER_TAG)]}
-    service_capacity.reconcile(ecs, cast(Engine, Mock()), "cluster", down_since)
+    service_capacity.reconcile(ecs, Mock(), cast(Engine, Mock()), "cluster", down_since, {})
     assert down_since == {}
 
 

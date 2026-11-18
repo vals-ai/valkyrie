@@ -1,8 +1,8 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, cast
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,9 +21,9 @@ from tests.utils import TEST_ORG_ID
 import tracker.auth as tracker_auth
 from tracker.api.projects import reject_archived_project
 from tracker.auth import RequestIdentity, get_current_org, get_current_runner, get_current_starter
-from tracker.aws.tags import ORG_ID_TAG
 from tracker.aws.secrets import SecretsManagerStore
-from tracker.clients.projects import ProjectServiceClient
+from tracker.clients.projects import ProjectServiceClient, UnavailableAwareTransport
+from tracker.config import DESCOPE_ORG_ADMIN_ROLE, PLATFORM_ADMIN_PERMISSION
 from tracker.exceptions import ProjectNameTakenError, SecretNotFoundError
 import tracker.repositories.project as project_repository
 from tracker.repositories.executor_release import ExecutorReleaseRepository
@@ -101,6 +101,79 @@ class GatewayAPI:
         raise AssertionError(f"Unexpected Gateway request: {request.method} {path}")
 
 
+class ProjectServiceAPI:
+    def __init__(self, gateway: GatewayAPI) -> None:
+        self.gateway = gateway
+        self.mints: list[str] = []
+        self.hand_overs: list[dict[str, Any]] = []
+        self.held = False
+        self.failures = {"POST": 0, "PUT": 0}
+        self.refuse_hand_over = False
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer project-service-token"
+        path = request.url.path
+        if self.failures[request.method]:
+            self.failures[request.method] -= 1
+            raise httpx.ConnectError("project service down")
+        if request.method == "POST" and path.endswith("/gateway-key"):
+            self.mints.append(path)
+            if self.gateway.status != "approved":
+                return httpx.Response(409, json={"detail": f"Gateway key request is {self.gateway.status}"})
+            if self.held:
+                return httpx.Response(409, json={"detail": "Gateway key was collected elsewhere"})
+            if path.split("/")[-2] in self.rows:
+                self.rows[path.split("/")[-2]]["gateway_key_id"] = str(self.gateway.key_id)
+            return httpx.Response(200, json={"gateway_key_id": str(self.gateway.key_id)})
+        if request.method == "POST" and path.endswith("/gateway-key-id"):
+            key_id = json.loads(request.content)["gateway_key_id"]
+            self.rows[path.split("/")[-2]]["gateway_key_id"] = key_id
+            return httpx.Response(200, json={"gateway_key_id": key_id})
+        if request.method == "PUT" and path.endswith("/gateway-key/secret"):
+            if self.refuse_hand_over:
+                return httpx.Response(409, json={"detail": "Secret is not for the project's Gateway key"})
+            self.hand_overs.append(json.loads(request.content))
+            self.held = False
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected project service request: {request.method} {path}")
+
+
+@pytest.fixture(autouse=True)
+def project_service_api(
+    request: pytest.FixtureRequest, monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
+) -> ProjectServiceAPI:
+    from tracker import project_gateway
+
+    service = ProjectServiceAPI(gateway_api)
+    if "project_service" in request.fixturenames:
+        service.rows = cast(MockProjectRoutes, request.getfixturevalue("project_service")).rows
+    tenant = f"valkyrie/tenants/{TEST_ORG_ID}/"
+    secrets = {
+        f"{tenant}projects/gateway-keys/{gateway_api.key_id}": "project-gateway-key",
+        f"{tenant}model-gateway-{gateway_api.key_id}": "mgwk_held",
+    }
+
+    async def read_secret(_self: SecretsManagerStore, name: str) -> dict[str, str]:
+        if name not in secrets:
+            raise SecretNotFoundError(name)
+        return {"MODEL_GATEWAY_URL": "https://model-gateway.example", "MODEL_GATEWAY_API_KEY": secrets[name]}
+
+    monkeypatch.setattr(SecretsManagerStore, "get", read_secret)
+    monkeypatch.setattr(
+        project_gateway,
+        "project_service",
+        lambda: ProjectServiceClient(
+            httpx.Client(
+                base_url="http://projects.test/",
+                headers={"Authorization": "Bearer project-service-token"},
+                transport=UnavailableAwareTransport(httpx.MockTransport(service.handle)),
+            )
+        ),
+    )
+    return service
+
+
 @pytest.fixture(autouse=True)
 def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
     from tracker import project_gateway
@@ -112,7 +185,7 @@ def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
     monkeypatch.setenv("MODEL_GATEWAY_MACHINE_API_KEY", "machine-test-key")
     monkeypatch.setattr(
         project_gateway,
-        "_gateway_client",
+        "gateway_client",
         lambda: httpx.AsyncClient(
             base_url="https://model-gateway.example/",
             headers={"Authorization": "Bearer machine-test-key"},
@@ -122,14 +195,16 @@ def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
     return gateway
 
 
-async def _collect_with_unpublished_checks(monkeypatch: MonkeyPatch, gateway_api: GatewayAPI, checks: int) -> UUID:
+async def _collect_with_unpublished_checks(
+    monkeypatch: MonkeyPatch, gateway_api: GatewayAPI, checks: int, gateway_key_id: UUID | None = None
+) -> UUID:
     from tracker import project_gateway
 
     monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_POLL_SECONDS", 0)
     gateway_api.unpublished_checks = checks
-    project = MagicMock(handle="blog", gateway_request_id=gateway_api.request_id)
-    return await project_gateway._collect_project_gateway_key(  # pyright: ignore[reportPrivateUsage]
-        project, MagicMock(id=TEST_ORG_ID), MagicMock(put=AsyncMock())
+    project = MagicMock(handle="blog", id=uuid4(), gateway_key_id=gateway_key_id)
+    return await project_gateway._project_service_gateway_key(  # pyright: ignore[reportPrivateUsage]
+        project, MagicMock(id=TEST_ORG_ID), SecretsManagerStore(MagicMock())
     )
 
 
@@ -138,6 +213,16 @@ async def test_a_collected_project_key_is_returned_once_the_gateway_accepts_it(
     monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
 ) -> None:
     assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 2) == gateway_api.key_id
+    assert gateway_api.paths.count("/registry") == 3
+
+
+@pytest.mark.description(
+    "A second run start inside the Gateway's publish cycle waits for the key the first start already minted."
+)
+async def test_a_second_start_waits_until_the_gateway_accepts_the_already_minted_key(
+    monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
+) -> None:
+    assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 2, gateway_api.key_id) == gateway_api.key_id
     assert gateway_api.paths.count("/registry") == 3
 
 
@@ -790,6 +875,125 @@ def test_gateway_key_eligibility_hides_projects_outside_the_human_org(
         assert response.status_code == 404
 
 
+class LimitRoute:
+    def __init__(self, routes: MockProjectRoutes) -> None:
+        self.routes = routes
+        self.sent: list[httpx.Request] = []
+        self.status = 200
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/limit"):
+            return self.routes.handle(request)
+        self.sent.append(request)
+        return httpx.Response(self.status, json=json.loads(request.content))
+
+
+@pytest.fixture
+def limit_route(monkeypatch: MonkeyPatch, project_service: MockProjectRoutes) -> LimitRoute:
+    route = LimitRoute(project_service)
+
+    def transport(retries: int) -> httpx.MockTransport:
+        return httpx.MockTransport(route.handle)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", transport)
+    monkeypatch.setattr(project_repository, "project_service", ProjectServiceClient.from_environment)
+    return route
+
+
+def _make_admin(login: MagicMock) -> None:
+    tenants = login.mgmt.user.load_by_user_id.return_value["user"]["userTenants"]
+    tenants[0]["roleNames"] = [DESCOPE_ORG_ADMIN_ROLE]
+
+
+def _set_limit(project: Project, org_id: UUID = TEST_ORG_ID) -> httpx.Response:
+    return client.put(
+        f"/projects/by-id/{project.id}/limit",
+        params={"org_id": str(org_id)},
+        json={"limit_dollars": "81", "reason": "raised for evals"},
+        headers={"authorization": "Bearer human-session"},
+    )
+
+
+@pytest.mark.parametrize(
+    "tenants",
+    [[{"tenantId": "default", "roleNames": []}], [{"tenantId": "other-org", "roleNames": [DESCOPE_ORG_ADMIN_ROLE]}]],
+)
+@pytest.mark.description("A member without the admin role, or an admin of another org, cannot set the limit.")
+def test_only_an_admin_of_the_projects_org_can_set_its_limit(
+    database_session: Session,
+    router_bench: Project,
+    gateway_key_login: MagicMock,
+    limit_route: LimitRoute,
+    tenants: list[dict[str, object]],
+) -> None:
+    gateway_key_login.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = tenants
+
+    response = _set_limit(router_bench)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == f"Only {DESCOPE_ORG_ADMIN_ROLE}s of default or platform admins can set a limit"
+    assert limit_route.sent == []
+
+
+@pytest.mark.description("An org admin's limit save reaches the project service with its amount, reason and token.")
+def test_an_admin_limit_save_forwards_amount_and_reason_with_the_token(
+    database_session: Session, router_bench: Project, gateway_key_login: MagicMock, limit_route: LimitRoute
+) -> None:
+    _make_admin(gateway_key_login)
+
+    response = _set_limit(router_bench)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"limit_dollars": "81", "reason": "raised for evals"}
+    (sent,) = limit_route.sent
+    assert (sent.method, sent.url.path) == ("PUT", f"/orgs/{TEST_ORG_ID}/projects/{router_bench.id}/limit")
+    assert sent.headers["authorization"] == "Bearer test-token"
+    assert json.loads(sent.content) == {"limit_dollars": "81", "reason": "raised for evals"}
+
+
+@pytest.mark.description("A platform admin outside the project's organization sets its limit by the organization's id.")
+def test_a_platform_admin_outside_the_org_sets_a_project_limit_by_org_id(
+    database_session: Session,
+    router_bench: Project,
+    gateway_key_login: MagicMock,
+    limit_route: LimitRoute,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(app.dependency_overrides, get_current_org)
+    monkeypatch.setattr(tracker_auth, "_validate_bearer", lambda _token: {"sub": "U-alice", "tenants": {}})
+    gateway_key_login.mgmt.user.load_by_user_id.return_value["user"].update(
+        userTenants=[], permissions=[PLATFORM_ADMIN_PERMISSION]
+    )
+
+    response = _set_limit(router_bench)
+
+    assert response.status_code == 200, response.text
+    assert [sent.url.path for sent in limit_route.sent] == [f"/orgs/{TEST_ORG_ID}/projects/{router_bench.id}/limit"]
+
+
+@pytest.mark.description("A limit save for an organization id Tracker does not know answers 404.")
+def test_a_limit_save_for_an_unknown_org_answers_404(
+    database_session: Session, router_bench: Project, gateway_key_login: MagicMock, limit_route: LimitRoute
+) -> None:
+    response = _set_limit(router_bench, org_id=uuid4())
+
+    assert response.status_code == 404, response.text
+    assert limit_route.sent == []
+
+
+@pytest.mark.description("A project service failure on a limit save answers 503 with a try-again message.")
+def test_a_project_service_failure_on_a_limit_save_answers_try_again(
+    database_session: Session, router_bench: Project, gateway_key_login: MagicMock, limit_route: LimitRoute
+) -> None:
+    _make_admin(gateway_key_login)
+    limit_route.status = 500
+
+    response = _set_limit(router_bench)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Project service unavailable, try again."}
+
+
 @pytest.mark.description("Updating a project changes its spend fields and keeps its identity.")
 def test_update_changes_spend_fields_without_replacing_project_identity(
     database_session: Session,
@@ -991,6 +1195,7 @@ def test_provision_keeps_supplied_keys_then_automatic_selects_one_project_gatewa
     gateway_api: GatewayAPI,
     vals_org: Org,
     project_service: MockProjectRoutes,
+    project_service_api: ProjectServiceAPI,
 ) -> None:
     from tracker.aws.secrets import SecretsManagerStore
 
@@ -1031,21 +1236,15 @@ def test_provision_keeps_supplied_keys_then_automatic_selects_one_project_gatewa
         response = client.post("/start-benchmark", json=request)
         assert response.status_code == 200, response.text
 
-    reference = f"valkyrie/tenants/{TEST_ORG_ID}/model-gateway-{gateway_api.key_id}"
+    reference = f"valkyrie/tenants/{TEST_ORG_ID}/projects/gateway-keys/{gateway_api.key_id}"
     expected_secrets = {
         "MODEL_GATEWAY_URL": reference,
         "MODEL_GATEWAY_API_KEY": reference,
         "UNRELATED_KEY": "caller-other",
     }
-    assert len(writes) == 1
-    assert writes[0][0] == reference
-    assert json.loads(writes[0][1]) == {
-        "MODEL_GATEWAY_URL": "https://model-gateway.example",
-        "MODEL_GATEWAY_API_KEY": "project-gateway-key",
-    }
-    assert writes[0][2] == {ORG_ID_TAG: str(TEST_ORG_ID)}
-    assert gateway_api.collections == [{"expected_revision": 3}]
-    assert gateway_api.paths.count(f"/admin/managed-auth/machine/keys/{gateway_api.key_id}/collect") == 1
+    assert writes == []
+    assert gateway_api.collections == []
+    assert project_service_api.mints == [f"/orgs/{TEST_ORG_ID}/projects/{project.id}/gateway-key"] * 2
     stored = project_service.project(project.id)
     assert stored is not None
     assert (stored.gateway_request_id, stored.gateway_key_id) == (gateway_api.request_id, gateway_api.key_id)
@@ -1072,54 +1271,103 @@ def test_provision_keeps_supplied_keys_then_automatic_selects_one_project_gatewa
 
 @pytest.mark.usefixtures("active_executor_release")
 @pytest.mark.description(
-    "A start whose project service write fails after the Gateway key collect gets 503, and the next start reuses the stored key without collecting again."
+    "A project whose key Tracker collected hands Tracker's copy over once, and a key with no Tracker copy gets the 409."
 )
-def test_start_after_a_failed_project_service_write_reuses_the_collected_gateway_key(
+def test_collected_project_hands_its_key_to_the_project_service(
     monkeypatch: MonkeyPatch,
     database_session: Session,
     contract: AgentContractRequest,
     mock_launcher: Any,
     gateway_api: GatewayAPI,
     vals_org: Org,
+    project_service_api: ProjectServiceAPI,
     project_service: MockProjectRoutes,
 ) -> None:
-    stored: dict[str, str] = {}
-
-    async def put_secret(_self: SecretsManagerStore, name: str, value: str, *, tags: dict[str, str]) -> None:
-        stored[name] = value
-
-    async def get_secret(_self: SecretsManagerStore, name: str) -> Any:
-        if name not in stored:
-            raise SecretNotFoundError(name)
-        return json.loads(stored[name])
-
-    monkeypatch.setattr(SecretsManagerStore, "put", put_secret)
-    monkeypatch.setattr(SecretsManagerStore, "get", get_secret)
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
     created = client.post("/projects", json={**_BLOG, **_BUDGET})
     assert created.status_code == 200, created.text
-    service = {"down": True}
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if service["down"] and request.url.path.endswith("/gateway-key-id"):
-            return httpx.Response(503, request=request)
-        return project_service.handle(request)
-
-    reader = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
-    monkeypatch.setattr(project_repository, "project_service", lambda: reader)
-    request = _start_request(contract, "blog")
-
-    failed = TestClient(app, raise_server_exceptions=False).post("/start-benchmark", json=request)
-    assert failed.status_code == 503, failed.text
     (project,) = project_service.projects()
-    assert project.gateway_key_id is None
-    assert gateway_api.collections == [{"expected_revision": 3}]
+    project_service.rows[str(project.id)]["gateway_key_id"] = str(gateway_api.key_id)
+    project_service_api.held = True
 
-    service["down"] = False
-    response = client.post("/start-benchmark", json=request)
+    for _ in range(2):
+        response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+        assert response.status_code == 200, response.text
+
+    assert project_service_api.hand_overs == [{"gateway_key_id": str(gateway_api.key_id), "secret": "mgwk_held"}]
+    reference = f"valkyrie/tenants/{TEST_ORG_ID}/projects/gateway-keys/{gateway_api.key_id}"
+    secrets = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]["contract"]["secrets"]
+    assert (secrets["MODEL_GATEWAY_URL"], secrets["MODEL_GATEWAY_API_KEY"]) == (reference, reference)
+    assert "mgwk_held" not in str(mock_launcher.queued_calls)
+    assert gateway_api.collections == []
+    project_service_api.held, project_service_api.refuse_hand_over = True, True
+    refused = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+    assert refused.status_code == 409, refused.text
+    assert "Secret is not for the project's Gateway key for project 'blog'" in refused.text
+    project_service.rows[str(project.id)]["gateway_key_id"] = str(uuid4())
+    project_service_api.held, project_service_api.refuse_hand_over = True, False
+    uncopied = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+    assert uncopied.status_code == 409, uncopied.text
+    assert "Gateway key was collected elsewhere for project 'blog'" in uncopied.text
+
+
+@pytest.mark.usefixtures("active_executor_release")
+@pytest.mark.description(
+    "A collected project whose key ID write failed gets its key ID from the Gateway request and hands its copy over."
+)
+def test_collected_project_without_a_key_id_recovers_it_from_the_gateway_request(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+    vals_org: Org,
+    project_service_api: ProjectServiceAPI,
+    project_service: MockProjectRoutes,
+) -> None:
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    created = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert created.status_code == 200, created.text
+    project_service_api.held = True
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
 
     assert response.status_code == 200, response.text
-    assert gateway_api.collections == [{"expected_revision": 3}]
+    assert project_service_api.hand_overs == [{"gateway_key_id": str(gateway_api.key_id), "secret": "mgwk_held"}]
+    (project,) = project_service.projects()
+    assert project.gateway_key_id == gateway_api.key_id
+
+
+@pytest.mark.usefixtures("active_executor_release")
+@pytest.mark.description(
+    "A project service that cannot be reached on the mint answers 503 and frees the project row, and the next start mints and binds the key."
+)
+def test_project_service_drop_is_503_and_the_next_start_mints(
+    monkeypatch: MonkeyPatch,
+    database_session: Session,
+    contract: AgentContractRequest,
+    mock_launcher: Any,
+    gateway_api: GatewayAPI,
+    vals_org: Org,
+    project_service_api: ProjectServiceAPI,
+    project_service: MockProjectRoutes,
+) -> None:
+    monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+    created = client.post("/projects", json={**_BLOG, **_BUDGET})
+    assert created.status_code == 200, created.text
+    project_service_api.failures["POST"] = 1
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+
+    assert response.status_code == 503, response.text
+    assert "Project service unavailable for project 'blog', try again" in response.text
+    assert (project_service_api.mints, mock_launcher.queued_calls) == ([], [])
+    (project,) = project_service.projects()
+    assert project.gateway_key_id is None
+
+    response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
+    assert response.status_code == 200, response.text
+    assert len(project_service_api.mints) == 1
     (project,) = project_service.projects()
     assert project.gateway_key_id == gateway_api.key_id
     assert len(mock_launcher.queued_calls) == 1
@@ -1179,7 +1427,7 @@ def test_pending_gateway_approval_does_not_start_a_selected_project(
     assert created.status_code == 200, created.text
     response = client.post("/start-benchmark", json=_start_request(contract, "blog"))
     assert response.status_code == 409, response.text
-    assert response.json()["detail"] == "Gateway key request for project 'blog' is pending"
+    assert response.json()["detail"] == "Gateway key request is pending for project 'blog'"
     assert database_session.exec(select(Benchmark)).all() == []
     assert database_session.exec(select(Task)).all() == []
     assert mock_launcher.queued_calls == []
@@ -1761,11 +2009,13 @@ async def test_recreated_project_starts_after_a_completed_lookup(
     project_service: MockProjectRoutes,
     vals_org: Org,
     gateway_api: GatewayAPI,
+    project_service_api: ProjectServiceAPI,
     mode: str,
 ) -> None:
     monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", mode)
     monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
-    stored: dict[str, str] = {}
+    minted = f"valkyrie/tenants/{TEST_ORG_ID}/projects/gateway-keys/{gateway_api.key_id}"
+    stored = {minted: json.dumps({"MODEL_GATEWAY_API_KEY": "project-gateway-key"})}
 
     async def put_secret(_self: SecretsManagerStore, name: str, value: str, *, tags: dict[str, str]) -> None:
         stored[name] = value
@@ -1790,7 +2040,8 @@ async def test_recreated_project_starts_after_a_completed_lookup(
     assert response.status_code == 200, response.text
     links = database_session.exec(select(RunProject)).all()
     assert [link.project_id for link in links] == [replacement.id]
-    assert len(gateway_api.collections) == (1 if mode == "automatic" else 0)
+    assert gateway_api.collections == []
+    assert len(project_service_api.mints) == (1 if mode == "automatic" else 0)
 
 
 @pytest.mark.usefixtures("active_executor_release")
@@ -1884,3 +2135,17 @@ def test_runs_without_a_project_get_their_own_default_project_whatever_names_oth
 
     assert (project.handle, project.name) == ("default", expected)
     assert ProjectRepository(database_session).get_or_create_default(TEST_ORG_ID, None).id == project.id
+
+
+@pytest.mark.description(
+    "The project service keeps the first Gateway key ID Tracker's hand-over path sets and returns that ID."
+)
+def test_the_project_service_keeps_the_first_gateway_key_id(project_service: MockProjectRoutes) -> None:
+    project = Project(org_id=TEST_ORG_ID, handle="keyed", name="keyed", spend_type=SpendType.DEVELOPMENT)
+    project_service.seed(project)
+    first, second = uuid4(), uuid4()
+
+    assert project_repository.project_service().set_gateway_key(TEST_ORG_ID, project.id, first) == first
+    assert project_repository.project_service().set_gateway_key(TEST_ORG_ID, project.id, second) == first
+    stored = project_service.project(project.id)
+    assert stored is not None and stored.gateway_key_id == first

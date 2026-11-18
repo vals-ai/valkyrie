@@ -5,7 +5,7 @@ import zipfile
 from typing import AsyncGenerator
 
 import pytest
-from benchmark_service import ImageSource, Resources, Sandbox, SandboxNotFoundError, SandboxProvider
+from benchmark_service import ImageSource, MCPServer, Resources, Sandbox, SandboxNotFoundError, SandboxProvider
 
 from tests.utils import random_task_id, unexpected_sandbox_record
 from tests.integration.seed_agent_artifacts import create_s3_client
@@ -405,6 +405,70 @@ class TestSandboxOperations:
         assert "line1" in output
         assert "line2" in output
         assert "line3" in output
+
+    @pytest.mark.description(
+        "`run_agent` gives the agent the MCP servers, the skills folder and the task folder of the task in a real sandbox."
+    )
+    async def test_run_agent_gives_the_agent_its_task_inputs(
+        self,
+        test_sandbox: Sandbox,
+        live_aws_runtime: AWSRuntime,
+    ) -> None:
+        logged_messages: list[str] = []
+
+        def log_callback(message: str) -> None:
+            logged_messages.append(message)
+
+        run_cmd = (
+            "cat {mcp_config_path} && echo && "
+            "test -d {skills_dir} && echo skills={skills_dir} && "
+            "cat {task_dir}/prompt.md && echo && echo task={task_dir} && "
+            "echo done > /tmp/agent_output.json"
+        )
+        contract = AgentContractRequest(
+            name="test_agent",
+            install_cmd="true",
+            run_cmd=run_cmd,
+            final_output="/tmp/agent_output.json",
+        )
+        object_store = S3ObjectStore(live_aws_runtime)
+
+        await test_sandbox.exec(
+            "mkdir -p /bundle/test_agent /opt/task-files && printf 'family prompt' > /opt/task-files/prompt.md"
+        )
+
+        await run_agent(
+            test_sandbox,
+            contract,
+            "some problem statement",
+            task_id=random_task_id(),
+            log_output=log_callback,
+            cwd="/",
+            object_store=object_store,
+            plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
+            deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            mcp_servers=[
+                MCPServer(
+                    name="web",
+                    transport="streamable-http",
+                    url="https://x",
+                    headers={"Authorization": "Bearer ${TOKEN}"},
+                ),
+                MCPServer(name="files", transport="stdio", command="fs-mcp", args=["/data"]),
+            ],
+            task_dir="/opt/task-files",
+            log_line=lambda text: log_callback(text + "\n"),
+        )
+
+        output = "\n".join(logged_messages)
+        assert (
+            '{"mcpServers": {"web": {"type": "http", "url": "https://x", '
+            '"headers": {"Authorization": "Bearer ${TOKEN}"}}, '
+            '"files": {"type": "stdio", "command": "fs-mcp", "args": ["/data"]}}}'
+        ) in output
+        assert "skills=/tmp/.valkyrie-agent/skills" in output
+        assert "family prompt" in output
+        assert "task=/opt/task-files" in output
 
     @pytest.mark.description("The real provider moves between allowlisted and unrestricted network stages.")
     async def test_run_policy_allowlist_then_unrestricted_transition(

@@ -29,6 +29,7 @@ from benchmark_service import (
     Episode,
     ExecResult,
     ImageSource,
+    MCPServer,
     Resources,
     SandboxBuildError,
     SandboxNotFoundError,
@@ -1189,8 +1190,8 @@ class TestRunAgent:
     @pytest.mark.description("The mcp config and skills placeholders point at what the task provides.")
     @pytest.mark.parametrize(
         ("skills_dir", "bound_skills_dir"),
-        [(None, "/tmp/.valkyrie-agent/skills"), ("/skills", "/skills")],
-        ids=["empty skills folder", "task skills folder"],
+        [(None, "/tmp/.valkyrie-agent/skills"), ("", "/tmp/.valkyrie-agent/skills"), ("/skills", "/skills")],
+        ids=["empty skills folder", "blank skills folder", "task skills folder"],
     )
     async def test_the_mcp_config_and_skills_placeholders_point_at_what_the_task_provides(
         self, monkeypatch: pytest.MonkeyPatch, skills_dir: str | None, bound_skills_dir: str
@@ -1214,7 +1215,7 @@ class TestRunAgent:
             object_store=_mock_object_store(),
             plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
             deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
-            mcp_servers={"web": {"type": "http", "url": "https://x"}},
+            mcp_servers=[MCPServer(name="web", transport="streamable-http", url="https://x")],
             skills_dir=skills_dir,
             log_line=_ignore_output,
         )
@@ -1229,7 +1230,91 @@ class TestRunAgent:
             """'{"mcpServers": {"web": {"type": "http", "url": "https://x"}}}' > /tmp/.valkyrie-agent/mcp.json"""
             in written
         )
-        assert ("mkdir -p /tmp/.valkyrie-agent/skills" in written) is (skills_dir is None)
+        assert ("mkdir -p /tmp/.valkyrie-agent/skills" in written) is (not skills_dir)
+
+    @pytest.mark.description("The task folder placeholder points at the folder that the benchmark service wrote.")
+    @pytest.mark.parametrize(
+        ("task_dir", "bound_task_dir"),
+        [(None, "/tmp/.valkyrie-agent/task"), ("", "/tmp/.valkyrie-agent/task"), ("/task", "/task")],
+        ids=["empty task folder", "blank task folder", "service task folder"],
+    )
+    async def test_the_task_folder_placeholder_points_at_the_folder_that_the_benchmark_service_wrote(
+        self, monkeypatch: pytest.MonkeyPatch, task_dir: str | None, bound_task_dir: str
+    ) -> None:
+        workload = _FakeCommandWorkload(wait_release=asyncio.Event())
+        workload.wait_release.set()
+        sandbox = _FakeControlledSandbox(workload)
+        contract = _controlled_contract().model_copy(
+            update={"run_cmd": "agent --task-dir {task_dir} {problem_statement_path}"}
+        )
+        run_exec = AsyncMock(return_value=ExecResult(exit_code=0))
+        monkeypatch.setattr(sandbox_module, "_exec", run_exec)
+
+        await run_agent(
+            cast(Any, sandbox),
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            _ignore_output,
+            "/workspace",
+            object_store=_mock_object_store(),
+            plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
+            deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            task_dir=task_dir,
+            log_line=_ignore_output,
+        )
+
+        (command, _cwd, _env) = sandbox.controlled_calls[0]
+        assert f"agent --task-dir {bound_task_dir} /tmp/problem.txt" in command
+
+        written = run_exec.await_args_list[0].args[1]
+        assert ("mkdir -p /tmp/.valkyrie-agent/task" in written) is (not task_dir)
+
+    @pytest.mark.description("The mcp config file lists each server in the shape that Claude Code reads.")
+    async def test_the_mcp_config_file_lists_each_server_in_the_shape_that_claude_code_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workload = _FakeCommandWorkload(wait_release=asyncio.Event())
+        workload.wait_release.set()
+        sandbox = _FakeControlledSandbox(workload)
+        contract = _controlled_contract().model_copy(
+            update={"run_cmd": "agent --mcp-config {mcp_config_path} {problem_statement_path}"}
+        )
+        run_exec = AsyncMock(return_value=ExecResult(exit_code=0))
+        monkeypatch.setattr(sandbox_module, "_exec", run_exec)
+
+        await run_agent(
+            cast(Any, sandbox),
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            _ignore_output,
+            "/workspace",
+            object_store=_mock_object_store(),
+            plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
+            deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            mcp_servers=[
+                MCPServer(
+                    name="web",
+                    transport="streamable-http",
+                    url="https://x",
+                    headers={"Authorization": "Bearer ${TOKEN}"},
+                ),
+                MCPServer(name="events", url="https://y/sse"),
+                MCPServer(name="files", transport="stdio", command="fs-mcp", args=["/data"]),
+            ],
+            log_line=_ignore_output,
+        )
+
+        written = shlex.split(run_exec.await_args_list[0].args[1])
+        config = json.loads(written[written.index("%s") + 1])
+        assert config == {
+            "mcpServers": {
+                "web": {"type": "http", "url": "https://x", "headers": {"Authorization": "Bearer ${TOKEN}"}},
+                "events": {"type": "sse", "url": "https://y/sse"},
+                "files": {"type": "stdio", "command": "fs-mcp", "args": ["/data"]},
+            }
+        }
 
     @pytest.mark.description(
         "The agent gets a per-attempt $VALKYRIE_SEARCH_COST_PATH, and the charges it writes there are saved after it exits."

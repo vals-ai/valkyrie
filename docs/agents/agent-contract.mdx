@@ -61,6 +61,7 @@ Valkyrie fills these in `run_cmd`:
 | `{task_id}` | The task's ID, such as `astropy__astropy-12907`. |
 | `{mcp_config_path}` | Path of a JSON file that lists the task's MCP servers under `mcpServers`, the format that Claude Code's `--mcp-config` option reads. A task without MCP servers gets an empty `mcpServers` object. |
 | `{skills_dir}` | Path of the task's skills folder, or of an empty folder when the task has none. |
+| `{task_dir}` | Path of the folder of task files that a benchmark service writes for the agent, or of an empty folder when the task has none. |
 | `{model}` and other parameter names | The parameter's value |
 | `{slot_dir}`, `{container_name}` | See [`turns`](#turns). |
 

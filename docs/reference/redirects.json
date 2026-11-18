@@ -660,12 +660,24 @@
     "destination": "/reference/sdk/projects#list"
   },
   {
+    "source": "/reference/sdk/projects/get",
+    "destination": "/reference/sdk/projects#get"
+  },
+  {
     "source": "/reference/sdk/projects/update",
     "destination": "/reference/sdk/projects#update"
   },
   {
     "source": "/reference/sdk/projects/delete",
     "destination": "/reference/sdk/projects#delete"
+  },
+  {
+    "source": "/reference/sdk/costs/by_project",
+    "destination": "/reference/sdk/costs#by-project"
+  },
+  {
+    "source": "/reference/sdk/costs/project_model",
+    "destination": "/reference/sdk/costs#project-model"
   },
   {
     "source": "/reference/sdk/providers/list",
@@ -756,6 +768,10 @@
     "destination": "/reference/sdk/models/account#members-response"
   },
   {
+    "source": "/reference/sdk/models/costs/month-model-cost",
+    "destination": "/reference/sdk/models/costs#month-model-cost"
+  },
+  {
     "source": "/reference/sdk/models/account/organization-entry",
     "destination": "/reference/sdk/models/account#organization-entry"
   },
@@ -836,6 +852,10 @@
     "destination": "/reference/sdk/models/benchmarks#benchmark-status-response"
   },
   {
+    "source": "/reference/sdk/models/costs/costs-by-project-response",
+    "destination": "/reference/sdk/models/costs#costs-by-project-response"
+  },
+  {
     "source": "/reference/sdk/models/runs/dataset-version",
     "destination": "/reference/sdk/models/runs#dataset-version"
   },
@@ -896,12 +916,24 @@
     "destination": "/reference/sdk/models/projects#new-project-request"
   },
   {
+    "source": "/reference/sdk/models/costs/project-cost-row",
+    "destination": "/reference/sdk/models/costs#project-cost-row"
+  },
+  {
     "source": "/reference/sdk/models/projects/project-create-request",
     "destination": "/reference/sdk/models/projects#project-create-request"
   },
   {
+    "source": "/reference/sdk/models/costs/project-model-costs",
+    "destination": "/reference/sdk/models/costs#project-model-costs"
+  },
+  {
     "source": "/reference/sdk/models/projects/project-response",
     "destination": "/reference/sdk/models/projects#project-response"
+  },
+  {
+    "source": "/reference/sdk/models/costs/project-run",
+    "destination": "/reference/sdk/models/costs#project-run"
   },
   {
     "source": "/reference/sdk/models/projects/projects-response",

@@ -3,6 +3,7 @@ from enum import Enum
 import os
 from urllib.parse import urlsplit
 
+import httpx
 from dotenv import load_dotenv
 
 from tracker.logging import configure_logging
@@ -28,7 +29,10 @@ class ProjectGatewayKeysMode(str, Enum):
 
 
 def project_gateway_keys_mode() -> ProjectGatewayKeysMode:
-    return ProjectGatewayKeysMode(os.environ.get("MODEL_GATEWAY_PROJECT_KEYS_MODE", "manual"))
+    try:
+        return ProjectGatewayKeysMode(os.environ.get("MODEL_GATEWAY_PROJECT_KEYS_MODE", "manual"))
+    except ValueError:
+        raise ValueError("Set MODEL_GATEWAY_PROJECT_KEYS_MODE to manual, provision, or automatic.") from None
 
 
 class BenchmarkServiceDestination(Enum):
@@ -87,6 +91,7 @@ def _positive_float_setting(name: str) -> float:
 
 EXTERNAL_SERVICE_GATEWAY_URL = os.environ.get("EXTERNAL_SERVICE_GATEWAY_URL", "").rstrip("/") or None
 EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN = os.environ.get("EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN")
+PROJECT_SERVICE_TOKEN = os.environ.get("PROJECT_SERVICE_TOKEN", "")
 EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS = (
     _positive_float_setting("EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS")
     if EXTERNAL_SERVICE_GATEWAY_URL is not None
@@ -95,11 +100,27 @@ EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS = (
 
 
 def project_gateway_configuration() -> tuple[str, str]:
-    url = os.environ["MODEL_GATEWAY_URL"]
-    machine_api_key = os.environ["MODEL_GATEWAY_MACHINE_API_KEY"]
-    if not url or not machine_api_key:
-        raise ValueError("MODEL_GATEWAY_URL and MODEL_GATEWAY_MACHINE_API_KEY must be nonempty")
-    return url, machine_api_key
+    message = "Set MODEL_GATEWAY_URL to the model Gateway's absolute HTTP or HTTPS URL."
+    try:
+        url = httpx.URL(os.environ.get("MODEL_GATEWAY_URL", "").strip())
+    except httpx.InvalidURL:
+        raise ValueError(message) from None
+    if url.scheme not in {"http", "https"} or not url.host or (url.port is not None and not 0 < url.port <= 65535):
+        raise ValueError(message)
+    machine_api_key = os.environ.get("MODEL_GATEWAY_MACHINE_API_KEY", "").strip()
+    if not machine_api_key:
+        raise ValueError("Set MODEL_GATEWAY_MACHINE_API_KEY to the model Gateway's machine bearer token.")
+    return str(url), machine_api_key
+
+
+def validate_enabled_project_gateway() -> None:
+    if project_gateway_keys_mode() is ProjectGatewayKeysMode.MANUAL and not any(
+        os.environ.get(name, "").strip() for name in ("MODEL_GATEWAY_URL", "MODEL_GATEWAY_MACHINE_API_KEY")
+    ):
+        return
+    _ = project_gateway_configuration()
+    if not VALKYRIE_STAGE.strip():
+        raise ValueError("Set VALKYRIE_STAGE to the environment used for this deployment's model Gateway project keys.")
 
 
 def project_service_configuration() -> tuple[str, str]:
@@ -150,3 +171,4 @@ DESCOPE_MANAGEMENT_KEY = os.environ.get("DESCOPE_MANAGEMENT_KEY", "")
 DESCOPE_BASE_URL = os.environ.get("DESCOPE_BASE_URL", "https://api.descope.com").rstrip("/")
 DESCOPE_CLI_CLIENT_ID = os.environ.get("DESCOPE_CLI_CLIENT_ID", "")
 DESCOPE_ORG_ADMIN_ROLE = os.environ.get("DESCOPE_ORG_ADMIN_ROLE", "Valkyrie Admin")
+PLATFORM_ADMIN_PERMISSION = "platform-admin"

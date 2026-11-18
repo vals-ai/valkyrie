@@ -97,6 +97,7 @@ RESOURCE_CARDS = {
     "SchedulerResource": ("Scheduler", "list-ordered", "inspecting queue positions and active tasks"),
     "SecretsResource": ("Secrets", "key-round", "storing, listing, and removing the secrets your runs reference"),
     "ProjectsResource": ("Projects", "folder-kanban", "managing the projects runs are started in"),
+    "CostsResource": ("Costs", "receipt", "reading the spend recorded against your projects"),
     "ProvidersResource": ("Providers", "server", "choosing the secret behind each sandbox provider"),
     "SettingsResource": (
         "Settings",
@@ -127,6 +128,7 @@ TYPE_CARDS = {
     "Logs": ("scroll-text", "benchmark log events and paginated responses"),
     "Scheduler": ("list-ordered", "sandbox queue totals, positions, and active task responses"),
     "Projects": ("folder-kanban", "projects and the spend fields their runs share"),
+    "Costs": ("receipt", "spend recorded against your projects, by month"),
     "Secrets": ("key-round", "stored secret names and references"),
     "Settings": ("sliders-horizontal", "sandbox provider mappings and saved run settings"),
     "Account": ("user-round", "your identity, access keys, organizations, and members"),

@@ -11,7 +11,7 @@ from tracker.aws.secrets import SecretBeingDeletedError, SecretsManagerStore
 from tracker.aws.tags import ORG_ID_TAG
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.config import AUTH_REQUIRED, DESCOPE_ORG_ADMIN_ROLE, VALKYRIE_STAGE
-from tracker.exceptions import SecretNotFoundError
+from tracker.exceptions import SecretAccessDeniedError, SecretNotFoundError
 from tracker.local import config as local_config
 from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
 from tracker.project_gateway import automatic_project_gateway
@@ -116,7 +116,7 @@ async def require_own_secret(name: str, org: Org) -> None:
         if not reference.startswith(tenant_secret_prefix(org.id)):
             raise SecretNotFoundError(reference)
         await secret_store(org).get(reference)
-    except SecretNotFoundError as error:
+    except (SecretNotFoundError, SecretAccessDeniedError) as error:
         raise HTTPException(
             status_code=404, detail=f"Secret '{name}' does not exist; create it with `valkyrie secret set {name}`"
         ) from error

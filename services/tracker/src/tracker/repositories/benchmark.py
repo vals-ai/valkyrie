@@ -25,6 +25,7 @@ from tracker.database.models import (
     EvaluationResult,
     FailureCategory,
     FinalEvaluation,
+    RunProject,
     SandboxRecord,
     Task,
     TaskStatus,
@@ -45,6 +46,22 @@ _STATUS_SORT_PRIORITY = case(
     },
     value=col(Task.status),
     else_=-1,
+)
+
+
+_ARGUMENTS = type_coerce(col(Benchmark.arguments), JSON)
+_SHOWN_DATASET = func.coalesce(
+    func.nullif(
+        case(
+            (
+                _ARGUMENTS[("dataset_ref", "revision")].as_integer().is_not(None),
+                _ARGUMENTS[("dataset_ref", "dataset")].as_string(),
+            ),
+            else_=col(Benchmark.dataset),
+        ),
+        "",
+    ),
+    "default",
 )
 
 
@@ -115,8 +132,33 @@ class BenchmarkRepository:
             .execution_options(populate_existing=True)
         ).one_or_none()
 
-    def _filtered(self, filters: BenchmarkFilters, org_id: UUID) -> SelectOfScalar[Benchmark]:
+    def _current_projects(self, org_id: UUID, *filters: Any) -> Any:
+        ranked = (
+            cast(Any, select)(
+                col(RunProject.benchmark_id).label("benchmark_id"),
+                col(RunProject.project_id).label("project_id"),
+                func.row_number()
+                .over(partition_by=col(RunProject.benchmark_id), order_by=col(RunProject.id).desc())
+                .label("newest"),
+            )
+            .join(Benchmark, col(Benchmark.id) == col(RunProject.benchmark_id))
+            .where(Benchmark.org_id == org_id, *filters)
+        ).subquery()
+        return cast(Any, select)(ranked.c.benchmark_id, ranked.c.project_id).where(ranked.c.newest == 1).subquery()
+
+    def _in_project(self, query: Any, org_id: UUID, project_id: UUID) -> Any:
+        current = self._current_projects(org_id)
+        return query.join(current, current.c.benchmark_id == col(Benchmark.id)).where(
+            current.c.project_id == project_id
+        )
+
+    def _filtered(
+        self, filters: BenchmarkFilters, org_id: UUID, project_id: UUID | None = None
+    ) -> SelectOfScalar[Benchmark]:
         query = select(Benchmark).where(Benchmark.org_id == org_id).options(selectinload(Benchmark.final_evaluation))
+
+        if project_id is not None:
+            query = self._in_project(query, org_id, project_id)
 
         if filters.agent_name:
             query = query.where(col(Benchmark.agent_name).in_(filters.agent_name))
@@ -125,11 +167,7 @@ class BenchmarkRepository:
             query = query.where(col(Benchmark.agent_model) == filters.model)
 
         if filters.dataset:
-            dataset_value = col(Benchmark.dataset)
-            if filters.dataset == "default":
-                query = query.where(or_(dataset_value == "default", dataset_value == "", dataset_value.is_(None)))
-            else:
-                query = query.where(dataset_value == filters.dataset)
+            query = query.where(_SHOWN_DATASET == filters.dataset)
 
         if filters.label is not None:
             query = query.where(func.lower(Benchmark.label) == filters.label.lower())
@@ -162,8 +200,9 @@ class BenchmarkRepository:
         limit: int,
         offset: int = 0,
         after: tuple[datetime, UUID] | None = None,
+        project_id: UUID | None = None,
     ) -> Sequence[Benchmark]:
-        query = self._filtered(filters, org_id)
+        query = self._filtered(filters, org_id, project_id)
         if after is not None:
             position = tuple_(col(Benchmark.started_at), col(Benchmark.id))
             cursor_position = tuple_(literal(after[0]), literal(str(after[1])))
@@ -172,8 +211,10 @@ class BenchmarkRepository:
             )
         return self._session.exec(query.limit(limit).offset(offset)).all()
 
-    def count_filtered(self, filters: BenchmarkFilters, org_id: UUID) -> int:
-        return self._session.exec(select(func.count()).select_from(self._filtered(filters, org_id).subquery())).one()
+    def count_filtered(self, filters: BenchmarkFilters, org_id: UUID, *, project_id: UUID | None = None) -> int:
+        return self._session.exec(
+            select(func.count()).select_from(self._filtered(filters, org_id, project_id).subquery())
+        ).one()
 
     def list_by_ids(self, org_id: UUID, benchmark_ids: Sequence[UUID]) -> list[Benchmark]:
         return list(
@@ -231,6 +272,10 @@ class BenchmarkRepository:
             counts.setdefault(benchmark_id, {})[TaskStatus(status)] = count
         return counts
 
+    def newest_project_ids(self, org_id: UUID, benchmark_ids: Sequence[UUID]) -> dict[UUID, UUID]:
+        current = self._current_projects(org_id, col(RunProject.benchmark_id).in_(benchmark_ids))
+        return dict(self._session.exec(select(current.c.benchmark_id, current.c.project_id)).all())
+
     def final_score(self, benchmark: Benchmark) -> float | None:
         return self._session.exec(
             select(FinalEvaluation.final_score)
@@ -257,26 +302,27 @@ class BenchmarkRepository:
             failures.setdefault(task_id, (error_message or "No error message was provided", category))
         return failures
 
-    def filter_options(self, org_id: UUID) -> FilterOptions:
+    def filter_options(self, org_id: UUID, *, project_id: UUID | None = None) -> FilterOptions:
         columns = {
             "benchmark_names": col(Benchmark.name),
             "agent_names": col(Benchmark.agent_name),
             "models": col(Benchmark.agent_model),
-            "datasets": func.coalesce(func.nullif(col(Benchmark.dataset), ""), "default"),
+            "datasets": _SHOWN_DATASET,
             "started_by_emails": col(Benchmark.started_by_email),
         }
-        statement = union_all(
-            *(
+        branches: list[Any] = []
+        for field, value in columns.items():
+            branch = (
                 sa_select(literal(field).label("field"), value.label("value"))
                 .where(col(Benchmark.org_id) == org_id)
                 .where(value.is_not(None))
                 .where(value != "")
-                .group_by(value)
-                for field, value in columns.items()
             )
-        )
+            if project_id is not None:
+                branch = self._in_project(branch, org_id, project_id)
+            branches.append(branch.group_by(value))
         values: dict[str, list[str]] = {field: [] for field in columns}
-        for field, value in self._session.execute(statement):
+        for field, value in self._session.execute(union_all(*branches)):
             values[field].append(value)
         return FilterOptions(**values)
 

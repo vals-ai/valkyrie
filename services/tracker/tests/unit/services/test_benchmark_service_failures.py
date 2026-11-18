@@ -42,6 +42,9 @@ import tracker.services.runs.start as run_orchestration_module
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tracker.aws.secrets import SecretsManagerStore
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.services.datasets.env import secret_reader
+from tracker.services.datasets.source import LocalFolderSource
 import tracker.services.tasks.execute as utils_module
 from tests.unit.services import task_execution_support
 from tests.unit.services.task_execution_support import (
@@ -1493,10 +1496,25 @@ class TestBenchmarkServiceFailures:
     @pytest.mark.parametrize(
         ("code", "public_detail"),
         [
-            ("AccessDeniedException", "Secret 'tenant-secret' does not exist"),
-            ("ResourceNotFoundException", "Secret 'tenant-secret' does not exist"),
+            (
+                "AccessDeniedException",
+                "Valkyrie can't read secret 'tenant-secret': it isn't set for your organization or access to it was denied. "
+                "If it isn't set, run `valkyrie secret set tenant-secret`. "
+                "Otherwise this is a Valkyrie problem and has been reported.",
+            ),
+            (
+                "ResourceNotFoundException",
+                "Secret 'tenant-secret' is not set for your organization. Run `valkyrie secret set tenant-secret`.",
+            ),
+            (
+                "DecryptionFailure",
+                "Valkyrie can't decrypt secret 'tenant-secret': decryption failed. "
+                "This is a Valkyrie problem, not your configuration, and has been reported.",
+            ),
         ],
     )
+    @pytest.mark.description("Secret task errors preserve safe details and report only Valkyrie faults to Sentry.")
+    @pytest.mark.parametrize("secret_location", ["contract", "verifier"])
     async def test_secret_lookup_sanitizes_task_views_but_preserves_diagnostic_traceback(
         self,
         contract: AgentContractRequest,
@@ -1508,8 +1526,11 @@ class TestBenchmarkServiceFailures:
         caplog: pytest.LogCaptureFixture,
         code: str,
         public_detail: str,
+        secret_location: str,
+        tmp_path: Path,
     ) -> None:
-        contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
+        if secret_location == "contract":
+            contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
         start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract, control_postgres_session, bound_controls
         )
@@ -1538,11 +1559,27 @@ class TestBenchmarkServiceFailures:
                 raise provider_error
 
         class FailingSecretsProvider:
+            region = "us-east-1"
+
             @asynccontextmanager
             async def secretsmanager_async_client(self) -> AsyncGenerator[FailingSecretsClient]:
                 yield FailingSecretsClient()
 
         failing_store = SecretsManagerStore(cast(AWSClientProvider, FailingSecretsProvider()))
+        dataset_service = None
+        if secret_location == "verifier":
+            task_dir = tmp_path / "task_0"
+            task_dir.mkdir()
+            (task_dir / "task.toml").write_text(
+                '[environment]\ndocker_image = "ubuntu:24.04"\n'
+                '[verifier]\nenv = { LANGCRAFT_API_KEY = "${tenant-secret}" }\n'
+            )
+            (task_dir / "instruction.md").write_text("Do the task.")
+            (task_dir / "tests").mkdir()
+            (task_dir / "tests" / "test.sh").write_text("exit 0\n")
+            dataset_service = DatasetTaskService(
+                LocalFolderSource(tmp_path), secret_reader(runtime_services.secrets, lambda name: [name])
+            )
         original_get = runtime_services.secrets.get
 
         async def read_secret(name: str) -> SecretValue:
@@ -1567,15 +1604,43 @@ class TestBenchmarkServiceFailures:
             utils_module.logger.addHandler(caplog.handler)
             try:
                 result = await run_process_task(
-                    start_benchmark_request, task_row, benchmark_id, runtime_services, control
+                    start_benchmark_request,
+                    task_row,
+                    benchmark_id,
+                    runtime_services,
+                    control,
+                    service=dataset_service,
                 )
             finally:
                 utils_module.logger.removeHandler(caplog.handler)
 
         assert result == {"task_0": None}
-        expected = f"SecretNotFoundError: Secret error: {public_detail}"
+        error_types = {
+            "AccessDeniedException": "SecretAccessDeniedError",
+            "DecryptionFailure": "SecretDecryptionError",
+            "ResourceNotFoundException": "SecretNotFoundError",
+        }
+        error_type = error_types[code]
+        if secret_location == "verifier":
+            if code != "DecryptionFailure":
+                public_detail = (
+                    "Secret reference 'tenant-secret' could not be resolved. Checked names: tenant-secret. "
+                    f"{public_detail}"
+                )
+            public_detail = f"Task 'task_0' [verifier].env sets LANGCRAFT_API_KEY: {public_detail}"
+        expected = f"{error_type}: Secret error: {public_detail}"
         error_result = self._latest_task_error_result(control_postgres_session, task_row)
         assert error_result.error_message == expected
+        platform_fault = code != "ResourceNotFoundException"
+        assert error_result.category == (FailureCategory.INFRASTRUCTURE if platform_fault else FailureCategory.UNKNOWN)
+        assert (
+            error_result.cause_code
+            == {
+                "AccessDeniedException": "secret_access_denied",
+                "DecryptionFailure": "secret_decryption_failed",
+                "ResourceNotFoundException": "secret_not_found",
+            }[code]
+        )
 
         client = task_api_client
         task_response = client.get(f"/benchmarks/{benchmark_id}/tasks/{task_row.task_id}")
@@ -1597,12 +1662,15 @@ class TestBenchmarkServiceFailures:
         assert provider_role not in public_output
         assert provider_secret not in public_output
 
-        event = next(event for event in events if "exception" in event)
-        exceptions = event["exception"]["values"]
-        assert [(exception["type"], exception["value"]) for exception in exceptions] == [
-            ("ClientError", str(provider_error)),
-            ("SecretNotFoundError", f"Secret error: {public_detail}"),
-        ]
+        exception_events = [event for event in events if "exception" in event]
+        if platform_fault:
+            assert exception_events
+            exceptions = exception_events[0]["exception"]["values"]
+            assert exceptions[0]["type"] == "ClientError"
+            assert exceptions[0]["value"] == str(provider_error)
+            assert exceptions[-1]["type"] == error_type
+        else:
+            assert not exception_events
         record = next(record for record in caplog.records if record.getMessage() == "Task execution failed")
         structured = json.loads(JsonFormatter().format(record))
         assert provider_role in structured["exc_info"]
@@ -1794,13 +1862,15 @@ class TestBenchmarkServiceFailures:
         captured_error = capture_exception.call_args.args[0]
         assert isinstance(captured_error, BenchmarkServiceError)
 
-    def _fail_run_start_secret(self, monkeypatch: pytest.MonkeyPatch) -> tuple[ClientError, str, str]:
+    def _fail_run_start_secret(
+        self, monkeypatch: pytest.MonkeyPatch, error_code: str = "KMSAccessDeniedException"
+    ) -> tuple[ClientError, str, str]:
         provider_role = "arn:aws:sts::999999999999:assumed-role/tracker-runtime/run-session"
         provider_secret = "arn:aws:secretsmanager:us-east-1:999999999999:secret:tenant-secret"
         provider_error = ClientError(
             {
                 "Error": {
-                    "Code": "KMSAccessDeniedException",
+                    "Code": error_code,
                     "Message": f"User {provider_role} cannot decrypt {provider_secret}",
                 }
             },
@@ -1812,6 +1882,8 @@ class TestBenchmarkServiceFailures:
                 raise provider_error
 
         class FailingSecretsProvider:
+            region = "us-east-1"
+
             @asynccontextmanager
             async def secretsmanager_async_client(self) -> AsyncGenerator[FailingSecretsClient]:
                 yield FailingSecretsClient()
@@ -1828,28 +1900,49 @@ class TestBenchmarkServiceFailures:
         return provider_error, provider_role, provider_secret
 
     @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.description(
+        "Run secret failures preserve safe public messages and their configuration or Tracker labels."
+    )
+    @pytest.mark.parametrize("error_code", ["KMSAccessDeniedException", "ResourceNotFoundException"])
     async def test_run_start_secret_failure_stores_public_error_without_traceback(
         self,
         contract: AgentContractRequest,
         control_postgres_session: Session,
         bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error_code: str,
     ) -> None:
         contract = contract.model_copy(update={"secrets": {"TOKEN": "tenant-secret"}})
         start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract, control_postgres_session, bound_controls
         )
-        _provider_error, provider_role, provider_secret = self._fail_run_start_secret(monkeypatch)
+        _provider_error, provider_role, provider_secret = self._fail_run_start_secret(monkeypatch, error_code)
 
-        await process_benchmark(
-            execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
-            executor_dispatch_id=str(control.ref.dispatch_id),
-            run_control=RunControl(control.client, control.ref),
-            task_control=control,
-            queue_control=QueueControl(control.client, control.ref),
-        )
+        run_orchestration_module.logger.addHandler(caplog.handler)
+        try:
+            await process_benchmark(
+                execution_context_json=_context(start_benchmark_request, benchmark_id, ["task_0"]),
+                executor_dispatch_id=str(control.ref.dispatch_id),
+                run_control=RunControl(control.client, control.ref),
+                task_control=control,
+                queue_control=QueueControl(control.client, control.ref),
+            )
+        finally:
+            run_orchestration_module.logger.removeHandler(caplog.handler)
 
-        expected = "SecretsError: Secret error: Failed to retrieve secret 'tenant-secret' (KMSAccessDeniedException)"
+        if error_code == "ResourceNotFoundException":
+            expected = (
+                "SecretNotFoundError: Secret error: Secret 'tenant-secret' is not set for your organization. "
+                "Run `valkyrie secret set tenant-secret`."
+            )
+            producer, operation, cause_code = "configuration", "resolve_secret", "secret_not_found"
+        else:
+            expected = (
+                "SecretDecryptionError: Secret error: Valkyrie can't decrypt secret 'tenant-secret': decryption failed. "
+                "This is a Valkyrie problem, not your configuration, and has been reported."
+            )
+            producer, operation, cause_code = "tracker", "process_benchmark", "secret_decryption_failed"
         with Session(bind=control_postgres_session.bind) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session, TEST_ORG)
             assert benchmark_row.status == BenchmarkStatus.ERROR
@@ -1857,6 +1950,15 @@ class TestBenchmarkServiceFailures:
             assert stored_task is not None
             assert stored_task.status == TaskStatus.ERROR
             task_error = self._latest_task_error(session, stored_task)
+            result = self._latest_task_error_result(session, stored_task)
+            assert (result.producer, result.operation, result.cause_code) == (producer, operation, cause_code)
+        record = next(record for record in caplog.records if record.getMessage() == "Run execution failed")
+        structured = json.loads(JsonFormatter().format(record))
+        assert (structured["producer"], structured["operation"], structured["cause_code"]) == (
+            producer,
+            operation,
+            cause_code,
+        )
         for stored in (benchmark_row.error_message, task_error):
             assert stored == expected
             assert provider_role not in stored
@@ -1864,6 +1966,7 @@ class TestBenchmarkServiceFailures:
             assert "Traceback" not in stored
 
     @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.description("Run secret permission faults reach Sentry while public messages omit provider details.")
     async def test_run_start_secret_failure_reports_provider_cause_to_operators(
         self,
         contract: AgentContractRequest,
@@ -1900,7 +2003,7 @@ class TestBenchmarkServiceFailures:
 
         event = next(event for event in events if "exception" in event)
         exceptions = event["exception"]["values"]
-        assert [exception["type"] for exception in exceptions] == ["ClientError", "SecretsError"]
+        assert [exception["type"] for exception in exceptions] == ["ClientError", "SecretDecryptionError"]
         assert exceptions[0]["value"] == str(provider_error)
         record = next(record for record in caplog.records if record.getMessage() == "Run execution failed")
         structured = json.loads(JsonFormatter().format(record))

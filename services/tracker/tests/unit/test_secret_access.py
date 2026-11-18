@@ -1,18 +1,57 @@
+from types import SimpleNamespace
+from typing import cast
 from uuid import UUID
 from unittest.mock import AsyncMock
 
 import pytest
 
 from tracker import config
-from tracker.exceptions import SecretNotFoundError
+from tracker.exceptions import (
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
+    SecretNotFoundError,
+    SecretsError,
+)
 from tracker.runtime.secrets import SecretValue, secret_display_name
 from tracker.runtime.services import RuntimeServices
 from tracker.services.runs.start import _task_secret_reader
-from tracker.secret_access import OrgSecretStore, resolve_secret_name, secret_name_candidates, validate_secret_names
+from tracker.database.models import Org
+from tracker.secret_access import (
+    OrgSecretStore,
+    resolve_secret_name,
+    secret_name_candidates,
+    selected_project_gateway_reference,
+    tenant_secret_prefix,
+    validate_secret_names,
+)
 from tracker.types import AgentContractRequest, OrgContext, RunExecutionRequest
 
 _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
 _OTHER_ORG_ID = UUID("00000000-0000-0000-0000-000000000002")
+
+
+@pytest.mark.description(
+    "Organization secret reads fall back on missing or denied tenant secrets but not decryption faults."
+)
+@pytest.mark.parametrize("error_type", [SecretNotFoundError, SecretAccessDeniedError, SecretDecryptionError])
+async def test_org_secret_store_candidate_fallback(error_type: type[SecretsError]) -> None:
+    source = AsyncMock()
+    error = error_type("Tenant lookup failed.")
+    source.get.side_effect = [error, "shared-value"]
+    store = OrgSecretStore(source, ["TOKEN"], org_id=_ORG_ID, org_name="internal.example", auth_required=True)
+
+    if error_type is SecretDecryptionError:
+        with pytest.raises(SecretDecryptionError) as captured:
+            await store.get("TOKEN")
+        assert captured.value is error
+        assert [call.args[0] for call in source.get.await_args_list] == [f"{tenant_secret_prefix(_ORG_ID)}TOKEN"]
+    else:
+        assert await store.get("TOKEN") == "shared-value"
+        assert [call.args[0] for call in source.get.await_args_list] == [
+            f"{tenant_secret_prefix(_ORG_ID)}TOKEN",
+            "TOKEN",
+        ]
 
 
 @pytest.mark.description(
@@ -48,9 +87,11 @@ async def test_dataset_fallback_preserves_overlapping_contract_secret(
         OrgContext(id=_ORG_ID, name="internal.example", storage_key="test-bucket"),
     )
 
-    assert await reader("dataset-config#FIELD") == (
-        "shared-field" if shared_value == {"FIELD": "shared-field"} else None
-    )
+    if shared_value == {"FIELD": "shared-field"}:
+        assert await reader("dataset-config#FIELD") == "shared-field"
+    else:
+        with pytest.raises(SecretConfigurationError, match="has no JSON field 'FIELD'"):
+            await reader("dataset-config#FIELD")
     assert [call.args[0] for call in source.get.await_args_list] == [f"{prefix}dataset-config", "dataset-config"]
 
 
@@ -207,8 +248,15 @@ def test_legacy_research_tenants_keep_explicit_shared_secret_access(
 
 
 @pytest.mark.description("Shared tenants cannot name another org's gateway key.")
-def test_shared_tenants_cannot_name_another_orgs_gateway_key() -> None:
-    key = "model-gateway-00000000-0000-0000-0000-0000000000aa"
+@pytest.mark.parametrize(
+    "key",
+    [
+        "model-gateway-00000000-0000-0000-0000-0000000000aa",
+        "projects/gateway-keys/00000000-0000-0000-0000-0000000000aa",
+    ],
+    ids=["tracker-copy", "project-service"],
+)
+def test_shared_tenants_cannot_name_another_orgs_gateway_key(key: str) -> None:
     validate_secret_names(
         [f"valkyrie/tenants/{_ORG_ID}/{key}"], org_id=_ORG_ID, org_name="internal.example", auth_required=True
     )
@@ -243,3 +291,19 @@ def test_secret_name_candidates_put_the_run_org_first(
     monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "internal.example")
 
     assert secret_name_candidates(name, org_id=_ORG_ID, org_name=org_name, auth_required=auth_required) == candidates
+
+
+@pytest.mark.description("A hosted run keeps a project-service Gateway key under its tenant path as its selected key.")
+def test_project_service_gateway_key_is_selected_for_a_hosted_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "GATEWAY_KEY_ORGS", frozenset({"internal.example"}))
+
+    def hosted(_benchmark_name: str, _custom_service: str | None) -> config.BenchmarkServiceDestination:
+        return config.BenchmarkServiceDestination.HOSTED
+
+    monkeypatch.setattr(config, "classify_benchmark_service_destination", hosted)
+    reference = f"valkyrie/tenants/{_ORG_ID}/projects/gateway-keys/00000000-0000-0000-0000-0000000000aa"
+    org = cast(Org, SimpleNamespace(id=_ORG_ID, name="internal.example"))
+    names = {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}
+
+    assert selected_project_gateway_reference(names, org, reference, "swebench", None) == reference
+    assert selected_project_gateway_reference(names, org, reference.replace("aa", "zz"), "swebench", None) is None

@@ -37,6 +37,7 @@ from tracker.api.benchmarks_status import router as benchmarks_status_router
 from tracker.api.dependencies import TrackedBenchmarkId, bind_benchmark_id, get_agent_library_runtime
 from tracker.api.dependencies import RunBenchmarkDependency, RunRuntimeDependency
 from tracker.api.costs import router as costs_router
+from tracker.api.project_service import router as project_service_router
 from tracker.api.filter_options import router as filter_options_router
 from tracker.api.logs import monitor_router
 from tracker.api.logs import router as logs_router
@@ -58,7 +59,9 @@ from tracker.repositories.project import ProjectRepository, ProjectRepositoryDep
 from tracker.repositories.run_settings import RunSettingsRepository
 from tracker.repositories.scheduler import SchedulerRepository
 from tracker.api.projects import (
+    PROJECT_NOT_FOUND,
     find_project,
+    limit_requests_router,
     preliminary_projects,
     reject_archived_project,
     reject_missing_project,
@@ -112,6 +115,7 @@ from tracker.config import (
     BenchmarkServiceDestination,
     classify_benchmark_service_destination,
     create_benchmark_service_url,
+    validate_enabled_project_gateway,
 )
 from tracker.types import AgentContractRequest, AgentReleaseSelection, AgentExecutionAttempt
 from tracker.database.models import (
@@ -137,7 +141,6 @@ from tracker.executor.dispatch_control import (
 from tracker.executor.dispatch_payload import PayloadKey, generate_payload_key, seal_payload
 from tracker.executor.launcher import launch_dispatch
 from tracker.database.session import check_database_connection, configure_server_threads, database_call, get_session
-from tracker.services.projects import migrate_projects
 from tracker.services.datasets.oracle import ORACLE_AGENT, ORACLE_CONTRACT
 from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDataset
 from tracker.services.datasets.scoring import scorer_for
@@ -152,7 +155,11 @@ from tracker.exceptions import (
     AmbiguousDigestError,
     InvalidSandboxConfigurationError,
     LambdaError,
+    ProjectNotFoundError,
     RunLimitExceededError,
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
     SecretNotFoundError,
     TrackerServiceError,
 )
@@ -256,6 +263,7 @@ from tracker.services.sandboxes import ForceStopError, capture_stop_sandboxes, f
 from tracker.services.tasks.execute import task_attempt_id
 
 configure_logging()
+validate_enabled_project_gateway()
 configure_observability("valkyrie-tracker", environment=ENVIRONMENT)
 
 logger = get_logger(__name__)
@@ -274,7 +282,6 @@ def _operation_id(route: APIRoute) -> str:
 async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     configure_server_threads()
     _ = project_service()
-    await database_call(migrate_projects)
     retirement = AutomaticReleaseRetirement()
     dispatch_recovery = AutomaticDispatchRecovery()
     sandbox_cost = AutomaticSandboxCost()
@@ -313,6 +320,7 @@ app.include_router(organizations_router)
 app.include_router(benchmark_services_router)
 app.include_router(benchmarks_status_router)
 app.include_router(costs_router)
+app.include_router(project_service_router)
 app.include_router(filter_options_router)
 app.include_router(logs_router)
 app.include_router(monitor_router)
@@ -325,6 +333,7 @@ app.include_router(run_settings_router)
 app.include_router(secrets_router)
 app.include_router(remote_grader_router)
 app.include_router(projects_router)
+app.include_router(limit_requests_router)
 v1 = APIRouter(prefix="/v1")
 v1.include_router(benchmark_definitions_router)
 v1.include_router(datasets_router)
@@ -582,13 +591,25 @@ async def _rollback_failed_start_admission(
 
 @app.exception_handler(SecretNotFoundError)
 async def secret_not_found_handler(_request: Request, exc: SecretNotFoundError):
-    raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+    return JSONResponse(status_code=404, content={"detail": str(exc.args[0])})
+
+
+@app.exception_handler(SecretConfigurationError)
+async def secret_configuration_handler(_request: Request, exc: SecretConfigurationError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.args[0])})
+
+
+@app.exception_handler(ProjectNotFoundError)
+async def project_not_found_handler(_request: Request, exc: ProjectNotFoundError):
+    raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
 @app.exception_handler(TrackerServiceError)
 async def tracker_service_error_handler(request: Request, exc: TrackerServiceError):
     logger.error("Tracker service operation failed on %s %s: %s", request.method, request.url.path, exc, exc_info=exc)
     sentry_sdk.capture_exception(exc)
+    if isinstance(exc, (SecretAccessDeniedError, SecretDecryptionError)):
+        return JSONResponse(status_code=500, content={"detail": str(exc.args[0])})
     return JSONResponse(status_code=500, content={"detail": "Tracker service operation failed"})
 
 
@@ -3030,6 +3051,7 @@ def _apply_recovery(
 @app.get(
     "/fetch-benchmarks",
     description="List runs that match the filters, a page at a time.",
+    responses=PROJECT_NOT_FOUND,
 )
 def fetch_benchmarks(
     agent_name: list[str] | None = Query(default=None),
@@ -3041,6 +3063,7 @@ def fetch_benchmarks(
     label: str | None = Query(default=None),
     started_after: datetime | None = Query(default=None),
     started_before: datetime | None = Query(default=None),
+    project: str | None = Query(default=None),
     order_by: Order = Query(default=Order.DESC),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
@@ -3048,7 +3071,7 @@ def fetch_benchmarks(
     session: Session = Depends(get_session),
     org: Org = Depends(get_current_org),
 ) -> FetchBenchmarksResponse:
-    text_filters = [model, dataset, label, *(agent_name or []), *(benchmark_name or []), *(started_by or [])]
+    text_filters = [model, dataset, label, project, *(agent_name or []), *(benchmark_name or []), *(started_by or [])]
     if any("\x00" in value for value in text_filters if value is not None):
         raise HTTPException(status_code=400, detail="Filters must not contain NUL characters")
 
@@ -3062,6 +3085,7 @@ def fetch_benchmarks(
         label=label,
         started_after=started_after,
         started_before=started_before,
+        project=project,
         order_by=order_by,
         cursor=cursor,
         limit=limit,
@@ -3074,7 +3098,7 @@ def fetch_benchmarks(
         raise HTTPException(status_code=400, detail="Invalid cursor") from error
 
     return FetchBenchmarksResponse(
-        benchmarks=build_benchmark_table_rows(benchmark_rows, session),
+        benchmarks=build_benchmark_table_rows(benchmark_rows, session, org.id),
         total_count=total_count,
         next_cursor=next_cursor,
     )

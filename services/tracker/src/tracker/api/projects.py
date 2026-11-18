@@ -1,8 +1,9 @@
 import asyncio
 from datetime import UTC, datetime
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from tracker.auth import (
     LoginIdentity,
@@ -12,20 +13,42 @@ from tracker.auth import (
     get_current_runner,
     get_current_starter,
 )
+from tracker.config import DESCOPE_ORG_ADMIN_ROLE, PLATFORM_ADMIN_PERMISSION
 from tracker.database.models import Org, Project
-from tracker.exceptions import ProjectHandleTakenError, ProjectNameTakenError
+from tracker.exceptions import (
+    ProjectHandleTakenError,
+    ProjectLimitRequestDecidedError,
+    ProjectLimitRequestNotFoundError,
+    ProjectNameTakenError,
+)
+from tracker.repositories.organization import OrganizationRepository, OrganizationRepositoryDependency
 from tracker.repositories.project import ProjectRepository, ProjectRepositoryDependency
-from tracker.project_gateway import requests_project_gateway_key, request_project_gateway_key
+from tracker.api.secrets import secret_store
+from tracker.project_gateway import hand_over_gateway_keys, requests_project_gateway_key, request_project_gateway_key
 from tracker.types import (
+    ErrorMessage,
     GatewayKeyEligibilityResponse,
+    GatewayKeyHandOverResponse,
+    LimitDecision,
+    LimitRequest,
+    LimitRequestInput,
+    LimitRequestStatus,
     NewProjectRequest,
     ProjectCreateRequest,
     ProjectIdResponse,
+    ProjectLimit,
     ProjectResponse,
     ProjectsResponse,
+    QueuedLimitRequest,
 )
 
 router = APIRouter(prefix="/projects")
+limit_requests_router = APIRouter(prefix="/limit-requests")
+
+
+PROJECT_NOT_FOUND: dict[int | str, dict[str, Any]] = {
+    404: {"model": ErrorMessage, "description": "The organization has no project with this handle."}
+}
 
 
 def reject_archived_project(project: Project) -> Project:
@@ -229,6 +252,36 @@ def list_projects(
     )
 
 
+@limit_requests_router.get(
+    "",
+    response_model=list[QueuedLimitRequest],
+    responses={403: {"description": "Platform administrator required"}},
+    description="List every org's limit requests from the project service for platform admins, newest first.",
+)
+def queue_limit_requests(
+    repository: ProjectRepositoryDependency,
+    organizations: OrganizationRepositoryDependency,
+    status: LimitRequestStatus | None = None,
+    login: LoginIdentity = Depends(get_current_login),
+) -> list[QueuedLimitRequest]:
+    _require_platform_admin(login)
+    rows = repository.limit_request_queue(status.value if status else None)
+    named = [(row, organizations.get(UUID(row["org_id"]))) for row in rows]
+    return [QueuedLimitRequest.model_validate(row | {"organization": org.name}) for row, org in named if org]
+
+
+@router.get(
+    "/{handle}",
+    response_model=ProjectResponse,
+    description="Return one of the organization's projects by handle, archived ones included.",
+    responses=PROJECT_NOT_FOUND,
+)
+def get_project(
+    handle: str, repository: ProjectRepositoryDependency, org: Org = Depends(get_current_org)
+) -> ProjectResponse:
+    return ProjectResponse.from_row(repository.resolve(org.id, handle))
+
+
 @router.get(
     "/by-id/{project_id}",
     response_model=ProjectIdResponse,
@@ -239,6 +292,133 @@ def get_project_by_id(
 ) -> ProjectIdResponse:
     project = _project_or_404(repository.get_by_id(org.id, project_id), project_id)
     return ProjectIdResponse(id=project.id, org_id=project.org_id)
+
+
+@router.put(
+    "/by-id/{project_id}/limit",
+    response_model=ProjectLimit,
+    responses={
+        403: {"model": ErrorMessage, "description": "The caller is not an admin of the org or a platform admin."},
+        404: {"model": ErrorMessage, "description": "Tracker has no org with org_id, or the org has no such project."},
+    },
+    description="Set a project's limit in the project service, as an admin of the organization named by org_id "
+    "or a platform admin.",
+)
+def set_project_limit(
+    project_id: UUID,
+    org_id: UUID,
+    request: ProjectLimit,
+    repository: ProjectRepositoryDependency,
+    organizations: OrganizationRepositoryDependency,
+    login: LoginIdentity = Depends(get_current_login),
+) -> ProjectLimit:
+    org = organizations.get(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not _may_set_limit(login, org):
+        raise HTTPException(
+            status_code=403, detail=f"Only {DESCOPE_ORG_ADMIN_ROLE}s of {org.name} or platform admins can set a limit"
+        )
+    project = _project_or_404(repository.get_by_id(org.id, project_id), project_id)
+    repository.set_limit(project, request)
+    return request
+
+
+def _may_set_limit(login: LoginIdentity, org: Org) -> bool:
+    is_org_admin = DESCOPE_ORG_ADMIN_ROLE in login.organizations.get(org.name, ())
+    return is_org_admin or PLATFORM_ADMIN_PERMISSION in login.permissions
+
+
+@router.post(
+    "/by-id/{project_id}/limit-requests",
+    status_code=201,
+    response_model=LimitRequest,
+    description="File a request to raise a project's limit in the project service, pending a platform admin's decision.",
+)
+def file_limit_request(
+    project_id: UUID,
+    request: LimitRequestInput,
+    repository: ProjectRepositoryDependency,
+    login: LoginIdentity = Depends(get_current_login),
+    org: Org = Depends(get_current_org),
+) -> LimitRequest:
+    project = _project_or_404(repository.get_by_id(org.id, project_id), project_id)
+    body = request.model_dump(mode="json") | {"requested_by_email": login.email}
+    try:
+        return repository.limit_requests(project, "POST", body=body)
+    except ProjectLimitRequestNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ProjectLimitRequestDecidedError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def platform_admin_org(
+    organizations: OrganizationRepositoryDependency, login: LoginIdentity = Depends(get_current_login)
+) -> Org:
+    _require_platform_admin(login)
+    return _named_org(organizations, login.organization)
+
+
+def member_or_platform_admin_org(
+    organizations: OrganizationRepositoryDependency, login: LoginIdentity = Depends(get_current_login)
+) -> Org:
+    if PLATFORM_ADMIN_PERMISSION in login.permissions:
+        return _named_org(organizations, login.organization)
+    return _named_org(organizations, login.current_organization)
+
+
+def _named_org(organizations: OrganizationRepository, name: str | None) -> Org:
+    org = organizations.get_by_name(name or "")
+    if org is None:
+        raise HTTPException(status_code=404, detail=f"Organization '{name}' not found")
+    return org
+
+
+def _require_platform_admin(login: LoginIdentity) -> None:
+    if PLATFORM_ADMIN_PERMISSION not in login.permissions:
+        raise HTTPException(status_code=403, detail="Platform administrator required")
+
+
+@router.get(
+    "/by-id/{project_id}/limit-requests",
+    response_model=list[LimitRequest],
+    description="List a project's limit requests from the project service, newest first.",
+)
+def list_limit_requests(
+    project_id: UUID, repository: ProjectRepositoryDependency, org: Org = Depends(member_or_platform_admin_org)
+) -> list[LimitRequest]:
+    project = _project_or_404(repository.get_by_id(org.id, project_id), project_id)
+    try:
+        return repository.limit_requests(project, "GET")
+    except ProjectLimitRequestNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ProjectLimitRequestDecidedError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/by-id/{project_id}/limit-requests/{request_id}/{decision}",
+    response_model=LimitRequest,
+    responses={403: {"description": "Platform administrator required"}, 409: {"description": "Already decided"}},
+    description="Approve or deny a pending limit request as a platform admin, in any org named by the tenant header. "
+    "An approval sets the project's limit.",
+)
+def decide_limit_request(
+    project_id: UUID,
+    request_id: UUID,
+    decision: LimitDecision,
+    repository: ProjectRepositoryDependency,
+    login: LoginIdentity = Depends(get_current_login),
+    org: Org = Depends(platform_admin_org),
+) -> LimitRequest:
+    project = _project_or_404(repository.get_by_id(org.id, project_id), project_id)
+    body = {"decided_by_email": login.email}
+    try:
+        return repository.limit_requests(project, "POST", f"/{request_id}/{decision.value}", body)
+    except ProjectLimitRequestNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ProjectLimitRequestDecidedError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get(
@@ -260,3 +440,17 @@ def get_gateway_key_eligibility(
         raise HTTPException(status_code=403, detail="This login cannot request a gateway key for this project")
     project = _project_or_404(repository.get_by_id(runner.org.id, project_id), project_id)
     return GatewayKeyEligibilityResponse(project_id=project.id, org_id=project.org_id, subject=login.user_id)
+
+
+@router.post(
+    "/gateway-keys/hand-over",
+    response_model=GatewayKeyHandOverResponse,
+    include_in_schema=False,
+    description="Hand every project's Tracker-held Gateway key secret to the project service, the way a run does. "
+    "Defaults to a dry run that counts secrets by name and reads none.",
+)
+def hand_over_project_gateway_keys(
+    org: Org = Depends(get_current_org),
+    apply: Annotated[bool, Query(description="Hand the secrets over. Defaults to a dry run.")] = False,
+) -> GatewayKeyHandOverResponse:
+    return asyncio.run(hand_over_gateway_keys(org, secret_store(org), apply))

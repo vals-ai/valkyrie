@@ -1,4 +1,3 @@
-from collections.abc import Sequence
 from datetime import datetime
 from functools import cache
 from uuid import UUID
@@ -7,13 +6,17 @@ import httpx
 
 from tracker.config import project_service_configuration
 from tracker.database.models import Project
-from tracker.types import ProjectResponse, ProjectsResponse
+from tracker.types import ProjectLimit
 
 UNAVAILABLE_STATUSES = {502, 503, 504}
 PROJECT_SERVICE_TIMEOUT = httpx.Timeout(30, connect=2)
 
 
 class ProjectServiceUnavailableError(Exception):
+    pass
+
+
+class GatewayKeyConflictError(Exception):
     pass
 
 
@@ -58,16 +61,6 @@ class ProjectServiceClient:
         _ = response.raise_for_status()
         return Project.model_validate(response.json() | {"org_id": org_id})
 
-    def replace(self, org_id: UUID, projects: Sequence[Project]) -> None:
-        body = {"projects": [project.model_dump(mode="json", exclude={"org_id"}) for project in projects]}
-        response = self._client.put(f"/orgs/{org_id}/projects", json=body)
-        _ = response.raise_for_status()
-
-    def list_projects(self, org_id: UUID) -> list[ProjectResponse]:
-        response = self._client.get(f"/orgs/{org_id}/projects", params={"include_archived": True})
-        _ = response.raise_for_status()
-        return ProjectsResponse.model_validate_json(response.content).projects
-
     def set_gateway_key(self, org_id: UUID, project_id: UUID, key_id: UUID) -> UUID:
         response = self._client.post(
             f"/orgs/{org_id}/projects/{project_id}/gateway-key-id", json={"gateway_key_id": str(key_id)}
@@ -75,12 +68,40 @@ class ProjectServiceClient:
         _ = response.raise_for_status()
         return UUID(response.json()["gateway_key_id"])
 
+    def mint_gateway_key(self, org_id: UUID, project_id: UUID) -> UUID:
+        response = self._client.post(f"/orgs/{org_id}/projects/{project_id}/gateway-key")
+        if response.status_code == 409:
+            raise GatewayKeyConflictError(response.json()["detail"])
+        _ = response.raise_for_status()
+        return UUID(response.json()["gateway_key_id"])
+
+    def hand_over_gateway_key(self, org_id: UUID, project_id: UUID, key_id: UUID, secret: str) -> None:
+        response = self._client.put(
+            f"/orgs/{org_id}/projects/{project_id}/gateway-key/secret",
+            json={"gateway_key_id": str(key_id), "secret": secret},
+        )
+        if response.status_code == 409:
+            raise GatewayKeyConflictError(response.json()["detail"])
+        _ = response.raise_for_status()
+
     def set_gateway_request(self, org_id: UUID, project_id: UUID, request_id: UUID) -> UUID:
         response = self._client.post(
             f"/orgs/{org_id}/projects/{project_id}/gateway-request", json={"gateway_request_id": str(request_id)}
         )
         _ = response.raise_for_status()
         return UUID(response.json()["gateway_request_id"])
+
+    def set_limit(self, org_id: UUID, project_id: UUID, limit: ProjectLimit) -> None:
+        path = f"/orgs/{org_id}/projects/{project_id}/limit"
+        _ = self._client.put(path, json=limit.model_dump(mode="json")).raise_for_status()
+
+    def limit_requests(self, project: Project, method: str, path: str = "", body: object = None) -> httpx.Response:
+        return self._client.request(
+            method, f"/orgs/{project.org_id}/projects/{project.id}/limit-requests{path}", json=body
+        )
+
+    def limit_request_queue(self, status: str | None) -> httpx.Response:
+        return self._client.get("/limit-requests", params={"status": status} if status else {})
 
     def create(self, project: Project) -> Project | None:
         response = self._client.post(
@@ -108,11 +129,23 @@ class ProjectServiceClient:
         if response.status_code != 404:
             _ = response.raise_for_status()
 
-    def list_rows(self, org_id: UUID, include_archived: bool, include_deleted: bool = False) -> list[Project]:
+    def list_rows(
+        self, org_id: UUID, include_archived: bool, include_deleted: bool = False, timeout: httpx.Timeout | None = None
+    ) -> list[Project]:
         params = {"include_archived": include_archived, "include_deleted": include_deleted}
-        response = self._client.get(f"/orgs/{org_id}/projects", params=params)
+        response = self._client.get(
+            f"/orgs/{org_id}/projects",
+            params=params,
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+        )
         _ = response.raise_for_status()
-        return [Project.model_validate(row | {"org_id": org_id}) for row in response.json()["projects"]]
+        try:
+            rows = response.json()["projects"]
+            if not isinstance(rows, list):
+                raise ValueError("Expected a project list")
+            return [Project.model_validate(row | {"org_id": org_id}) for row in rows]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProjectServiceUnavailableError("Project service returned an invalid project list") from error
 
     def get(self, org_id: UUID, project_id: UUID) -> Project | None:
         response = self._client.get(f"/orgs/{org_id}/projects/{project_id}")

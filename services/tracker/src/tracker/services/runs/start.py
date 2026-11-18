@@ -18,7 +18,7 @@ from tracker.clients.task_service import TaskService
 
 from tracker.config import AUTH_REQUIRED, BenchmarkServiceDestination, classify_benchmark_service_destination
 from tracker.domain import BenchmarkStatus, FailureCategory, TaskStatus
-from tracker.exceptions import ExecutionAuthorityRevoked, TrackerServiceError
+from tracker.exceptions import ExecutionAuthorityRevoked, SecretConfigurationError, TrackerServiceError
 from tracker.executor.control_protocol import TaskRef
 from tracker.executor.control_runs import RunControl, RunFailure, RunTaskState, upload_final_view
 from tracker.executor.control_tasks import TaskControl, TaskReadResponse
@@ -46,7 +46,7 @@ from tracker.local.resources import LocalResources, reads_secrets_file
 from tracker.local.secrets import SecretsFile
 from tracker.runtime.artifacts import task_artifact_key
 from tracker.secret_access import OrgSecretStore, secret_name_candidates, validate_secret_names
-from tracker.services.failures import classify_failure
+from tracker.services.failures import classify_failure, describe_failure
 from tracker.services.tasks.error_summary import summarize_task_errors
 from tracker.services.tasks.execute import ResizableLimiter, TaskMonitor, TrackedTask, process_task
 
@@ -693,7 +693,19 @@ async def _process_benchmark(
         )
     except Exception as error:
         category = classify_failure(error)
-        _capture_run_error(error, benchmark_id, producer="tracker", operation="process_benchmark", category=category)
+        cause_code = getattr(error, "cause_code", None)
+        producer, operation = "tracker", "process_benchmark"
+        if isinstance(error, SecretConfigurationError):
+            failure = describe_failure(error, str(error))
+            producer, operation = failure.producer, failure.operation
+        _capture_run_error(
+            error,
+            benchmark_id,
+            producer=producer,
+            operation=operation,
+            category=category,
+            cause_code=cause_code,
+        )
         error_message = (
             f"{type(error).__name__}: {error}"
             if isinstance(error, TrackerServiceError) and not error.include_cause_in_task_error
@@ -703,11 +715,11 @@ async def _process_benchmark(
             run_control,
             RunFailure(
                 error_message=error_message,
-                producer="tracker",
-                operation="process_benchmark",
+                producer=producer,
+                operation=operation,
                 error_type=type(error).__name__,
                 category=category,
-                cause_code=None,
+                cause_code=cause_code,
                 task_ids=task_ids,
                 fingerprint=None,
             ),

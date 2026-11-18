@@ -1,24 +1,28 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, PlainValidator
 
+from tracker.api.projects import PROJECT_NOT_FOUND
 from tracker.auth import get_current_org
-from tracker.config import AUTH_REQUIRED
 from tracker.database.models import Org
 from tracker.database.session import database_call
+from tracker.exceptions import GatewayUnavailableError
+from tracker.logging import get_logger
 from tracker.repositories.cost import DAYTONA_PROVIDER, CostRepositoryDependency
-from tracker.repositories.provider_secret import ProviderSecretRepositoryDependency
-from tracker.sandbox_cost import daytona_last_ends
-from tracker.secret_access import resolve_secret_name
+from tracker.repositories.project import ProjectRepositoryDependency
+from tracker.services.costs import ProjectModelCosts, as_utc, project_model_spend
+from tracker.types import ErrorMessage
 
 router = APIRouter(prefix="/costs")
+logger = get_logger(__name__)
 
 
 def _parse_window_bound(value: Any) -> date | datetime:
@@ -116,11 +120,6 @@ class CostsByProjectResponse(BaseModel):
     runs: list[ProjectRun]
 
 
-def _as_utc(moment: datetime) -> datetime:
-    utc = ZoneInfo("UTC")
-    return moment.replace(tzinfo=utc) if moment.tzinfo is None else moment.astimezone(utc)
-
-
 def _vendor(provider: str) -> str:
     return provider.title()
 
@@ -158,7 +157,7 @@ def get_costs_by_project(
     run_rows, cost_rows = repository.by_project(org.id, window_start, window_end)
     grouped: dict[tuple[str, str, str | None], dict[str, Any]] = {}
     for cost in cost_rows:
-        month = _as_utc(cost.placed_at).strftime("%Y-%m")
+        month = as_utc(cost.placed_at).strftime("%Y-%m")
         key = (month, _vendor(cost.provider), cost.handle)
         group = grouped.setdefault(key, {"project": cost, "amount_usd": 0.0, "run_ids": set()})
         group["amount_usd"] += cost.amount_usd
@@ -184,10 +183,59 @@ def get_costs_by_project(
         end=window_end,
         rows=rows,
         runs=[
-            ProjectRun(project_handle=row.handle, run_id=row.run_id, started_at=_as_utc(row.started_at))
+            ProjectRun(project_handle=row.handle, run_id=row.run_id, started_at=as_utc(row.started_at))
             for row in run_rows
         ],
     )
+
+
+@router.get(
+    "/project-model",
+    response_model=ProjectModelCosts,
+    description=(
+        "Return one project's model spend per UTC month from the model Gateway, for its runs placed in `[start, end)`.\n"
+        "\n"
+        "A run counts under its newest project link and in the UTC month it finished, or started if it has not finished.\n"
+        "\n"
+        "`unattributed_usd` is the project key's all-time spend outside any run or on runs with no project.\n"
+        "`through` is the time the Gateway's usage data runs to."
+    ),
+    responses={
+        **PROJECT_NOT_FOUND,
+        503: {"model": ErrorMessage, "description": "The model Gateway is unavailable."},
+    },
+)
+async def get_project_model_costs(
+    repository: CostRepositoryDependency,
+    projects: ProjectRepositoryDependency,
+    project: Annotated[str, Query(description="Handle of the project whose model spend is returned.")],
+    start: Annotated[
+        WindowBound,
+        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted."),
+    ],
+    end: Annotated[
+        WindowBound,
+        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."),
+    ],
+    org: Org = Depends(get_current_org),
+) -> ProjectModelCosts:
+    window_start, window_end = _window(start, end)
+    try:
+        return await project_model_spend(
+            repository,
+            org.id,
+            await database_call(lambda: projects.resolve(org.id, project).id),
+            window_start,
+            window_end,
+        )
+    except GatewayUnavailableError as error:
+        cause = error.__cause__
+        logger.warning(
+            "Model Gateway is unavailable: %s status=%s",
+            type(cause).__name__,
+            cause.response.status_code if isinstance(cause, httpx.HTTPStatusError) else None,
+        )
+        raise HTTPException(status_code=503, detail="The model Gateway is unavailable") from error
 
 
 class ProjectDaytonaRow(BaseModel):
@@ -381,9 +429,9 @@ def get_sandbox_cost_rows(
             SandboxCostEntry(
                 source_id=row.source_id,
                 kind=SandboxRowKind.HOURLY if row.hourly else SandboxRowKind.LIFETIME,
-                placed_at=_as_utc(row.placed_at),
+                placed_at=as_utc(row.placed_at),
                 amount_usd=row.amount_usd,
-                usage_end=None if row.usage_end is None else _as_utc(row.usage_end),
+                usage_end=None if row.usage_end is None else as_utc(row.usage_end),
                 run_id=row.run_id,
                 project_handle=row.handle,
             )
@@ -397,68 +445,5 @@ def get_sandbox_cost_rows(
                 total_usd=sum(amounts.values()),
             )
             for day, amounts in sorted(days.items())
-        ],
-    )
-
-
-class UsageEndFill(BaseModel):
-    run_cost_id: UUID
-    source_id: str
-    amount_usd: float
-    placed_at: datetime
-    usage_end: datetime
-
-
-class UsageEndFillResponse(BaseModel):
-    start: datetime
-    end: datetime
-    applied: bool
-    rows: list[UsageEndFill]
-
-
-@router.post(
-    "/sandbox-usage-end",
-    response_model=UsageEndFillResponse,
-    include_in_schema=False,
-    description="Fill the missing `usage_end` of this organization's Daytona sandbox rows whose sandbox ended in [start, end), from Daytona's last usage time.",
-)
-async def fill_sandbox_usage_end(
-    repository: CostRepositoryDependency,
-    secrets: ProviderSecretRepositoryDependency,
-    start: Annotated[
-        WindowBound,
-        Query(description="First UTC date, or timezone-aware ISO-8601 datetime, of Daytona usage read."),
-    ],
-    end: Annotated[
-        WindowBound,
-        Query(description="UTC date, or timezone-aware ISO-8601 datetime, at which the Daytona read stops (excluded)."),
-    ],
-    apply: Annotated[bool, Query(description="Write the rows and save their IDs. Defaults to a dry run.")] = False,
-    org: Org = Depends(get_current_org),
-) -> UsageEndFillResponse:
-    window_start, window_end = _window(start, end)
-    secret_name = (await database_call(lambda: secrets.list_all(org.id))).get(DAYTONA_PROVIDER)
-    if secret_name is None:
-        raise HTTPException(status_code=409, detail=f"{org.name} has no Daytona secret.")
-    reference = resolve_secret_name(secret_name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
-    last_ends = await daytona_last_ends(org, reference, window_start, window_end)
-    rows = await database_call(lambda: repository.missing_usage_end_rows(org.id, DAYTONA_PROVIDER, list(last_ends)))
-    if apply:
-        usage_ends = {row.id: last_ends[row.source_id] for row in rows}
-        changed = set(await database_call(lambda: repository.backfill_usage_end(usage_ends, datetime.now(UTC))))
-        rows = [row for row in rows if row.id in changed]
-    return UsageEndFillResponse(
-        start=window_start,
-        end=window_end,
-        applied=apply,
-        rows=[
-            UsageEndFill(
-                run_cost_id=row.id,
-                source_id=row.source_id,
-                amount_usd=row.amount_usd,
-                placed_at=_as_utc(row.placed_at),
-                usage_end=last_ends[row.source_id],
-            )
-            for row in rows
         ],
     )

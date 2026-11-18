@@ -421,6 +421,14 @@ class ProjectsResponse(BaseModel):
     projects: list[ProjectResponse]
 
 
+class GatewayKeyHandOverResponse(BaseModel):
+    applied: bool
+    projects_with_key: int
+    held: int
+    to_hand_over: int
+    without_tracker_copy: list[str]
+
+
 class ProjectIdResponse(BaseModel):
     id: UUID
     org_id: UUID
@@ -430,6 +438,42 @@ class GatewayKeyEligibilityResponse(BaseModel):
     project_id: UUID
     org_id: UUID
     subject: str
+
+
+class ProjectLimit(BaseModel):
+    limit_dollars: Decimal = Field(gt=0)
+    reason: str | None = None
+
+
+class LimitRequestStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+
+
+class LimitDecision(str, Enum):
+    APPROVE = "approve"
+    DENY = "deny"
+
+
+class LimitRequestInput(BaseModel):
+    limit_dollars: Decimal = Field(gt=0)
+    reason: str = Field(min_length=1)
+
+
+class LimitRequest(LimitRequestInput):
+    id: UUID
+    project_id: UUID
+    status: LimitRequestStatus
+    requested_by_email: str | None
+    decided_by_email: str | None
+    created_at: datetime
+    decided_at: datetime | None
+
+
+class QueuedLimitRequest(LimitRequest):
+    org_id: UUID
+    organization: str
 
 
 RESOURCE_NAME_PATTERN = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
@@ -879,6 +923,10 @@ class AWSRuntimeResponse(BaseModel):
     s3_bucket: str | None = None
 
 
+class ErrorMessage(BaseModel):
+    detail: str
+
+
 class StatusResponse(BaseModel):
     status: str
 
@@ -953,6 +1001,7 @@ class BenchmarkFilters(BaseModel):
     started_by: list[str] | None = None
     started_after: datetime | None = None
     started_before: datetime | None = None
+    project: str | None = None
     order_by: Order = Order.DESC
 
 
@@ -973,6 +1022,9 @@ class BenchmarkTableRow(BaseModel):
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
     dataset: str = "default"
+    dataset_version: str | None = None
+    task_subset: bool = False
+    project_handle: str | None = None
     started_by_email: str | None
     started_at: datetime
     finished_at: datetime | None

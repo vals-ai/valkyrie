@@ -23,11 +23,6 @@ from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.project import ProjectRepository
 
 
-@pytest.fixture(autouse=True)
-def migration_database(monkeypatch: pytest.MonkeyPatch, postgres_engine: Engine) -> None:
-    monkeypatch.setattr("tracker.database.session.engine", postgres_engine)
-
-
 @pytest.mark.description("A project can be created, edited, and deleted over HTTP against Postgres.")
 def test_project_create_edit_delete_http_lifecycle_uses_postgres(
     monkeypatch: pytest.MonkeyPatch,

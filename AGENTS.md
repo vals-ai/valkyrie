@@ -13,6 +13,11 @@ Documentation lives in framework metadata instead:
 - Click commands, groups, options, and arguments: `help=`.
 - Tests: `@pytest.mark.description("...")`.
 
+## Code style
+
+- Inline a local variable read only once, for example pass `ValkyrieConfig(url=url)` straight to `ValkyrieClient`
+  instead of naming it `config`. Keep the name when the value is read inside a loop, comprehension or lambda.
+
 ## Writing descriptions
 
 `scripts/check_descriptions.py` runs in `make lint`. It fails on any of these:
@@ -26,7 +31,9 @@ Write one present-tense sentence: subject, action, the condition that matters, a
 Leave out implementation details unless a caller can see them.
 
 - Routes: start with a verb (`Return`, `List`, `Start`, `Stop`) and name the resource and its key inputs.
-  Add any state change and any non-obvious status code in a second sentence ("Returns 404 when ...").
+  Add any state change in a second sentence.
+  - Document error statuses and their bodies in the decorator's `responses=`, never in `description=`.
+  - Give each `responses=` entry a `model` and a one-sentence `description`.
 - Commands: start with an imperative verb and name the object ("Stop a run by its ID."). Groups say what they manage.
 - Command examples: put one after a blank line as `Example:` followed by the command indented four spaces. Add it only
   when it shows a non-obvious flag.
@@ -110,8 +117,22 @@ Read the matching skill before starting. `.claude/skills/` links to the same fil
 
 - Titles follow `type(scope): summary`, for example `fix(tracker): ...` or `docs: ...`.
 - Descriptions follow `.github/PULL_REQUEST_TEMPLATE.md`.
-- In Claude Code, `.claude/hooks/pr-format-check.py` checks `gh` PR bodies against it. Other agents match the template
-  by hand.
+- Fill in its `## Release notes` section as described below.
+- In Claude Code, `.claude/hooks/pr-format-check.py` checks `gh` PR bodies against it and the release-note format.
+  Other agents match the template by hand.
+
+## Release notes
+
+The `## Release notes` lines in a PR body become the public release notes and `CHANGELOG.md` on `vals-ai/Valkyrie`.
+The `Release notes` check runs `.github/scripts/release_notes.py` on every PR to `dev`.
+
+- Write one line per change a CLI, SDK, or Tracker user will notice, as `- CLI: ...`, `- SDK: ...` or `- Tracker: ...`.
+- Start with a verb, say what the user sees, and end with a period. Keep each line under 100 characters.
+- Mark a breaking change as `- SDK: Breaking: ...` and say what to change.
+- Write `None.` for CI, infra, test, and internal-only changes.
+- Leave out PR links, @-mentions, repository names, authors, and how the change works. The check rejects the first three.
+- Leave out customer and org names, unreleased model names, and internal services. No check catches these, so reviewers flag them.
+- Reviewers flag notes that don't match the diff: a user-visible change marked `None.`, or a note for a change users can't see.
 
 ## Tracker services
 

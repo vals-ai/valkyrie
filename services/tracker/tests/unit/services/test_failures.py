@@ -14,6 +14,9 @@ from tracker.exceptions import (
     SandboxDNSResolutionError,
     SandboxError,
     SandboxSetupError,
+    SecretAccessDeniedError,
+    SecretDecryptionError,
+    SecretNotFoundError,
 )
 from tracker.services.failures import Disposition, decide, describe_failure, is_agent_outcome
 
@@ -101,6 +104,9 @@ def _setup_error_with_cause(cause_code: str) -> SandboxSetupError:
             "docker_not_ready",
         ),
         (RuntimeError("x"), FailureCategory.UNKNOWN, "tracker", None),
+        (SecretNotFoundError("x"), FailureCategory.UNKNOWN, "configuration", "secret_not_found"),
+        (SecretAccessDeniedError("x"), FailureCategory.INFRASTRUCTURE, "tracker", "secret_access_denied"),
+        (SecretDecryptionError("x"), FailureCategory.INFRASTRUCTURE, "tracker", "secret_decryption_failed"),
     ],
 )
 def test_describe_failure_provenance(

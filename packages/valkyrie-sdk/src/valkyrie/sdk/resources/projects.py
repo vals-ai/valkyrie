@@ -51,6 +51,10 @@ class ProjectsResource:
         params = {"include_archived": True} if include_archived else None
         return await self._sdk.request_model("GET", "/projects", ProjectsResponse, params=params)
 
+    async def get(self, handle: str) -> ProjectResponse:
+        """Return one of the organization's projects by handle, archived ones included."""
+        return await self._sdk.request_model("GET", _project_path(handle), ProjectResponse)
+
     async def update(
         self,
         handle: str,

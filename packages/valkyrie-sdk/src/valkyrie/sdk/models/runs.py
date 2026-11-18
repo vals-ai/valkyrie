@@ -112,6 +112,7 @@ class FetchBenchmarksRequest(BaseModel):
     started_by: list[str] | None = None
     started_after: datetime | None = None
     started_before: datetime | None = None
+    project: str | None = None
     order_by: Order = Order.DESC
     cursor: str | None = None
     limit: int = Field(default=50, ge=1, le=500)

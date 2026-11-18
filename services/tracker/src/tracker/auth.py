@@ -112,6 +112,7 @@ class LoginIdentity:
     email: str | None
     organizations: dict[str, tuple[str, ...]]
     organization: str | None
+    permissions: tuple[str, ...] = ()
 
     @property
     def current_organization(self) -> str:
@@ -691,6 +692,7 @@ async def get_current_login(request: Request) -> LoginIdentity:
         email=_string_claim(user, "email", lowercase=True) if user.get("verifiedEmail") is True else None,
         organizations=organizations,
         organization=_chosen_organization(list(organizations), request.headers.get(TENANT_HEADER), claims),
+        permissions=tuple(user.get("permissions") or ()),
     )
 
 

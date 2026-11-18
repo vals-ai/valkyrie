@@ -23,12 +23,14 @@ logger = get_logger(__name__)
 
 DEMAND_SCALING_TAG = "vals:demand-scaling"
 MIN_TASKS_TAG = "vals:min-tasks"
+WARM_TASKS_TAG = "vals:warm-tasks"
 SERVICE_TAG = "vals:service"
 
 _ACTIVE_RUN_STATUSES = (BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING)
 _ACTIVE_TASK_STATUSES = (TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
 _IDLE_MINUTES = 30
 _DOWN_MINUTES = 10
+_FLOOR_REFRESH = timedelta(minutes=5)
 _RECONCILE_SECONDS = 30.0
 _AWS_CONFIG = Config(connect_timeout=3, read_timeout=8, retries={"max_attempts": 3})
 API_WAKE_SECONDS = 40.0
@@ -53,15 +55,23 @@ class ScaledService:
     desired: int
     running: int = 0
     deploying: bool = False
+    warm_tasks: int = 0
+
+    def floor(self, demand: ServiceDemand, now: datetime) -> int:
+        return max(self.min_tasks, 1) if demand.needed(now) else self.warm_tasks
 
     def target(self, demand: ServiceDemand, now: datetime) -> int:
         if demand.needed(now):
-            return max(self.min_tasks, 1, self.desired)
-        return self.desired if self.deploying else 0
+            return max(self.floor(demand, now), self.desired)
+        return self.desired if self.deploying else self.warm_tasks
 
 
 def _ecs() -> Any:
     return cast(Any, boto3.client("ecs", config=_AWS_CONFIG))  # pyright: ignore[reportUnknownMemberType]
+
+
+def _autoscaling() -> Any:
+    return cast(Any, boto3.client("application-autoscaling", config=_AWS_CONFIG))  # pyright: ignore[reportUnknownMemberType]
 
 
 def _utc(moment: datetime | None) -> datetime | None:
@@ -102,20 +112,25 @@ def read_demand(engine: Engine, now: datetime) -> dict[str, ServiceDemand]:
     return demand
 
 
+def _count_tag(tags: dict[str, str], key: str, default: int, ecs_name: str) -> int:
+    try:
+        return max(int(tags.get(key, str(default))), 0)
+    except ValueError:
+        logger.warning("Ignoring malformed task-count tag", extra={"ecs_service": ecs_name, "tag": key})
+        return default
+
+
 def _scaled_service(raw: dict[str, Any]) -> ScaledService | None:
     tags = {tag["key"]: tag["value"] for tag in raw.get("tags", [])}
     if tags.get(DEMAND_SCALING_TAG) != "tracker" or raw["status"] != "ACTIVE":
         return None
-    try:
-        min_tasks = int(tags.get(MIN_TASKS_TAG, "1"))
-    except ValueError:
-        logger.warning("Ignoring malformed min-tasks tag", extra={"ecs_service": raw["serviceName"]})
-        min_tasks = 1
+    min_tasks = _count_tag(tags, MIN_TASKS_TAG, 1, raw["serviceName"])
     deployments = raw.get("deployments", [])
     return ScaledService(
         name=tags.get(SERVICE_TAG, raw["serviceName"]),
         ecs_name=raw["serviceName"],
         min_tasks=min_tasks,
+        warm_tasks=min(_count_tag(tags, WARM_TASKS_TAG, 0, raw["serviceName"]), min_tasks),
         desired=raw["desiredCount"],
         running=raw.get("runningCount", 0),
         deploying=len(deployments) > 1
@@ -138,15 +153,30 @@ def read_scaled_services(ecs: Any, cluster: str) -> list[ScaledService]:
     return describe_scaled_services(ecs, cluster, arns)
 
 
-def reconcile(ecs: Any, engine: Engine, cluster: str, down_since: dict[str, datetime]) -> None:
+def reconcile(
+    ecs: Any,
+    autoscaling: Any,
+    engine: Engine,
+    cluster: str,
+    down_since: dict[str, datetime],
+    floors: dict[str, tuple[int, datetime]],
+) -> None:
     now = datetime.now(UTC)
     services = read_scaled_services(ecs, cluster)
     demand = read_demand(engine, now)
+    for stale in floors.keys() - {service.ecs_name for service in services}:
+        del floors[stale]
     for service in services:
         needed = demand.get(service.name, ServiceDemand())
         _check_down(service, needed, now, down_since)
+        if service.deploying:
+            floors.pop(service.ecs_name, None)
+        floor = service.floor(needed, now)
         target = service.target(needed, now)
-        if target == service.desired:
+        last = floors.get(service.ecs_name)
+        stale = last is None or last[0] != floor or now - last[1] >= _FLOOR_REFRESH
+        set_floor = not service.deploying and stale
+        if not set_floor and target == service.desired:
             continue
         logger.info(
             "Scaling benchmark service",
@@ -154,12 +184,22 @@ def reconcile(ecs: Any, engine: Engine, cluster: str, down_since: dict[str, date
                 "service": service.name,
                 "desired_count": service.desired,
                 "target_count": target,
+                "target_floor": floor,
                 "active_runs": needed.active_runs,
                 "active_tasks": needed.active_tasks,
             },
         )
         try:
-            ecs.update_service(cluster=cluster, service=service.ecs_name, desiredCount=target)
+            if target != service.desired:
+                ecs.update_service(cluster=cluster, service=service.ecs_name, desiredCount=target)
+            if set_floor:
+                autoscaling.register_scalable_target(
+                    ServiceNamespace="ecs",
+                    ResourceId=f"service/{cluster.rsplit('/', 1)[-1]}/{service.ecs_name}",
+                    ScalableDimension="ecs:service:DesiredCount",
+                    MinCapacity=floor,
+                )
+                floors[service.ecs_name] = (floor, now)
         except Exception:
             logger.exception("Could not reconcile benchmark service", extra={"service": service.name})
 
@@ -202,13 +242,16 @@ class ServiceCapacityScheduler:
 
     async def _run(self, cluster: str) -> None:
         ecs = _ecs()
+        autoscaling = _autoscaling()
         lock = PostgresAdvisoryLock(self._engine, resource_id="benchmark-service-capacity")
         down_since: dict[str, datetime] = {}
+        floors: dict[str, tuple[int, datetime]] = {}
         while True:
             try:
-                if lock.held or await lock.acquire():
-                    if await lock.still_held():
-                        await asyncio.to_thread(reconcile, ecs, self._engine, cluster, down_since)
+                if not lock.held and await lock.acquire():
+                    floors.clear()
+                if lock.held and await lock.still_held():
+                    await asyncio.to_thread(reconcile, ecs, autoscaling, self._engine, cluster, down_since, floors)
             except asyncio.CancelledError:
                 await lock.release()
                 raise

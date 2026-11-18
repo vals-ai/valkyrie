@@ -658,8 +658,6 @@ def test_regrade_reads_the_project_service_before_the_admission_lock(
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
-    control_postgres_session.add(project)
-    control_postgres_session.flush()
     control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
     control_postgres_session.commit()
     row = project.model_dump(mode="json", exclude={"org_id"})
@@ -735,8 +733,6 @@ def test_regrade_of_a_run_whose_project_the_service_lost_creates_no_run(
     _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
     source = _finished_source(control_postgres_session, _start(local_tracker, "daytona"))
     project = Project(org_id=source.org_id, handle="regrade", name="Regrade", spend_type=SpendType.INTERNAL)
-    control_postgres_session.add(project)
-    control_postgres_session.flush()
     control_postgres_session.add(RunProject(benchmark_id=source.id, project_id=project.id))
     control_postgres_session.commit()
     source_status = source.status

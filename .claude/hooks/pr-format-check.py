@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import importlib.util
 import json
 import os
 import re
@@ -121,6 +122,16 @@ def problems(body: str, template: str) -> list[str]:
     return issues
 
 
+def release_note_problems(root: Path, body: str) -> list[str]:
+    script = root / ".github" / "scripts" / "release_notes.py"
+    spec = importlib.util.spec_from_file_location("release_notes", script)
+    if not script.is_file() or spec is None or spec.loader is None:
+        return []
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.parse(body)[1]
+
+
 def main() -> int:
     event = json.load(sys.stdin)
     command = (event.get("tool_input") or {}).get("command") or ""
@@ -159,6 +170,8 @@ def main() -> int:
         return 2
 
     found = problems(body, template_path.read_text())
+    if any(name == "Release notes" for name, _ in sections(body)):
+        found += release_note_problems(root, body)
     if not found:
         return 0
     print("The PR description doesn't follow .github/PULL_REQUEST_TEMPLATE.md. Fix it and try again:", file=sys.stderr)

@@ -366,7 +366,7 @@ class TestAddSandboxHourCost:
         database_session.add_all(
             [
                 RunCost(
-                    benchmark_id=benchmark.id, cost_type="search", source_id="req-1", provider="tavily", amount_usd=0.01
+                    benchmark_id=benchmark.id, cost_type="egress", source_id="req-1", provider="tavily", amount_usd=0.01
                 )
                 for _ in range(2)
             ]
@@ -1820,30 +1820,3 @@ class TestAutomaticSandboxCost:
         thread.stop()
 
         assert leader.acquires == 1
-
-
-@pytest.mark.description(
-    (
-        "Daytona's last usage time is kept only for sandboxes that ended inside the read window.\n"
-        "\n"
-        "Test cases:\n"
-        "- A sandbox ending before `end` keeps its last usage time.\n"
-        "- A sandbox whose usage runs to `end` is left for a later window.\n"
-        "- A listed sandbox with no price or no last usage time is left out."
-    )
-)
-async def test_daytona_last_ends_keeps_sandboxes_that_ended_in_the_window() -> None:
-    end = START + timedelta(hours=1)
-    usage: HourUsage = {
-        "sb-ended": _usage("sb-ended", 1.0, last_end=START + timedelta(minutes=20)),
-        "sb-running": _usage("sb-running", 1.0, last_end=end),
-        "sb-no-end": _usage("sb-no-end", 1.0, last_end=None),
-        "sb-unpriced": None,
-    }
-
-    async def read(_org: Org, _secret: str, _start: datetime, _end: datetime) -> HourUsage:
-        return usage
-
-    last_ends = await sandbox_cost.daytona_last_ends(Org(name="org"), SECRET_NAME, START, end, open_usage=_opener(read))
-
-    assert last_ends == {"sb-ended": START + timedelta(minutes=20)}

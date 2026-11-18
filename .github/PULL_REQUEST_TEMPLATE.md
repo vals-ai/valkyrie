@@ -6,6 +6,15 @@
 small fixes, wording, and file-by-file detail. -->
 - 
 
+## Release notes
+<!-- One line per change a CLI, SDK, or Tracker user will notice. These lines become the public
+release notes, so write for people outside Vals AI. Start with a verb, end with a period, and
+stay under 100 characters. Write "None." when users see no change.
+- CLI: Add ...
+- SDK: Breaking: Rename ...
+- Tracker: Fix ... -->
+
+
 ## Related Issues
 <!-- Search the issues first. Link each related one, such as "Closes #123". If none relate,
 delete this section. -->

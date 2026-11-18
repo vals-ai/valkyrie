@@ -33,7 +33,16 @@ import tracker.services.tasks.execute as task_monitor_module
 from tracker.domain import FailureCategory, TaskStatus
 from tracker.executor.control_tasks import TaskState
 from tracker.executor.control_protocol import DispatchRef
-from tracker.exceptions import SandboxError, SandboxSetupError, SSLConnectionError
+from tracker.exceptions import (
+    SandboxError,
+    SandboxSetupError,
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
+    SecretNotFoundError,
+    SecretsError,
+    SSLConnectionError,
+)
 from tracker.logging.context import (
     attempt_started_at_var,
     benchmark_id_var,
@@ -44,6 +53,30 @@ from tracker.logging.context import (
 
 BeforeSend = Callable[[Event, Hint], Event | None]
 BeforeSendLog = Callable[[Log, Hint], Log | None]
+
+
+@pytest.mark.description("Secret configuration failures skip Sentry while unexpected secret faults remain reportable.")
+@pytest.mark.parametrize(
+    "error",
+    [
+        SecretNotFoundError("missing"),
+        SecretConfigurationError("bad config"),
+        SecretsError("fault"),
+        SecretAccessDeniedError("denied"),
+        SecretDecryptionError("decrypt"),
+    ],
+)
+def test_secret_error_sentry_policy(error: SecretsError, monkeypatch: pytest.MonkeyPatch) -> None:
+    capture = Mock()
+    monkeypatch.setattr(sentry_sdk, "capture_exception", capture)
+    sentry_module.capture_exception(error)
+    event = _before_send()({}, {"exc_info": (type(error), error, None)})
+    if isinstance(error, SecretConfigurationError):
+        capture.assert_not_called()
+        assert event is None
+    else:
+        capture.assert_called_once_with(error)
+        assert event is not None
 
 
 def _before_send() -> BeforeSend:

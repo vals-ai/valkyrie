@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 
-from projects.models import SpendType
+from projects.models import LimitRequestStatus, SpendType
 
 
 def _utc(value: datetime) -> str:
@@ -73,3 +74,41 @@ class ProjectResponse(BaseModel):
 
 class ProjectsResponse(BaseModel):
     projects: list[ProjectResponse]
+
+
+class LimitInput(BaseModel):
+    limit_dollars: Decimal = Field(gt=0)
+    reason: str | None = None
+
+
+class LimitRequestInput(BaseModel):
+    limit_dollars: Decimal = Field(gt=0)
+    reason: str = Field(min_length=1)
+    requested_by_email: str | None = None
+
+
+class LimitDecision(BaseModel):
+    decided_by_email: str | None = None
+
+
+class LimitRequestRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    project_id: UUID
+    limit_dollars: Decimal
+    reason: str
+    status: LimitRequestStatus
+    requested_by_email: str | None
+    decided_by_email: str | None
+    created_at: UTCDateTime
+    decided_at: UTCDateTime | None
+
+
+class GatewayKeySecret(BaseModel):
+    gateway_key_id: UUID
+    secret: str
+
+
+class QueuedLimitRequest(LimitRequestRecord):
+    org_id: UUID

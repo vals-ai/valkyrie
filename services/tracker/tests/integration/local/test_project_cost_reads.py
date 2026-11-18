@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
+import httpx
 import pytest
 from sqlmodel import Session
 
@@ -17,15 +18,17 @@ class MockProjectList:
     def __init__(self, projects: list[Project]) -> None:
         self._projects = projects
 
-    def list_rows(self, org_id: UUID, include_archived: bool, include_deleted: bool = False) -> list[Project]:
-        assert (org_id, include_archived, include_deleted) == (TEST_ORG_ID, True, True)
+    def list_rows(
+        self, org_id: UUID, include_archived: bool, include_deleted: bool = False, timeout: httpx.Timeout | None = None
+    ) -> list[Project]:
+        assert (org_id, include_archived, include_deleted, timeout) == (TEST_ORG_ID, True, True, None)
         return self._projects
 
 
 def _linked_run(tracker_database: Session, handle: str) -> tuple[Project, UUID]:
     project = Project(org_id=TEST_ORG_ID, handle=handle, name=f"Stale {handle}", spend_type=SpendType.DEVELOPMENT)
     run = make_benchmark(status=BenchmarkStatus.FINISHED, started_at=datetime(2026, 11, 2, tzinfo=UTC))
-    tracker_database.add_all([project, run])
+    tracker_database.add(run)
     tracker_database.commit()
     tracker_database.add_all(
         [

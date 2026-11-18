@@ -182,18 +182,6 @@ async def open_daytona_usage(org: Org, secret_name: str) -> AsyncGenerator[HourR
         yield read_hour
 
 
-async def daytona_last_ends(
-    org: Org, secret_name: str, start: datetime, end: datetime, open_usage: UsageOpener = open_daytona_usage
-) -> dict[str, datetime]:
-    async with open_usage(org, secret_name) as read:
-        usage = await read(start, end)
-    return {
-        sandbox_id: found.last_end
-        for sandbox_id, found in usage.items()
-        if found is not None and found.last_end is not None and found.last_end < end
-    }
-
-
 def _usage_of(record: ModelsSandboxUsage) -> SandboxUsage | None:
     if record.total_price is None or not record.sandbox_id:
         return None

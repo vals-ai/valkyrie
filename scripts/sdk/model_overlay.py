@@ -114,6 +114,29 @@ MODELS: dict[str, ModelOverlay] = {
         "config": {"frozen": "True"},
         "base": "valkyrie.sdk.models._validation.LocalResourcesBase",
     },
+    "ProjectCostRow": {
+        "module": "costs",
+        "doc": "Spend in one month for one vendor and project, with the number of runs that incurred it.",
+    },
+    "ProjectRun": {
+        "module": "costs",
+        "doc": "One run that incurred spend in the window, with the project it ran in.",
+        "fields": {"started_at": {**DATETIME}},
+    },
+    "CostsByProjectResponse": {
+        "module": "costs",
+        "doc": "Spend grouped by month, vendor and project over a time window, with the runs behind it.",
+        "fields": {"start": {**DATETIME}, "end": {**DATETIME}},
+    },
+    "MonthModelCost": {
+        "module": "costs",
+        "doc": "A project's model spend in one UTC month.",
+    },
+    "ProjectModelCosts": {
+        "module": "costs",
+        "doc": "A project's model spend per UTC month, with its key's spend on no project's run.",
+        "fields": {"start": {**DATETIME}, "end": {**DATETIME}, "through": {**DATETIME}},
+    },
     "DatasetTaskResponse": {
         "module": "datasets",
         "doc": "One task of a dataset version, with the digest of its files and the size of its archive.",

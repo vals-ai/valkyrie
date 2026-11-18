@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from itertools import batched
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, NamedTuple, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from dataclasses import dataclass
 
@@ -21,7 +21,6 @@ from tracker.database.models import (
     ExecutorDispatch,
     Project,
     RunCost,
-    RunCostUsageEndBackfill,
     RunProject,
     SandboxCostCursor,
     SandboxUnmatchedUsage,
@@ -31,6 +30,22 @@ from tracker.database.models import (
 
 SANDBOX_COST_TYPE = "sandbox"
 SEARCH_COST_TYPE = "search"
+SANDBOX_CPU_COST_TYPE = "sandbox_cpu"
+SANDBOX_MEMORY_COST_TYPE = "sandbox_memory"
+SANDBOX_DISK_COST_TYPE = "sandbox_disk"
+SANDBOX_GPU_COST_TYPE = "sandbox_gpu"
+EXECUTOR_COST_TYPE = "executor"
+EGRESS_COST_TYPE = "egress"
+STORAGE_COST_TYPE = "storage"
+PROJECT_COST_TYPES = (
+    SANDBOX_COST_TYPE,
+    SANDBOX_CPU_COST_TYPE,
+    SANDBOX_MEMORY_COST_TYPE,
+    SANDBOX_DISK_COST_TYPE,
+    SANDBOX_GPU_COST_TYPE,
+    SEARCH_COST_TYPE,
+)
+EXCLUDED_COST_TYPES = (EXECUTOR_COST_TYPE, EGRESS_COST_TYPE, STORAGE_COST_TYPE)
 _HOUR = timedelta(hours=1)
 _LAST_MOMENT_OF_HOUR = _HOUR - timedelta(microseconds=1)
 _SANDBOX_HOUR_COST_BATCH = 1000
@@ -103,11 +118,10 @@ class ProjectSandboxTotalRow(NamedTuple):
     total_usd: float
 
 
-class MissingUsageEndRow(NamedTuple):
-    id: UUID
-    source_id: str
-    amount_usd: float
-    placed_at: datetime
+class ProjectRunCostRow(NamedTuple):
+    run_id: UUID
+    cost_type: str | None
+    cost_usd: float
 
 
 class UnpricedSandbox(NamedTuple):
@@ -374,38 +388,52 @@ class CostRepository:
         rows = cast(Sequence[ProjectSandboxTotalRow], cast(Any, self._session.exec(statement)).all())
         return [ProjectSandboxTotalRow(*row) for row in rows if row.project_id in projects]
 
-    def missing_usage_end_rows(self, org_id: UUID, provider: str, source_ids: list[str]) -> list[MissingUsageEndRow]:
-        if not source_ids:
+    def project_run_costs(self, org_id: UUID, project_id: UUID) -> Sequence[ProjectRunCostRow]:
+        current = self._current_projects(org_id)
+        statement = (
+            cast(Any, select)(
+                current.c.benchmark_id.label("run_id"),
+                col(RunCost.cost_type).label("cost_type"),
+                func.coalesce(func.sum(col(RunCost.amount_usd)), 0.0).label("cost_usd"),
+            )
+            .select_from(current)
+            .outerjoin(
+                RunCost,
+                (col(RunCost.benchmark_id) == current.c.benchmark_id) & col(RunCost.cost_type).in_(PROJECT_COST_TYPES),
+            )
+            .where(current.c.project_id == project_id)
+            .group_by(current.c.benchmark_id, col(RunCost.cost_type))
+            .order_by(current.c.benchmark_id, col(RunCost.cost_type))
+        )
+        return cast(Sequence[ProjectRunCostRow], cast(Any, self._session.exec(statement)).all())
+
+    def project_runs(self, org_id: UUID, project_id: UUID, start: datetime, end: datetime) -> dict[UUID, datetime]:
+        current = self._current_projects(org_id)
+        placed_at = func.coalesce(col(Benchmark.finished_at), col(Benchmark.started_at))
+        return dict(
+            self._session.exec(
+                select(col(Benchmark.id), placed_at)
+                .select_from(current)
+                .join(Benchmark, col(Benchmark.id) == current.c.benchmark_id)
+                .where(current.c.project_id == project_id, placed_at >= start, placed_at < end)
+                .order_by(placed_at, col(Benchmark.id))
+            ).all()
+        )
+
+    def rollback(self) -> None:
+        self._session.rollback()
+
+    def linked_run_ids(self, org_id: UUID, run_ids: list[UUID]) -> list[UUID]:
+        if not run_ids:
             return []
         statement = (
-            cast(Any, select)(col(RunCost.id), col(RunCost.source_id), col(RunCost.amount_usd), _placed_at())
-            .join(Benchmark, col(Benchmark.id) == col(RunCost.benchmark_id))
-            .where(
-                col(Benchmark.org_id) == org_id,
-                col(RunCost.cost_type) == SANDBOX_COST_TYPE,
-                col(RunCost.provider) == provider,
-                col(RunCost.usage_end).is_(None),
-                col(RunCost.source_id).in_(source_ids),
-            )
-            .order_by(col(RunCost.id))
+            select(col(RunProject.benchmark_id))
+            .join(Benchmark, col(Benchmark.id) == col(RunProject.benchmark_id))
+            .where(col(Benchmark.org_id) == org_id, col(RunProject.benchmark_id).in_(run_ids))
+            .distinct()
+            .order_by(col(RunProject.benchmark_id))
         )
-        return [MissingUsageEndRow(*row) for row in cast(Any, self._session.exec(statement)).all()]
-
-    def backfill_usage_end(self, usage_ends: dict[UUID, datetime], backfilled_at: datetime) -> list[UUID]:
-        changed: list[UUID] = []
-        for run_cost_id, usage_end in usage_ends.items():
-            result = self._session.exec(
-                update(RunCost)
-                .where(col(RunCost.id) == run_cost_id, col(RunCost.usage_end).is_(None))
-                .values(usage_end=usage_end)
-            )
-            if result.rowcount == 1:
-                changed.append(run_cost_id)
-        self._session.add_all(
-            RunCostUsageEndBackfill(run_cost_id=run_cost_id, backfilled_at=backfilled_at) for run_cost_id in changed
-        )
-        self._session.commit()
-        return changed
+        return list(self._session.exec(statement).all())
 
     def record_sandbox(self, provider: str, sandbox_id: str, benchmark_id: UUID) -> None:
         self._session.exec(
@@ -504,29 +532,31 @@ class CostRepository:
 
     def add_search_costs(self, *, benchmark_id: UUID, attempt_id: str, charges: list[SearchCharge]) -> int:
         totals = attempt_totals(charges, attempt_id)
-        saved = set(
-            self._session.exec(
-                select(RunCost.provider, RunCost.source_id).where(
-                    RunCost.benchmark_id == benchmark_id,
-                    RunCost.cost_type == SEARCH_COST_TYPE,
-                    col(RunCost.source_id).in_([charge.source_id for charge in totals]),
-                )
-            ).all()
-        )
-        new = [charge for charge in totals if (charge.provider, charge.source_id) not in saved]
+        if not totals:
+            return 0
         saved_at = datetime.now(UTC)
-        self._session.add_all(
-            RunCost(
-                benchmark_id=benchmark_id,
-                cost_type=SEARCH_COST_TYPE,
-                source_id=charge.source_id,
-                provider=charge.provider,
-                amount_usd=float(charge.amount_usd),
-                usage_end=saved_at,
+        result = self._session.exec(
+            insert(RunCost)
+            .values(
+                [
+                    {
+                        "id": uuid4(),
+                        "benchmark_id": benchmark_id,
+                        "cost_type": SEARCH_COST_TYPE,
+                        "source_id": charge.source_id,
+                        "provider": charge.provider,
+                        "amount_usd": float(charge.amount_usd),
+                        "usage_end": saved_at,
+                    }
+                    for charge in totals
+                ]
             )
-            for charge in new
+            .on_conflict_do_nothing(
+                index_elements=["benchmark_id", "provider", "source_id"],
+                index_where=col(RunCost.cost_type) == SEARCH_COST_TYPE,
+            )
         )
-        return len(new)
+        return result.rowcount
 
     def modal_runs_to_price(self) -> list[Benchmark]:
         used_modal = select(SandboxRecord.benchmark_id).where(col(SandboxRecord.provider) == MODAL_PROVIDER)

@@ -1,3 +1,4 @@
+import re
 from typing import Protocol, TypeAlias
 
 from benchmark_service import SandboxProviderConfig, sandbox_provider_config_from_mapping
@@ -16,6 +17,13 @@ def secret_display_name(name: str) -> str:
     if not name.startswith(TENANT_SECRET_ROOT):
         return name
     return name.removeprefix(TENANT_SECRET_ROOT).partition("/")[2] or name
+
+
+def secret_set_instruction(name: str) -> str:
+    display = secret_display_name(name)
+    if re.fullmatch(r"[A-Za-z0-9_+=.@-]{1,128}", display):
+        return f"Run `valkyrie secret set {display}`."
+    return "Set it with `valkyrie secret set` and use the printed reference."
 
 
 def sandbox_provider_config_from_secret(secret: SecretValue, provider_type: str) -> SandboxProviderConfig:

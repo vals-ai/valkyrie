@@ -9,7 +9,14 @@ from botocore.validate import ParamValidator
 
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.secrets import SecretBeingDeletedError, SecretsManagerStore
-from tracker.exceptions import SecretsError
+from tracker.exceptions import (
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
+    SecretNotFoundError,
+    SecretRegionError,
+    SecretsError,
+)
 
 
 _ORIGINAL_GET = SecretsManagerStore.get
@@ -88,6 +95,8 @@ class FakeAsyncClientContext:
 
 
 class FakeAsyncClientProvider:
+    region = "us-east-1"
+
     def __init__(self, context: FakeAsyncClientContext) -> None:
         self.context = context
         self.calls = 0
@@ -123,14 +132,31 @@ async def test_get_preserves_json_and_raw_string_domains(secret_string: str, exp
 
 @pytest.mark.description("A failed secret read is translated and keeps the client error as its cause.")
 @pytest.mark.parametrize(
-    ("code", "message"),
+    ("code", "error_type", "message"),
     [
-        ("ResourceNotFoundException", "Secret 'named-secret' does not exist"),
-        ("AccessDeniedException", "Secret 'named-secret' does not exist"),
-        ("ThrottlingException", "Failed to retrieve secret 'named-secret' (ThrottlingException)"),
+        (
+            "ResourceNotFoundException",
+            SecretNotFoundError,
+            "Secret 'named-secret' is not set for your organization. Run `valkyrie secret set named-secret`.",
+        ),
+        ("AccessDeniedException", SecretAccessDeniedError, "access to it was denied"),
+        ("AccessDenied", SecretAccessDeniedError, "access to it was denied"),
+        ("DecryptionFailure", SecretDecryptionError, "decryption failed"),
+        ("DecryptionFailureException", SecretDecryptionError, "decryption failed"),
+        ("KMSAccessDeniedException", SecretDecryptionError, "decryption failed"),
+        ("ThrottlingException", SecretsError, "Failed to retrieve secret 'named-secret' (ThrottlingException)"),
+        ("InternalServiceError", SecretsError, "Failed to retrieve secret 'named-secret' (InternalServiceError)"),
+        (
+            "InvalidParameterException",
+            SecretsError,
+            "Failed to retrieve secret 'named-secret' (InvalidParameterException)",
+        ),
+        ("InvalidRequestException", SecretsError, "Failed to retrieve secret 'named-secret' (InvalidRequestException)"),
     ],
 )
-async def test_get_preserves_client_error_translation_and_cause(code: str, message: str) -> None:
+async def test_get_preserves_client_error_translation_and_cause(
+    code: str, error_type: type[SecretsError], message: str
+) -> None:
     provider_error = ClientError({"Error": {"Code": code, "Message": "provider failure"}}, "GetSecretValue")
     client = FakeAsyncSecretsManagerClient(error=provider_error)
 
@@ -139,12 +165,14 @@ async def test_get_preserves_client_error_translation_and_cause(code: str, messa
             "named-secret"
         )
 
-    assert str(captured.value) == f"Secret error: {message}"
+    assert type(captured.value) is error_type
+    assert message in str(captured.value)
+    assert "provider failure" not in str(captured.value)
     assert captured.value.__cause__ is provider_error
 
 
 @pytest.mark.description(
-    "An access denied tenant secret is reported as not existing under its short name, without the tenant prefix."
+    "An access denied tenant secret names the Valkyrie fault without the tenant prefix or provider details."
 )
 async def test_denied_tenant_secret_is_named_without_its_prefix_or_the_provider_error() -> None:
     provider_error = ClientError(
@@ -163,7 +191,91 @@ async def test_denied_tenant_secret_is_named_without_its_prefix_or_the_provider_
             "valkyrie/tenants/00000000-0000-0000-0000-000000000001/daytona"
         )
 
-    assert str(captured.value) == "Secret error: Secret 'daytona' does not exist"
+    assert isinstance(captured.value, SecretAccessDeniedError)
+    assert captured.value.args[0] == (
+        "Valkyrie can't read secret 'daytona': it isn't set for your organization or access to it was denied. "
+        "If it isn't set, run `valkyrie secret set daytona`. "
+        "Otherwise this is a Valkyrie problem and has been reported."
+    )
+    assert not isinstance(captured.value, SecretConfigurationError)
+    assert "role/Tenant" not in str(captured.value)
+    assert "valkyrie/tenants" not in str(captured.value)
+
+
+@pytest.mark.description("Secret reads distinguish Valkyrie permission faults from deletion configuration errors.")
+@pytest.mark.parametrize(
+    ("code", "detail", "error_type", "fix"),
+    [
+        ("AccessDeniedException", "Access to KMS key is denied", SecretDecryptionError, "decryption failed"),
+        ("AccessDenied", "KMS access denied", SecretDecryptionError, "decryption failed"),
+        ("AccessDeniedException", "Access to KMS is not allowed", SecretDecryptionError, "decryption failed"),
+        (
+            "AccessDeniedException",
+            "Cannot read secret kms-token",
+            SecretAccessDeniedError,
+            "access to it was denied",
+        ),
+        (
+            "InvalidRequestException",
+            "scheduled for deletion",
+            SecretBeingDeletedError,
+            "Wait for the deletion to finish",
+        ),
+        (
+            "InvalidRequestException",
+            "secret is being deleted",
+            SecretBeingDeletedError,
+            "Wait for the deletion to finish",
+        ),
+    ],
+)
+async def test_get_reports_configuration_fix(code: str, detail: str, error_type: type[SecretsError], fix: str) -> None:
+    error = ClientError({"Error": {"Code": code, "Message": detail}}, "GetSecretValue")
+    with pytest.raises(error_type, match=fix):
+        await _store(FakeAsyncSecretsManagerClient(error=error)).get("named-secret")
+
+
+@pytest.mark.description("A deleting secret gives the exact wait and recreate instruction.")
+async def test_get_deleting_secret_message() -> None:
+    error = ClientError(
+        {"Error": {"Code": "InvalidRequestException", "Message": "scheduled for deletion"}}, "GetSecretValue"
+    )
+    with pytest.raises(SecretBeingDeletedError) as captured:
+        await _store(FakeAsyncSecretsManagerClient(error=error)).get("named-secret")
+    assert captured.value.args[0] == (
+        "Secret 'named-secret' is being deleted. Wait for the deletion to finish, then "
+        "run `valkyrie secret set named-secret`."
+    )
+
+
+@pytest.mark.description("A cross-region ARN is rejected before AWS can return an ambiguous access or lookup error.")
+@pytest.mark.parametrize(
+    "stored_name",
+    ["named-secret-aB12Cd", "valkyrie/tenants/org-id/named-secret-aB12Cd", "valkyrie/tenants/org-id/API_KEY"],
+)
+async def test_get_rejects_wrong_region_arn(stored_name: str) -> None:
+    client = FakeAsyncSecretsManagerClient()
+    with pytest.raises(SecretRegionError) as captured:
+        await _store(client).get(f"arn:aws:secretsmanager:us-west-2:123456789012:secret:{stored_name}")
+    expected_name = "API_KEY" if stored_name.endswith("API_KEY") else "named-secret"
+    assert str(captured.value).startswith(f"Secret error: Secret '{expected_name}' is in region")
+    assert "123456789012" not in str(captured.value)
+    assert "valkyrie/tenants/" not in str(captured.value)
+    assert "org-id" not in str(captured.value)
+    assert "aB12Cd" not in str(captured.value)
+    assert "Tracker reads region 'us-east-1'" in str(captured.value)
+    assert "is in region 'us-west-2'" in str(captured.value)
+    assert "Use a Tracker in region 'us-west-2'." in str(captured.value)
+    assert not client.secret_ids
+
+
+@pytest.mark.description("A missing ARN suggests setting the secret and using its printed reference.")
+async def test_missing_arn_suggests_a_valid_cli_command() -> None:
+    client = FakeAsyncSecretsManagerClient(error=_client_error("ResourceNotFoundException", "GetSecretValue"))
+    with pytest.raises(SecretNotFoundError) as captured:
+        await _store(client).get("arn:aws:secretsmanager:us-east-1:123456789012:secret:api-key-abcdef")
+    assert "Set it with `valkyrie secret set` and use the printed reference." in str(captured.value)
+    assert "run-secret" not in str(captured.value)
 
 
 @pytest.mark.description("Cancelling a secret read cancels the request and closes the client.")

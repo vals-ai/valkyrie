@@ -474,8 +474,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.76.1"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.76.1#8b40ee57ce06bedbbc25bd68d4319c1782a19252" }
+version = "0.77.1"
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.77.1#1ed9e4432e17a8a23376b899d61593f3fed2e1cb" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -2393,7 +2393,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.42.20" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.76.1" },
+    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.77.1" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
@@ -2640,7 +2640,7 @@ dev = [
 
 [[package]]
 name = "valkyrie-sdk"
-version = "0.36.0"
+version = "0.39.0"
 source = { editable = "packages/valkyrie-sdk" }
 dependencies = [
     { name = "filelock" },

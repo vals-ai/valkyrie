@@ -66,6 +66,9 @@ class BenchmarkTableRow(ResponseModel):
     executor_artifact_digest: str | None = None
     executor_protocol_version: str | None = None
     dataset: str = "default"
+    dataset_version: str | None = None
+    task_subset: bool = False
+    project_handle: str | None = None
     started_by_email: str | None
     started_at: UTCDateTime
     finished_at: UTCDateTime | None

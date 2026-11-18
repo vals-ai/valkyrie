@@ -830,6 +830,108 @@
         }
       }
     },
+    "/costs/project-model": {
+      "get": {
+        "summary": "Get Project Model Costs",
+        "description": "Return one project's model spend per UTC month from the model Gateway, for its runs placed in `[start, end)`.\n\nA run counts under its newest project link and in the UTC month it finished, or started if it has not finished.\n\n`unattributed_usd` is the project key's all-time spend outside any run or on runs with no project.\n`through` is the time the Gateway's usage data runs to.",
+        "operationId": "get_project_model_costs",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Handle of the project whose model spend is returned.",
+              "title": "Project"
+            },
+            "description": "Handle of the project whose model spend is returned."
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ],
+              "description": "First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted.",
+              "title": "Start"
+            },
+            "description": "First UTC date, or timezone-aware ISO-8601 datetime, whose runs are counted."
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ],
+              "description": "UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded).",
+              "title": "End"
+            },
+            "description": "UTC date, or timezone-aware ISO-8601 datetime, at which counting stops (excluded)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectModelCosts"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization has no project with this handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model Gateway is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/costs/project-daytona": {
       "get": {
         "summary": "Get Project Daytona Costs",
@@ -1158,6 +1260,24 @@
         "summary": "Get Filter Options",
         "description": "List the distinct benchmark, agent, model, dataset, and starter values in this organization's runs, for the runs-list filters.",
         "operationId": "get_filter_options",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1165,6 +1285,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/FilterOptionsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization has no project with this handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -2912,6 +3052,54 @@
             }
           }
         }
+      },
+      "get": {
+        "summary": "Get Project",
+        "description": "Return one of the organization's projects by handle, archived ones included.",
+        "operationId": "get_project",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Handle"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization has no project with this handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/projects/{handle}/archive": {
@@ -3041,6 +3229,246 @@
         }
       }
     },
+    "/projects/by-id/{project_id}/limit": {
+      "put": {
+        "summary": "Set Project Limit",
+        "description": "Set a project's limit in the project service, as an admin of the organization named by org_id or a platform admin.",
+        "operationId": "set_project_limit",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Org Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectLimit-Input"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectLimit-Output"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin of the org or a platform admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tracker has no org with org_id, or the org has no such project.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/by-id/{project_id}/limit-requests": {
+      "post": {
+        "summary": "File Limit Request",
+        "description": "File a request to raise a project's limit in the project service, pending a platform admin's decision.",
+        "operationId": "file_limit_request",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitRequestInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitRequest"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Limit Requests",
+        "description": "List a project's limit requests from the project service, newest first.",
+        "operationId": "list_limit_requests",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LimitRequest"
+                  },
+                  "title": "Response List Limit Requests"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/by-id/{project_id}/limit-requests/{request_id}/{decision}": {
+      "post": {
+        "summary": "Decide Limit Request",
+        "description": "Approve or deny a pending limit request as a platform admin, in any org named by the tenant header. An approval sets the project's limit.",
+        "operationId": "decide_limit_request",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Request Id"
+            }
+          },
+          {
+            "name": "decision",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/LimitDecision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitRequest"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Platform administrator required"
+          },
+          "409": {
+            "description": "Already decided"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/projects/by-id/{project_id}/gateway-key-eligibility": {
       "get": {
         "summary": "Get Gateway Key Eligibility",
@@ -3068,6 +3496,60 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/limit-requests": {
+      "get": {
+        "summary": "Queue Limit Requests",
+        "description": "List every org's limit requests from the project service for platform admins, newest first.",
+        "operationId": "queue_limit_requests",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/LimitRequestStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedLimitRequest"
+                  },
+                  "title": "Response Queue Limit Requests"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Platform administrator required"
           },
           "422": {
             "description": "Validation Error",
@@ -5501,6 +5983,22 @@
             }
           },
           {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project"
+            }
+          },
+          {
             "name": "order_by",
             "in": "query",
             "required": false,
@@ -5556,6 +6054,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/FetchBenchmarksResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization has no project with this handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
                 }
               }
             }
@@ -6933,6 +7441,33 @@
             "title": "Dataset",
             "default": "default"
           },
+          "dataset_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dataset Version"
+          },
+          "task_subset": {
+            "type": "boolean",
+            "title": "Task Subset",
+            "default": false
+          },
+          "project_handle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Handle"
+          },
           "started_by_email": {
             "anyOf": [
               {
@@ -7715,6 +8250,19 @@
         ],
         "title": "EmailCost"
       },
+      "ErrorMessage": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorMessage"
+      },
       "FailureCategory": {
         "type": "string",
         "enum": [
@@ -8372,6 +8920,130 @@
         ],
         "title": "InviteResponse"
       },
+      "LimitDecision": {
+        "type": "string",
+        "enum": [
+          "approve",
+          "deny"
+        ],
+        "title": "LimitDecision"
+      },
+      "LimitRequest": {
+        "properties": {
+          "limit_dollars": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Limit Dollars"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Project Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LimitRequestStatus"
+          },
+          "requested_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By Email"
+          },
+          "decided_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided By Email"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars",
+          "reason",
+          "id",
+          "project_id",
+          "status",
+          "requested_by_email",
+          "decided_by_email",
+          "created_at",
+          "decided_at"
+        ],
+        "title": "LimitRequest"
+      },
+      "LimitRequestInput": {
+        "properties": {
+          "limit_dollars": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              }
+            ],
+            "title": "Limit Dollars"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars",
+          "reason"
+        ],
+        "title": "LimitRequestInput"
+      },
+      "LimitRequestStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "approved",
+          "denied"
+        ],
+        "title": "LimitRequestStatus"
+      },
       "LocalBenchmarkArguments": {
         "properties": {
           "contract": {
@@ -9017,6 +9689,24 @@
         "title": "MonitoredRunsResponse",
         "description": "In-progress runs an external monitor should enroll, for one organization."
       },
+      "MonthModelCost": {
+        "properties": {
+          "month": {
+            "type": "string",
+            "title": "Month"
+          },
+          "amount_usd": {
+            "type": "number",
+            "title": "Amount Usd"
+          }
+        },
+        "type": "object",
+        "required": [
+          "month",
+          "amount_usd"
+        ],
+        "title": "MonthModelCost"
+      },
       "NativeOutputFile": {
         "properties": {
           "path": {
@@ -9449,6 +10139,103 @@
         ],
         "title": "ProjectIdResponse"
       },
+      "ProjectLimit-Input": {
+        "properties": {
+          "limit_dollars": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+              }
+            ],
+            "title": "Limit Dollars"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars"
+        ],
+        "title": "ProjectLimit"
+      },
+      "ProjectLimit-Output": {
+        "properties": {
+          "limit_dollars": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Limit Dollars"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars"
+        ],
+        "title": "ProjectLimit"
+      },
+      "ProjectModelCosts": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start"
+          },
+          "end": {
+            "type": "string",
+            "format": "date-time",
+            "title": "End"
+          },
+          "months": {
+            "items": {
+              "$ref": "#/components/schemas/MonthModelCost"
+            },
+            "type": "array",
+            "title": "Months"
+          },
+          "unattributed_usd": {
+            "type": "number",
+            "title": "Unattributed Usd"
+          },
+          "through": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Through"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "months",
+          "unattributed_usd",
+          "through"
+        ],
+        "title": "ProjectModelCosts"
+      },
       "ProjectResponse": {
         "properties": {
           "id": {
@@ -9660,6 +10447,96 @@
           "providers"
         ],
         "title": "ProvidersResponse"
+      },
+      "QueuedLimitRequest": {
+        "properties": {
+          "limit_dollars": {
+            "type": "string",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Limit Dollars"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "project_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Project Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LimitRequestStatus"
+          },
+          "requested_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By Email"
+          },
+          "decided_by_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided By Email"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "org_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Org Id"
+          },
+          "organization": {
+            "type": "string",
+            "title": "Organization"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars",
+          "reason",
+          "id",
+          "project_id",
+          "status",
+          "requested_by_email",
+          "decided_by_email",
+          "created_at",
+          "decided_at",
+          "org_id",
+          "organization"
+        ],
+        "title": "QueuedLimitRequest"
       },
       "RegradeBenchmarkRequest": {
         "properties": {

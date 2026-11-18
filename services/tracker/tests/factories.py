@@ -2,15 +2,21 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from benchmark_service.schemas import DatasetVersion
 from sqlmodel import Session
 
+from tests.project_service import MockProjectRoutes
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import (
     Benchmark,
     ErrorResult,
     EvaluationResult,
+    Project,
+    RunProject,
+    SpendType,
     Task,
 )
+from tracker.services.datasets.ref import DatasetRef
 from tracker.types import AgentContractRequest, AWSBenchmarkArguments
 from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, TaskStatus
 
@@ -24,6 +30,10 @@ def make_benchmark(
     agent_name: str = "a",
     model: str | None = None,
     dataset: str | None = None,
+    dataset_ref: DatasetRef | None = None,
+    dataset_version: DatasetVersion | None = None,
+    task_ids: list[str] | None = None,
+    slice_str: str | None = None,
     concurrency: int = 1,
     started_at: datetime | None = None,
     started_by_id: str | None = None,
@@ -41,6 +51,10 @@ def make_benchmark(
         arguments=AWSBenchmarkArguments(
             contract=contract or AgentContractRequest(name=agent_name, model=model, install_cmd="i", run_cmd="r"),
             dataset=dataset,
+            dataset_ref=dataset_ref,
+            dataset_version=dataset_version,
+            task_ids=task_ids,
+            slice_str=slice_str,
             concurrency=concurrency,
             sandbox_provider="daytona",
             sandbox_provider_secret_name="test-provider-secret",
@@ -120,3 +134,28 @@ def make_error_result(
         retry_scheduled=retry_scheduled,
         failed_attempt_number=failed_attempt_number,
     )
+
+
+def make_project(
+    service: MockProjectRoutes,
+    handle: str,
+    spend_type: SpendType = SpendType.DEVELOPMENT,
+    subcategory: str = "new_benchmark_generation",
+    *,
+    org_id: UUID = TEST_ORG_ID,
+) -> Project:
+    project = Project(
+        org_id=org_id,
+        handle=handle,
+        name=handle.replace("-", " ").title(),
+        spend_type=spend_type,
+        subcategory=subcategory,
+        customer="google" if spend_type is SpendType.CUSTOMER else None,
+    )
+    service.seed(project)
+    return project
+
+
+def link_run_project(session: Session, benchmark_id: UUID, project: Project, created_at: datetime) -> None:
+    session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id, created_at=created_at))
+    session.flush()

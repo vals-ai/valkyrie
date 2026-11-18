@@ -30,6 +30,9 @@ from tracker.exceptions import (
     SandboxError,
     SandboxImageBuildError,
     SandboxSetupError,
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
     SecretsError,
 )
 
@@ -83,6 +86,8 @@ def is_agent_outcome(exc: BaseException) -> bool:
 
 
 def classify_failure(exc: BaseException) -> FailureCategory:
+    if isinstance(exc, SecretConfigurationError):
+        return FailureCategory.UNKNOWN
     if isinstance(exc, asyncio.CancelledError):
         return FailureCategory.CANCELLED
     if isinstance(exc, AgentRunFailedError):
@@ -104,6 +109,9 @@ class _Labels(NamedTuple):
 
 
 _LABELS: dict[type[BaseException], _Labels] = {
+    SecretAccessDeniedError: _Labels("tracker", "resolve_secret", transient=False),
+    SecretDecryptionError: _Labels("tracker", "resolve_secret", transient=False),
+    SecretConfigurationError: _Labels("configuration", "resolve_secret", transient=False),
     UnsupportedSandboxConfigError: _Labels("sandbox_provider", "setup", transient=False),
     SandboxSetupError: _Labels("sandbox_provider", "setup", transient=True),
     SandboxDNSResolutionError: _Labels("sandbox_provider", "dns", transient=True, cause_code="sandbox_dns_resolution"),

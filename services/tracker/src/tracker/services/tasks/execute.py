@@ -1663,8 +1663,9 @@ async def _process_task_attempt(
                             secret_env_names=secret_env_names,
                             user=run_user,
                             artifact_folder=output_folder,
-                            mcp_servers=folder.mcp_servers if folder is not None else None,
-                            skills_dir=folder.skills_dir if folder is not None else None,
+                            mcp_servers=task_data.mcp_servers,
+                            skills_dir=task_data.skills_dir,
+                            task_dir=task_data.task_dir,
                             on_search_costs=lambda charges: save_search_costs(charges, step_name),
                         )
                     except AgentRunFailedError as agent_error:

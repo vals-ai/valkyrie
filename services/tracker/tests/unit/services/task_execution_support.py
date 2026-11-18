@@ -7,7 +7,6 @@ from uuid import UUID
 
 import pytest
 from benchmark_service import ImageSource, Resources
-from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import RetrieveTaskResponse
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -15,6 +14,7 @@ from sqlmodel import Session, select
 from main import app
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity, get_current_org
+from tracker.clients.task_service import TaskService
 from tracker.aws.runtime import AWSResources
 from tracker.database.models import Org, Task
 from tracker.database.session import get_session
@@ -127,7 +127,7 @@ async def run_process_task(
     control: TaskControl,
     *,
     queue_context: SandboxQueueContext | None = None,
-    service: BenchmarkServiceClient | None = None,
+    service: TaskService | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     response = await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
     state = response.task

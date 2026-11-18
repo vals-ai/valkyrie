@@ -28,6 +28,7 @@ from benchmark_service import (
     DockerfileSource,
     ExecResult,
     ImageSource,
+    MCPServer,
     Sandbox,
     SandboxBuildError,
     SandboxCreateRequest,
@@ -750,6 +751,7 @@ _STATUS_DIR = "/tmp/.valkyrie"
 _AGENT_INPUTS_DIR = "/tmp/.valkyrie-agent"
 _MCP_CONFIG_PLACEHOLDER = "mcp_config_path"
 _SKILLS_PLACEHOLDER = "skills_dir"
+_TASK_DIR_PLACEHOLDER = "task_dir"
 AGENT_ERROR_PATH_ENV = "VALKYRIE_ERROR_PATH"
 _AGENT_ERROR_MAX_BYTES = 2048
 _POST_EXIT_READ_TIMEOUT_SECONDS = 5
@@ -1992,24 +1994,47 @@ def working_directory_command(cwd: str, user: str | None) -> str:
     return f"[ -d {directory} ] || {{ mkdir -p {directory} && chown {shlex.quote(user)} {directory}; }}"
 
 
+def _mcp_config_entries(servers: list[MCPServer]) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    for server in servers:
+        if server.transport == "stdio":
+            entries[server.name] = {"type": "stdio", "command": server.command, "args": server.args}
+            continue
+        entry: dict[str, Any] = {"type": "http" if server.transport == "streamable-http" else "sse", "url": server.url}
+        if server.headers:
+            entry["headers"] = server.headers
+        entries[server.name] = entry
+    return entries
+
+
 async def _agent_inputs(
-    sandbox: Sandbox, contract: AgentContractRequest, mcp_servers: dict[str, Any], skills_dir: str | None
+    sandbox: Sandbox,
+    contract: AgentContractRequest,
+    mcp_servers: list[MCPServer],
+    skills_dir: str | None,
+    task_dir: str | None,
 ) -> dict[str, str]:
     commands = f"{contract.run_cmd} {contract.turns.continue_cmd if contract.turns else ''}"
     inputs: dict[str, str] = {}
     setup = [f"mkdir -p {_AGENT_INPUTS_DIR}"]
     if f"{{{_MCP_CONFIG_PLACEHOLDER}}}" in commands:
         inputs[_MCP_CONFIG_PLACEHOLDER] = f"{_AGENT_INPUTS_DIR}/mcp.json"
-        config = json.dumps({"mcpServers": mcp_servers})
+        config = json.dumps({"mcpServers": _mcp_config_entries(mcp_servers)})
         setup.append(f"printf %s {shlex.quote(config)} > {inputs[_MCP_CONFIG_PLACEHOLDER]}")
     if f"{{{_SKILLS_PLACEHOLDER}}}" in commands:
         inputs[_SKILLS_PLACEHOLDER] = skills_dir or f"{_AGENT_INPUTS_DIR}/skills"
-        if skills_dir is None:
+        if not skills_dir:
             setup.append(f"mkdir -p {inputs[_SKILLS_PLACEHOLDER]}")
+    if f"{{{_TASK_DIR_PLACEHOLDER}}}" in commands:
+        inputs[_TASK_DIR_PLACEHOLDER] = task_dir or f"{_AGENT_INPUTS_DIR}/task"
+        if not task_dir:
+            setup.append(f"mkdir -p {inputs[_TASK_DIR_PLACEHOLDER]}")
     if inputs:
         result = await _exec(sandbox, " && ".join([*setup, f"chmod -R a+rX {_AGENT_INPUTS_DIR}"]))
         if result.exit_code != _SUCCESS_EXIT_CODE:
-            raise SandboxError(f"Failed to write the agent's MCP config and skills folder: {result.output}")
+            raise SandboxError(
+                f"Failed to write the agent's MCP config, skills folder and task folder: {result.output}"
+            )
     return inputs
 
 
@@ -2035,8 +2060,9 @@ async def run_agent(
     secret_env_names: tuple[str, ...] = (),
     user: str | None = None,
     artifact_folder: str = "",
-    mcp_servers: dict[str, Any] | None = None,
+    mcp_servers: list[MCPServer] | None = None,
     skills_dir: str | None = None,
+    task_dir: str | None = None,
     on_search_costs: Callable[[list[SearchCharge]], Awaitable[None]] | None = None,
 ) -> tuple[AgentCausedExitReason | None, float]:
     if contract.isolate_agent_uid and (user is not None or plan.episode is None):
@@ -2057,7 +2083,7 @@ async def run_agent(
     static_bindings = {
         **contract.kwargs,
         "task_id": task_id,
-        **await _agent_inputs(sandbox, contract, mcp_servers or {}, skills_dir),
+        **await _agent_inputs(sandbox, contract, mcp_servers or [], skills_dir, task_dir),
     }
     if plan.episode is None:
         bindings = {**static_bindings, "problem_statement_path": problem_path}

@@ -1,8 +1,7 @@
 import math
 from pathlib import Path, PurePosixPath
-from typing import Any
 
-from benchmark_service import ComposeSource, DockerfileSource, ImageSource, Resources
+from benchmark_service import ComposeSource, DockerfileSource, ImageSource, MCPServer, Resources
 from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, RetrieveTaskResponse
 from pydantic import BaseModel, Field
 
@@ -10,7 +9,6 @@ from tracker.services.datasets.compose import ComposeRuntime, compose_runtime, c
 from tracker.services.datasets.config import (
     EnvironmentConfig,
     HealthcheckConfig,
-    MCPServerConfig,
     MultiStepRewardStrategy,
     NetworkMode,
     NetworkSettings,
@@ -52,8 +50,6 @@ class TaskFolderResponse(RetrieveTaskResponse):
     steps: list[StepPlan] = Field(default_factory=list)
     reward_strategy: MultiStepRewardStrategy = MultiStepRewardStrategy.MEAN
     cwd_from_image: bool = False
-    mcp_servers: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    skills_dir: str | None = None
 
 
 def dockerfile_workdir(dockerfile: Path) -> str | None:
@@ -100,19 +96,6 @@ def sandbox_source(task_dir: Path, config: TaskConfig) -> ImageSource | Dockerfi
                 f"Task {task_dir.name!r} has no docker_image, {ENVIRONMENT_DIR}/{DOCKERFILE} "
                 f"or {ENVIRONMENT_DIR}/{COMPOSE_FILE} to run"
             )
-
-
-def mcp_server_entries(servers: list[MCPServerConfig]) -> dict[str, dict[str, Any]]:
-    entries: dict[str, dict[str, Any]] = {}
-    for server in servers:
-        if server.transport == "stdio":
-            entries[server.name] = {"type": "stdio", "command": server.command, "args": server.args}
-            continue
-        entry: dict[str, Any] = {"type": "http" if server.transport == "streamable-http" else "sse", "url": server.url}
-        if server.headers:
-            entry["headers"] = server.headers
-        entries[server.name] = entry
-    return entries
 
 
 def sandbox_resources(environment: EnvironmentConfig, fallback: EnvironmentConfig | None = None) -> Resources:
@@ -162,6 +145,6 @@ def retrieve_task_response(task_dir: Path, config: TaskConfig) -> TaskFolderResp
         ],
         reward_strategy=config.reward_strategy,
         cwd_from_image=workdir is None and isinstance(source, (ImageSource, DockerfileSource)),
-        mcp_servers=mcp_server_entries(environment.mcp_servers),
+        mcp_servers=[MCPServer.model_validate(server.model_dump()) for server in environment.mcp_servers],
         skills_dir=environment.skills_dir,
     )

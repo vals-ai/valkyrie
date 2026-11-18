@@ -34,6 +34,13 @@ from valkyrie.sdk.models.benchmarks import (
     TaskSummary,
 )
 from valkyrie.sdk.models.config import AWSResources, LocalResources
+from valkyrie.sdk.models.costs import (
+    CostsByProjectResponse,
+    MonthModelCost,
+    ProjectCostRow,
+    ProjectModelCosts,
+    ProjectRun,
+)
 from valkyrie.sdk.models.datasets import (
     folder_run_name,
     BenchmarkDefinitionResponse,
@@ -175,6 +182,7 @@ __all__ = [
     "BenchmarkStatusEntry",
     "BenchmarkStatusResponse",
     "BenchmarkTableRow",
+    "CostsByProjectResponse",
     "DatasetLocation",
     "DatasetRef",
     "DatasetResponse",
@@ -192,6 +200,7 @@ __all__ = [
     "ManifestInfo",
     "ManifestTask",
     "MissingBlobsResponse",
+    "MonthModelCost",
     "VersionManifest",
     "DatasetVersion",
     "DocentReadingStatus",
@@ -215,8 +224,11 @@ __all__ = [
     "RetrieveResultsResponse",
     "ResultsExistResponse",
     "NewProjectRequest",
+    "ProjectCostRow",
     "ProjectCreateRequest",
+    "ProjectModelCosts",
     "ProjectResponse",
+    "ProjectRun",
     "ProjectsResponse",
     "RetryMode",
     "RegradeBenchmarkRequest",

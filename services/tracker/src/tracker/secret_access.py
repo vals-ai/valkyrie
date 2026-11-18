@@ -4,23 +4,22 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from tracker import config
-from tracker.exceptions import SecretNotFoundError
+from tracker.exceptions import SecretAccessDeniedError, SecretNotFoundError
 from tracker.runtime.secrets import TENANT_SECRET_ROOT, SecretStore, SecretValue, secret_display_name
 
 if TYPE_CHECKING:
     from tracker.database.models import Org
 
 GATEWAY_SECRET_NAME_PREFIX = "model-gateway-"
+PROJECT_SERVICE_GATEWAY_SECRET_PREFIX = "projects/gateway-keys/"
+_GENERATED_GATEWAY_SECRET = re.compile(
+    rf"(?:^|/)(?:{GATEWAY_SECRET_NAME_PREFIX}|{PROJECT_SERVICE_GATEWAY_SECRET_PREFIX})"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 def is_generated_project_gateway_secret_name(name: str) -> bool:
-    if not name.startswith(GATEWAY_SECRET_NAME_PREFIX):
-        return False
-    key_id = name.removeprefix(GATEWAY_SECRET_NAME_PREFIX)
-    try:
-        return str(UUID(key_id)) == key_id
-    except ValueError:
-        return False
+    return _GENERATED_GATEWAY_SECRET.search(name) is not None
 
 
 def tenant_secret_prefix(org_id: UUID) -> str:
@@ -75,7 +74,7 @@ class OrgSecretStore:
         for candidate in candidates[:-1]:
             try:
                 return await self._store.get(candidate)
-            except SecretNotFoundError:
+            except (SecretNotFoundError, SecretAccessDeniedError):
                 pass
         return await self._store.get(candidates[-1])
 
@@ -87,9 +86,7 @@ def validate_secret_names(names: Iterable[str], *, org_id: UUID, org_name: str, 
     prefix = tenant_secret_prefix(org_id)
     shared = may_use_shared_secrets(org_name)
     for name in names:
-        if not name.startswith(prefix) and (
-            not shared or is_generated_project_gateway_secret_name(name.split("/")[-1])
-        ):
+        if not name.startswith(prefix) and (not shared or is_generated_project_gateway_secret_name(name)):
             raise ValueError(f"Secret '{secret_display_name(name)}' does not exist")
 
 

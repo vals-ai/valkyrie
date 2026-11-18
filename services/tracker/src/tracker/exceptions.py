@@ -32,6 +32,10 @@ class MembershipUnavailableError(Exception):
     pass
 
 
+class GatewayUnavailableError(Exception):
+    pass
+
+
 class RunLimitExceededError(Exception):
     def __init__(self, limit: int, active: int) -> None:
         super().__init__(
@@ -146,12 +150,29 @@ class SecretsError(TrackerServiceError):
         return "Secret error: " + super().__str__()
 
 
-class SecretNotFoundError(SecretsError):
-    pass
+class SecretConfigurationError(SecretsError):
+    transient = False
+    status_code = 400
+    cause_code = "secret_configuration"
 
 
-class ProjectMigrationConflictError(TrackerServiceError):
-    pass
+class SecretNotFoundError(SecretConfigurationError):
+    status_code = 404
+    cause_code = "secret_not_found"
+
+
+class SecretAccessDeniedError(SecretsError):
+    transient = False
+    cause_code = "secret_access_denied"
+
+
+class SecretDecryptionError(SecretsError):
+    transient = False
+    cause_code = "secret_decryption_failed"
+
+
+class SecretRegionError(SecretConfigurationError):
+    cause_code = "secret_wrong_region"
 
 
 class ProjectHandleTakenError(TrackerServiceError):
@@ -159,11 +180,24 @@ class ProjectHandleTakenError(TrackerServiceError):
         super().__init__(f"Project '{handle}' already exists")
 
 
+class ProjectNotFoundError(LookupError):
+    def __init__(self, handle: str) -> None:
+        super().__init__(f"Project '{handle}' was not found")
+
+
 class ProjectNameTakenError(TrackerServiceError):
     def __init__(self, holder_name: str, holder_handle: str) -> None:
         super().__init__(
             f"A project named '{holder_name}' already exists (handle {holder_handle}). Choose another name."
         )
+
+
+class ProjectLimitRequestNotFoundError(TrackerServiceError):
+    pass
+
+
+class ProjectLimitRequestDecidedError(TrackerServiceError):
+    pass
 
 
 class BenchmarkNameTakenError(TrackerServiceError):

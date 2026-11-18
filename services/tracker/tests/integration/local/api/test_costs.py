@@ -1,22 +1,25 @@
+from collections.abc import Callable
+import json
 from datetime import datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from tests.project_service import MockProjectRoutes
-from tests.factories import make_benchmark
+from tests.factories import link_run_project, make_benchmark, make_project
 from tests.utils import TEST_ORG_ID
+from tracker import project_gateway
 import tracker.api.costs as costs_api
+from tracker.clients import gateway_usage
 from tracker.database.models import (
     BenchmarkStatus,
     Org,
-    OrgProviderSecret,
-    Project,
     RunCost,
-    RunCostUsageEndBackfill,
     RunProject,
     SandboxUnmatchedUsage,
     SpendType,
@@ -217,26 +220,6 @@ class TestCostsByEmail:
         assert response.status_code == 401
 
 
-def _project(
-    service: MockProjectRoutes, handle: str, spend_type: SpendType, subcategory: str, *, org_id: UUID = TEST_ORG_ID
-) -> Project:
-    project = Project(
-        org_id=org_id,
-        handle=handle,
-        name=handle.replace("-", " ").title(),
-        spend_type=spend_type,
-        subcategory=subcategory,
-        customer="google" if spend_type is SpendType.CUSTOMER else None,
-    )
-    service.seed(project)
-    return project
-
-
-def _link(session: Session, benchmark_id: UUID, project: Project, *, created_at: datetime) -> None:
-    session.add(RunProject(benchmark_id=benchmark_id, project_id=project.id, created_at=created_at))
-    session.flush()
-
-
 def _tagged_run(
     session: Session,
     *,
@@ -292,31 +275,31 @@ class TestCostsByProject:
     ) -> None:
         utc = ZoneInfo("UTC")
         stamp = datetime(2026, 10, 20, tzinfo=utc)
-        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
-        blog = _project(project_service, "blog-xyz", SpendType.INTERNAL, "blog")
-        google = _project(project_service, "google-report-xyz", SpendType.CUSTOMER, "report")
+        router = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        blog = make_project(project_service, "blog-xyz", SpendType.INTERNAL, "blog")
+        google = make_project(project_service, "google-report-xyz", SpendType.CUSTOMER, "report")
 
         moved = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0, 0.5])
-        _link(database_session, moved, router, created_at=stamp)
-        _link(database_session, moved, blog, created_at=stamp + timedelta(minutes=5))
+        link_run_project(database_session, moved, router, created_at=stamp)
+        link_run_project(database_session, moved, blog, created_at=stamp + timedelta(minutes=5))
         tied = _tagged_run(database_session, started_at=datetime(2026, 10, 6, tzinfo=utc), amounts=[2.0])
-        _link(database_session, tied, google, created_at=stamp)
-        _link(database_session, tied, router, created_at=stamp)
+        link_run_project(database_session, tied, google, created_at=stamp)
+        link_run_project(database_session, tied, router, created_at=stamp)
         untagged = _tagged_run(
             database_session, started_at=datetime(2026, 10, 7, tzinfo=utc), amounts=[0.25], provider="modal"
         )
         november = _tagged_run(database_session, started_at=datetime(2026, 11, 1, tzinfo=utc), amounts=[9.0])
-        _link(database_session, november, router, created_at=stamp)
+        link_run_project(database_session, november, router, created_at=stamp)
         other_org = Org(id=uuid4(), name="other-tenant")
         database_session.add(other_org)
         database_session.commit()
         foreign = _tagged_run(
             database_session, started_at=datetime(2026, 10, 8, tzinfo=utc), amounts=[9.0], org_id=other_org.id
         )
-        foreign_project = _project(
+        foreign_project = make_project(
             project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation", org_id=other_org.id
         )
-        _link(database_session, foreign, foreign_project, created_at=stamp)
+        link_run_project(database_session, foreign, foreign_project, created_at=stamp)
         database_session.commit()
 
         response = client.get(
@@ -389,14 +372,14 @@ class TestCostsByProject:
     ) -> None:
         utc = ZoneInfo("UTC")
         stamp = datetime(2026, 10, 20, tzinfo=utc)
-        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         finished_inside = _tagged_run(
             database_session,
             started_at=datetime(2026, 9, 28, tzinfo=utc),
             finished_at=datetime(2026, 10, 2, tzinfo=utc),
             amounts=[],
         )
-        _link(database_session, finished_inside, project, created_at=stamp)
+        link_run_project(database_session, finished_inside, project, created_at=stamp)
         finished_after = _tagged_run(
             database_session,
             started_at=datetime(2026, 9, 29, tzinfo=utc),
@@ -522,7 +505,7 @@ class TestCostsByProject:
         project_service: MockProjectRoutes,
     ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         carried_in = _tagged_run(
             database_session,
             started_at=datetime(2026, 9, 28, tzinfo=utc),
@@ -530,7 +513,7 @@ class TestCostsByProject:
             usage_end=datetime(2026, 10, 1, 6, tzinfo=utc),
             amounts=[1.0, 2.0],
         )
-        _link(database_session, carried_in, router, created_at=datetime(2026, 9, 28, tzinfo=utc))
+        link_run_project(database_session, carried_in, router, created_at=datetime(2026, 9, 28, tzinfo=utc))
         idle = make_benchmark(
             status=BenchmarkStatus.IN_PROGRESS,
             started_at=datetime(2026, 10, 10, tzinfo=utc),
@@ -576,9 +559,11 @@ class TestCostsByProject:
         other_org = Org(id=uuid4(), name="other-tenant")
         database_session.add(other_org)
         database_session.commit()
-        foreign_project = _project(project_service, "secret-project", SpendType.CUSTOMER, "report", org_id=other_org.id)
+        foreign_project = make_project(
+            project_service, "secret-project", SpendType.CUSTOMER, "report", org_id=other_org.id
+        )
         run = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0])
-        _link(database_session, run, foreign_project, created_at=datetime(2026, 10, 6, tzinfo=utc))
+        link_run_project(database_session, run, foreign_project, created_at=datetime(2026, 10, 6, tzinfo=utc))
         database_session.commit()
 
         response = client.get(
@@ -604,9 +589,9 @@ class TestCostsByProject:
         self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
     ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         run = _tagged_run(database_session, started_at=datetime(2026, 10, 5, tzinfo=utc), amounts=[1.0, 0.5])
-        _link(database_session, run, router, created_at=datetime(2026, 10, 5, tzinfo=utc))
+        link_run_project(database_session, run, router, created_at=datetime(2026, 10, 5, tzinfo=utc))
         database_session.commit()
         window = {"start": "2026-10-01", "end": "2026-11-01"}
         before = client.get("/costs/by-project", params=window, headers={"X-Api-Key": "fake"}).json()
@@ -635,7 +620,7 @@ class TestCostsByProject:
         project_service: MockProjectRoutes,
     ) -> None:
         utc = ZoneInfo("UTC")
-        router = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        router = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         ran_into_november = _tagged_run(
             database_session,
             started_at=datetime(2026, 10, 30, tzinfo=utc),
@@ -650,7 +635,7 @@ class TestCostsByProject:
             usage_end=datetime(2026, 10, 2, tzinfo=utc),
             amounts=[2.0],
         )
-        _link(database_session, started_in_september, router, created_at=datetime(2026, 9, 29, tzinfo=utc))
+        link_run_project(database_session, started_in_september, router, created_at=datetime(2026, 9, 29, tzinfo=utc))
         database_session.commit()
 
         october = client.get(
@@ -887,6 +872,121 @@ class TestCostsByProject:
         assert response.status_code == 401
 
 
+_GOLDEN_WINDOW = {"start": "2026-10-01", "end": "2026-11-01"}
+_GOLDEN_SANDBOX_USD_BY_PROJECT: dict[str | None, float] = {
+    "blog-xyz": 3.5,
+    "google-report-xyz": 5.5,
+    "router-bench": 11.0,
+    None: 0.25,
+}
+
+
+def _seed_golden_cost_org(session: Session, project_service: MockProjectRoutes) -> None:
+    utc = ZoneInfo("UTC")
+    router = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+    blog = make_project(project_service, "blog-xyz", SpendType.INTERNAL, "blog")
+    google = make_project(project_service, "google-report-xyz", SpendType.CUSTOMER, "report")
+    october_5 = datetime(2026, 10, 5, tzinfo=utc)
+
+    router_run = _tagged_run(
+        session, started_at=october_5, usage_end=datetime(2026, 10, 6, tzinfo=utc), amounts=[1.25, 0.75]
+    )
+    link_run_project(session, router_run, router, created_at=october_5)
+    moved_run = _tagged_run(
+        session, started_at=october_5, usage_end=datetime(2026, 10, 20, tzinfo=utc), amounts=[3.0, 0.5]
+    )
+    link_run_project(session, moved_run, router, created_at=october_5)
+    link_run_project(session, moved_run, blog, created_at=october_5 + timedelta(hours=1))
+    google_daytona = _tagged_run(
+        session, started_at=october_5, usage_end=datetime(2026, 10, 31, 23, tzinfo=utc), amounts=[4.0]
+    )
+    link_run_project(session, google_daytona, google, created_at=october_5)
+    google_modal = _tagged_run(
+        session,
+        started_at=october_5,
+        usage_end=datetime(2026, 10, 12, tzinfo=utc),
+        amounts=[1.5],
+        provider="modal",
+    )
+    link_run_project(session, google_modal, google, created_at=october_5)
+    _tagged_run(session, started_at=october_5, usage_end=datetime(2026, 10, 7, tzinfo=utc), amounts=[0.25])
+    carried_in = _tagged_run(
+        session,
+        started_at=datetime(2026, 9, 28, tzinfo=utc),
+        finished_at=datetime(2026, 10, 2, tzinfo=utc),
+        amounts=[9.0],
+    )
+    link_run_project(session, carried_in, router, created_at=datetime(2026, 9, 28, tzinfo=utc))
+    september = _tagged_run(
+        session,
+        started_at=datetime(2026, 9, 20, tzinfo=utc),
+        usage_end=datetime(2026, 9, 30, 23, tzinfo=utc),
+        amounts=[16.0],
+    )
+    link_run_project(session, september, router, created_at=datetime(2026, 9, 20, tzinfo=utc))
+    november = _tagged_run(
+        session,
+        started_at=datetime(2026, 10, 30, tzinfo=utc),
+        usage_end=datetime(2026, 11, 1, tzinfo=utc),
+        amounts=[32.0],
+    )
+    link_run_project(session, november, blog, created_at=datetime(2026, 10, 30, tzinfo=utc))
+    other_org = Org(id=uuid4(), name="other-tenant")
+    session.add(other_org)
+    session.commit()
+    foreign_project = make_project(
+        project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation", org_id=other_org.id
+    )
+    foreign = _tagged_run(
+        session,
+        started_at=october_5,
+        usage_end=datetime(2026, 10, 6, tzinfo=utc),
+        amounts=[64.0],
+        org_id=other_org.id,
+    )
+    link_run_project(session, foreign, foreign_project, created_at=october_5)
+    session.commit()
+
+
+@pytest.mark.description("A fixed fixture org pins the sandbox dollars `/costs/by-project` reports per project.")
+class TestCostsByProjectGolden:
+    @pytest.mark.description(
+        (
+            "The golden org's October sandbox dollars per project must match the pinned totals.\n"
+            "\n"
+            "Test cases:\n"
+            "- Each project sums its sandbox rows across vendors and runs.\n"
+            "- A run moved between projects counts only under its newest project.\n"
+            "- A run with no project sums under a null handle.\n"
+            "- A row with no usage end that its run finished inside the window is counted.\n"
+            "- Rows whose usage ended before `start` or exactly at `end` are left out.\n"
+            "- Another org's rows under a project with the same handle are left out.\n"
+            "- Each counted run is listed under its newest project."
+        )
+    )
+    def test_sandbox_dollars_per_project_match_the_golden_totals(
+        self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
+    ) -> None:
+        _seed_golden_cost_org(database_session, project_service)
+
+        response = client.get("/costs/by-project", params=_GOLDEN_WINDOW, headers={"X-Api-Key": "fake"})
+
+        assert response.status_code == 200, response.text
+        totals: dict[str | None, float] = {}
+        for row in response.json()["rows"]:
+            totals[row["project_handle"]] = totals.get(row["project_handle"], 0.0) + row["amount_usd"]
+        assert totals == _GOLDEN_SANDBOX_USD_BY_PROJECT
+        assert sorted(run["project_handle"] or "" for run in response.json()["runs"]) == [
+            "",
+            "blog-xyz",
+            "blog-xyz",
+            "google-report-xyz",
+            "google-report-xyz",
+            "router-bench",
+            "router-bench",
+        ]
+
+
 @pytest.mark.description("Daytona sandbox totals per project for runs started in a window.")
 class TestProjectDaytonaCosts:
     @pytest.mark.description(
@@ -903,13 +1003,13 @@ class TestProjectDaytonaCosts:
         self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
     ) -> None:
         utc = ZoneInfo("UTC")
-        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for started_at, amount in [
             (datetime(2026, 10, 30, 21, 30, tzinfo=utc), 1.0),
             (datetime(2026, 10, 30, 20, 30, tzinfo=utc), 2.0),
         ]:
             run = _tagged_run(database_session, started_at=started_at, amounts=[amount])
-            _link(database_session, run, project, created_at=started_at)
+            link_run_project(database_session, run, project, created_at=started_at)
         database_session.commit()
 
         response = client.get(
@@ -937,13 +1037,13 @@ class TestProjectDaytonaCosts:
         self, client: TestClient, database_session: Session, project_service: MockProjectRoutes
     ) -> None:
         utc = ZoneInfo("UTC")
-        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for started_at, amount in [
             (datetime(2026, 10, 30, 21, 30, tzinfo=utc), 1.0),
             (datetime(2026, 10, 30, 20, 30, tzinfo=utc), 2.0),
         ]:
             run = _tagged_run(database_session, started_at=started_at, amounts=[amount])
-            _link(database_session, run, project, created_at=started_at)
+            link_run_project(database_session, run, project, created_at=started_at)
         database_session.commit()
 
         response = client.get(
@@ -974,10 +1074,10 @@ class TestProjectSandboxCosts:
     ) -> None:
         utc = ZoneInfo("UTC")
         started_at = datetime(2026, 10, 30, 21, 30, tzinfo=utc)
-        project = _project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+        project = make_project(project_service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
         for provider, amounts in [("daytona", [1.0, 0.5]), ("modal", [32.69])]:
             run = _tagged_run(database_session, started_at=started_at, amounts=amounts, provider=provider)
-            _link(database_session, run, project, created_at=started_at)
+            link_run_project(database_session, run, project, created_at=started_at)
         database_session.commit()
         params = {"start": "2026-10-30", "end": "2026-10-31"}
 
@@ -1015,16 +1115,16 @@ def _sandbox_cost(
 
 def _seed_november_sandbox_rows(session: Session, service: MockProjectRoutes) -> dict[str, UUID]:
     utc = ZoneInfo("UTC")
-    blog = _project(service, "blog-xyz", SpendType.INTERNAL, "blog")
-    router = _project(service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
+    blog = make_project(service, "blog-xyz", SpendType.INTERNAL, "blog")
+    router = make_project(service, "router-bench", SpendType.DEVELOPMENT, "new_benchmark_generation")
     tagged = _tagged_run(
         session,
         started_at=datetime(2026, 10, 20, tzinfo=utc),
         finished_at=datetime(2026, 11, 3, 12, tzinfo=utc),
         amounts=[],
     )
-    _link(session, tagged, blog, created_at=datetime(2026, 10, 19, tzinfo=utc))
-    _link(session, tagged, router, created_at=datetime(2026, 10, 20, tzinfo=utc))
+    link_run_project(session, tagged, blog, created_at=datetime(2026, 10, 19, tzinfo=utc))
+    link_run_project(session, tagged, router, created_at=datetime(2026, 10, 20, tzinfo=utc))
     session.commit()
     _sandbox_cost(session, tagged, "sb-october", 4.0, datetime(2026, 11, 2, 3, tzinfo=utc))
     _sandbox_cost(session, tagged, "sb-a:2026-11-01T05:00:00+00:00", 0.5, datetime(2026, 11, 1, 5, 59, tzinfo=utc))
@@ -1223,127 +1323,286 @@ class TestDaytonaUnmatchedCosts:
         }
 
 
-def _usage_ends(session: Session, rows: dict[str, RunCost]) -> dict[str, datetime | None]:
-    session.expire_all()
-    ends = {name: session.get_one(RunCost, row.id).usage_end for name, row in rows.items()}
-    return {name: end and end.replace(tzinfo=ZoneInfo("UTC")) for name, end in ends.items()}
+MACHINE_KEY = "machine-key-secret"
 
 
-@pytest.mark.description("A Daytona row with no `usage_end` gets its sandbox's last usage time from Daytona.")
-class TestFillSandboxUsageEnd:
+class FakeRunSums:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.open_transactions: list[bool] = []
+        self.calls: list[dict[str, Any]] = []
+        self.runs: dict[UUID, str] = {}
+        self.project_key: list[tuple[UUID | str | None, str]] = []
+        self.throughs = ["2026-11-16T12:00:00+00:00"]
+        self.answer: Callable[[httpx.Request], httpx.Response] | None = None
+
+    def returns(self, runs: dict[UUID, str], project_key: list[tuple[UUID | str | None, str]]) -> None:
+        self.runs = runs
+        self.project_key = project_key
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/managed-auth/machine/usage/run-sums"
+        self.open_transactions.append(self.session.in_transaction())
+        if self.answer is not None:
+            return self.answer(request)
+        body = json.loads(request.content)
+        self.calls.append(body)
+        through = self.throughs[min(len(self.calls), len(self.throughs)) - 1]
+
+        return httpx.Response(
+            200,
+            json={
+                "runs": [
+                    {"run_id": run_id, "amount_usd": self.runs.get(UUID(run_id), "0")} for run_id in body["run_ids"]
+                ],
+                "project_key": [
+                    {"run_id": None if run_id is None else str(run_id), "amount_usd": amount}
+                    for run_id, amount in (self.project_key if body["project_id"] else [])
+                ],
+                "through": through,
+            },
+        )
+
+
+@pytest.fixture
+def fake_run_sums(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> FakeRunSums:
+    fake = FakeRunSums(database_session)
+    monkeypatch.setattr(gateway_usage, "VALKYRIE_STAGE", "dev")
+    monkeypatch.setattr(
+        gateway_usage,
+        "gateway_client",
+        lambda: httpx.AsyncClient(
+            base_url="https://model-gateway.example/",
+            headers={"Authorization": f"Bearer {MACHINE_KEY}"},
+            transport=httpx.MockTransport(fake.handle),
+        ),
+    )
+    return fake
+
+
+@pytest.mark.description("One project's model spend per UTC month, read from the model Gateway.")
+class TestProjectModelCosts:
     @pytest.mark.description(
         (
-            "A dry run lists the rows it would date and writes nothing, and an applied run dates them and saves their IDs.\n"
+            "Each run's model dollars land in the UTC month it finished, or started while running.\n"
             "\n"
             "Test cases:\n"
-            "- A row with no `usage_end` whose sandbox Daytona lists gets its last usage time.\n"
-            "- A row that already has a `usage_end` keeps it.\n"
-            "- A row whose sandbox Daytona does not list keeps no `usage_end`.\n"
-            "- Another organization's row is not touched, even when Daytona lists its sandbox."
+            "- A run started in September and finished on 31 October counts in October.\n"
+            "- A run still running counts in the month it started.\n"
+            "- A run that finished before the window or moved to another project is not asked about.\n"
+            "- Key spend outside any run or on a run with no project counts as unattributed.\n"
+            "- Key spend on a run linked to this or another project is not unattributed.\n"
+            "- The database transaction is ended before the Gateway is called."
         )
     )
-    def test_dry_run_then_apply(
-        self, client: TestClient, database_session: Session, monkeypatch: pytest.MonkeyPatch
+    def test_places_model_dollars_in_each_runs_finish_month(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
     ) -> None:
-        finished = datetime(2026, 11, 5, 12, tzinfo=ZoneInfo("UTC"))
-        ended = datetime(2026, 10, 20, 8, tzinfo=ZoneInfo("UTC"))
-        kept = datetime(2026, 10, 21, tzinfo=ZoneInfo("UTC"))
-        other_org = Org(id=uuid4(), name="other-org")
-        database_session.add_all(
-            [other_org, OrgProviderSecret(org_id=TEST_ORG_ID, provider="daytona", secret_name="DaytonaSecret")]
+        utc = ZoneInfo("UTC")
+        project = make_project(project_service, "p")
+        other = make_project(project_service, "other")
+        finished = _tagged_run(
+            database_session,
+            started_at=datetime(2026, 9, 30, tzinfo=utc),
+            finished_at=datetime(2026, 10, 31, 23, tzinfo=utc),
+            amounts=[],
         )
+        running = _tagged_run(
+            database_session,
+            started_at=datetime(2026, 11, 2, tzinfo=utc),
+            amounts=[],
+            status=BenchmarkStatus.IN_PROGRESS,
+        )
+        earlier = _tagged_run(database_session, started_at=datetime(2026, 9, 15, tzinfo=utc), amounts=[])
+        moved = _tagged_run(database_session, started_at=datetime(2026, 10, 10, tzinfo=utc), amounts=[])
+        unlinked = _tagged_run(database_session, started_at=datetime(2026, 10, 12, tzinfo=utc), amounts=[])
+        for run in (finished, running, earlier, moved):
+            link_run_project(database_session, run, project, created_at=datetime(2026, 9, 1, tzinfo=utc))
+        link_run_project(database_session, moved, other, created_at=datetime(2026, 10, 11, tzinfo=utc))
         database_session.commit()
-        ours = make_benchmark(
-            status=BenchmarkStatus.FINISHED, started_at=ended, org_id=TEST_ORG_ID, session=database_session
-        )
-        theirs = make_benchmark(
-            status=BenchmarkStatus.FINISHED, started_at=ended, org_id=other_org.id, session=database_session
-        )
-        ours.finished_at = theirs.finished_at = finished
-        rows = {
-            "missing": RunCost(
-                benchmark_id=ours.id, cost_type="sandbox", source_id="sb-a", provider="daytona", amount_usd=2.0
-            ),
-            "dated": RunCost(
-                benchmark_id=ours.id,
-                cost_type="sandbox",
-                source_id="sb-b",
-                provider="daytona",
-                amount_usd=3.0,
-                usage_end=kept,
-            ),
-            "unlisted": RunCost(
-                benchmark_id=ours.id, cost_type="sandbox", source_id="sb-c", provider="daytona", amount_usd=4.0
-            ),
-            "other_org": RunCost(
-                benchmark_id=theirs.id, cost_type="sandbox", source_id="sb-d", provider="daytona", amount_usd=5.0
-            ),
-        }
-        database_session.add_all([ours, theirs, *rows.values()])
-        database_session.commit()
-        reads: list[tuple[str, datetime, datetime]] = []
-
-        async def last_ends(_org: Org, secret_name: str, start: datetime, end: datetime) -> dict[str, datetime]:
-            reads.append((secret_name, start, end))
-            return {"sb-a": ended, "sb-b": ended, "sb-d": ended}
-
-        monkeypatch.setattr(costs_api, "daytona_last_ends", last_ends)
-        window = {"start": "2026-10-20T00:00:00Z", "end": "2026-10-21T00:00:00Z"}
-
-        dry_run = client.post("/costs/sandbox-usage-end", params=window, headers={"X-Api-Key": "fake"})
-        after_dry_run = _usage_ends(database_session, rows)
-        applied = client.post(
-            "/costs/sandbox-usage-end", params=window | {"apply": "true"}, headers={"X-Api-Key": "fake"}
+        fake_run_sums.returns(
+            runs={finished: "1.50", running: "0.25"},
+            project_key=[(None, "0.10"), (unlinked, "0.05"), (finished, "9"), (earlier, "3"), (moved, "4")],
         )
 
-        assert dry_run.status_code == 200
-        assert [row["run_cost_id"] for row in dry_run.json()["rows"]] == [str(rows["missing"].id)]
-        assert dry_run.json()["rows"][0]["placed_at"].startswith("2026-11-05T12:00:00")
-        assert after_dry_run == {"missing": None, "dated": kept, "unlisted": None, "other_org": None}
-        assert applied.status_code == 200
-        assert [row["run_cost_id"] for row in applied.json()["rows"]] == [str(rows["missing"].id)]
-        assert _usage_ends(database_session, rows) == {
-            "missing": ended,
-            "dated": kept,
-            "unlisted": None,
-            "other_org": None,
-        }
-        assert [saved.run_cost_id for saved in database_session.exec(select(RunCostUsageEndBackfill)).all()] == [
-            rows["missing"].id
-        ]
-        assert [row.amount_usd for row in rows.values()] == [2.0, 3.0, 4.0, 5.0]
-        assert reads[0][0] == "DaytonaSecret"
-
-    @pytest.mark.description("A tenant's Daytona mapping by secret name is read under its tenant path.")
-    def test_a_tenant_mapping_by_name_is_read_under_its_tenant_path(
-        self, client: TestClient, database_session: Session, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        database_session.add(OrgProviderSecret(org_id=TEST_ORG_ID, provider="daytona", secret_name="daytona"))
-        database_session.commit()
-        reads: list[str] = []
-
-        async def last_ends(_org: Org, secret_name: str, _start: datetime, _end: datetime) -> dict[str, datetime]:
-            reads.append(secret_name)
-            return {}
-
-        monkeypatch.setattr(costs_api, "daytona_last_ends", last_ends)
-        monkeypatch.setattr(costs_api, "AUTH_REQUIRED", True)
-
-        response = client.post(
-            "/costs/sandbox-usage-end",
-            params={"start": "2026-10-20", "end": "2026-10-21"},
+        response = client.get(
+            "/costs/project-model",
+            params={"project": "p", "start": "2026-10-01", "end": "2026-12-01"},
             headers={"X-Api-Key": "fake"},
         )
 
-        assert response.status_code == 200
-        assert reads == [f"valkyrie/tenants/{TEST_ORG_ID}/daytona"]
+        assert response.status_code == 200, response.text
+        assert [call["run_ids"] for call in fake_run_sums.calls] == [[str(finished), str(running)]]
 
-    @pytest.mark.description("An organization without a Daytona secret gets a 409.")
-    def test_an_org_without_a_daytona_secret_gets_409(self, client: TestClient) -> None:
-        response = client.post(
-            "/costs/sandbox-usage-end",
-            params={"start": "2026-10-20", "end": "2026-10-21", "apply": "true"},
+        body = response.json()
+        assert body["start"] == "2026-10-01T00:00:00Z"
+        assert body["end"] == "2026-12-01T00:00:00Z"
+        assert body["months"] == [{"month": "2026-10", "amount_usd": 1.5}, {"month": "2026-11", "amount_usd": 0.25}]
+        assert body["unattributed_usd"] == 0.15
+        assert body["through"] == "2026-11-16T12:00:00Z"
+        assert fake_run_sums.open_transactions == [False]
+
+    @pytest.mark.description(
+        (
+            "More than 1000 runs are asked about in batches of 1000.\n"
+            "\n"
+            "Test cases:\n"
+            "- Only the first batch carries the project ID, and every batch names the environment.\n"
+            "- `through` is the oldest time any batch reports."
+        )
+    )
+    def test_batches_past_1000_runs(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+    ) -> None:
+        started_at = datetime(2026, 10, 5, tzinfo=ZoneInfo("UTC"))
+        project = make_project(project_service, "p")
+        runs = [make_benchmark(started_at=started_at) for _ in range(1001)]
+        database_session.add_all(runs)
+        database_session.flush()
+        database_session.add_all([RunProject(benchmark_id=run.id, project_id=project.id) for run in runs])
+        database_session.commit()
+        fake_run_sums.throughs = ["2026-11-16T11:00:00+00:00", "2026-11-16T12:00:00+00:00"]
+
+        response = client.get(
+            "/costs/project-model",
+            params={"project": "p", "start": "2026-10-01", "end": "2026-11-01"},
             headers={"X-Api-Key": "fake"},
         )
 
-        assert response.status_code == 409
+        assert response.status_code == 200, response.text
+        assert [len(call["run_ids"]) for call in fake_run_sums.calls] == [1000, 1]
+        assert [call["project_id"] for call in fake_run_sums.calls] == [str(project.id), None]
+        assert {call["project_environment"] for call in fake_run_sums.calls} == {"dev"}
+        assert response.json()["through"] == "2026-11-16T11:00:00Z"
+
+    @pytest.mark.description(
+        (
+            "Another organization's projects and runs stay out of this organization's model spend.\n"
+            "\n"
+            "Test cases:\n"
+            "- A handle only another organization has gets a 404 and no Gateway call.\n"
+            "- Another organization's run linked to a project with the same handle is not sent to the Gateway.\n"
+            "- Key spend on another organization's linked run or a non-UUID run ID counts as unattributed."
+        )
+    )
+    def test_keeps_other_organizations_out(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+    ) -> None:
+        utc = ZoneInfo("UTC")
+        started_at = datetime(2026, 10, 5, tzinfo=utc)
+        other_org = Org(id=uuid4(), name="other-tenant")
+        database_session.add(other_org)
+        database_session.commit()
+        project = make_project(project_service, "p")
+        foreign_project = make_project(project_service, "p", org_id=other_org.id)
+        _ = make_project(project_service, "solo", org_id=other_org.id)
+        ours = _tagged_run(database_session, started_at=started_at, amounts=[])
+        foreign = _tagged_run(database_session, started_at=started_at, amounts=[], org_id=other_org.id)
+        link_run_project(database_session, ours, project, created_at=started_at)
+        link_run_project(database_session, foreign, foreign_project, created_at=started_at)
+        database_session.commit()
+        fake_run_sums.returns(runs={ours: "1"}, project_key=[(foreign, "0.5"), ("external-run", "0.25")])
+        window = {"start": "2026-10-01", "end": "2026-11-01"}
+
+        missing = client.get(
+            "/costs/project-model", params={"project": "solo", **window}, headers={"X-Api-Key": "fake"}
+        )
+        calls_after_missing = len(fake_run_sums.calls)
+        response = client.get("/costs/project-model", params={"project": "p", **window}, headers={"X-Api-Key": "fake"})
+
+        assert (missing.status_code, missing.json()["detail"]) == (404, "Project not found")
+        assert calls_after_missing == 0
+        assert response.status_code == 200, response.text
+        assert [call["run_ids"] for call in fake_run_sums.calls] == [[str(ours)]]
+        assert response.json()["months"] == [{"month": "2026-10", "amount_usd": 1.0}]
+        assert response.json()["unattributed_usd"] == 0.75
+
+    @pytest.mark.description("A project with no runs in the window still reports its key's unattributed spend.")
+    def test_a_project_without_runs_still_reports_key_spend(
+        self, client: TestClient, project_service: MockProjectRoutes, fake_run_sums: FakeRunSums
+    ) -> None:
+        project = make_project(project_service, "p")
+        fake_run_sums.returns(runs={}, project_key=[(None, "2.5")])
+
+        response = client.get(
+            "/costs/project-model",
+            params={"project": "p", "start": "2026-10-01", "end": "2026-11-01"},
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert fake_run_sums.calls == [{"run_ids": [], "project_id": str(project.id), "project_environment": "dev"}]
+        assert response.json()["months"] == []
+        assert response.json()["unattributed_usd"] == 2.5
+
+    @pytest.mark.description(
+        (
+            "A Gateway that cannot answer gets a 503 and a warning that names only the error type and HTTP status.\n"
+            "\n"
+            "Test cases:\n"
+            "- The Gateway answers 503.\n"
+            "- The connection fails.\n"
+            "- The body is not the run sums shape.\n"
+            "- The Gateway URL is not configured.\n"
+            "- The warning carries no header, URL or machine key."
+        )
+    )
+    @pytest.mark.parametrize(
+        ("failure", "logged"),
+        [
+            ("status", "HTTPStatusError status=503"),
+            ("connection", "ConnectError status=None"),
+            ("malformed", "ValidationError status=None"),
+            ("unconfigured", "ValueError status=None"),
+        ],
+    )
+    def test_gateway_failure_returns_503(
+        self,
+        client: TestClient,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failure: str,
+        logged: str,
+    ) -> None:
+        monkeypatch.setattr(costs_api.logger, "handlers", [caplog.handler])
+        _ = make_project(project_service, "p")
+
+        def connection_error(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+        answers: dict[str, Callable[[httpx.Request], httpx.Response]] = {
+            "status": lambda _request: httpx.Response(503, json={"detail": "Redshift is unavailable"}),
+            "connection": connection_error,
+            "malformed": lambda _request: httpx.Response(200, json={"runs": "none"}),
+        }
+        if failure == "unconfigured":
+            monkeypatch.setattr(gateway_usage, "gateway_client", project_gateway.gateway_client)
+            monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
+        else:
+            fake_run_sums.answer = answers[failure]
+
+        response = client.get(
+            "/costs/project-model",
+            params={"project": "p", "start": "2026-10-01", "end": "2026-11-01"},
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "The model Gateway is unavailable"
+        [record] = [record for record in caplog.records if record.levelname == "WARNING"]
+        assert record.getMessage() == f"Model Gateway is unavailable: {logged}"
+        assert MACHINE_KEY not in caplog.text

@@ -31,7 +31,13 @@ import main as main_module
 import tracker.auth as auth_module
 from tracker import config
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
-from main import app, benchmark_service_error_handler, tracker_service_error_handler
+from main import (
+    app,
+    benchmark_service_error_handler,
+    secret_configuration_handler,
+    secret_not_found_handler,
+    tracker_service_error_handler,
+)
 from tests.storage_lifecycle_support import MemoryS3
 from tests.utils import TEST_ORG_ID, FakeAccessKeys, async_iterator
 from tracker.auth import RequestIdentity, get_current_identity, get_current_org, get_current_runner
@@ -69,7 +75,16 @@ from tracker.domain import (
     ExecutorReleaseStatus,
     TaskStatus,
 )
-from tracker.exceptions import SecretNotFoundError, TrackerServiceError
+from tracker.exceptions import (
+    SecretAccessDeniedError,
+    SecretConfigurationError,
+    SecretDecryptionError,
+    SecretNotFoundError,
+    SecretRegionError,
+    SecretsError,
+    TrackerServiceError,
+)
+from tracker.aws.secrets import SecretBeingDeletedError
 from tracker.executor.launcher import DefinitiveLaunchFailure
 from tracker.scheduler import service_capacity
 from tracker.runtime.artifacts import copy_agent_to_benchmark as copy_agent_artifact_to_benchmark
@@ -1006,6 +1021,36 @@ class TestTrackerAPI:
         assert response.status_code == 500
         assert json.loads(response.body) == {"detail": "Tracker service operation failed"}
         assert sensitive_detail in caplog.text
+
+    @pytest.mark.description("Secret handlers preserve safe messages and report only Valkyrie faults to Sentry.")
+    @pytest.mark.parametrize(
+        ("error_type", "status"),
+        [
+            (SecretNotFoundError, 404),
+            (SecretAccessDeniedError, 500),
+            (SecretDecryptionError, 500),
+            (SecretBeingDeletedError, 409),
+            (SecretRegionError, 400),
+        ],
+    )
+    async def test_secret_configuration_handlers(
+        self, monkeypatch: MonkeyPatch, error_type: type[SecretsError], status: int
+    ) -> None:
+        capture = Mock()
+        monkeypatch.setattr("sentry_sdk.capture_exception", capture)
+        error = error_type("Actionable configuration fix.")
+        if isinstance(error, SecretNotFoundError):
+            response = await secret_not_found_handler(MagicMock(), error)
+        elif isinstance(error, SecretConfigurationError):
+            response = await secret_configuration_handler(MagicMock(), error)
+        else:
+            response = await tracker_service_error_handler(MagicMock(), error)
+        assert response.status_code == status
+        assert json.loads(response.body) == {"detail": "Actionable configuration fix."}
+        if status == 500:
+            capture.assert_called_once_with(error)
+        else:
+            capture.assert_not_called()
 
     @pytest.mark.description("A failed upstream benchmark service request is a bad gateway, not a Tracker error.")
     async def test_benchmark_service_error_returns_bad_gateway(self, monkeypatch: MonkeyPatch) -> None:

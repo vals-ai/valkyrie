@@ -1,57 +1,31 @@
 from collections.abc import Iterator
-from datetime import UTC, datetime
-from hashlib import sha256
 from itertools import count
-import json
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 import httpx
 from fastapi import Depends
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from tracker.clients.projects import ProjectServiceUnavailableError, project_service
 from tracker.database.session import get_session
-from tracker.database.models import Benchmark, Project, ProjectBackfill, ProjectCutover, RunProject, SpendType
+from tracker.database.models import Benchmark, Project, RunProject, SpendType
 from tracker.logging import get_logger
-from tracker.exceptions import ProjectHandleTakenError, ProjectMigrationConflictError, ProjectNameTakenError
+from tracker.exceptions import (
+    ProjectHandleTakenError,
+    ProjectLimitRequestDecidedError,
+    ProjectLimitRequestNotFoundError,
+    ProjectNameTakenError,
+    ProjectNotFoundError,
+)
 from tracker.repositories.advisory_lock import advisory_lock_key
+from tracker.types import ProjectLimit
 
 
 DEFAULT_PROJECT_HANDLE = "default"
 DEFAULT_PROJECT_NAME = "Default"
 logger = get_logger(__name__)
-PROJECT_COPY_FIELDS = {
-    "id",
-    "org_id",
-    "handle",
-    "name",
-    "spend_type",
-    "subcategory",
-    "customer",
-    "extra_tags",
-    "gateway_request_id",
-    "gateway_key_id",
-    "created_at",
-    "created_by_email",
-    "archived_at",
-}
-
-
-def _project_values(project: Project) -> dict[str, object]:
-    values = project.model_dump(mode="json", include=PROJECT_COPY_FIELDS)
-    for field in ("created_at", "archived_at"):
-        value = getattr(project, field)
-        if isinstance(value, datetime):
-            values[field] = (value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)).isoformat()
-
-    return values
-
-
-def project_hash(project: Project) -> str:
-    return sha256(json.dumps(_project_values(project), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _default_names() -> Iterator[str]:
@@ -135,6 +109,12 @@ class ProjectRepository:
         rows = self._service.list_rows(org_id, include_archived=True)
         return next((row for row in rows if row.handle == handle), None)
 
+    def resolve(self, org_id: UUID, handle: str) -> Project:
+        project = self.get(org_id, handle)
+        if project is None:
+            raise ProjectNotFoundError(handle)
+        return project
+
     def get_by_id(self, org_id: UUID, project_id: UUID) -> Project | None:
         return self._service.get(org_id, project_id)
 
@@ -152,15 +132,32 @@ class ProjectRepository:
                 {"key": advisory_lock_key(f"project-gateway-key:{project_id}")},
             )
 
-    def set_gateway_key(self, project: Project, key_id: UUID) -> UUID:
-        try:
-            return self._service.set_gateway_key(project.org_id, project.id, key_id)
-        except httpx.HTTPError as error:
-            raise ProjectServiceUnavailableError() from error
-
     def set_gateway_request(self, project: Project, request_id: UUID) -> None:
         try:
             project.gateway_request_id = self._service.set_gateway_request(project.org_id, project.id, request_id)
+        except httpx.HTTPError as error:
+            raise ProjectServiceUnavailableError() from error
+
+    def set_limit(self, project: Project, limit: ProjectLimit) -> None:
+        try:
+            self._service.set_limit(project.org_id, project.id, limit)
+        except httpx.HTTPError as error:
+            raise ProjectServiceUnavailableError() from error
+
+    def limit_requests(self, project: Project, method: str, path: str = "", body: object = None) -> Any:
+        response = self._service.limit_requests(project, method, path, body)
+        if response.status_code == 404:
+            raise ProjectLimitRequestNotFoundError(response.json()["detail"])
+        if response.status_code == 409:
+            raise ProjectLimitRequestDecidedError(response.json()["detail"])
+        try:
+            return response.raise_for_status().json()
+        except httpx.HTTPError as error:
+            raise ProjectServiceUnavailableError() from error
+
+    def limit_request_queue(self, status: str | None) -> Any:
+        try:
+            return self._service.limit_request_queue(status).raise_for_status().json()
         except httpx.HTTPError as error:
             raise ProjectServiceUnavailableError() from error
 
@@ -190,160 +187,15 @@ class ProjectRepository:
             raise LookupError(f"Project {project_id} is not in the project service")
         return project
 
-    def list_all(self, org_id: UUID, include_archived: bool = False, include_deleted: bool = False) -> list[Project]:
-        return self._service.list_rows(org_id, include_archived, include_deleted)
-
-    def list_every(self) -> list[Project]:
-        query = select(Project).order_by(col(Project.org_id), col(Project.handle))
-        return list(self._session.exec(query).all())
-
-    def backfill(self, *, reconcile: bool = False) -> tuple[int, int]:
-        existing: dict[UUID, set[UUID]] = {}
-        baselines = {row.project_id: row for row in self._session.exec(select(ProjectBackfill)).all()}
-        projects = self.list_every()
-        source_ids = {project.id for project in projects}
-        copied = 0
-        skipped = 0
-        for project in projects:
-            baseline = baselines.get(project.id)
-            if not reconcile and baseline is not None and baseline.confirmed:
-                skipped += 1
-                continue
-            source_hash = project_hash(project)
-            concurrent_insert = False
-            if project.org_id not in existing:
-                existing[project.org_id] = {
-                    row.id
-                    for row in self._service.list_rows(project.org_id, include_archived=True, include_deleted=True)
-                }
-            if project.id not in existing[project.org_id]:
-                if project.id not in baselines:
-                    baselines[project.id] = self._record_baseline(project, source_hash)
-                if self._service.create(project) is not None:
-                    existing[project.org_id].add(project.id)
-                    baselines[project.id] = self._record_baseline(project, source_hash, refresh=True, confirmed=True)
-                    copied += 1
-                    continue
-                concurrent_insert = True
-                existing[project.org_id] = {
-                    row.id
-                    for row in self._service.list_rows(project.org_id, include_archived=True, include_deleted=True)
-                }
-                if project.id not in existing[project.org_id]:
-                    if reconcile:
-                        self._migration_conflict(
-                            project.id, "conflicts with a different project in the project service"
-                        )
-                    logger.warning(
-                        "Project %s conflicts with a different service project, skipping startup copy", project.id
-                    )
-                    skipped += 1
-                    continue
-            baseline = baselines.get(project.id)
-            if (
-                baseline is not None
-                and baseline.confirmed
-                and not concurrent_insert
-                and (not reconcile or source_hash == baseline.source_hash)
-            ):
-                skipped += 1
-                continue
-            current = self._service.get(project.org_id, project.id)
-            if baseline is None:
-                if current is not None and project_hash(current) == source_hash:
-                    baselines[project.id] = self._record_baseline(project, source_hash, confirmed=True)
-                else:
-                    logger.warning(
-                        "Project %s has pre-existing service divergence and no backfill baseline", project.id
-                    )
-                skipped += 1
-                continue
-            if current is not None and project_hash(current) == source_hash:
-                if concurrent_insert or not baseline.confirmed:
-                    skipped += 1
-                baselines[project.id] = self._record_baseline(project, source_hash, refresh=True, confirmed=True)
-                logger.info("Recorded already-applied legacy edit for project %s", project.id)
-                continue
-            if not reconcile:
-                logger.warning("Project %s has service divergence and retains its backfill baseline", project.id)
-                skipped += 1
-                continue
-            if current is None:
-                fields = ["deleted_at"]
-            else:
-                source = _project_values(project)
-                service = _project_values(current)
-                fields = sorted(field for field in PROJECT_COPY_FIELDS if source[field] != service[field])
-            self._migration_conflict(
-                project.id, f"requires manual reconciliation of a legacy edit; differing fields: {', '.join(fields)}"
-            )
-        if reconcile:
-            for project_id, baseline in baselines.items():
-                if project_id in source_ids:
-                    continue
-                current = self._service.get(baseline.org_id, project_id)
-                if current is None:
-                    skipped += 1
-                    continue
-                self._migration_conflict(
-                    project_id, "requires manual reconciliation of a legacy deletion; differing fields: deleted_at"
-                )
-        return copied, skipped
-
-    def finish_startup_backfill(self) -> None:
-        project_id = self._session.exec(
-            select(Project.id)
-            .outerjoin(ProjectBackfill, col(Project.id) == col(ProjectBackfill.project_id))
-            .where(col(ProjectBackfill.confirmed).is_not(True))
-            .limit(1)
-        ).first()
-        if project_id is None:
-            return
-        if self._session.get(ProjectCutover, 1) is not None:
-            logger.warning("Project %s remains unconfirmed after completed project cutover", project_id)
-            return
-        self._migration_conflict(project_id, "has no confirmed project service backfill baseline")
-
-    def complete_cutover(self) -> None:
-        if self._session.get(ProjectCutover, 1) is not None:
-            return
-        self._session.add(ProjectCutover())
-        try:
-            self._session.commit()
-        except IntegrityError:
-            self._session.rollback()
-            if self._session.get(ProjectCutover, 1) is None:
-                raise
-
-    def _record_baseline(
-        self, project: Project, source_hash: str, *, refresh: bool = False, confirmed: bool = False
-    ) -> ProjectBackfill:
-        baseline = self._session.get(ProjectBackfill, project.id)
-        if baseline is not None and not refresh:
-            return baseline
-        if baseline is None:
-            baseline = ProjectBackfill(
-                project_id=project.id, org_id=project.org_id, source_hash=source_hash, confirmed=confirmed
-            )
-        else:
-            baseline.source_hash = source_hash
-            baseline.confirmed = confirmed
-            baseline.copied_at = datetime.now(UTC)
-        self._session.add(baseline)
-        try:
-            self._session.commit()
-        except IntegrityError:
-            self._session.rollback()
-            saved = self._session.get(ProjectBackfill, project.id)
-            if saved is None:
-                raise
-            return saved
-        return baseline
-
-    def _migration_conflict(self, project_id: UUID, reason: str) -> None:
-        message = f"Project {project_id} {reason}"
-        logger.error(message)
-        raise ProjectMigrationConflictError(message)
+    def list_all(
+        self,
+        org_id: UUID,
+        include_archived: bool = False,
+        include_deleted: bool = False,
+        *,
+        timeout: httpx.Timeout | None = None,
+    ) -> list[Project]:
+        return self._service.list_rows(org_id, include_archived, include_deleted, timeout)
 
 
 ProjectRepositoryDependency = Annotated[ProjectRepository, Depends(ProjectRepository)]
