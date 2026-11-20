@@ -41,12 +41,14 @@ from tracker.database.models import (
     ErrorResult,
     Org,
     Project,
+    RunCostReportToken,
     RunProject,
     Task,
 )
 from tracker.database.models import FinalEvaluation
 from tracker.domain import SpendType, TaskStatus
 from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus
+from tracker.services.cost_reports import COST_REPORT_TOKEN_HEADER, cost_report_token_hash
 from tracker.services.runs.limits import OrgRunLimitsCache
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
 from tracker.aws.secrets import SecretsManagerStore
@@ -630,7 +632,13 @@ def test_regrade_copies_saved_states_into_a_new_run(
     sealed = control_postgres_session.get(ExecutorDispatchPayload, dispatch.id)
     assert sealed is not None
     payload = open_payload(dispatch.id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
-    assert payload["execution_context_json"]["start_benchmark_request"]["service_headers"] == service_headers
+    sent_headers = payload["execution_context_json"]["start_benchmark_request"]["service_headers"]
+    token = sent_headers.pop(COST_REPORT_TOKEN_HEADER)
+    assert sent_headers == service_headers
+    stored_tokens = control_postgres_session.exec(
+        select(RunCostReportToken.benchmark_id).where(RunCostReportToken.token_hash == cost_report_token_hash(token))
+    ).all()
+    assert stored_tokens == [run.id]
     tasks = control_postgres_session.exec(
         select(Task).where(Task.benchmark == run.id).order_by(col(Task.task_id))
     ).all()

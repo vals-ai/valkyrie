@@ -13,7 +13,7 @@ import tracker.repositories.project as project_repository
 from main import app
 from tests.project_service import MockProjectRoutes
 from tests.utils import TEST_ORG_ID
-from tracker.auth import get_current_runner
+from tracker.auth import get_current_org, get_current_runner
 from tracker.clients.projects import ProjectServiceClient
 from tracker.database.models import Org, Project, SpendType
 from tracker.exceptions import ProjectLimitRequestDecidedError, ProjectLimitRequestNotFoundError
@@ -72,7 +72,10 @@ def descope(monkeypatch: MonkeyPatch) -> MagicMock:
     monkeypatch.setattr(tracker_auth, "DESCOPE_MANAGEMENT_KEY", "management-key")
     monkeypatch.setattr(tracker_auth, "_validate_bearer", _claims)
     descope = MagicMock()
-    user = {"userId": "U-alice", "email": "alice@vals.ai", "verifiedEmail": True, "permissions": []}
+    user = {"userId": "U-alice", "email": "alice@vals.ai", "verifiedEmail": True, "roleNames": []}
+    descope.mgmt.role.load_all.return_value = {
+        "roles": [{"name": "platform-operator", "permissionNames": ["platform-admin"]}]
+    }
     descope.mgmt.user.load_by_user_id.return_value = {"user": user | {"userTenants": [{"tenantId": "default"}]}}
     monkeypatch.setattr(tracker_auth, "_descope_client", descope)
     monkeypatch.setattr(tracker_auth, "_descope_user_client", descope)
@@ -87,7 +90,7 @@ def project(project_service: MockProjectRoutes) -> Project:
 
 
 def _make_platform_admin(descope: MagicMock) -> None:
-    descope.mgmt.user.load_by_user_id.return_value["user"]["permissions"] = ["platform-admin"]
+    descope.mgmt.user.load_by_user_id.return_value["user"]["roleNames"] = ["platform-operator"]
 
 
 def _decide(project: Project, action: str) -> httpx.Response:
@@ -297,3 +300,258 @@ def test_a_platform_admin_lists_another_orgs_raises(
 
     assert response.status_code == 200, response.text
     assert [item["id"] for item in response.json()] == [RECORD["id"]]
+
+
+DASHBOARD_TENANT = HUMAN | {"x-valkyrie-tenant": str(TEST_ORG_ID)}
+
+
+def _admin_claims(token: str) -> dict[str, object]:
+    return _claims(token) | {"permissions": ["platform-admin"]}
+
+
+@pytest.mark.parametrize("tenants", [[], [{"tenantId": "default"}, {"tenantId": "other-org"}]])
+@pytest.mark.parametrize("method", ["GET", "POST", "approve"])
+@pytest.mark.description("A platform admin with no selected organization gets 400 without forwarding a limit request.")
+def test_platform_admin_needs_a_selected_org(
+    database_session: Session,
+    project: Project,
+    descope: MagicMock,
+    limit_requests: LimitRequestRoutes,
+    tenants: list[dict[str, str]],
+    method: str,
+) -> None:
+    _make_platform_admin(descope)
+    descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = tenants
+    path = f"/projects/by-id/{project.id}/limit-requests"
+
+    response = (
+        _decide(project, method)
+        if method == "approve"
+        else client.request(method, path, json=RAISE if method == "POST" else None, headers=HUMAN)
+    )
+
+    assert response.status_code == 400, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description("A member lists a project's raises when the Dashboard names the org by its id.")
+def test_a_member_lists_raises_with_the_org_id_as_tenant(
+    database_session: Session, project: Project, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    response = client.get(f"/projects/by-id/{project.id}/limit-requests", headers=DASHBOARD_TENANT)
+
+    assert response.status_code == 200, response.text
+    assert [item["id"] for item in response.json()] == [RECORD["id"]]
+
+
+@pytest.mark.description("A member files a raise when the Dashboard names the org by its id.")
+def test_a_member_files_a_raise_with_the_org_id_as_tenant(
+    database_session: Session,
+    project: Project,
+    descope: MagicMock,
+    limit_requests: LimitRequestRoutes,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(app.dependency_overrides, get_current_org)
+    limit_requests.status = 201
+
+    response = client.post(f"/projects/by-id/{project.id}/limit-requests", json=RAISE, headers=DASHBOARD_TENANT)
+
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.description("A member of another org cannot list this org's raises by its id, and nothing is sent.")
+def test_a_member_of_another_org_cannot_list_raises_by_org_id(
+    database_session: Session, project: Project, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = [{"tenantId": "other-org"}]
+
+    response = client.get(f"/projects/by-id/{project.id}/limit-requests", headers=DASHBOARD_TENANT)
+
+    assert response.status_code == 403, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description(
+    "An old session that still claims platform-admin after its removal is refused, and nothing is sent."
+)
+def test_a_revoked_admins_old_session_is_refused(
+    database_session: Session,
+    project: Project,
+    descope: MagicMock,
+    limit_requests: LimitRequestRoutes,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tracker_auth, "_validate_bearer", _admin_claims)
+    _make_platform_admin(descope)
+    assert client.get("/limit-requests", headers=HUMAN).status_code == 200
+    limit_requests.sent.clear()
+    descope.mgmt.user.load_by_user_id.return_value["user"]["roleNames"] = []
+    descope.mgmt.user.load_by_user_id.return_value["user"]["permissions"] = ["platform-admin"]
+
+    queue = client.get("/limit-requests", headers=HUMAN)
+    decide = client.post(f"/projects/by-id/{project.id}/limit-requests/{uuid4()}/approve", headers=DASHBOARD_TENANT)
+
+    assert queue.status_code == 403, queue.text
+    assert decide.status_code == 403, decide.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.parametrize("tenant_role", [False, True])
+@pytest.mark.description("Tenant roles and roles without the project permission cannot grant platform administration.")
+def test_only_project_role_permissions_grant_platform_admin(
+    database_session: Session, descope: MagicMock, limit_requests: LimitRequestRoutes, tenant_role: bool
+) -> None:
+    _make_platform_admin(descope)
+    if tenant_role:
+        descope.mgmt.role.load_all.return_value["roles"][0]["tenantId"] = "default"
+        descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"][0]["roleNames"] = ["platform-operator"]
+    else:
+        descope.mgmt.role.load_all.return_value["roles"][0]["permissionNames"] = []
+
+    response = client.get("/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 403, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.parametrize("tenant_only", [False, True])
+@pytest.mark.description("Only project roles assigned at the project level grant their permissions to a user.")
+def test_unassigned_project_admin_role_does_not_grant_permissions(
+    database_session: Session, descope: MagicMock, limit_requests: LimitRequestRoutes, tenant_only: bool
+) -> None:
+    user = descope.mgmt.user.load_by_user_id.return_value["user"]
+    user["roleNames"] = ["project-reader"]
+    descope.mgmt.role.load_all.return_value["roles"].append({"name": "project-reader", "permissionNames": []})
+    if tenant_only:
+        user["userTenants"][0]["roleNames"] = ["platform-operator"]
+
+    response = client.get("/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 403, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description("An unavailable role service refuses authorization with 503 and sends nothing.")
+def test_role_lookup_failure_refuses_authorization(
+    database_session: Session, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    _make_platform_admin(descope)
+    descope.mgmt.role.load_all.side_effect = httpx.ConnectError("unavailable")
+
+    response = client.get("/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 503, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description(
+    "Project role definitions are reused for five seconds before permission revocation is observed."
+)
+def test_project_role_definitions_cache_expires(
+    database_session: Session, descope: MagicMock, limit_requests: LimitRequestRoutes, monkeypatch: MonkeyPatch
+) -> None:
+    _make_platform_admin(descope)
+    clock = MagicMock()
+    clock.monotonic.return_value = 0.0
+    monkeypatch.setattr(tracker_auth, "time", clock)
+    lookup = descope.mgmt.role.load_all
+
+    assert client.get("/limit-requests", headers=HUMAN).status_code == 200
+    lookup.return_value = {"roles": [{"name": "platform-operator", "permissionNames": []}]}
+    clock.monotonic.return_value = tracker_auth._USER_LOOKUP_CACHE_TTL_SECONDS - 0.001
+    assert client.get("/limit-requests", headers=HUMAN).status_code == 200
+    lookup.assert_called_once_with()
+    limit_requests.sent.clear()
+    clock.monotonic.return_value = tracker_auth._USER_LOOKUP_CACHE_TTL_SECONDS
+
+    response = client.get("/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 403, response.text
+    assert lookup.call_count == 2
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description(
+    "Invalidating a user also reloads project roles so permission changes take effect immediately."
+)
+def test_user_invalidation_clears_project_roles(
+    database_session: Session, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    _make_platform_admin(descope)
+    assert client.get("/limit-requests", headers=HUMAN).status_code == 200
+    descope.mgmt.role.load_all.return_value = {"roles": []}
+    tracker_auth.invalidate_user_cache("U-alice")
+    limit_requests.sent.clear()
+
+    response = client.get("/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 403, response.text
+    assert descope.mgmt.role.load_all.call_count == 2
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description(
+    "A platform admin who is not a member of the org cannot file a raise there, and nothing is sent."
+)
+def test_a_non_member_platform_admin_cannot_file_a_raise(
+    database_session: Session,
+    project: Project,
+    descope: MagicMock,
+    limit_requests: LimitRequestRoutes,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(app.dependency_overrides, get_current_org)
+    _make_platform_admin(descope)
+    descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = [{"tenantId": "other-org"}]
+
+    response = client.post(f"/projects/by-id/{project.id}/limit-requests", json=RAISE, headers=DASHBOARD_TENANT)
+
+    assert response.status_code == 403, response.text
+    assert limit_requests.sent == []
+
+
+@pytest.mark.description("A sole membership named like another org's id is read as a name when no tenant is sent.")
+def test_an_implicit_membership_named_like_an_id_is_read_as_a_name(
+    database_session: Session,
+    project_service: MockProjectRoutes,
+    descope: MagicMock,
+    limit_requests: LimitRequestRoutes,
+) -> None:
+    look_alike = Org(name=str(TEST_ORG_ID))
+    database_session.add(look_alike)
+    database_session.commit()
+    own = Project(org_id=look_alike.id, handle="own-bench", name="Own Bench", spend_type=SpendType.DEVELOPMENT)
+    project_service.seed(own)
+    descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = [{"tenantId": str(TEST_ORG_ID)}]
+
+    response = client.get(f"/projects/by-id/{own.id}/limit-requests", headers=HUMAN)
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.description("A platform admin decides a raise when the Dashboard names the org by its id.")
+def test_a_platform_admin_decides_with_the_org_id_as_tenant(
+    database_session: Session, project: Project, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    _make_platform_admin(descope)
+
+    response = client.post(f"/projects/by-id/{project.id}/limit-requests/{uuid4()}/approve", headers=DASHBOARD_TENANT)
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.description("An org named with another org's id never captures that id, which names its own org.")
+def test_an_org_named_like_another_orgs_id_does_not_capture_it(
+    database_session: Session, project: Project, descope: MagicMock, limit_requests: LimitRequestRoutes
+) -> None:
+    database_session.add(Org(name=str(TEST_ORG_ID)))
+    database_session.commit()
+    member = client.get(f"/projects/by-id/{project.id}/limit-requests", headers=DASHBOARD_TENANT)
+    descope.mgmt.user.load_by_user_id.return_value["user"]["userTenants"] = [{"tenantId": str(TEST_ORG_ID)}]
+
+    impostor = client.get(f"/projects/by-id/{project.id}/limit-requests", headers=DASHBOARD_TENANT)
+
+    assert member.status_code == 200, member.text
+    assert impostor.status_code == 403, impostor.text
+    assert len(limit_requests.sent) == 1

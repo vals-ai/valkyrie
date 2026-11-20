@@ -186,7 +186,13 @@ def _usage_of(record: ModelsSandboxUsage) -> SandboxUsage | None:
     if record.total_price is None or not record.sandbox_id:
         return None
     return SandboxUsage(
-        sandbox_id=record.sandbox_id, total_price=float(record.total_price), last_end=_parse_time(record.last_end)
+        sandbox_id=record.sandbox_id,
+        total_price=float(record.total_price),
+        last_end=_parse_time(record.last_end),
+        cpu_seconds=float(record.total_cpu_seconds or 0),
+        memory_gib_seconds=float(record.total_ramgb_seconds or 0),
+        disk_gib_seconds=float(record.total_disk_gb_seconds or 0),
+        gpu_seconds=float(record.total_gpu_seconds or 0),
     )
 
 
@@ -203,7 +209,13 @@ def _added(earlier: SandboxUsage | None, later: SandboxUsage | None) -> SandboxU
         return None
     last_end = None if earlier.last_end is None or later.last_end is None else max(earlier.last_end, later.last_end)
     return SandboxUsage(
-        sandbox_id=earlier.sandbox_id, total_price=earlier.total_price + later.total_price, last_end=last_end
+        sandbox_id=earlier.sandbox_id,
+        total_price=earlier.total_price + later.total_price,
+        last_end=last_end,
+        cpu_seconds=earlier.cpu_seconds + later.cpu_seconds,
+        memory_gib_seconds=earlier.memory_gib_seconds + later.memory_gib_seconds,
+        disk_gib_seconds=earlier.disk_gib_seconds + later.disk_gib_seconds,
+        gpu_seconds=earlier.gpu_seconds + later.gpu_seconds,
     )
 
 

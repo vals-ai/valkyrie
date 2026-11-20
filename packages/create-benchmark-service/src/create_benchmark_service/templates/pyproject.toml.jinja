@@ -1,0 +1,58 @@
+[project]
+name = "{{ benchmark_name }}-benchmark-service"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "create-benchmark-service @ {{ framework_source }}",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.38.0",
+    "ruff>=0.14.10",
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# A freshly scaffolded project has no git tags (or no repo yet); fall back so it
+# still builds. Real versions come from tags once the repo is set up.
+fallback-version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{{ benchmark_package }}"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.basedpyright]
+venvPath="."
+venv=".venv"
+typeCheckingMode = "strict"
+reportExplicitAny = false
+reportAny = false
+reportMissingTypeStubs = false
+enableTypeIgnoreComments = true
+exclude = [".*"]
+
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { certifi = false }

@@ -36,6 +36,7 @@ from tracker.executor.control_protocol import DispatchRef
 from tracker.exceptions import (
     SandboxError,
     SandboxSetupError,
+    ModelGatewayConfigurationError,
     SecretAccessDeniedError,
     SecretConfigurationError,
     SecretDecryptionError,
@@ -55,23 +56,24 @@ BeforeSend = Callable[[Event, Hint], Event | None]
 BeforeSendLog = Callable[[Log, Hint], Log | None]
 
 
-@pytest.mark.description("Secret configuration failures skip Sentry while unexpected secret faults remain reportable.")
+@pytest.mark.description("User configuration failures skip Sentry while unexpected secret faults remain reportable.")
 @pytest.mark.parametrize(
     "error",
     [
         SecretNotFoundError("missing"),
         SecretConfigurationError("bad config"),
+        ModelGatewayConfigurationError("Unknown model(s): invalid-model"),
         SecretsError("fault"),
         SecretAccessDeniedError("denied"),
         SecretDecryptionError("decrypt"),
     ],
 )
-def test_secret_error_sentry_policy(error: SecretsError, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_secret_error_sentry_policy(error: Exception, monkeypatch: pytest.MonkeyPatch) -> None:
     capture = Mock()
     monkeypatch.setattr(sentry_sdk, "capture_exception", capture)
     sentry_module.capture_exception(error)
     event = _before_send()({}, {"exc_info": (type(error), error, None)})
-    if isinstance(error, SecretConfigurationError):
+    if isinstance(error, (SecretConfigurationError, ModelGatewayConfigurationError)):
         capture.assert_not_called()
         assert event is None
     else:

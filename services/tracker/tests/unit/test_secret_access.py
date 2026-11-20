@@ -31,6 +31,21 @@ _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
 _OTHER_ORG_ID = UUID("00000000-0000-0000-0000-000000000002")
 
 
+@pytest.mark.description("A confirmed missing tenant secret stays missing when shared fallback is missing or denied.")
+@pytest.mark.parametrize("shared_error", [SecretNotFoundError, SecretAccessDeniedError])
+async def test_missing_tenant_precedes_shared_failure(shared_error: type[SecretsError]) -> None:
+    source = AsyncMock()
+    missing = SecretNotFoundError("Secret 'TOKEN' is not set for your organization. Run `valkyrie secret set TOKEN`.")
+    source.get.side_effect = [missing, shared_error("Shared lookup failed.")]
+    store = OrgSecretStore(source, ["TOKEN"], org_id=_ORG_ID, org_name="internal.example", auth_required=True)
+
+    with pytest.raises(SecretNotFoundError) as captured:
+        await store.get("TOKEN")
+
+    assert captured.value is missing
+    assert "Shared lookup failed" not in str(captured.value)
+
+
 @pytest.mark.description(
     "Organization secret reads fall back on missing or denied tenant secrets but not decryption faults."
 )

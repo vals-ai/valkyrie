@@ -396,3 +396,48 @@ class TestGatewayClient:
         ] == [("gateway.test", "Bearer machine-key", "bench")]
         assert _limits() == [(Decimal(80), None)]
         assert "Gateway budget push failed" in caplog.text
+
+
+class TestGetLimit:
+    @pytest.mark.description("A project with no limit returns null rather than 404.")
+    def test_no_limit_is_null(self, client: TestClient) -> None:
+        project_id = _project(client)
+        response = client.get(f"/orgs/{ORG}/projects/{project_id}/limit", headers=TOKEN)
+
+        assert response.status_code == 200
+        assert response.json() == {"limit_dollars": None, "reason": None, "applied": False, "updated_at": None}
+
+    @pytest.mark.description("The limit reads back unapplied until the Gateway accepts it.")
+    def test_reads_the_limit_and_whether_the_gateway_applied_it(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gateway, "put_project_budget", _refuses)
+        project_id = _project(client)
+        assert (
+            client.put(
+                f"/orgs/{ORG}/projects/{project_id}/limit",
+                json={"limit_dollars": "80", "reason": "full rerun"},
+                headers=TOKEN,
+            ).status_code
+            == 200
+        )
+        pending = client.get(f"/orgs/{ORG}/projects/{project_id}/limit", headers=TOKEN).json()
+        monkeypatch.setattr(gateway, "put_project_budget", _accepts)
+        gateway.push_budgets(app.state.bound)
+        applied = client.get(f"/orgs/{ORG}/projects/{project_id}/limit", headers=TOKEN).json()
+
+        assert (Decimal(pending["limit_dollars"]), pending["reason"], pending["applied"]) == (
+            Decimal(80),
+            "full rerun",
+            False,
+        )
+        assert applied["applied"] is True
+        assert applied["updated_at"] is not None
+
+    @pytest.mark.description("Another org's project and a missing token are refused.")
+    def test_refuses_other_orgs_and_missing_tokens(self, client: TestClient) -> None:
+        project_id = _project(client)
+        other = UUID("00000000-0000-0000-0000-0000000000b2")
+
+        assert client.get(f"/orgs/{other}/projects/{project_id}/limit", headers=TOKEN).status_code == 404
+        assert client.get(f"/orgs/{ORG}/projects/{project_id}/limit").status_code == 401

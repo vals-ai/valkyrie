@@ -78,6 +78,7 @@ from tracker.repositories.sandbox_build_reservation import SandboxBuildReservati
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
+from tracker.runtime.run_egress import ScopedGateway
 from tracker.runtime.services import RuntimeServices
 from tracker.database.models import (
     Benchmark,
@@ -116,7 +117,9 @@ from tracker.executor.control_queue import (
 )
 from tracker.executor.release_control import promote_release
 import tracker.remote_grader as remote_grader
-import tracker.runtime.model_gateway as model_gateway
+import tracker.services.gateway.tokens as tokens
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.clients.model_gateway import tenant
 import tracker.scheduler.admission as admission
 import tracker.scheduler.coordinator as coordinator
 import tracker.scheduler.store as store
@@ -1698,7 +1701,7 @@ async def test_resumed_evaluation_persists_callback_before_result(
         )
         service.grading_requirements.return_value = ["openai/gpt-5"]
         monkeypatch.setattr(
-            model_gateway,
+            tenant,
             "_client",
             httpx.AsyncClient(
                 transport=httpx.MockTransport(
@@ -4084,6 +4087,7 @@ async def test_control_remote_grader_grant_assignment_and_project(
     "grading_path",
     [
         "project",
+        "dataset",
         "remote-direct",
         "remote-queued",
         "old-service",
@@ -4189,7 +4193,7 @@ async def test_evaluation_uses_saved_project_grading_root(
             )
         return httpx.Response(200)
 
-    monkeypatch.setattr(model_gateway, "_client", httpx.AsyncClient(transport=httpx.MockTransport(gateway)))
+    monkeypatch.setattr(tenant, "_client", httpx.AsyncClient(transport=httpx.MockTransport(gateway)))
     monkeypatch.setattr(task_execution, "resolve_secrets", resolve)
     if remote:
         monkeypatch.setattr(remote_grader, "Session", Mock(side_effect=AssertionError("executor DB unavailable")))
@@ -4212,7 +4216,7 @@ async def test_evaluation_uses_saved_project_grading_root(
     monkeypatch.setattr(task_execution, "upload_agent_artifacts", AsyncMock())
     monkeypatch.setattr(task_execution, "install_agent_dependencies", AsyncMock())
     monkeypatch.setattr(task_execution, "run_agent", AsyncMock(side_effect=_run_agent_success))
-    service = AsyncMock(spec=BenchmarkServiceClient)
+    service = AsyncMock(spec=DatasetTaskService if grading_path == "dataset" else BenchmarkServiceClient)
     _use_real_sandbox_recovery(service)
     service.retrieve_task.return_value = RetrieveTaskResponse(
         source=_SOURCE, resources=_RESOURCES, problem_path="/tmp/problem.txt", cwd="/testbed"
@@ -4273,7 +4277,11 @@ async def test_evaluation_uses_saved_project_grading_root(
     assert result == {"task_0": {"score": 1.0}}
     assert _task(postgres_engine, task).status == TaskStatus.FINISHED
     evaluation = service.evaluate_instance.await_args
-    assert evaluation.kwargs["grading_token"] == ("grading-child" if grading_path == "project" else None)
+    if grading_path == "dataset":
+        assert evaluation.kwargs["grading_gateway"] == ScopedGateway("https://gateway.test", "grading-child")
+        assert "grading_token" not in evaluation.kwargs
+    else:
+        assert evaluation.kwargs["grading_token"] == ("grading-child" if grading_path == "project" else None)
     if remote:
         assert events.index("create") < events.index("setup") < events.index("evaluate")
         service.setup_task.assert_awaited_once()
@@ -4305,7 +4313,7 @@ async def test_evaluation_uses_saved_project_grading_root(
         else:
             service.grading_requirements_response.assert_not_awaited()
             service.grading_requirements.assert_awaited_once_with("task_0", dataset=None)
-    if grading_path == "project":
+    if grading_path in {"project", "dataset"}:
         assert gateway_calls == [
             (
                 "/service-auth",
@@ -4317,7 +4325,7 @@ async def test_evaluation_uses_saved_project_grading_root(
                     "allowed_operations": ["query", "tokens_count"],
                     "identity": {"benchmark_name": benchmark.name, "agent_name": "grader"},
                     "egress": "*",
-                    "ttl_seconds": model_gateway.GATEWAY_TOKEN_TTL_SECONDS,
+                    "ttl_seconds": tokens.GATEWAY_TOKEN_TTL_SECONDS,
                 },
                 "Bearer saved-project-root",
             ),

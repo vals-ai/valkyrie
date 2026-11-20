@@ -116,25 +116,25 @@ async def test_running_sighting_bounds_the_bill(database_session: Session) -> No
 @pytest.mark.description(
     "A sighting saved after a sandbox was priced raises its bill to that sighting on the next sweep."
 )
-async def test_later_sighting_reprices_the_bill(database_session: Session) -> None:
-    _link(database_session, "sb-verifier")
+async def test_later_sighting_reprices_the_bill(control_postgres_session: Session) -> None:
+    _link(control_postgres_session, "sb-verifier")
     sandbox = _sandbox(ended=True)
 
     @asynccontextmanager
     async def open_provider(org: Org, provider: str, secret_name: str) -> AsyncIterator[Mock]:
         yield Mock(get_sandbox=AsyncMock(return_value=sandbox))
 
-    bind = database_session.get_bind()
+    bind = control_postgres_session.get_bind()
     assert await sweep_priced_sandbox_costs(bind, now=NOW, providers=[PROVIDER], open_provider=open_provider) == 1
-    benchmark_id = database_session.exec(select(Benchmark.id)).one()
-    BenchmarkRepository(database_session).record_sandbox_link(PROVIDER, "sb-verifier", benchmark_id, NOW)
-    database_session.commit()
+    benchmark_id = control_postgres_session.exec(select(Benchmark.id)).one()
+    BenchmarkRepository(control_postgres_session).record_sandbox_link(PROVIDER, "sb-verifier", benchmark_id, NOW)
+    control_postgres_session.commit()
     sandbox.cost_usd.return_value = 2 * COST
 
     assert await sweep_priced_sandbox_costs(bind, now=NOW, providers=[PROVIDER], open_provider=open_provider) == 1
     assert await sweep_priced_sandbox_costs(bind, now=NOW, providers=[PROVIDER], open_provider=open_provider) == 0
-    database_session.expire_all()
-    row = database_session.exec(select(RunCost)).one()
+    control_postgres_session.expire_all()
+    row = control_postgres_session.exec(select(RunCost)).one()
     assert (row.amount_usd, _utc(row.usage_end)) == (pytest.approx(2 * COST), NOW)
 
 
@@ -182,6 +182,20 @@ def test_recording_a_link_moves_last_seen_forward(database_session: Session) -> 
     repository.record_sandbox_link(PROVIDER, "sb-new", benchmark_id, LAST_SEEN)
     database_session.commit()
     assert _last_seen(database_session, "sb-new") == NOW
+
+
+@pytest.mark.description("A sandbox linked without an attempt takes the first attempt a later link gives and keeps it.")
+def test_a_later_link_fills_a_missing_attempt(database_session: Session) -> None:
+    _link(database_session)
+    benchmark_id = database_session.exec(select(Benchmark.id)).one()
+    repository = BenchmarkRepository(database_session)
+
+    for attempt_id in (None, "attempt-1", "attempt-2"):
+        repository.record_sandbox_link(PROVIDER, "sb-new", benchmark_id, NOW, attempt_id)
+    database_session.commit()
+
+    attempt = database_session.exec(select(SandboxRecord.attempt_id).where(SandboxRecord.sandbox_id == "sb-new")).one()
+    assert attempt == "attempt-1"
 
 
 @pytest.mark.description(

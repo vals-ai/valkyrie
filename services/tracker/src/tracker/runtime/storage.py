@@ -18,6 +18,13 @@ class StoredObjectCopy:
     deletion_token: str | None
 
 
+@dataclass(frozen=True)
+class UploadForm:
+    url: str
+    fields: dict[str, str]
+    expires_in: int
+
+
 class ObjectStore(Protocol):
     async def put_bytes(self, key: str, content: bytes) -> None:
         raise NotImplementedError  # pragma: no cover
@@ -33,6 +40,9 @@ class ObjectStore(Protocol):
         raise NotImplementedError  # pragma: no cover
 
     async def get_bytes(self, key: str) -> bytes:
+        raise NotImplementedError  # pragma: no cover
+
+    async def get_range(self, key: str, start: int, length: int) -> bytes:
         raise NotImplementedError  # pragma: no cover
 
     def get_stream(self, key: str) -> AsyncIterator[bytes]:
@@ -62,6 +72,9 @@ class ObjectStore(Protocol):
         raise NotImplementedError  # pragma: no cover
 
     async def temporary_download_url(self, key: str, *, expires_in: int) -> str | None:
+        raise NotImplementedError  # pragma: no cover
+
+    async def temporary_upload_form(self, key: str, *, size: int, sha256: str, expires_in: int) -> UploadForm | None:
         raise NotImplementedError  # pragma: no cover
 
 

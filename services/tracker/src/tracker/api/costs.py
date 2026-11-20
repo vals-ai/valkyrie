@@ -14,6 +14,7 @@ from tracker.api.projects import PROJECT_NOT_FOUND
 from tracker.auth import get_current_org
 from tracker.database.models import Org
 from tracker.database.session import database_call
+from tracker.domain import SandboxResource
 from tracker.exceptions import GatewayUnavailableError
 from tracker.logging import get_logger
 from tracker.repositories.cost import DAYTONA_PROVIDER, CostRepositoryDependency
@@ -361,6 +362,7 @@ SANDBOX_ROWS_MAX_PAGE_SIZE = 20_000
 
 class SandboxCostEntry(BaseModel):
     source_id: str | None
+    resource: SandboxResource | None
     kind: SandboxRowKind
     placed_at: datetime
     amount_usd: float
@@ -428,6 +430,7 @@ def get_sandbox_cost_rows(
         rows=[
             SandboxCostEntry(
                 source_id=row.source_id,
+                resource=row.resource,
                 kind=SandboxRowKind.HOURLY if row.hourly else SandboxRowKind.LIFETIME,
                 placed_at=as_utc(row.placed_at),
                 amount_usd=row.amount_usd,

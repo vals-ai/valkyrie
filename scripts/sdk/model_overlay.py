@@ -137,6 +137,15 @@ MODELS: dict[str, ModelOverlay] = {
         "doc": "A project's model spend per UTC month, with its key's spend on no project's run.",
         "fields": {"start": {**DATETIME}, "end": {**DATETIME}, "through": {**DATETIME}},
     },
+    "RunResourceCost": {
+        "module": "costs",
+        "doc": "A run's spend of one cost type with one provider, resource and unit, with the summed quantity.",
+    },
+    "RunCosts": {
+        "module": "costs",
+        "doc": "A run's spend in total, per cost type and per resource.",
+        "fields": {"model_through": {**DATETIME}},
+    },
     "DatasetTaskResponse": {
         "module": "datasets",
         "doc": "One task of a dataset version, with the digest of its files and the size of its archive.",
@@ -259,6 +268,11 @@ MODELS: dict[str, ModelOverlay] = {
         "fields": {"extra_tags": {"default": {}}, "created_at": {**DATETIME}, "archived_at": {**DATETIME}},
     },
     "ProjectsResponse": {"module": "projects", "doc": "The organization's projects, by handle."},
+    "ProjectBudget": {
+        "module": "projects",
+        "doc": "A project's limit and its all-time spend in total and per cost type.",
+        "fields": {"model_through": {**DATETIME}},
+    },
     "SpendType": {"module": "projects", "doc": "Why a run spends money."},
     "AWSBenchmarkArguments": {
         "module": "runs",

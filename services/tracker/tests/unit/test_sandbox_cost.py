@@ -26,9 +26,10 @@ import tracker.sandbox as sandbox_module
 import tracker.sandbox_cost as sandbox_cost
 from tests.factories import make_benchmark, make_task
 from tests.utils import TEST_ORG_ID
-from tracker.repositories.cost import CostRepository
+from tracker.repositories.cost import CostRepository, daytona_resource_costs
 from tracker.search_cost import SearchCharge
 from tracker.aws.runtime import AWSResources
+from daytona_analytics_api_client_async.models.models_sandbox_usage import ModelsSandboxUsage
 from tracker.database.models import (
     Benchmark,
     Org,
@@ -801,17 +802,17 @@ class TestReadDaytonaUsage:
 
         async def read_page(
             _usage_api: object, organization_id: str, start: datetime, end: datetime, offset: int
-        ) -> list[SimpleNamespace]:
+        ) -> list[ModelsSandboxUsage]:
             requests.append((organization_id, start, end, offset))
             return [
-                SimpleNamespace(
+                ModelsSandboxUsage(
                     sandbox_id="sb-1",
                     total_price=0.25,
                     first_start="2026-10-21T19:30:26Z",
                     last_end="2026-10-21T19:31:00Z",
                 ),
-                SimpleNamespace(sandbox_id="", total_price=9.0, first_start=None, last_end=None),
-                SimpleNamespace(sandbox_id="sb-2", total_price=None, first_start=None, last_end=None),
+                ModelsSandboxUsage(sandbox_id="", total_price=9.0, first_start=None, last_end=None),
+                ModelsSandboxUsage(sandbox_id="sb-2", total_price=None, first_start=None, last_end=None),
             ]
 
         monkeypatch.setattr(sandbox_cost, "_account_provider_config", provider_config)
@@ -864,7 +865,7 @@ class FakeDaytona:
 
     async def read_page(
         self, _usage_api: object, _organization_id: str, start: datetime, end: datetime, offset: int
-    ) -> list[SimpleNamespace]:
+    ) -> list[ModelsSandboxUsage]:
         self.listing_reads.append((start, end))
         self.offsets.append(offset)
         self.in_flight += 1
@@ -889,7 +890,7 @@ class FakeDaytona:
             priced = self.listed(start, end)
             ranked = sorted(priced, key=lambda sandbox_id: (-priced[sandbox_id], sandbox_id))
             return [
-                SimpleNamespace(
+                ModelsSandboxUsage(
                     sandbox_id=sandbox_id,
                     total_price=None
                     if self.unpriced_after is not None and start >= self.unpriced_after
@@ -1820,3 +1821,22 @@ class TestAutomaticSandboxCost:
         thread.stop()
 
         assert leader.acquires == 1
+
+
+@pytest.mark.description(
+    "A Daytona GPU sandbox priced below its CPU, memory and disk list rates gets a $0 GPU line, and its lines still sum to the price."
+)
+def test_gpu_line_never_goes_negative() -> None:
+    usage = SandboxUsage(
+        sandbox_id="sb-gpu",
+        total_price=0.01,
+        last_end=None,
+        cpu_seconds=3600,
+        memory_gib_seconds=3600,
+        gpu_seconds=3600,
+    )
+
+    costs = daytona_resource_costs(usage)
+
+    assert costs["gpu"] == (3600, 0.0)
+    assert math.isclose(sum(amount for _, amount in costs.values()), 0.01)

@@ -19,6 +19,7 @@ from tracker.database.models import (
     RunCost,
     SandboxRecord,
 )
+from tracker.domain import SandboxResource
 from tracker.modal_cost import modal_usage_window, read_modal_run_cost, sweep_modal_costs
 from tracker.repositories.advisory_lock import PostgresAdvisoryLock
 from tracker.repositories.cost import MODAL_PROVIDER, CostRepository
@@ -93,9 +94,11 @@ class TestSweepModalCosts:
         run = _modal_run(database_session, finished=NOW - timedelta(hours=2, minutes=30))
         windows: list[tuple[object, datetime, datetime]] = []
 
-        async def read_modal_cost(org: Org, benchmark: Benchmark, start: datetime, end: datetime) -> float:
+        async def read_modal_cost(
+            org: Org, benchmark: Benchmark, start: datetime, end: datetime
+        ) -> dict[tuple[str | None, str], float]:
             windows.append((benchmark.id, start, end))
-            return 63.65
+            return {(None, SandboxResource.CPU): 63.65}
 
         bind = database_session.get_bind()
         first = await sweep_modal_costs(bind, now=NOW, read_modal_cost=read_modal_cost)
@@ -105,18 +108,20 @@ class TestSweepModalCosts:
         assert windows == [(run.id, NOW - timedelta(hours=6), NOW - timedelta(hours=2))]
         rows = database_session.exec(select(RunCost)).all()
         assert [
-            (r.cost_type, r.provider, r.source_id, r.benchmark_id, r.amount_usd, modal_cost._as_utc(r.usage_end))
+            (r.cost_type, r.resource, r.provider, r.source_id, r.amount_usd, modal_cost._as_utc(r.usage_end))
             for r in rows
             if r.usage_end is not None
-        ] == [("sandbox", MODAL_PROVIDER, str(run.id), run.id, 63.65, NOW - timedelta(hours=2, minutes=30))]
+        ] == [("sandbox", "cpu", MODAL_PROVIDER, str(run.id), 63.65, NOW - timedelta(hours=2, minutes=30))]
 
     @pytest.mark.description("A retried Modal run replaces its prior total and window end without adding a row.")
     async def test_reprices_a_retried_run_once(self, database_session: Session) -> None:
         run = _modal_run(database_session, finished=NOW - timedelta(hours=4, minutes=30))
         totals = iter([12.5, 18.75])
 
-        async def read_modal_cost(_org: Org, _run: Benchmark, _start: datetime, _end: datetime) -> float:
-            return next(totals)
+        async def read_modal_cost(
+            _org: Org, _run: Benchmark, _start: datetime, _end: datetime
+        ) -> dict[tuple[str | None, str], float]:
+            return {(None, SandboxResource.CPU): next(totals)}
 
         bind = database_session.get_bind()
         first = await sweep_modal_costs(bind, now=NOW, read_modal_cost=read_modal_cost)
@@ -139,9 +144,11 @@ class TestSweepModalCosts:
         run = _modal_run(database_session, finished=finished, started=datetime(2026, 10, 31, 20, 5, tzinfo=UTC))
         windows: list[tuple[datetime, datetime]] = []
 
-        async def read_modal_cost(_org: Org, _run: Benchmark, start: datetime, end: datetime) -> float:
+        async def read_modal_cost(
+            _org: Org, _run: Benchmark, start: datetime, end: datetime
+        ) -> dict[tuple[str | None, str], float]:
             windows.append((start, end))
-            return 4.0
+            return {(None, SandboxResource.CPU): 4.0}
 
         await sweep_modal_costs(
             database_session.get_bind(), now=datetime(2026, 11, 1, 1, tzinfo=UTC), read_modal_cost=read_modal_cost
@@ -157,9 +164,11 @@ class TestSweepModalCosts:
         _finished_dispatch(database_session, run, NOW - timedelta(hours=2, minutes=30))
         windows: list[tuple[datetime, datetime]] = []
 
-        async def read_modal_cost(_org: Org, _run: Benchmark, start: datetime, end: datetime) -> float:
+        async def read_modal_cost(
+            _org: Org, _run: Benchmark, start: datetime, end: datetime
+        ) -> dict[tuple[str | None, str], float]:
             windows.append((start, end))
-            return 7.25
+            return {(None, SandboxResource.CPU): 7.25}
 
         written = await sweep_modal_costs(database_session.get_bind(), now=NOW, read_modal_cost=read_modal_cost)
 
@@ -173,7 +182,7 @@ class TestSweepModalCosts:
     @pytest.mark.description("A stopped Modal run without a finish time or completed dispatch is skipped.")
     async def test_skips_a_stopped_run_without_an_end(self, database_session: Session) -> None:
         _modal_run(database_session, finished=None, status=BenchmarkStatus.STOPPED)
-        read_modal_cost = AsyncMock(return_value=1.0)
+        read_modal_cost = AsyncMock(return_value={(None, SandboxResource.CPU): 1.0})
 
         written = await sweep_modal_costs(database_session.get_bind(), now=NOW, read_modal_cost=read_modal_cost)
 
@@ -183,7 +192,7 @@ class TestSweepModalCosts:
     @pytest.mark.description("A Modal run is priced only once its last UTC hour has closed and the margin has passed.")
     async def test_waits_until_the_runs_last_hour_has_closed(self, database_session: Session) -> None:
         _modal_run(database_session, finished=NOW - timedelta(minutes=10))
-        read_modal_cost = AsyncMock(return_value=1.0)
+        read_modal_cost = AsyncMock(return_value={(None, SandboxResource.CPU): 1.0})
         bind = database_session.get_bind()
 
         written = await sweep_modal_costs(bind, now=NOW, read_modal_cost=read_modal_cost)
@@ -201,10 +210,12 @@ class TestSweepModalCosts:
         warning = Mock()
         monkeypatch.setattr(modal_cost.logger, "warning", warning)
 
-        async def read_modal_cost(org: Org, benchmark: Benchmark, start: datetime, end: datetime) -> float:
+        async def read_modal_cost(
+            org: Org, benchmark: Benchmark, start: datetime, end: datetime
+        ) -> dict[tuple[str | None, str], float]:
             if benchmark.id == failing.id:
                 raise RuntimeError("modal unavailable")
-            return 2.5
+            return {(None, SandboxResource.CPU): 2.5}
 
         written = await sweep_modal_costs(database_session.get_bind(), now=NOW, read_modal_cost=read_modal_cost)
 
@@ -255,7 +266,8 @@ class TestReadModalRunCost:
 
         async def stats(**kwargs: Any) -> Any:
             requests.append(kwargs)
-            yield SimpleNamespace(cost=1.25)
+            yield SimpleNamespace(tags={"attempt-id": "attempt-1"}, cost_by_resource={"CPU": 1.0, "H100": 0.25})
+            yield SimpleNamespace(tags={}, cost_by_resource={"Memory": 0.5})
 
         app = SimpleNamespace(sandboxes=SimpleNamespace(stats=SimpleNamespace(aio=stats)))
         from_credentials = AsyncMock(return_value=Mock())
@@ -274,7 +286,11 @@ class TestReadModalRunCost:
         total = await read_modal_run_cost(Mock(), cast(Benchmark, run), start, NOW)
         await read_modal_run_cost(Mock(), cast(Benchmark, run), start, start + timedelta(days=1))
 
-        assert total == 2.5
+        assert total == {
+            ("attempt-1", SandboxResource.CPU): 2.0,
+            ("attempt-1", SandboxResource.GPU): 0.5,
+            (None, SandboxResource.MEMORY): 1.0,
+        }
         from_credentials.assert_awaited_once_with("id", "secret")
         assert [(r["since"], r["until"]) for r in requests] == [
             (start, start + timedelta(days=7)),
@@ -282,6 +298,38 @@ class TestReadModalRunCost:
             (start, start + timedelta(days=1)),
         ]
         assert all(r["tags"] == {"run-id": run.id} for r in requests)
+
+    @pytest.mark.description(
+        "A window Modal refuses for having too many groups is read again in hour-aligned halves and counted once."
+    )
+    async def test_too_many_groups_splits_the_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = SimpleNamespace(id="3c6b5748-eef0-4c1b-8eef-15e6a44a712d")
+        windows: list[tuple[datetime, datetime]] = []
+
+        async def stats(**kwargs: Any) -> Any:
+            if kwargs["until"] - kwargs["since"] > timedelta(hours=2):
+                raise modal_cost.InvalidError("There are more than 10,000 groups.")
+            windows.append((kwargs["since"], kwargs["until"]))
+            yield SimpleNamespace(tags={"attempt-id": "attempt-1"}, cost_by_resource={"CPU": 1.0})
+
+        app = SimpleNamespace(sandboxes=SimpleNamespace(stats=SimpleNamespace(aio=stats)))
+        monkeypatch.setattr(
+            modal_cost,
+            "run_provider_config",
+            AsyncMock(return_value=modal_cost.ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")),
+        )
+        monkeypatch.setattr(modal_cost, "_modal_client", AsyncMock(return_value=Mock()))
+        monkeypatch.setattr(modal_cost, "App", SimpleNamespace(lookup=SimpleNamespace(aio=AsyncMock(return_value=app))))
+        start = NOW - timedelta(hours=5)
+
+        costs = await read_modal_run_cost(Mock(), cast(Benchmark, run), start, NOW)
+
+        assert windows == [
+            (start, start + timedelta(hours=2)),
+            (start + timedelta(hours=2), start + timedelta(hours=3)),
+            (start + timedelta(hours=3), NOW),
+        ]
+        assert costs == {("attempt-1", SandboxResource.CPU): 3.0}
 
 
 class _Leader:

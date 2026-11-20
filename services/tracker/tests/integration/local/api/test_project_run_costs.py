@@ -11,13 +11,13 @@ import tracker.config as config_module
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
 from tracker.database.models import BenchmarkStatus, Org, RunCost, RunProject
+from tracker.domain import SandboxResource
 from tracker.repositories import cost as cost_repository
 from tracker.repositories.cost import SANDBOX_COST_TYPE, SEARCH_COST_TYPE
 
 TOKEN = "project-service-token"
 STAMP = datetime(2026, 10, 20, tzinfo=UTC)
 _LAST_YEAR = datetime(2025, 1, 15, tzinfo=UTC)
-_SANDBOX_SPLIT = ["sandbox_cpu", "sandbox_memory", "sandbox_disk", "sandbox_gpu"]
 
 
 @pytest.fixture
@@ -118,39 +118,53 @@ class TestProjectRunCosts:
         )
 
     @pytest.mark.description("Each cost type in the project total counts toward it.")
-    @pytest.mark.parametrize("cost_type", ["sandbox", *_SANDBOX_SPLIT, "search"])
+    @pytest.mark.parametrize("cost_type", ["sandbox", "search"])
     def test_a_listed_cost_type_counts(
         self, cost_type: str, machine_client: TestClient, database_session: Session
     ) -> None:
         assert _one_run_costs(machine_client, database_session, [(cost_type, 2.0)]) == 2.0
 
-    @pytest.mark.description("An excluded cost type, or one nobody has classified yet, stays out of the project total.")
-    @pytest.mark.parametrize("cost_type", ["executor", "egress", "storage", "made_up"])
-    def test_an_unlisted_cost_type_stays_out(
-        self, cost_type: str, machine_client: TestClient, database_session: Session
-    ) -> None:
-        assert _one_run_costs(machine_client, database_session, [(SANDBOX_COST_TYPE, 1.0), (cost_type, 8.0)]) == 1.0
+    @pytest.mark.description("A cost type nobody has classified yet stays out of the project total.")
+    def test_an_unlisted_cost_type_stays_out(self, machine_client: TestClient, database_session: Session) -> None:
+        assert _one_run_costs(machine_client, database_session, [(SANDBOX_COST_TYPE, 1.0), ("made_up", 8.0)]) == 1.0
 
     @pytest.mark.description(
-        "A run holding an old sandbox line and the four per-resource lines counts all five, so a double count shows."
+        "A run holding an old sandbox line and four per-resource sandbox lines counts all five under the `sandbox` key."
     )
     def test_old_and_split_sandbox_lines_both_count(
         self, machine_client: TestClient, database_session: Session
     ) -> None:
-        costs = [(SANDBOX_COST_TYPE, 1.0), *((cost_type, 0.25) for cost_type in _SANDBOX_SPLIT)]
+        project = uuid4()
+        run = _run(database_session, [(SANDBOX_COST_TYPE, 1.0, STAMP)])
+        database_session.add_all(
+            [
+                RunCost(
+                    benchmark_id=run,
+                    cost_type=SANDBOX_COST_TYPE,
+                    resource=resource.value,
+                    source_id="sb-1:2026-10-20T00:00:00+00:00",
+                    provider="daytona",
+                    amount_usd=0.25,
+                    usage_end=STAMP,
+                )
+                for resource in SandboxResource
+            ]
+        )
+        database_session.commit()
+        _link(database_session, run, project)
 
-        assert _one_run_costs(machine_client, database_session, costs) == 2.0
+        response = machine_client.get(
+            _path(project), params={"environment": "dev"}, headers={"Authorization": f"Bearer {TOKEN}"}
+        )
 
-    @pytest.mark.description(
-        "Every cost type Tracker names is either counted in the project total or excluded from it."
-    )
+        [row] = response.json()["runs"]
+        assert (row["cost_usd"], row["by_type"]) == (2.0, {"sandbox": 2.0})
+
+    @pytest.mark.description("Every cost type Tracker names is counted in the project total.")
     def test_every_cost_type_is_classified(self) -> None:
         named = {value for name, value in vars(cost_repository).items() if name.endswith("_COST_TYPE")}
-        counted = set(cost_repository.PROJECT_COST_TYPES)
-        excluded = set(cost_repository.EXCLUDED_COST_TYPES)
 
-        assert not counted & excluded
-        assert named == counted | excluded
+        assert named == set(cost_repository.PROJECT_COST_TYPES)
 
     @pytest.mark.description("A project with no linked runs answers with an empty list, not 404.")
     def test_a_project_without_runs_has_no_rows(self, machine_client: TestClient) -> None:

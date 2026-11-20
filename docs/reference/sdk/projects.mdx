@@ -105,6 +105,28 @@ async def get(handle: str) -> ProjectResponse
 
 For examples, see the [Python SDK guide](/sdk/resources).
 
+## `client.projects.budget` {#budget}
+
+Return a project's limit and its all-time spend in total and per cost type.
+
+`limit_dollars` is None when no limit is set. When the Gateway is unavailable, model spend is left out and `model_spend_available` is false.
+
+```python Signature
+async def budget(handle: str) -> ProjectBudget
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"handle"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · str</span></div>
+</div>
+
+**Returns**
+
+ProjectBudget
+
+For examples, see the [Python SDK guide](/sdk/resources).
+
 ## `client.projects.update` {#update}
 
 Replace a project's shared spend metadata without changing its handle.

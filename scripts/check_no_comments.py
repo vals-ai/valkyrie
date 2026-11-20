@@ -7,7 +7,13 @@ import tokenize
 from collections.abc import Iterator
 
 PRAGMA = re.compile(r"#\s*(type:\s*ignore|noqa|pyright:|pragma:|fmt:)")
-SKIP = ("services/tracker/src/tracker/database/migrations/", "/vendor/")
+SKIP = (
+    "services/tracker/src/tracker/database/migrations/",
+    "packages/create-benchmark-service/",
+    "packages/vals-grading/",
+    "packages/vals-benchmark-service/",
+    "/vendor/",
+)
 PUBLIC_DOCSTRINGS = "packages/valkyrie-sdk/src/"
 GENERATED_MODELS = f"{PUBLIC_DOCSTRINGS}valkyrie/sdk/models/_generated/"
 DEFINITIONS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)

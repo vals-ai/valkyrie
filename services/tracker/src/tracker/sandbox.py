@@ -62,6 +62,7 @@ from tracker.runtime.lifecycle import finish_cleanup
 from tracker.generation_plan import GenerationPlan
 from tracker.runtime.storage import ObjectStore
 from tracker.egress import EgressPolicy
+from tracker.clients.model_gateway import MODEL_GATEWAY_URL
 from tracker.external_service_gateway import (
     GenerationAccountingSummary,
     ExternalServiceDeadlineController,
@@ -100,6 +101,7 @@ logger = get_logger(__name__)
 
 
 bundle_path = PurePosixPath("/bundle")
+MODAL_ATTEMPT_TAG = "attempt-id"
 SANDBOX_AUTO_STOP_INTERVAL = 10 * 60
 SANDBOX_CREATE_TIMEOUT = 360
 _SANDBOX_CREATE_WARNING_INTERVAL_SECONDS = 120
@@ -440,7 +442,9 @@ def _record_announced(
         return nullcontext()
 
     async def announce(provider: AnnouncedSandboxProvider, sandbox_id: str) -> None:
-        await record_sandbox(SandboxLink(benchmark_id=link.benchmark_id, provider=provider), sandbox_id)
+        await record_sandbox(
+            SandboxLink(benchmark_id=link.benchmark_id, provider=provider, attempt_id=link.attempt_id), sandbox_id
+        )
 
     return sandbox_created_scope(announce)
 
@@ -1127,7 +1131,7 @@ async def _stream_controlled_output(
     controller = deadline_controller
     stage = _StageOutput(stage_key, on_output) if stage_key is not None else None
     try:
-        env_name = "MODEL_GATEWAY_URL" if episode is None and stage is None else "VALKYRIE_GENERATION_MODEL_GATEWAY_URL"
+        env_name = MODEL_GATEWAY_URL if episode is None and stage is None else "VALKYRIE_GENERATION_MODEL_GATEWAY_URL"
         env_vars = {**(extra_env or {})}
         if generation_gateway_url is not None:
             env_vars[env_name] = generation_gateway_url

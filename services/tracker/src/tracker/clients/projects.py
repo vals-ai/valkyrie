@@ -1,5 +1,6 @@
 from datetime import datetime
 from functools import cache
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -94,6 +95,10 @@ class ProjectServiceClient:
     def set_limit(self, org_id: UUID, project_id: UUID, limit: ProjectLimit) -> None:
         path = f"/orgs/{org_id}/projects/{project_id}/limit"
         _ = self._client.put(path, json=limit.model_dump(mode="json")).raise_for_status()
+
+    def limit(self, org_id: UUID, project_id: UUID) -> dict[str, Any]:
+        response = self._client.get(f"/orgs/{org_id}/projects/{project_id}/limit")
+        return response.raise_for_status().json()
 
     def limit_requests(self, project: Project, method: str, path: str = "", body: object = None) -> httpx.Response:
         return self._client.request(

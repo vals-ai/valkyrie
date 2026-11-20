@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 import tracker.api.remote_grader as remote_api
 import tracker.remote_grader as grants
-import tracker.runtime.model_gateway as gateway_module
+from tracker.clients.model_gateway import tenant
 from tests.factories import make_benchmark, make_task
 from tracker.database.models import (
     Benchmark,
@@ -217,7 +217,7 @@ async def test_registered_remote_grading_attempt_survives_tracker_attempt_end_an
     deadline = (datetime.now(UTC) + timedelta(hours=1)).timestamp()
     registration_scope = {"allowed_models": ["openai/gpt-5"], "first_pickup_deadline": deadline}
     async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as gateway_client:
-        monkeypatch.setattr(gateway_module, "_client", gateway_client)
+        monkeypatch.setattr(tenant, "_client", gateway_client)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://tracker"
         ) as client:

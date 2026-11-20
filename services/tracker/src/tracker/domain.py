@@ -45,6 +45,19 @@ class DocentReadingStatus(str, Enum):
     DONE = "DONE"
 
 
+class DatasetUploadStatus(str, Enum):
+    UPLOADING = "UPLOADING"
+    QUEUED = "QUEUED"
+    VALIDATING = "VALIDATING"
+    READY = "READY"
+    PUBLISH_QUEUED = "PUBLISH_QUEUED"
+    PUBLISHING = "PUBLISHING"
+    SUCCEEDED = "SUCCEEDED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+
+
 class AgentCausedExitReason(str, Enum):
     TIMEOUT = "TIMEOUT"
     OS_KILLED = "OS_KILLED"
@@ -67,6 +80,13 @@ class FailurePhase(str, Enum):
     SETUP = "setup"
     AGENT = "agent"
     EVALUATION = "evaluation"
+
+
+class SandboxResource(str, Enum):
+    CPU = "cpu"
+    MEMORY = "memory"
+    DISK = "disk"
+    GPU = "gpu"
 
 
 class RetryMode(str, Enum):

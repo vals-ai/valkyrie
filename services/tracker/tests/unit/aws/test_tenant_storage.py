@@ -26,6 +26,7 @@ def tenant_bucket_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "AWS_TENANT_BUCKET_PREFIX", _PREFIX)
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_REGION", "us-east-1")
     monkeypatch.setattr(config, "AWS_DEPLOYMENT_ACCOUNT_ID", "123456789012")
+    monkeypatch.setattr(config, "DATASET_UPLOAD_ORIGINS", ("https://dashboards.vals.ai",))
 
 
 @pytest.fixture
@@ -93,6 +94,26 @@ def test_new_tenant_gets_a_configured_bucket_recorded_on_its_org(database_sessio
     rule = s3.put_bucket_lifecycle_configuration.call_args.kwargs["LifecycleConfiguration"]["Rules"][0]
     assert rule["AbortIncompleteMultipartUpload"] == {"DaysAfterInitiation": 1}
     assert rule["NoncurrentVersionExpiration"] == {"NoncurrentDays": 30}
+    rules = s3.put_bucket_lifecycle_configuration.call_args.kwargs["LifecycleConfiguration"]["Rules"]
+    assert rules[1]["Filter"] == {"Prefix": "dataset-uploads/"}
+    assert rules[1]["Expiration"] == {"Days": 2}
+    assert rules[1]["NoncurrentVersionExpiration"] == {"NoncurrentDays": 1}
+    assert rules[2]["Filter"] == {"Prefix": "dataset-uploads/"}
+    assert rules[2]["Expiration"] == {"ExpiredObjectDeleteMarker": True}
+    s3.put_bucket_cors.assert_called_once_with(
+        CORSConfiguration={
+            "CORSRules": [
+                {
+                    "ID": "dataset-uploads",
+                    "AllowedMethods": ["POST"],
+                    "AllowedOrigins": ["https://dashboards.vals.ai"],
+                    "AllowedHeaders": ["content-type"],
+                    "MaxAgeSeconds": 300,
+                }
+            ]
+        },
+        **owner,
+    )
     s3.put_bucket_abac.assert_called_once_with(AbacStatus={"Status": "Enabled"}, **owner)
     s3.tag_resource.assert_not_called()
     database_session.expire_all()
@@ -134,6 +155,7 @@ def test_bucket_setup_requests_match_the_s3_api(
         )
         stubber.add_response("put_bucket_versioning", {})
         stubber.add_response("put_bucket_lifecycle_configuration", {})
+        stubber.add_response("put_bucket_cors", {})
         stubber.add_response(
             "put_bucket_abac",
             {},
@@ -194,7 +216,16 @@ def test_bucket_tagged_for_another_org_is_refused(database_session: Session, s3:
 
 @pytest.mark.description("When bucket creation or setup fails, the org's `storage_key` stays empty.")
 @pytest.mark.parametrize(
-    "failing_call", ["create_bucket", "get_bucket_tagging", "tag_resource", "put_bucket_versioning", "put_bucket_abac"]
+    "failing_call",
+    [
+        "create_bucket",
+        "get_bucket_tagging",
+        "tag_resource",
+        "put_bucket_versioning",
+        "put_bucket_lifecycle_configuration",
+        "put_bucket_cors",
+        "put_bucket_abac",
+    ],
 )
 def test_failed_bucket_setup_leaves_the_org_without_a_bucket(
     database_session: Session, s3: MagicMock, failing_call: str

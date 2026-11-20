@@ -1,5 +1,6 @@
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from tracker.external_service_gateway import (
 )
 from tracker.logging import get_logger
 from tracker.logging.events import LogEvent
+from tracker.runtime.run_egress import ScopedGateway
 from tracker.runtime.task_logs import TaskLogBuffer
 
 logger = get_logger(__name__)
@@ -48,6 +50,7 @@ class StepRun:
     set_phase: Callable[[FailurePhase], None]
     redact: Callable[[str], str]
     restrict_egress: Callable[[EgressPolicy | None, str, str], Awaitable[None]] | None
+    grading_gateway: Callable[[], AbstractAsyncContextManager[ScopedGateway | None]]
 
 
 @dataclass
@@ -126,18 +129,20 @@ async def run_steps(run: StepRun, controller: ExternalServiceDeadlineController)
         if run.restrict_egress is not None:
             await run.restrict_egress(step.egress_evaluation, step.name, "evaluation")
         run.task_logs.last_log_time = time.monotonic()
-        outcome = await run.until_stream_ends(
-            run_benchmark_service_websocket(
-                run.service.grade_step(
-                    run.task_id,
-                    run.sandbox_id,
-                    step.name,
-                    on_message=log_output,
-                    on_sandbox_created=run.on_sandbox_created,
-                    sandbox_provider=run.sandbox_provider,
+        async with run.grading_gateway() as gateway:
+            outcome = await run.until_stream_ends(
+                run_benchmark_service_websocket(
+                    run.service.grade_step(
+                        run.task_id,
+                        run.sandbox_id,
+                        step.name,
+                        on_message=log_output,
+                        on_sandbox_created=run.on_sandbox_created,
+                        sandbox_provider=run.sandbox_provider,
+                        grading_gateway=gateway,
+                    )
                 )
             )
-        )
         result.evaluation_time += time.perf_counter() - evaluation_started
         if outcome.problem is not None:
             outcome = outcome._replace(problem=run.redact(outcome.problem))

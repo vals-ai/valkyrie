@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from tracker import config
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
 from tracker.exceptions import SecretAccessDeniedError, SecretNotFoundError
 from tracker.runtime.secrets import TENANT_SECRET_ROOT, SecretStore, SecretValue, secret_display_name
 
@@ -71,12 +72,21 @@ class OrgSecretStore:
         candidates = secret_name_candidates(
             name, org_id=self._org_id, org_name=self._org_name, auth_required=self._auth_required
         )
+        tenant_missing: SecretNotFoundError | None = None
         for candidate in candidates[:-1]:
             try:
                 return await self._store.get(candidate)
-            except (SecretNotFoundError, SecretAccessDeniedError):
+            except SecretNotFoundError as error:
+                if candidate.startswith(tenant_secret_prefix(self._org_id)):
+                    tenant_missing = error
+            except SecretAccessDeniedError:
                 pass
-        return await self._store.get(candidates[-1])
+        try:
+            return await self._store.get(candidates[-1])
+        except (SecretNotFoundError, SecretAccessDeniedError):
+            if tenant_missing is not None and candidates[-1] == name:
+                raise tenant_missing from None
+            raise
 
 
 def validate_secret_names(names: Iterable[str], *, org_id: UUID, org_name: str, auth_required: bool) -> None:
@@ -97,7 +107,7 @@ def selected_project_gateway_reference(
     benchmark_name: str,
     custom_benchmark_service: str | None,
 ) -> str | None:
-    reference = secret_names.get("MODEL_GATEWAY_API_KEY")
+    reference = secret_names.get(MODEL_GATEWAY_API_KEY)
     prefix = tenant_secret_prefix(org.id)
     if (
         org.name in config.GATEWAY_KEY_ORGS
@@ -105,7 +115,7 @@ def selected_project_gateway_reference(
         == config.BenchmarkServiceDestination.HOSTED
         and selected_project_gateway_secret_ref is not None
         and reference == selected_project_gateway_secret_ref
-        and reference == secret_names.get("MODEL_GATEWAY_URL")
+        and reference == secret_names.get(MODEL_GATEWAY_URL)
         and reference.startswith(prefix)
         and is_generated_project_gateway_secret_name(reference.removeprefix(prefix))
     ):

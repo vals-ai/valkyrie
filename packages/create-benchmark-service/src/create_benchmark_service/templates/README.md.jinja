@@ -1,0 +1,44 @@
+# {{ benchmark_name }} Service
+
+## Getting started
+
+Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six abstract methods on `ExampleBenchmark`:
+
+| Method | What to do |
+|--------|------------|
+| `load_datasets()` | Return `dict[dataset_name, dict[task_id, ...]]` of all datasets |
+| `retrieve_task()` | Return sandbox source, problem statement, and resource requirements |
+| `setup_task()` | Prepare the sandbox before evaluation (upload files, run install commands) |
+| `evaluate_response()` | Score a plain-text response without a sandbox |
+| `evaluate_instance()` | Run tests / evaluation scripts in the sandbox |
+| `calculate_final_score()` | Aggregate per-task results into a single score |
+
+`setup_task` and `evaluate_instance` are async generators — yield `StreamMessageChunk`, `StreamErrorChunk`, and finally `StreamResultChunk`.
+
+## Authentication
+
+Set `AUTH_REQUIRED=true` to require authentication. Implement `check_auth()` for boolean authentication, or `resolve_tenant()` and `check_dataset_access()` for tenant-aware access. With authentication required, the default rejects requests until you implement these hooks. This app includes the shared HTTP and WebSocket routes; it has no `/v1/*` routes.
+
+Authentication is disabled by default. Hosted registry deployments set `AUTH_REQUIRED=true`. `AUTH_DISABLED` is no longer supported and cannot override that setting.
+
+## Dependencies
+
+The base framework includes Daytona, Modal, and the OpenTelemetry API.
+
+## Development
+
+```bash
+make install   # install dependencies
+make dev       # run local server
+make test      # run tests
+make help      # list all commands
+```
+
+## Releasing
+
+Versions come from git tags (hatch-vcs). To enable the release flow in this repo:
+
+- Add a **`GH_PAT`** repository secret — a personal access token with permission to push tags (`contents: write`). `auto-tag-release` uses it to push the version tag on merge to `main`; the workflow fails without it.
+- Every PR title must include **`#patch`**, **`#minor`**, or **`#major`** — `check-pr-title` enforces this and the tag is bumped accordingly on merge.
+
+Until the first tag exists, the package builds at version `0.0.0`.

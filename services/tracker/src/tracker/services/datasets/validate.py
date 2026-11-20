@@ -15,6 +15,7 @@ from tracker.services.datasets.config import (
     EnvironmentConfig,
     HealthcheckConfig,
     MCPServerConfig,
+    NetworkMode,
     SolutionConfig,
     StepConfig,
     TaskConfig,
@@ -37,14 +38,15 @@ from tracker.services.datasets.separate_verifier import VerifierKind, verifier_k
 from tracker.services.datasets.source import TASK_FILES
 from tracker.services.datasets.steps import STEPS_DIR, step_layers, step_verifier
 from tracker.runtime.artifacts import TASK_ID_PATTERN
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
 
 PLATFORM_ENV_NAMES = {
     "RUN_ID",
     "TASK_ID",
     "ATTEMPT_ID",
     "IDENTITY",
-    "MODEL_GATEWAY_URL",
-    "MODEL_GATEWAY_API_KEY",
+    MODEL_GATEWAY_URL,
+    MODEL_GATEWAY_API_KEY,
     "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS",
 }
 OLDER_ENVIRONMENT_KEYS = {"memory", "storage", "allow_internet"}
@@ -136,9 +138,18 @@ def _compose_verifier_problems(config: TaskConfig, task_dir: Path, kind: Sandbox
     for step_name, verifier, layers in graders:
         layer = verifier_kind(layers)
         runs_compose = layer == VerifierKind.COMPOSE or (layer == VerifierKind.AGENT and kind == SandboxKind.COMPOSE)
+        subject = "a compose verifier" if step_name is None else f"the compose verifier of step {step_name!r}"
         if verifier.is_separate and runs_compose and (verifier.environment or config.environment).gpus:
-            subject = "a compose verifier" if step_name is None else f"the compose verifier of step {step_name!r}"
             problems.append(f"{subject} can't request GPUs")
+
+        in_compose = runs_compose if verifier.is_separate else kind == SandboxKind.COMPOSE
+        environments = [config.environment, verifier.environment or config.environment]
+        if (
+            verifier.models
+            and in_compose
+            and any(environment.network_mode == NetworkMode.NO_NETWORK for environment in environments)
+        ):
+            problems.append(f"{subject} can't list models while its main service has no network")
     return problems
 
 
@@ -198,6 +209,17 @@ def _env_problems(config: TaskConfig) -> list[str]:
         f"[environment].env can't set {key}, which the platform owns"
         for key in config.environment.env
         if key in PLATFORM_ENV_NAMES or key.startswith("VALKYRIE_")
+    )
+    verifiers = {
+        "[verifier]": config.verifier,
+        **{f"[steps.{step.name}.verifier]": step_verifier(config, step) for step in config.steps},
+    }
+    problems.extend(
+        f"{label}.env can't set {key}; the platform sets it for [verifier].models"
+        for label, verifier in verifiers.items()
+        if verifier.models
+        for key in (MODEL_GATEWAY_URL, MODEL_GATEWAY_API_KEY)
+        if key in verifier.env
     )
     return problems
 

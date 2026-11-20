@@ -6,6 +6,7 @@ import click
 from pydantic import TypeAdapter
 from valkyrie.sdk import ValkyrieClient
 from valkyrie.sdk.errors import ValkyrieAPIError, ValkyrieDatasetPushError
+from valkyrie.sdk.harbor_dataset import dataset_problems
 from valkyrie.sdk.models import (
     BlobResponse,
     DatasetLocation,
@@ -240,6 +241,31 @@ _CONCURRENCY = click.option(
 @_CONCURRENCY
 def push_dataset(dataset_reference: str, folder: Path, tags: tuple[str, ...], concurrency: int) -> None:
     _publish(dataset_reference, tags, concurrency, folder)
+
+
+@dataset.command(
+    name="check",
+    help=(
+        "List every way the Harbor dataset under FOLDER departs from the porting standard, without uploading it.\n\n"
+        "Example:\n"
+        "    valkyrie dataset check out/a2j --details sample/details.json"
+    ),
+)
+@click.argument("folder", metavar="FOLDER", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--details",
+    "details",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="A `details.json` a grader wrote, checked against the score types. Repeatable.",
+)
+def check_dataset(folder: Path, details: tuple[Path, ...]) -> None:
+    problems = dataset_problems(folder, details)
+    for problem in problems:
+        click.echo(click.style(f"✗ {one_line(problem)}", fg="red"), err=True)
+    if problems:
+        raise click.ClickException(f"{len(problems)} problem(s) found in {folder}")
+    click.secho(f"✓ {folder} follows the Harbor dataset standard", fg="green", bold=True)
 
 
 @dataset.command(

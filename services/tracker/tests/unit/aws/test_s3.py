@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from aiobotocore.response import StreamingBody
+from aiohttp import StreamReader, test_utils, web
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from starlette.requests import Request
@@ -108,6 +109,32 @@ class DownloadClient:
         if isinstance(response, ClientError):
             raise response
         return {"Body": StreamingBody(DownloadBody(response), str(len(response)))}
+
+
+@pytest.mark.description("An S3 range read retains bucket ownership and refuses an oversized response.")
+async def test_object_range_is_bounded(monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime) -> None:
+    requests: list[tuple[str, str, str]] = []
+    read = StreamReader.read
+
+    async def fragmented_read(stream: StreamReader, n: int = -1) -> bytes:
+        return await read(stream, min(n, 1))
+
+    async def get_object(request: web.Request) -> web.Response:
+        requests.append((request.path, request.headers["Range"], request.headers["x-amz-expected-bucket-owner"]))
+        return web.Response(status=206, body=b"234" if request.path.endswith("/task.zip") else b"too much data")
+
+    app = web.Application()
+    app.router.add_get("/test-bucket/{key}", get_object)
+    monkeypatch.setattr(StreamReader, "read", fragmented_read)
+    store = S3ObjectStore(aws_runtime)
+    async with test_utils.TestServer(app) as server:
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", str(server.make_url("/")))
+
+        assert await store.get_range("task.zip", 2, 3) == b"234"
+        assert await store.get_range("task.zip", 0, 0) == b""
+        assert requests == [("/test-bucket/task.zip", "bytes=2-4", "123456789012")]
+        with pytest.raises(S3Error, match="more bytes"):
+            await store.get_range("oversized.zip", 2, 3)
 
 
 @pytest.mark.description("A stored object streams in chunks without being read whole.")

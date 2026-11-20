@@ -6,6 +6,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from sqlmodel import Session
 
 from tracker import config
+from tracker.aws.dataset_upload_storage import upload_cors_rule, upload_lifecycle_rules
 from tracker.aws.tags import ORG_ID_TAG
 from tracker.database.models import Org
 from tracker.repositories.organization import OrganizationRepository
@@ -98,11 +99,18 @@ def _create_bucket(bucket: str, org: Org) -> None:
                         "Filter": {},
                         "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
                         "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
-                    }
+                    },
+                    *upload_lifecycle_rules(),
                 ]
             },
             ExpectedBucketOwner=account_id,
         )
+        if config.DATASET_UPLOAD_ORIGINS:
+            s3.put_bucket_cors(
+                Bucket=bucket,
+                ExpectedBucketOwner=account_id,
+                CORSConfiguration={"CORSRules": [upload_cors_rule(list(config.DATASET_UPLOAD_ORIGINS))]},
+            )
         s3.put_bucket_abac(Bucket=bucket, AbacStatus={"Status": "Enabled"}, ExpectedBucketOwner=account_id)
     except (ClientError, BotoCoreError) as error:
         raise TenantBucketError(f"Could not create the organization bucket {bucket}") from error

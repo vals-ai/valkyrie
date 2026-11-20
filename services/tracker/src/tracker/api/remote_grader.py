@@ -20,7 +20,8 @@ from tracker.outbound_security import validate_custom_service_destination, valid
 from tracker.remote_grader import attempt_id_for
 from tracker.remote_grader_crypt import decrypt_grader_token, encrypt_grader_token
 from tracker.repositories.remote_grader import RemoteGraderRepository
-from tracker.runtime.model_gateway import mint_gateway_lease, revoke_gateway_lease
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
+from tracker.clients.model_gateway.tenant import mint_gateway_lease, revoke_gateway_lease
 from tracker.runtime.secrets import resolve_secrets
 
 router = APIRouter(prefix="/remote-grader", tags=["remote-grader"])
@@ -97,14 +98,14 @@ def _root(
         raise HTTPException(status_code=409, detail="Saved project Gateway binding is unavailable")
     secrets = asyncio.run_coroutine_threadsafe(
         resolve_secrets(
-            {"MODEL_GATEWAY_URL": grant.gateway_secret_ref, "MODEL_GATEWAY_API_KEY": grant.gateway_secret_ref},
+            {MODEL_GATEWAY_URL: grant.gateway_secret_ref, MODEL_GATEWAY_API_KEY: grant.gateway_secret_ref},
             secret_store(org),
         ),
         loop,
     ).result()
-    url = validate_service_url_syntax(secrets["MODEL_GATEWAY_URL"])
+    url = validate_service_url_syntax(secrets[MODEL_GATEWAY_URL])
     validate_custom_service_destination(url, org_name=org.name, auth_required=AUTH_REQUIRED, restrict_vals_hosts=False)
-    return url, secrets["MODEL_GATEWAY_API_KEY"]
+    return url, secrets[MODEL_GATEWAY_API_KEY]
 
 
 def _register(

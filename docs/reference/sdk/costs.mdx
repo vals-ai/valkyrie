@@ -69,3 +69,25 @@ async def project_model(
 <a href="/reference/sdk/models/costs#project-model-costs"><code>ProjectModelCosts</code></a>
 
 For examples, see the [Python SDK guide](/sdk/resources).
+
+## `client.costs.run` {#run}
+
+Return one run's spend in total, per cost type and per provider, resource and unit.
+
+Model spend from the Gateway appears as the `model` cost type. When the Gateway is unavailable it is left out and `model_spend_available` is false.
+
+```python Signature
+async def run(run_id: UUID | str) -> RunCosts
+```
+
+**Parameters**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"run_id"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · UUID | str</span></div>
+</div>
+
+**Returns**
+
+RunCosts
+
+For examples, see the [Python SDK guide](/sdk/resources).

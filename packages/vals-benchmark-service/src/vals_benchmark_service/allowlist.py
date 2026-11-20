@@ -1,0 +1,211 @@
+"""Tenant allowlist clients and policy models."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Callable
+from typing import Literal
+from urllib.parse import quote
+
+import httpx
+from cachetools import TTLCache
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from tenacity import retry, retry_if_exception_type, retry_if_result, stop_after_attempt, wait_random_exponential
+
+from benchmark_service.auth import AuthenticationUnavailableError
+
+logger = logging.getLogger(__name__)
+
+DESCOPE_API_KEY_HEADER = "x-descope-api-key"
+DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS = 300
+# How long past its TTL a policy still answers when the catalog cannot.
+ALLOWLIST_UNAVAILABLE_GRACE_SECONDS = 900
+ALLOWLIST_CACHE_MAX_SIZE = 1024
+DEFAULT_CATALOG_REQUEST_TIMEOUT_SECONDS = 5.0
+CATALOG_ATTEMPT_TIMEOUT_SECONDS = 2.0
+
+
+EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
+
+
+class EvaluationQuotaConfig(BaseModel):
+    """Per-tenant evaluation request quota."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: PositiveInt
+    period: EvaluationQuotaPeriod
+
+
+class TenantConfig(BaseModel):
+    """Per-tenant access rules within a benchmark service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    datasets: list[str] = Field(default_factory=list)
+    evaluation_quota: EvaluationQuotaConfig | None = None
+    trial_mode: bool = Field(
+        default=False,
+        description=(
+            "If true, responses on /v1/evaluate and /v1/score are sanitized to "
+            "score-only fields. Set this on prospects' tenants in allowlist.yaml."
+        ),
+    )
+
+
+class _CatalogAllowlistResponse(BaseModel):
+    """Strict response contract for the service-specific catalog endpoint."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    name: str
+    datasets: list[str]
+    evaluation_quota: EvaluationQuotaConfig | None = None
+    trial_mode: bool
+
+
+class _NonClosingTransport(httpx.AsyncBaseTransport):
+    """Adapt a caller-owned transport without taking ownership of its lifetime."""
+
+    def __init__(self, delegate: httpx.AsyncBaseTransport) -> None:
+        self._delegate = delegate
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._delegate.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        # The caller owns the delegated transport and closes it separately.
+        return None
+
+
+def _transient_catalog_response(response: httpx.Response) -> bool:
+    return response.status_code in (408, 429) or 500 <= response.status_code < 600
+
+
+class CatalogAllowlistClient:
+    """Fetch and cache one service's tenant policy from the catalog API."""
+
+    def __init__(
+        self,
+        base_url: str,
+        service_name: str,
+        *,
+        timeout: float = DEFAULT_CATALOG_REQUEST_TIMEOUT_SECONDS,
+        transport: httpx.AsyncBaseTransport | None = None,
+        cache_timer: Callable[[], float] | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.service_name = service_name
+        if not self.base_url:
+            raise ValueError("Catalog API base URL must not be empty")
+        if not self.service_name:
+            raise ValueError("Catalog service name must not be empty")
+
+        client_transport = _NonClosingTransport(transport) if transport is not None else None
+        self._request_timeout = timeout
+        self._client = httpx.AsyncClient(
+            timeout=min(timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS), transport=client_transport
+        )
+        timer = cache_timer or time.monotonic
+        self._cache = TTLCache[str, TenantConfig](
+            maxsize=ALLOWLIST_CACHE_MAX_SIZE, ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS, timer=timer
+        )
+        self._last_good = TTLCache[str, TenantConfig](
+            maxsize=ALLOWLIST_CACHE_MAX_SIZE,
+            ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS + ALLOWLIST_UNAVAILABLE_GRACE_SECONDS,
+            timer=timer,
+        )
+
+    @property
+    def endpoint(self) -> str:
+        """Return the service-specific catalog endpoint."""
+        return f"{self.base_url}/benchmark-services/{quote(self.service_name, safe='')}"
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client and transport."""
+        await self._client.aclose()
+
+    def clear_cache(self) -> None:
+        """Clear successful tenant policies."""
+        self._cache.clear()
+        self._last_good.clear()
+
+    def cached_tenant_config(self, tenant: str) -> TenantConfig | None:
+        """Return a cached policy without making a network request."""
+        return self._cache.get(tenant)
+
+    @retry(
+        retry=(
+            retry_if_exception_type(
+                (TimeoutError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+            )
+            | retry_if_result(_transient_catalog_response)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=0.1, max=0.5),
+        reraise=True,
+    )
+    async def _fetch_policy(self, access_key: str) -> httpx.Response:
+        async with asyncio.timeout(min(self._request_timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS)):
+            return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
+
+    async def get_tenant_config(self, access_key: str, tenant: str) -> TenantConfig | None:
+        """Fetch a tenant policy, returning ``None`` when the catalog refuses the tenant.
+
+        When the catalog cannot answer, the tenant's last good policy answers for up to
+        ``ALLOWLIST_UNAVAILABLE_GRACE_SECONDS`` past its TTL. Without one, this raises
+        ``AuthenticationUnavailableError``.
+        """
+        cached = self._cache.get(tenant)
+        if cached is not None:
+            return cached
+
+        try:
+            config = await self._fetch_tenant_config(access_key)
+        except AuthenticationUnavailableError:
+            last_good = self._last_good.get(tenant)
+            if last_good is None:
+                raise
+            logger.warning(
+                "Benchmark catalog API is unavailable, so tenant %s keeps its last policy", tenant, exc_info=True
+            )
+            return last_good
+
+        if config is None:
+            self._last_good.pop(tenant, None)
+            return None
+        self._cache[tenant] = config
+        self._last_good[tenant] = config
+        return config
+
+    async def _fetch_tenant_config(self, access_key: str) -> TenantConfig | None:
+        try:
+            async with asyncio.timeout(self._request_timeout):
+                response = await self._fetch_policy(access_key)
+        except Exception as exc:
+            raise AuthenticationUnavailableError("Benchmark catalog API is unavailable") from exc
+
+        if _transient_catalog_response(response):
+            raise AuthenticationUnavailableError(f"Benchmark catalog API returned status {response.status_code}")
+
+        if response.status_code != 200:
+            logger.warning("Benchmark catalog API returned status %s", response.status_code)
+            return None
+
+        try:
+            payload = _CatalogAllowlistResponse.model_validate(response.json())
+        except Exception:
+            logger.warning("Benchmark catalog API returned a malformed tenant policy", exc_info=True)
+            return None
+
+        if payload.name != self.service_name:
+            logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
+            return None
+
+        return TenantConfig(
+            datasets=payload.datasets,
+            evaluation_quota=payload.evaluation_quota,
+            trial_mode=payload.trial_mode,
+        )

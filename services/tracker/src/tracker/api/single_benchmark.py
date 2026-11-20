@@ -11,6 +11,8 @@ from tracker.aws.resolver import resolve_run_metadata_aws_runtime
 from tracker.aws.s3 import create_benchmark_url
 from tracker.database.models import Org
 from tracker.domain import TaskStatus
+from tracker.repositories.cost import CostRepositoryDependency
+from tracker.services.costs import RunCosts, run_spend
 from tracker.database.scoping import assert_org
 from tracker.repositories.benchmark import BenchmarkRepositoryDependency, TaskSort
 from tracker.types import OrgContext, SingleBenchmarkResponse, TasksResponse, TaskSummary
@@ -79,6 +81,25 @@ async def get_single_benchmark(
         s3_bucket_url=s3_bucket_url,
         storage_bucket=storage_bucket,
     )
+
+
+@router.get(
+    "/{benchmark_id}/costs",
+    response_model=RunCosts,
+    description=(
+        "Return a run's counted dollars in total and per cost type.\n"
+        "\n"
+        "`resources` splits each cost type by provider, resource and unit, with the summed quantity.\n"
+        "\n"
+        "Model spend comes from the model Gateway as the `model` cost type.\n"
+        "\n"
+        "When the Gateway is unavailable, model spend is left out and `model_spend_available` is false.\n"
+        "\n"
+        "`model_through` is the time the Gateway's usage data runs to."
+    ),
+)
+async def get_benchmark_costs(benchmark: RunBenchmarkDependency, costs: CostRepositoryDependency) -> RunCosts:
+    return await run_spend(costs, benchmark.id)
 
 
 @router.get(

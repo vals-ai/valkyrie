@@ -56,6 +56,7 @@ _EXPECTED_CLI_PATHS = (
     "dataset remove",
     "dataset restore",
     "dataset push",
+    "dataset check",
     "dataset install",
     "dataset versions",
     "dataset tag",
@@ -133,8 +134,8 @@ _EXPECTED_RESOURCES = {
     "LogsResource": ("page_task", "fetch_task", "page_run", "fetch_run", "stream_task"),
     "SchedulerResource": ("overview",),
     "SecretsResource": ("list", "set", "remove"),
-    "ProjectsResource": ("create", "list", "get", "update", "delete"),
-    "CostsResource": ("by_project", "project_model"),
+    "ProjectsResource": ("create", "list", "get", "budget", "update", "delete"),
+    "CostsResource": ("by_project", "project_model", "run"),
     "ProvidersResource": ("list", "set", "remove"),
     "SettingsResource": ("get", "set_default_provider", "set_benchmark_service", "remove_benchmark_service"),
     "AccountResource": (

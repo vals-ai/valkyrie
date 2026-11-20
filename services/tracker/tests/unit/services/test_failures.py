@@ -10,6 +10,7 @@ from tracker.domain import FailureCategory, FailurePhase
 from tracker.exceptions import (
     AgentRunFailedError,
     EpisodeOrchestratorFailedError,
+    ModelGatewayConfigurationError,
     OutputArtifactError,
     SandboxDNSResolutionError,
     SandboxError,
@@ -66,6 +67,7 @@ from tracker.services.failures import Disposition, decide, describe_failure, is_
         (BenchmarkServiceError("Command failed: docker compose up"), FailurePhase.AGENT, Disposition.TERMINAL),
         (BenchmarkServiceError("Command failed: docker compose up"), FailurePhase.EVALUATION, Disposition.TERMINAL),
         (RuntimeError("boom"), FailurePhase.SETUP, Disposition.TERMINAL),
+        (ModelGatewayConfigurationError("Unknown model"), FailurePhase.SANDBOX, Disposition.TERMINAL),
     ],
 )
 def test_decide_picks_the_cheapest_recovery(exc: Exception, phase: FailurePhase, expected: Disposition) -> None:
@@ -105,6 +107,12 @@ def _setup_error_with_cause(cause_code: str) -> SandboxSetupError:
         ),
         (RuntimeError("x"), FailureCategory.UNKNOWN, "tracker", None),
         (SecretNotFoundError("x"), FailureCategory.UNKNOWN, "configuration", "secret_not_found"),
+        (
+            ModelGatewayConfigurationError("x"),
+            FailureCategory.UNKNOWN,
+            "configuration",
+            "model_gateway_configuration",
+        ),
         (SecretAccessDeniedError("x"), FailureCategory.INFRASTRUCTURE, "tracker", "secret_access_denied"),
         (SecretDecryptionError("x"), FailureCategory.INFRASTRUCTURE, "tracker", "secret_decryption_failed"),
     ],

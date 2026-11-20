@@ -331,6 +331,7 @@ class VerifierConfig(NetworkSettings):
     environment_mode: VerifierEnvironmentMode | None = None
     environment: EnvironmentConfig | None = None
     collect: list[CollectConfig] = Field(default_factory=list)
+    models: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def mode_agrees_with_environment(self) -> Self:

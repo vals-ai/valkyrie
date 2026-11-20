@@ -7,6 +7,7 @@ from sqlmodel import Session
 
 from tests.factories import make_benchmark
 from tracker.database.models import BenchmarkStatus, Org, RunCost
+from tracker.domain import SandboxResource
 from tracker.repositories.cost import CostRepository, SandboxDayTotalRow
 
 
@@ -57,3 +58,37 @@ def test_sandbox_rows_are_placed_on_their_utc_day(postgres_session: Session) -> 
         SandboxDayTotalRow(day=date(2026, 11, 4), hourly=True, amount_usd=0.25, row_count=1),
     ]
     assert [row.source_id for row in (*first_page, *second_page)] == ["sb-october", "sb-a:2026-11-04T23:00:00+00:00"]
+
+
+@pytest.mark.description("Modal cost rows for each attempt of a run count as lifetime rows and name their resource.")
+def test_modal_attempt_rows_are_lifetime_rows(postgres_session: Session) -> None:
+    org = Org(id=uuid4(), name="modal-rows")
+    postgres_session.add(org)
+    postgres_session.commit()
+    run = make_benchmark(
+        status=BenchmarkStatus.FINISHED,
+        started_at=datetime(2026, 11, 3, tzinfo=UTC),
+        org_id=org.id,
+        session=postgres_session,
+    )
+    repository = CostRepository(postgres_session)
+    repository.replace_modal_run_costs(
+        benchmark_id=run.id,
+        costs={
+            ("attempt-1", SandboxResource.CPU): 1.5,
+            ("attempt-1", SandboxResource.MEMORY): 0.5,
+            (None, SandboxResource.CPU): 0.25,
+        },
+        usage_end=datetime(2026, 11, 4, 2, tzinfo=UTC),
+    )
+    postgres_session.commit()
+
+    window = (org.id, "modal", datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 6, tzinfo=UTC))
+
+    days = repository.sandbox_day_totals(*window)
+    rows = repository.sandbox_rows(*window, limit=10, offset=0)
+
+    assert list(days) == [SandboxDayTotalRow(day=date(2026, 11, 4), hourly=False, amount_usd=2.25, row_count=3)]
+    assert sorted((row.source_id, row.resource) for row in rows) == sorted(
+        [("attempt-1", "cpu"), ("attempt-1", "memory"), (str(run.id), "cpu")]
+    )

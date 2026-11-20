@@ -1365,9 +1365,12 @@ class TestRunAgent:
         assert path.startswith("/tmp/.valkyrie/") and path.endswith(".search-costs.jsonl")
 
     @pytest.mark.description(
-        "A normal generation opens SSP connections only inside the controlled child and closes them after."
+        "Ordinary controlled generation uses the native or overridden Gateway URL without changing evaluation routing."
     )
-    async def test_ordinary_generation_uses_ssp_only_in_controlled_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("expected_gateway", ["native", "generation"])
+    async def test_ordinary_generation_uses_selected_gateway_only_in_controlled_child(
+        self, monkeypatch: pytest.MonkeyPatch, expected_gateway: str
+    ) -> None:
         requests: list[str] = []
 
         async def endpoint(label: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1385,9 +1388,9 @@ class TestRunAgent:
             await writer.wait_closed()
 
         native = await asyncio.start_server(lambda r, w: endpoint("native", r, w), "127.0.0.1", 0)
-        ssp = await asyncio.start_server(lambda r, w: endpoint("ssp", r, w), "127.0.0.1", 0)
+        generation = await asyncio.start_server(lambda r, w: endpoint("generation", r, w), "127.0.0.1", 0)
         native_url = f"http://127.0.0.1:{native.sockets[0].getsockname()[1]}"
-        ssp_url = f"http://127.0.0.1:{ssp.sockets[0].getsockname()[1]}"
+        generation_url = f"http://127.0.0.1:{generation.sockets[0].getsockname()[1]}"
         monkeypatch.setenv("MODEL_GATEWAY_URL", native_url)
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             monkeypatch.delenv(name, raising=False)
@@ -1437,7 +1440,7 @@ class TestRunAgent:
                 "/workspace",
                 messages.append,
                 ExternalServiceDeadlineController(base_allowance_seconds=None),
-                generation_gateway_url=ssp_url,
+                generation_gateway_url=generation_url if expected_gateway == "generation" else None,
                 extra_env={
                     "HTTP_PROXY": "http://run-key:token@proxy.example:3128",
                     "NO_PROXY": "localhost,127.0.0.1,::1",
@@ -1445,7 +1448,7 @@ class TestRunAgent:
                 on_accounting_failure=AsyncMock(),
             )
             assert reason is None
-            assert messages == ["ssp\n"]
+            assert messages == [f"{expected_gateway}\n"]
             assert captured_env_vars[0]["HTTP_PROXY"] == "http://run-key:token@proxy.example:3128"
             assert captured_env_vars[0]["NO_PROXY"] == "localhost,127.0.0.1,::1"
             assert "HTTP_PROXY" not in os.environ
@@ -1458,12 +1461,12 @@ class TestRunAgent:
             output, _ = await evaluation.communicate()
             assert evaluation.returncode == 0
             assert output == b"native\n"
-            assert requests == ["ssp", "native"]
+            assert requests == [expected_gateway, "native"]
         finally:
             native.close()
-            ssp.close()
+            generation.close()
             await native.wait_closed()
-            await ssp.wait_closed()
+            await generation.wait_closed()
 
     @pytest.mark.description("A timed out agent run collects outputs only after the kill is confirmed.")
     async def test_run_agent_timeout_collects_only_after_confirmed_kill(
@@ -1755,11 +1758,11 @@ first = agents.stop("a")
 second = agents.stop("b")
 agents.start("a", "/tmp/next-observation")
 continued = agents.wait_any()
-print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons": [first.reason, second.reason, continued.reason]}), flush=True)
+print(json.dumps({"orchestrator_gateway": os.environ["MODEL_GATEWAY_URL"], "slots": [first.slot, second.slot, continued.slot], "reasons": [first.reason, second.reason, continued.reason]}), flush=True)
 """
 
         class LocalWorkload:
-            def __init__(self) -> None:
+            def __init__(self, env_vars: Mapping[str, str]) -> None:
                 self.started = asyncio.create_task(
                     asyncio.create_subprocess_exec(
                         sys.executable,
@@ -1767,7 +1770,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                         orchestrator,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        env=dict(os.environ, VALKYRIE_STAGE_DIR=str(stage), TEST_SLOTS_ROOT=str(slots)),
+                        env=dict(os.environ, **env_vars, VALKYRIE_STAGE_DIR=str(stage), TEST_SLOTS_ROOT=str(slots)),
                         start_new_session=True,
                     )
                 )
@@ -1814,7 +1817,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             def fake_workload(
                 self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
             ) -> LocalWorkload:
-                self.workload = LocalWorkload()
+                self.workload = LocalWorkload(env_vars or {})
                 return self.workload
 
         acknowledgements: list[str] = []
@@ -1826,6 +1829,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         contract = _controlled_contract().model_copy(
             update={
                 "run_cmd": (
+                    "printf '%s' \"$MODEL_GATEWAY_URL\" > {slot_dir}/gateway-url; "
                     "echo $$ > {slot_dir}/group.pid; echo task-{task_id} > {slot_dir}/first; "
                     "touch {slot_dir}/ready; timeout 30 sh -c 'while :; do sleep 0.05; done'"
                 ),
@@ -1833,6 +1837,9 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
             }
         )
         output: list[str] = []
+        native_url = "http://native.example.test"
+        generation_url = "http://generation.example.test"
+        monkeypatch.setenv("MODEL_GATEWAY_URL", native_url)
         controller = ExternalServiceDeadlineController(base_allowance_seconds=10.0)
         completed = False
         try:
@@ -1853,6 +1860,7 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
                     ),
                     deadline_controller=controller,
                     on_external_service_finalized=persisted,
+                    generation_gateway_url=generation_url,
                     log_line=lambda text: output.append(text + "\n"),
                 )
                 completed = True
@@ -1869,8 +1877,15 @@ print(json.dumps({"slots": [first.slot, second.slot, continued.slot], "reasons":
         assert (slots / "a" / "agent" / "first").read_text().strip() == "task-task_0"
         assert (slots / "b" / "agent" / "first").read_text().strip() == "task-task_0"
         assert (slots / "a" / "agent" / "continued").read_text().strip() == "resumed"
+        assert (slots / "a" / "agent" / "gateway-url").read_text() == generation_url
+        assert (slots / "b" / "agent" / "gateway-url").read_text() == generation_url
         assert any(
-            json.loads(message) == {"slots": ["a", "b", "a"], "reasons": ["stopped", "stopped", "exited"]}
+            json.loads(message)
+            == {
+                "orchestrator_gateway": native_url,
+                "slots": ["a", "b", "a"],
+                "reasons": ["stopped", "stopped", "exited"],
+            }
             for message in output
             if message.startswith("{")
         )
@@ -4999,7 +5014,7 @@ class TestSandboxLifecycle:
         assert [call.kwargs["extra"]["event"] for call in warning_log.call_args_list] == ["sandbox.create.failed"]
 
     @pytest.mark.description(
-        "A sandbox the provider announces before its start fails is still recorded for the run under the announced provider."
+        "A sandbox the provider announces before its start fails is still recorded for its run and attempt under the announced provider."
     )
     async def test_announced_sandbox_is_recorded_when_its_start_fails(self) -> None:
         benchmark_id = uuid4()
@@ -5020,13 +5035,13 @@ class TestSandboxLifecycle:
                 resources=Resources(vcpu=2, memory=4, disk=5),
                 creation_semaphore=asyncio.Semaphore(1),
                 creation_state=SandboxCreationState(cleanup_pending=False),
-                sandbox_link=SandboxLink(benchmark_id=benchmark_id, provider="configured"),
+                sandbox_link=SandboxLink(benchmark_id=benchmark_id, provider="configured", attempt_id="attempt-1"),
                 record_sandbox=record_sandbox,
             ):
                 pass
 
         record_sandbox.assert_awaited_once_with(
-            SandboxLink(benchmark_id=benchmark_id, provider="daytona_v2"), "sbx-never-started"
+            SandboxLink(benchmark_id=benchmark_id, provider="daytona_v2", attempt_id="attempt-1"), "sbx-never-started"
         )
 
     @pytest.mark.description("A failed image build is not retried and carries the end of its log once.")

@@ -12,7 +12,7 @@ SDK_SOURCE = "packages/valkyrie-sdk/src"
 SOURCE_ROOTS = (SDK_SOURCE, "src")
 DYNAMIC_IMPORTERS = {"import_module", "__import__"}
 SDK = "valkyrie.sdk"
-PUBLIC_SDK = (SDK, f"{SDK}.models", f"{SDK}.errors")
+PUBLIC_SDK = (SDK, f"{SDK}.models", f"{SDK}.errors", f"{SDK}.harbor_dataset")
 
 
 @dataclass(frozen=True)

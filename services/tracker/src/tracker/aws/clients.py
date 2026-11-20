@@ -17,8 +17,13 @@ from botocore.config import Config
 
 from tracker.aws.tags import ORG_ID_TAG, SECRET_SCOPE_TAG
 
+
+def _s3_client_config(signature_version: str | None = None) -> Config:
+    return Config(max_pool_connections=200, retries={"mode": "standard"}, signature_version=signature_version)
+
+
 _LOGS_CLIENT_CONFIG = Config(max_pool_connections=200, retries={"mode": "adaptive", "total_max_attempts": 20})
-_S3_CLIENT_CONFIG = Config(max_pool_connections=200, retries={"mode": "standard"})
+_S3_CLIENT_CONFIG = _s3_client_config()
 ECS_CONFIG = Config(
     connect_timeout=3,
     read_timeout=8,
@@ -87,8 +92,9 @@ class AWSClientProvider:
     def _data_session(self) -> aioboto3.Session:
         return self._task_session()
 
-    def s3_client(self) -> Any:
-        return self._data_session().client("s3", config=_S3_CLIENT_CONFIG)  # pyright: ignore[reportUnknownMemberType]
+    def s3_client(self, *, signature_version: str | None = None) -> Any:
+        client_config = _S3_CLIENT_CONFIG if signature_version is None else _s3_client_config(signature_version)
+        return cast(Any, self._data_session().client("s3", config=client_config))  # pyright: ignore[reportUnknownMemberType]
 
     def secretsmanager_async_client(self) -> Any:
         return self._data_session().client("secretsmanager")  # pyright: ignore[reportUnknownMemberType]

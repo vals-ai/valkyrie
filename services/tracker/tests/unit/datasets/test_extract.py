@@ -79,9 +79,10 @@ class TestExtract:
         assert written == ["task.toml", "tests/cases/one.txt", "tests/test.sh"]
         assert (tmp_path / "tests" / "cases" / "one.txt").read_bytes() == b"1"
 
-    @pytest.mark.description("A prefix does not match a sibling with the same start.")
-    def test_a_prefix_does_not_match_a_sibling_with_the_same_start(self, tmp_path: Path) -> None:
-        extract(archive_of({"tests/a": b"1", "tests-extra/b": b"2"}), ["tests"], tmp_path)
+    @pytest.mark.description("A stored task reads only the selected prefix and accepts legacy path spellings.")
+    def test_read_selected_task_prefix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(extraction, "MAX_EXTRACTED_BYTES", 1)
+        extract(archive_of({"tests/./a": b"1", "tests-extra/b": b"excluded"}), ["tests"], tmp_path)
 
         assert sorted(path.name for path in tmp_path.rglob("*") if path.is_file()) == ["a"]
 
@@ -105,12 +106,13 @@ class TestExtract:
             extract(archive_of(TASK), ["environment"], tmp_path)
 
     @pytest.mark.description("A name that appears twice is refused.")
-    def test_a_name_that_appears_twice_is_refused(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("name", ["tests/a", "tests/"])
+    def test_a_name_that_appears_twice_is_refused(self, tmp_path: Path, name: str) -> None:
         buffer = io.BytesIO()
         with warnings.catch_warnings(), zipfile.ZipFile(buffer, "w") as writer:
             warnings.simplefilter("ignore")
-            writer.writestr("tests/a", b"1")
-            writer.writestr("tests/a", b"2")
+            writer.writestr(name, b"")
+            writer.writestr(name, b"")
 
         with pytest.raises(UnsafeArchiveError, match="more than once"):
             extract(zipfile.ZipFile(buffer), ["tests"], tmp_path)

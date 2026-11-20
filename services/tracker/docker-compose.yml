@@ -62,7 +62,8 @@ services:
   migration:
     image: tracker-service
     build:
-      context: .
+      context: ../..
+      dockerfile: services/tracker/Dockerfile
     command: ["alembic", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql://tracker:tracker@postgres:5432/tracker

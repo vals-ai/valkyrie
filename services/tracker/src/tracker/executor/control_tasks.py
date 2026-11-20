@@ -36,6 +36,7 @@ logger = get_logger(__name__)
 class SandboxLink:
     benchmark_id: UUID
     provider: str
+    attempt_id: str | None = None
 
 
 class TaskState(BaseModel):
@@ -196,6 +197,7 @@ class SandboxLinkRequest(BaseModel):
     provider: str
     sandbox_id: str
     seen_at: datetime | None = None
+    attempt_id: str | None = None
 
 
 class SandboxCostRequest(BaseModel):
@@ -343,6 +345,7 @@ class TaskControl:
                     provider=link.provider,
                     sandbox_id=sandbox_id,
                     seen_at=seen_at or datetime.now(UTC),
+                    attempt_id=link.attempt_id,
                 ),
                 TaskDecision,
             )

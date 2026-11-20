@@ -40,6 +40,8 @@ from valkyrie.sdk.models.costs import (
     ProjectCostRow,
     ProjectModelCosts,
     ProjectRun,
+    RunCosts,
+    RunResourceCost,
 )
 from valkyrie.sdk.models.datasets import (
     folder_run_name,
@@ -72,6 +74,7 @@ from valkyrie.sdk.models.logs import LogEvent, LogPage
 from valkyrie.sdk.models.projects import (
     SPEND_SUBCATEGORIES,
     NewProjectRequest,
+    ProjectBudget,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
@@ -226,10 +229,13 @@ __all__ = [
     "NewProjectRequest",
     "ProjectCostRow",
     "ProjectCreateRequest",
+    "ProjectBudget",
     "ProjectModelCosts",
     "ProjectResponse",
     "ProjectRun",
     "ProjectsResponse",
+    "RunCosts",
+    "RunResourceCost",
     "RetryMode",
     "RegradeBenchmarkRequest",
     "RegradeBenchmarkResponse",

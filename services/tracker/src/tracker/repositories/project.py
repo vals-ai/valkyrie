@@ -144,6 +144,12 @@ class ProjectRepository:
         except httpx.HTTPError as error:
             raise ProjectServiceUnavailableError() from error
 
+    def limit(self, project: Project) -> dict[str, Any]:
+        try:
+            return self._service.limit(project.org_id, project.id)
+        except httpx.HTTPError as error:
+            raise ProjectServiceUnavailableError() from error
+
     def limit_requests(self, project: Project, method: str, path: str = "", body: object = None) -> Any:
         response = self._service.limit_requests(project, method, path, body)
         if response.status_code == 404:

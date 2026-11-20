@@ -16,13 +16,20 @@ from tests.unit.datasets.support import FakeSandbox, OuterSandbox, store_archive
 from tracker.services.datasets import artifacts
 from tracker.services.datasets.artifacts import STAGING_ROOT, ArtifactSink
 from tracker.services.datasets.env import SecretReader
-from tracker.services.datasets.grading import REWARD_TEXT_PATH, RESET_STEP_LOG_DIRS, VERIFIER_OUTPUT_PATH
+from tracker.services.datasets.grading import (
+    REWARD_TEXT_PATH,
+    RESET_STEP_LOG_DIRS,
+    VERIFIER_OUTPUT_PATH,
+    VerifierResultError,
+)
 from tracker.services.datasets.config import MultiStepRewardStrategy
 from tracker.services.datasets.retrieve_task import TaskFolderResponse
+from tracker.clients import dataset_tasks
 from tracker.clients.dataset_tasks import DatasetTaskService, InvalidTaskError, TaskSelectionError
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, TaskSource
-from tracker.exceptions import SecretsError
+from tracker.exceptions import InvalidSandboxConfigurationError, SecretsError
 from tracker.local.storage import FilesystemObjectStore
+from tracker.runtime.run_egress import ScopedGateway
 
 TASK_TOML = """
 [agent]
@@ -38,6 +45,7 @@ memory_mb = 4096
 workdir = "/app"
 """
 PROVIDER = DockerProviderConfig(type="docker")
+GATEWAY = ScopedGateway("https://gateway.example", "mgwt_grading")
 DAYTONA = cast(SandboxProviderConfig, SimpleNamespace(type="daytona"))
 MODAL_VM = ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 DOCKERFILE_TOML = "[environment]\ncpus = 1\nworkdir = '/app'"
@@ -514,6 +522,19 @@ class TestSteps:
 
         assert any("MODE=two" in command for command in sandbox.commands)
 
+    @pytest.mark.description("A step whose verifier lists models gets the grading token.")
+    async def test_a_step_whose_verifier_lists_models_gets_the_grading_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = STEPS_TOML.replace('env = { MODE = "two" }', "models = ['openai/gpt-4o']")
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+        service = service_for(LocalFolderSource(write_steps_task(tmp_path, toml)), sandbox, monkeypatch)
+
+        await service.grade_step("task-s", "sandbox-1", "two", PROVIDER, grading_gateway=GATEWAY)
+
+        assert await service.grading_requirements("task-s") == ["openai/gpt-4o"]
+        assert any("MODEL_GATEWAY_API_KEY=mgwt_grading" in command for command in sandbox.commands)
+
     @pytest.mark.description("A task with steps cannot be graded as one.")
     async def test_a_task_with_steps_cannot_be_graded_as_one(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -572,19 +593,23 @@ class TestOracleSolution:
 
 @pytest.mark.description("Grading in the agent's sandbox.")
 class TestEvaluateInstance:
-    @pytest.mark.description("Dataset grading requires no gateway models or remote grader service.")
-    async def test_grading_requirements(self, dataset: Path) -> None:
+    @pytest.mark.description("A dataset task's grading models are the ones its verifier lists, with no remote grader.")
+    @pytest.mark.parametrize("listed", [[], ["openai/gpt-4o", "anthropic/claude-haiku-4-5"]])
+    async def test_grading_requirements(self, dataset: Path, listed: list[str]) -> None:
+        (dataset / "task-a" / "task.toml").write_text(
+            TASK_TOML.replace("[verifier]\n", f"[verifier]\nmodels = {listed!r}\n")
+        )
+
         async with DatasetTaskService(LocalFolderSource(dataset)) as service:
             requirements = await service.grading_requirements_response("task-a", dataset="dataset")
             models = await service.grading_requirements("task-a", dataset="dataset")
 
-        assert requirements.models == models == []
+        assert requirements.models == models == listed
         assert requirements.remote_grader_service is None
 
     @pytest.mark.description("The task is graded and its result returned.")
-    @pytest.mark.parametrize("authorization", [None, RemoteGradingAuthorization(issuer="dev", token="test-grant")])
     async def test_the_task_is_graded_and_its_result_returned(
-        self, dataset: Path, monkeypatch: pytest.MonkeyPatch, authorization: RemoteGradingAuthorization | None
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
         messages: list[str] = []
@@ -594,12 +619,7 @@ class TestEvaluateInstance:
             "sandbox-1",
             sandbox_provider=PROVIDER,
             on_message=messages.append,
-            on_eval_resume_state=lambda _state: None,
             on_sandbox_created=lambda _sandbox: None,
-            dataset=None,
-            child_egress={},
-            grading_token=None,
-            remote_grading_authorization=authorization,
         )
 
         assert isinstance(result, dict)
@@ -607,16 +627,71 @@ class TestEvaluateInstance:
         assert sandbox.files["/tests/data.txt"] == b"data"
         assert messages[0] == "Running the verifier for task-a"
 
-    @pytest.mark.description("A grading token from the Tracker is accepted and the task is still graded.")
-    async def test_a_grading_token_is_accepted(self, dataset: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+    @pytest.mark.description(
+        "A verifier that lists models gets the run's Gateway and grading token, masked, and only the Gateway host."
+    )
+    async def test_a_verifier_that_lists_models_gets_the_gateway_and_the_grading_token(
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        applied: list[tuple[str, object]] = []
+
+        async def apply(sandbox: FakeSandbox, policy: object) -> None:
+            applied.append((sandbox.id, policy))
+
+        monkeypatch.setattr(dataset_tasks, "apply_egress_policy", apply)
+        (dataset / "task-a" / "task.toml").write_text(
+            TASK_TOML.replace("[verifier]\n", "[verifier]\nnetwork_mode = 'no-network'\nmodels = ['openai/gpt-4o']\n")
+        )
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1", VERIFIER_OUTPUT_PATH: b"judging with mgwt_grading"})
 
         result = await service_for(LocalFolderSource(dataset), sandbox, monkeypatch).evaluate_instance(
-            "task-a", "sandbox-1", PROVIDER, grading_token="token"
+            "task-a", "sandbox-1", PROVIDER, grading_gateway=GATEWAY
         )
 
+        assert any(
+            "MODEL_GATEWAY_URL=https://gateway.example" in command and "MODEL_GATEWAY_API_KEY=mgwt_grading" in command
+            for command in sandbox.commands
+        )
+        assert applied == [("sandbox-1", ["gateway.example"]), ("sandbox-1", [])]
         assert isinstance(result, dict)
-        assert result["rewards"] == {"reward": 1.0}
+        assert result["metadata"]["verifier_output"] == "judging with [REDACTED]"
+
+    @pytest.mark.description("The Gateway host is removed again when grading fails.")
+    async def test_the_gateway_host_is_removed_again_when_grading_fails(
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        applied: list[object] = []
+
+        async def apply(_sandbox: FakeSandbox, policy: object) -> None:
+            applied.append(policy)
+
+        monkeypatch.setattr(dataset_tasks, "apply_egress_policy", apply)
+        (dataset / "task-a" / "task.toml").write_text(
+            TASK_TOML.replace("[verifier]\n", "[verifier]\nnetwork_mode = 'no-network'\nmodels = ['openai/gpt-4o']\n")
+        )
+
+        with pytest.raises(VerifierResultError):
+            await service_for(LocalFolderSource(dataset), FakeSandbox(), monkeypatch).evaluate_instance(
+                "task-a", "sandbox-1", PROVIDER, grading_gateway=GATEWAY
+            )
+
+        assert applied == [["gateway.example"], []]
+
+    @pytest.mark.description("A verifier that lists models is not run when the run has no grading token.")
+    async def test_a_verifier_that_lists_models_is_not_run_without_a_grading_token(
+        self, dataset: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (dataset / "task-a" / "task.toml").write_text(
+            TASK_TOML.replace("[verifier]\n", "[verifier]\nmodels = ['openai/gpt-4o']\n")
+        )
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+
+        with pytest.raises(InvalidSandboxConfigurationError, match="no Model Gateway grading token"):
+            await service_for(LocalFolderSource(dataset), sandbox, monkeypatch).evaluate_instance(
+                "task-a", "sandbox-1", PROVIDER
+            )
+
+        assert sandbox.commands == []
 
     @pytest.mark.description("A separate verifier is handed the artifacts convention folder once when it holds files.")
     @pytest.mark.parametrize(

@@ -2,7 +2,13 @@ import re
 import subprocess
 import sys
 
-SKIP = ("docs/reference/", "/vendor/", ".github/", "CHANGELOG.md", "packages/valkyrie-sdk/")
+SKIP = (
+    "docs/reference/",
+    "/vendor/",
+    ".github/",
+    "CHANGELOG.md",
+    "packages/valkyrie-sdk/",
+)
 MAX_SENTENCES = 2
 MAX_CHARACTERS = 300
 ITEM = re.compile(r"^\s*([-*+]|\d+[.)])\s+")

@@ -143,7 +143,7 @@ class ProjectServiceAPI:
 def project_service_api(
     request: pytest.FixtureRequest, monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
 ) -> ProjectServiceAPI:
-    from tracker import project_gateway
+    from tracker.services.gateway import keys
 
     service = ProjectServiceAPI(gateway_api)
     if "project_service" in request.fixturenames:
@@ -161,7 +161,7 @@ def project_service_api(
 
     monkeypatch.setattr(SecretsManagerStore, "get", read_secret)
     monkeypatch.setattr(
-        project_gateway,
+        keys,
         "project_service",
         lambda: ProjectServiceClient(
             httpx.Client(
@@ -176,15 +176,15 @@ def project_service_api(
 
 @pytest.fixture(autouse=True)
 def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
-    from tracker import project_gateway
+    from tracker.clients.model_gateway import machine
 
     gateway = GatewayAPI()
-    monkeypatch.setattr(project_gateway, "VALKYRIE_STAGE", "dev")
+    monkeypatch.setattr(machine, "VALKYRIE_STAGE", "dev")
     monkeypatch.delenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", raising=False)
     monkeypatch.setenv("MODEL_GATEWAY_URL", "https://model-gateway.example")
     monkeypatch.setenv("MODEL_GATEWAY_MACHINE_API_KEY", "machine-test-key")
     monkeypatch.setattr(
-        project_gateway,
+        machine,
         "gateway_client",
         lambda: httpx.AsyncClient(
             base_url="https://model-gateway.example/",
@@ -198,12 +198,13 @@ def gateway_api(monkeypatch: MonkeyPatch) -> GatewayAPI:
 async def _collect_with_unpublished_checks(
     monkeypatch: MonkeyPatch, gateway_api: GatewayAPI, checks: int, gateway_key_id: UUID | None = None
 ) -> UUID:
-    from tracker import project_gateway
+    from tracker.clients.model_gateway import machine
+    from tracker.services.gateway import keys
 
-    monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_POLL_SECONDS", 0)
+    monkeypatch.setattr(machine, "_KEY_PUBLICATION_POLL_SECONDS", 0)
     gateway_api.unpublished_checks = checks
     project = MagicMock(handle="blog", id=uuid4(), gateway_key_id=gateway_key_id)
-    return await project_gateway._project_service_gateway_key(  # pyright: ignore[reportPrivateUsage]
+    return await keys._project_service_gateway_key(  # pyright: ignore[reportPrivateUsage]
         project, MagicMock(id=TEST_ORG_ID), SecretsManagerStore(MagicMock())
     )
 
@@ -230,9 +231,9 @@ async def test_a_second_start_waits_until_the_gateway_accepts_the_already_minted
 async def test_a_collected_project_key_the_gateway_never_accepts_stops_waiting_at_the_deadline(
     monkeypatch: MonkeyPatch, gateway_api: GatewayAPI
 ) -> None:
-    from tracker import project_gateway
+    from tracker.clients.model_gateway import machine
 
-    monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(machine, "_KEY_PUBLICATION_TIMEOUT_SECONDS", 0)
     assert await _collect_with_unpublished_checks(monkeypatch, gateway_api, 3) == gateway_api.key_id
     assert gateway_api.paths.count("/registry") == 1
 
@@ -241,18 +242,19 @@ async def test_a_collected_project_key_the_gateway_never_accepts_stops_waiting_a
 async def test_a_collected_project_key_wait_stops_at_the_deadline_during_a_slow_registry_check(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    from tracker import project_gateway
+    from tracker.clients.model_gateway import machine
 
     async def hang(*_: Any, **__: Any) -> httpx.Response:
         await asyncio.sleep(3600)
         raise AssertionError("registry check was not cut off")
 
-    monkeypatch.setattr(project_gateway, "_KEY_PUBLICATION_TIMEOUT_SECONDS", 0.01)
-    client = MagicMock(get=hang)
-    await asyncio.wait_for(
-        project_gateway._wait_for_gateway_to_accept(client, "new-key", MagicMock(handle="blog")),  # pyright: ignore[reportPrivateUsage]
-        timeout=1,
+    monkeypatch.setattr(machine, "_KEY_PUBLICATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        machine,
+        "gateway_client",
+        lambda: httpx.AsyncClient(base_url="https://model-gateway.example/", transport=httpx.MockTransport(hang)),
     )
+    await asyncio.wait_for(machine.wait_for_gateway_to_accept("new-key", MagicMock(handle="blog")), timeout=1)
 
 
 @pytest.mark.description("Run start keeps a newly collected project key when the Gateway registry check times out.")
@@ -790,6 +792,45 @@ def test_list_shows_only_the_callers_org_projects_by_handle(
     assert {key: projects[1][key] for key in _CUSTOMER_PROJECT} == _CUSTOMER_PROJECT
 
 
+@pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.description(
+    "Archiving an archived project retries the service and preserves its timestamp or reports its failure."
+)
+def test_archive_retries_an_archived_project(
+    database_session: Session,
+    router_bench: Project,
+    project_service: MockProjectRoutes,
+    monkeypatch: MonkeyPatch,
+    status: int,
+) -> None:
+    archived_at = "2026-11-02T12:00:00+00:00"
+    project_service.rows[str(router_bench.id)]["archived_at"] = archived_at
+    archives: list[dict[str, str]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/archive"):
+            archives.append(json.loads(request.content))
+            if status != 200:
+                return httpx.Response(status)
+
+        return project_service.handle(request)
+
+    service = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(project_repository_module, "project_service", lambda: service)
+
+    if status == 200:
+        response = client.post("/projects/router-bench/archive")
+
+        assert response.status_code == 200
+        assert response.json()["archived_at"] == archived_at
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            _ = client.post("/projects/router-bench/archive")
+
+    assert archives == [{"archived_at": archived_at}]
+    assert project_service.rows[str(router_bench.id)]["archived_at"] == archived_at
+
+
 @pytest.mark.description("A project ID lookup is scoped to the caller's org.")
 def test_project_id_lookup_is_scoped_to_the_callers_org(
     database_session: Session, router_bench: Project, project_service: MockProjectRoutes
@@ -873,6 +914,33 @@ def test_gateway_key_eligibility_hides_projects_outside_the_human_org(
             headers={"authorization": "Bearer human-session"},
         )
         assert response.status_code == 404
+
+
+@pytest.mark.description(
+    "Unarchiving a project that looks active still reaches the service, so a timed-out archive is undone."
+)
+def test_unarchive_reaches_the_service_after_an_archive_timed_out(
+    database_session: Session, router_bench: Project, project_service: MockProjectRoutes, monkeypatch: MonkeyPatch
+) -> None:
+    unarchives: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/archive"):
+            return httpx.Response(503)
+        if request.url.path.endswith("/unarchive"):
+            unarchives.append(request.url.path)
+        return project_service.handle(request)
+
+    service = ProjectServiceClient(httpx.Client(base_url="http://projects", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(project_repository_module, "project_service", lambda: service)
+    with pytest.raises(httpx.HTTPStatusError):
+        _ = client.post("/projects/router-bench/archive")
+
+    response = client.post("/projects/router-bench/unarchive")
+
+    assert response.status_code == 200
+    assert response.json()["archived_at"] is None
+    assert unarchives == [f"/orgs/{TEST_ORG_ID}/projects/{router_bench.id}/unarchive"]
 
 
 class LimitRoute:
@@ -962,8 +1030,11 @@ def test_a_platform_admin_outside_the_org_sets_a_project_limit_by_org_id(
     monkeypatch.delitem(app.dependency_overrides, get_current_org)
     monkeypatch.setattr(tracker_auth, "_validate_bearer", lambda _token: {"sub": "U-alice", "tenants": {}})
     gateway_key_login.mgmt.user.load_by_user_id.return_value["user"].update(
-        userTenants=[], permissions=[PLATFORM_ADMIN_PERMISSION]
+        userTenants=[], roleNames=["platform-operator"]
     )
+    gateway_key_login.mgmt.role.load_all.return_value = {
+        "roles": [{"name": "platform-operator", "permissionNames": [PLATFORM_ADMIN_PERMISSION]}]
+    }
 
     response = _set_limit(router_bench)
 

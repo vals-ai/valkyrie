@@ -11,6 +11,7 @@ from sqlalchemy import (
     Connection,
     DateTime,
     Dialect,
+    Enum as SAEnum,
     ForeignKeyConstraint,
     Identity,
     Index,
@@ -20,7 +21,7 @@ from sqlalchemy import (
     event,
     text,
 )
-from sqlalchemy.orm import Mapped, Mapper
+from sqlalchemy.orm import Mapped, Mapper, deferred
 from sqlmodel import (
     JSON,
     CheckConstraint,
@@ -38,6 +39,7 @@ from tracker.database.utils import has_field_changed
 from tracker.domain import (
     AgentCausedExitReason,
     BenchmarkStatus,
+    DatasetUploadStatus,
     DocentReadingStatus,
     ExecutorDispatchKind,
     ExecutorReleaseStatus,
@@ -232,6 +234,7 @@ class SandboxRecord(SQLModel, table=True):
     sandbox_id: str = Field(primary_key=True)
     benchmark_id: UUID = Field(foreign_key="benchmark.id")
     last_seen_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    attempt_id: str | None = None
 
 
 class RunCost(SQLModel, table=True):
@@ -242,7 +245,9 @@ class RunCost(SQLModel, table=True):
             "uq_run_cost_sandbox_provider_source_id",
             "provider",
             "source_id",
+            "resource",
             unique=True,
+            postgresql_nulls_not_distinct=True,
             postgresql_where=text("cost_type = 'sandbox'"),
             sqlite_where=text("cost_type = 'sandbox'"),
         ),
@@ -255,15 +260,42 @@ class RunCost(SQLModel, table=True):
             postgresql_where=text("cost_type = 'search'"),
             sqlite_where=text("cost_type = 'search'"),
         ),
+        Index(
+            "uq_run_cost_reported_source_id",
+            "benchmark_id",
+            "attempt_id",
+            "provider",
+            "source_id",
+            "cost_type",
+            unique=True,
+            postgresql_where=text("reporter IS NOT NULL"),
+            sqlite_where=text("reporter IS NOT NULL"),
+        ),
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     benchmark_id: UUID = Field(foreign_key="benchmark.id")
+    attempt_id: str | None = None
     cost_type: str
+    resource: str | None = None
     source_id: str | None = None
     provider: str
     amount_usd: float
+    quantity: float | None = None
+    unit: str | None = None
     usage_end: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    reporter: str | None = None
+
+
+class RunCostReportToken(SQLModel, table=True):
+    __tablename__ = "run_cost_report_token"
+
+    token_hash: str = Field(primary_key=True)
+    benchmark_id: UUID = Field(foreign_key="benchmark.id", index=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(ZoneInfo("UTC")),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
 
 class RunCostUsageEndBackfill(SQLModel, table=True):
@@ -656,6 +688,49 @@ class DatasetTag(SQLModel, table=True):
     dataset_id: UUID = Field(foreign_key="dataset.id", primary_key=True)
     tag: str = Field(primary_key=True)
     version_id: UUID = Field(foreign_key="dataset_version.id", index=True)
+
+
+_upload_review = Column[dict[str, Any]]("review", JSON, nullable=True)
+
+
+class DatasetUpload(SQLModel, table=True):
+    __mapper_args__ = {"properties": {"review": deferred(_upload_review)}}
+    __tablename__ = "dataset_upload"
+    __table_args__ = (
+        Index("ix_dataset_upload_dataset_created", "dataset_id", "created_at"),
+        Index("ix_dataset_upload_status_lease", "status", "lease_expires_at"),
+        Index("ix_dataset_upload_expires", "expires_at"),
+        Index("ix_dataset_upload_cleanup", "archive_cleanup_at"),
+        CheckConstraint("archive_size > 0", name="ck_dataset_upload_positive_size"),
+    )
+
+    id: UUID = Field(primary_key=True)
+    dataset_id: UUID = Field(foreign_key="dataset.id")
+    owner: str
+    created_by_email: str | None = None
+    archive_sha256: str
+    archive_size: int = Field(sa_column=Column(BigInteger, nullable=False))
+    status: DatasetUploadStatus = Field(
+        default=DatasetUploadStatus.UPLOADING,
+        sa_column=Column(SAEnum(DatasetUploadStatus, native_enum=False), nullable=False),
+    )
+    created_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+    updated_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+    expires_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
+    attempts: int = 0
+    lease_id: UUID | None = None
+    lease_expires_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    processing_deadline: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    review: dict[str, Any] | None = Field(default=None, sa_column=_upload_review)
+    review_digest: str | None = None
+    task_count: int | None = None
+    total_task_bytes: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    metric_digest: str | None = None
+    tags: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    warnings: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    error: str | None = None
+    published_version_id: UUID | None = Field(default=None, foreign_key="dataset_version.id")
+    archive_cleanup_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
 
 
 @event.listens_for(Benchmark, "before_insert")

@@ -23,7 +23,7 @@ from tracker.api.organizations import (
     OrganizationResponse,
     OrganizationsResponse,
 )
-from tracker.services.costs import MonthModelCost, ProjectModelCosts
+from tracker.services.costs import MonthModelCost, ProjectModelCosts, RunCosts, RunResourceCost
 from tracker.types import FinalEvaluation
 from tracker.types import (
     AWSBenchmarkArguments,
@@ -90,6 +90,7 @@ from tracker.types import (
     ShedBenchmarkResponse,
     SPEND_SUBCATEGORIES,
     NewProjectRequest,
+    ProjectBudget,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
@@ -106,6 +107,8 @@ from valkyrie.sdk.models.costs import (
     ProjectCostRow as SDKProjectCostRow,
     ProjectModelCosts as SDKProjectModelCosts,
     ProjectRun as SDKProjectRun,
+    RunCosts as SDKRunCosts,
+    RunResourceCost as SDKRunResourceCost,
 )
 from valkyrie.sdk.models import (
     AccessKeyResponse as SDKAccessKeyResponse,
@@ -184,6 +187,7 @@ from valkyrie.sdk.models import (
     ShedBenchmarkResponse as SDKShedBenchmarkResponse,
     SPEND_SUBCATEGORIES as SDK_SPEND_SUBCATEGORIES,
     NewProjectRequest as SDKNewProjectRequest,
+    ProjectBudget as SDKProjectBudget,
     ProjectCreateRequest as SDKProjectCreateRequest,
     ProjectResponse as SDKProjectResponse,
     ProjectsResponse as SDKProjectsResponse,
@@ -206,6 +210,7 @@ ROUTES = (
     ("/projects/{handle}", "get", "handle"),
     ("/projects/{handle}", "put", "handle"),
     ("/projects/{handle}", "delete", "handle"),
+    ("/projects/{handle}/budget", "get", "handle"),
     ("/v1/benchmarks", "post", ""),
     ("/v1/benchmarks", "get", "include_archived"),
     ("/v1/benchmarks/{benchmark}", "get", "benchmark"),
@@ -269,6 +274,7 @@ ROUTES = (
     ),
     ("/costs/by-project", "get", "start end"),
     ("/costs/project-model", "get", "project start end"),
+    ("/benchmarks/{benchmark_id}/costs", "get", "benchmark_id"),
     ("/agents", "get", ""),
     ("/agents/{name}/download-url", "get", "name download"),
     ("/agents/{name}", "put", "name overwrite"),
@@ -346,6 +352,8 @@ RESPONSE_MODELS = {
     ("/projects/{handle}", "put"): "ProjectResponse",
     ("/costs/by-project", "get"): "CostsByProjectResponse",
     ("/costs/project-model", "get"): "ProjectModelCosts",
+    ("/benchmarks/{benchmark_id}/costs", "get"): "RunCosts",
+    ("/projects/{handle}/budget", "get"): "ProjectBudget",
     ("/projects/{handle}", "delete"): "ProjectResponse",
     ("/v1/benchmarks", "get"): "BenchmarkDefinitionsResponse",
     ("/v1/benchmarks/{benchmark}", "get"): "BenchmarkDefinitionResponse",
@@ -416,6 +424,9 @@ MODEL_PAIRS = (
     (CostsByProjectResponse, SDKCostsByProjectResponse),
     (MonthModelCost, SDKMonthModelCost),
     (ProjectModelCosts, SDKProjectModelCosts),
+    (RunResourceCost, SDKRunResourceCost),
+    (RunCosts, SDKRunCosts),
+    (ProjectBudget, SDKProjectBudget),
     (BenchmarkDefinitionResponse, SDKBenchmarkDefinitionResponse),
     (BenchmarkDefinitionsResponse, SDKBenchmarkDefinitionsResponse),
     (DatasetResponse, SDKDatasetResponse),
@@ -463,6 +474,17 @@ MODEL_PAIRS = (
     (FetchBenchmarkMetadataResponse, SDKFetchBenchmarkMetadataResponse),
 )
 INTERNAL_ROUTES = {
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads", "get"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}", "put"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}", "get"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/form", "post"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/complete", "post"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/tasks", "get"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/publish", "post"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/cancel", "post"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/search", "get"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}/files", "get"),
+    ("/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}/preview", "get"),
     ("/benchmarks/{benchmark_id}/monitor/tasks", "get"),
     ("/benchmarks/{benchmark_id}/monitor/stop-receipt", "get"),
     ("/monitor/runs", "get"),
@@ -473,6 +495,7 @@ INTERNAL_ROUTES = {
     ("/costs/daytona-unmatched", "get"),
     ("/costs/sandbox-rows", "get"),
     ("/costs/project-sandbox", "get"),
+    ("/costs/runs/{run_id}/reported", "post"),
     ("/projects/{handle}/archive", "post"),
     ("/projects/{handle}/unarchive", "post"),
     ("/auth/cli", "get"),

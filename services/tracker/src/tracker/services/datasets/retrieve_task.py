@@ -1,6 +1,7 @@
 import math
 from pathlib import Path, PurePosixPath
 
+import httpx
 from benchmark_service import ComposeSource, DockerfileSource, ImageSource, MCPServer, Resources
 from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, RetrieveTaskResponse
 from pydantic import BaseModel, Field
@@ -78,6 +79,14 @@ def stage_egress(stage: NetworkSettings, environment: EnvironmentConfig) -> Egre
             return list(settings.allowed_hosts or [])
         case _:
             return "*"
+
+
+def with_gateway(policy: EgressPolicy, gateway_url: str) -> EgressPolicy:
+    if policy == "*":
+        return policy
+
+    host = httpx.URL(gateway_url).host
+    return policy if host in policy else [*policy, host]
 
 
 def sandbox_source(task_dir: Path, config: TaskConfig) -> ImageSource | DockerfileSource | ComposeSource:

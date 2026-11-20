@@ -41,6 +41,8 @@ class DatasetVersionRepository:
         created_by_email: str | None,
         manifest: VersionManifest | None = None,
         metric_digest: str | None = None,
+        *,
+        commit: bool = True,
     ) -> tuple[DatasetVersion, bool]:
         self._lock(dataset_id)
         digest = version_digest(
@@ -84,7 +86,10 @@ class DatasetVersionRepository:
                 row.source_name = _source_name(manifest, row.task_id)
         for tag in dict.fromkeys([LATEST, *tags]):
             self._point(dataset_id, tag, version.id)
-        self._session.commit()
+        if commit:
+            self._session.commit()
+        else:
+            self._session.flush()
         return version, created
 
     def get(self, dataset_id: UUID, ref: VersionRef) -> DatasetVersion | None:

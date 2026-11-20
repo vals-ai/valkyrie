@@ -253,7 +253,7 @@ def test_file_only_selected_project_keeps_manual_gateway_references(
     tmp_path: Path,
     project_service: MockProjectRoutes,
 ) -> None:
-    from tracker import project_gateway
+    from tracker.clients.model_gateway import machine
 
     monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
     monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
@@ -276,7 +276,7 @@ def test_file_only_selected_project_keeps_manual_gateway_references(
     )
     monkeypatch.setattr(main, "SANDBOX_QUEUE_ENABLED", False)
     monkeypatch.setattr(
-        project_gateway,
+        machine,
         "project_gateway_configuration",
         lambda: (_ for _ in ()).throw(AssertionError("file-only execution must not configure Gateway")),
     )

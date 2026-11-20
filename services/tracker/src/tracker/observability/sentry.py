@@ -12,7 +12,7 @@ from sentry_sdk.integrations.otlp import OTLPIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from sentry_sdk.types import Event, Hint, Log
 
-from tracker.exceptions import SecretConfigurationError, SSLConnectionError
+from tracker.exceptions import ModelGatewayConfigurationError, SecretConfigurationError, SSLConnectionError
 from tracker.logging import task_id_var
 from tracker.logging.context import (
     attempt_started_at_var,
@@ -53,7 +53,7 @@ def _before_send(
     exc_info = hint.get("exc_info")
     if exc_info:
         exc = exc_info[1]
-        if isinstance(exc, SecretConfigurationError):
+        if isinstance(exc, (SecretConfigurationError, ModelGatewayConfigurationError)):
             return None
         if isinstance(exc, SSLConnectionError):
             event["fingerprint"] = ["{{ default }}", "SSLConnectionError"]
@@ -129,7 +129,7 @@ def init_sentry(service_name: str, environment: str) -> None:
 
 
 def capture_exception(error: BaseException) -> None:
-    if isinstance(error, SecretConfigurationError):
+    if isinstance(error, (SecretConfigurationError, ModelGatewayConfigurationError)):
         return
     try:
         sentry_sdk.capture_exception(error)

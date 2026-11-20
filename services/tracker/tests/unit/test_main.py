@@ -4,15 +4,17 @@ import logging
 import re
 import tarfile
 import time
+import zipfile
 from collections.abc import AsyncIterator, Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import UUID, uuid4
 
 import httpx
+from cachetools import TTLCache
 import pytest
 from botocore.exceptions import ClientError
 from benchmark_service.client import (
@@ -29,6 +31,8 @@ from sqlmodel import Session, select
 
 import main as main_module
 import tracker.auth as auth_module
+import tracker.services.gateway.tokens as tokens
+from tracker.clients.model_gateway import tenant
 from tracker import config
 from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from main import (
@@ -46,6 +50,9 @@ from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws.s3 import S3ObjectStore, s3_owner_arguments, upload_to_s3
 from tracker.aws.services import CloudRuntimeFactory
+from tracker.aws.secrets import SecretsManagerStore
+from tracker.local.resources import LocalResources
+from tracker.local.storage import FilesystemObjectStore
 from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.storage import ObjectStore, StoredObject, StoredObjectCopy
 from tracker.database.models import (
@@ -273,6 +280,153 @@ class TestNoStartRoleHTTP:
 
 @pytest.mark.description("Tracker API route behavior and error responses.")
 class TestTrackerAPI:
+    @pytest.mark.description(
+        "Gateway model validation uses org secrets, rejects invalid run configuration, and tolerates registry failures."
+    )
+    @pytest.mark.parametrize(
+        (
+            "model",
+            "companion",
+            "passkey",
+            "registry_status",
+            "expected_status",
+            "fix",
+            "gateway_url",
+            "tenant_override",
+            "local",
+        ),
+        [
+            ("eleven_v4", None, True, 200, 400, "--model", "https://gateway.test", False, False),
+            (
+                "openai/gpt-4o",
+                "invalid-model",
+                False,
+                200,
+                400,
+                "--kwarg companion_models",
+                "https://gateway.test",
+                False,
+                False,
+            ),
+            ("eleven_v4", None, False, 200, 200, "", "https://gateway.test", False, False),
+            ("eleven_v4", None, True, 503, 200, "", "https://gateway.test", False, False),
+            ("openai/gpt-4o", "openai/future/*", False, 200, 200, "", "https://gateway.test", False, False),
+            ("provider/model", None, False, 200, 400, "MODEL_GATEWAY_URL", "secret-invalid-url", False, False),
+            ("openai/gpt-4o", None, False, 200, 200, "", "https://gateway.test", True, False),
+            ("openai/gpt-4o", None, False, 200, 200, "", "https://gateway.test", True, True),
+        ],
+    )
+    async def test_start_gateway_model_validation(
+        self,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        model: str,
+        companion: str | None,
+        passkey: bool,
+        registry_status: int,
+        expected_status: int,
+        fix: str,
+        gateway_url: str,
+        tenant_override: bool,
+        local: bool,
+        tmp_path: Path,
+    ) -> None:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "dummy/contract.yaml",
+                json.dumps(
+                    {
+                        "name": "dummy",
+                        "install_cmd": "true",
+                        "run_cmd": "echo {problem_statement_path}",
+                        "kwargs": {"companion_models": {"type": "str", "required": False}},
+                    }
+                ),
+            )
+        monkeypatch.setattr(S3ObjectStore, "get_bytes", AsyncMock(return_value=archive.getvalue()))
+        if local:
+            monkeypatch.setattr(
+                main_module.local_config,
+                "resources",
+                LocalResources(data_root=tmp_path, secrets_manager_region="us-east-1"),
+            )
+            monkeypatch.setattr(FilesystemObjectStore, "get_bytes", AsyncMock(return_value=archive.getvalue()))
+        monkeypatch.setattr(tokens, "PASSKEY_ORGS", frozenset({"default"}) if passkey else frozenset[str]())
+        monkeypatch.setattr(tenant, "_registry_cache", TTLCache(maxsize=128, ttl=60))
+        monkeypatch.setattr(main_module, "AUTH_REQUIRED", tenant_override)
+        monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "default")
+        original_get = SecretsManagerStore.get
+
+        async def get_secret(store: Any, name: str) -> Any:
+            if tenant_override and name == "gateway-key":
+                return {"MODEL_GATEWAY_API_KEY": "shared-key", "MODEL_GATEWAY_URL": "https://shared-gateway.test"}
+            if name in {"gateway-key", f"valkyrie/tenants/{TEST_ORG_ID}/gateway-key"}:
+                return {"MODEL_GATEWAY_API_KEY": "managed-key", "MODEL_GATEWAY_URL": gateway_url}
+
+            return await original_get(store, name)
+
+        monkeypatch.setattr(SecretsManagerStore, "get", get_secret)
+        registry_requests: list[httpx.Request] = []
+
+        def registry(request: httpx.Request) -> httpx.Response:
+            registry_requests.append(request)
+            assert request.url.path == "/registry"
+            assert request.headers["Authorization"] == (
+                "Bearer shared-key" if local and tenant_override else "Bearer managed-key"
+            )
+
+            return httpx.Response(
+                registry_status,
+                json={
+                    "models": {
+                        "openai/gpt-4o": {
+                            "provider_name": "openai",
+                            "full_key": "openai/gpt-4o",
+                            "properties": {},
+                            "metadata": {"deprecated": False},
+                        }
+                    }
+                },
+            )
+
+        request = StartBenchmarkRequest(
+            benchmark_name="swebench",
+            sandbox_provider="daytona",
+            sandbox_provider_secret_name="provider-secret",
+            contract=AgentContractRequest(
+                name="dummy",
+                model=model,
+                kwargs={"companion_models": companion} if companion else {},
+                secrets={"MODEL_GATEWAY_API_KEY": "gateway-key", "MODEL_GATEWAY_URL": "gateway-key"},
+            ),
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(registry)) as gateway_client:
+            monkeypatch.setattr(tenant, "_client", gateway_client)
+            response = cast(httpx.Client, local_client if local else client).post(
+                "/start-benchmark", json=request.model_dump(mode="json")
+            )
+
+        assert response.status_code == expected_status, response.text
+        if tenant_override:
+            assert len(registry_requests) == 1
+            assert registry_requests[0].url.host == ("shared-gateway.test" if local else "gateway.test")
+        runs = database_session.exec(select(Benchmark)).all()
+        assert len(runs) == (1 if expected_status == 200 else 0)
+        if expected_status == 400:
+            detail = response.json()["detail"]
+            assert "Valkyrie" in detail
+            assert "Model Gateway" in detail
+            assert "Tracker" not in detail
+            assert fix in detail
+            assert "managed-key" not in detail
+            if fix == "MODEL_GATEWAY_URL":
+                assert gateway_url not in detail
+                assert "Set it to a valid Model Gateway service URL" in detail
+            else:
+                assert (companion or model) in detail
+
     @pytest.mark.description("A start with path segments in the agent name is rejected before storage.")
     @pytest.mark.parametrize("agent_name", ["team/secret-agent", "../secret-agent", ".."])
     @pytest.mark.parametrize("inline_contract", [False, True])

@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import zipfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import IO
@@ -9,6 +9,7 @@ from uuid import UUID
 
 from tracker import config
 from tracker.database.models import DatasetVersion
+from tracker.exceptions import S3Error
 from tracker.repositories.dataset_version import DatasetVersionRepository
 from tracker.runtime.artifacts import dataset_blob_key, dataset_file_key
 from tracker.runtime.storage import STREAM_CHUNK_BYTES, ObjectStore
@@ -74,7 +75,7 @@ async def stored_sizes(objects: ObjectStore, dataset_id: UUID, digests: list[str
     return dict(found for found in await asyncio.gather(*(look(digest) for digest in digests)) if found is not None)
 
 
-async def _spool(body: AsyncIterator[bytes], spool: IO[bytes]) -> int:
+async def _spool(body: AsyncIterator[bytes], spool: IO[bytes]) -> None:
     uploaded = 0
     async for chunk in body:
         uploaded += len(chunk)
@@ -84,7 +85,6 @@ async def _spool(body: AsyncIterator[bytes], spool: IO[bytes]) -> int:
     spool.seek(0)
     if spool.read(len(ZIP_MAGIC)) != ZIP_MAGIC:
         raise InvalidUploadError("Expected a zip archive")
-    return uploaded
 
 
 def _inspect(spool: IO[bytes]) -> tuple[str, TaskReport]:
@@ -103,6 +103,18 @@ async def _chunks(spool: IO[bytes]) -> AsyncIterator[bytes]:
         yield chunk
 
 
+async def store_task_blob(objects: ObjectStore, key: str, chunks: AsyncIterable[bytes]) -> tuple[int, bool]:
+    if not await objects.exists(key):
+        try:
+            return await objects.put_stream(key, chunks, overwrite=False), False
+        except FileExistsError:
+            pass
+        except S3Error:
+            if not await objects.exists(key):
+                raise
+    return (await objects.stat(key)).size, True
+
+
 async def store_task_archive(
     objects: ObjectStore,
     dataset_id: UUID,
@@ -112,16 +124,14 @@ async def store_task_archive(
 ) -> StoredUpload:
     key = dataset_blob_key(str(dataset_id), digest)
     with tempfile.TemporaryFile() as spool:
-        size = await _spool(body, spool)
+        await _spool(body, spool)
         actual, report = await asyncio.to_thread(_inspect, spool)
         if actual != digest:
             raise RejectedUploadError(f"The archive's files hash to {actual}, not {digest}")
         if not report.ok:
             raise RejectedUploadError(f"The task is not valid: {'; '.join(report.errors)}")
         with guard("Blob"):
-            existed = await objects.exists(key)
-            if not existed:
-                await objects.put_stream(key, _chunks(spool))
+            size, existed = await store_task_blob(objects, key, _chunks(spool))
     return StoredUpload(size=size, existed=existed, warnings=list(report.warnings))
 
 
@@ -155,14 +165,12 @@ async def store_metric_script(
     return StoredUpload(size=size, existed=existed)
 
 
-async def publish_version(
+async def verify_version_objects(
     objects: ObjectStore,
-    versions: DatasetVersionRepository,
     dataset_id: UUID,
     request: VersionCreateRequest,
-    email: str | None,
     guard: StorageGuard = _unguarded,
-) -> tuple[DatasetVersion, bool]:
+) -> dict[str, int]:
     tasks, manifest = request.tasks, request.manifest
     if manifest is not None:
         check_manifest(tasks, manifest)
@@ -176,7 +184,19 @@ async def publish_version(
     absent = [digest for digest in digests if digest not in sizes]
     if absent:
         raise NotStoredError(f"{len(absent)} task archives are not stored yet, such as {absent[0]}; upload them first")
-    sized = {task_id: (digest, sizes[digest]) for task_id, digest in tasks.items()}
+    return sizes
+
+
+async def publish_version(
+    objects: ObjectStore,
+    versions: DatasetVersionRepository,
+    dataset_id: UUID,
+    request: VersionCreateRequest,
+    email: str | None,
+    guard: StorageGuard = _unguarded,
+) -> tuple[DatasetVersion, bool]:
+    sizes = await verify_version_objects(objects, dataset_id, request, guard)
+    tasks = {task_id: (digest, sizes[digest]) for task_id, digest in request.tasks.items()}
     return await asyncio.to_thread(
-        versions.publish, dataset_id, sized, request.tags, email, manifest, request.metric_digest
+        versions.publish, dataset_id, tasks, request.tags, email, request.manifest, request.metric_digest
     )

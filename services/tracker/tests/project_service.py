@@ -11,6 +11,7 @@ class MockProjectRoutes:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
         self.orgs: dict[str, str] = {}
+        self.limits: dict[str, dict[str, Any]] = {}
 
     def seed(self, *projects: Project) -> None:
         for project in projects:
@@ -58,6 +59,9 @@ class MockProjectRoutes:
         row = self.rows.get(parts[4])
         if row is None or self.orgs[parts[4]] != parts[2] or row.get("deleted_at") is not None:
             return httpx.Response(404, request=request)
+        if parts[-1] == "limit" and request.method == "GET":
+            unset = {"limit_dollars": None, "reason": None, "applied": False, "updated_at": None}
+            return httpx.Response(200, json=self.limits.get(parts[4], unset))
         if parts[-1] == "delete":
             row["deleted_at"] = "2026-11-03T12:00:00Z"
             return httpx.Response(204)

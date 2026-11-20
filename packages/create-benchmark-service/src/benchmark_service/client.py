@@ -1,0 +1,945 @@
+"""HTTP/WebSocket client for communicating with a benchmark service."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import os
+import time
+from collections.abc import Awaitable, Callable, Generator
+from functools import partial
+from typing import Any, TypeVar, cast
+
+import httpx
+from pydantic import BaseModel, TypeAdapter
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random,
+)
+from websockets.asyncio.client import ClientConnection, connect as ws_connect
+from websockets.asyncio.connection import Connection
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+
+from benchmark_service.draining import is_drain_rejection
+from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
+from benchmark_service.remote_grading import RemoteGradingAuthorization
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
+from benchmark_service.sandbox_recovery import (
+    SandboxProviders,
+    SandboxRecoveryAttempt,
+    run_with_sandbox_recovery,
+)
+from benchmark_service.sandbox.tracker import SandboxCall, TrackerSandboxHandler
+from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
+    ChildEgress,
+    DatasetVersionId,
+    EvaluateInstanceRequest,
+    EvaluateResponseRequest,
+    FinalScoreResponse,
+    HealthCheckResponse,
+    GradingRequirementsRequest,
+    GradingRequirementsResponse,
+    MonitoringRequirementsRequest,
+    MonitoringRequirementsResponse,
+    JsonValue,
+    ListDatasetsResponse,
+    ResolveDatasetRequest,
+    ResolveDatasetResponse,
+    RetrieveTaskResponse,
+    SandboxCreatedData,
+    SetupTaskRequest,
+    SetupTaskResponse,
+    StreamChunk,
+    StreamDatasetVersionChunk,
+    VerifyTaskIdsResponse,
+    VersionResponse,
+)
+from benchmark_service.v1_schemas import (
+    V1DatasetTasksResponse,
+    V1EvalRequest,
+    V1EvalResponse,
+    V1Payload,
+    V1PayloadType,
+    V1ScoreItem,
+    V1ScoreRequest,
+    V1ScoreResponse,
+    V1UploadUrlRequest,
+    V1UploadUrlResponse,
+    V1Versions,
+)
+
+logger = logging.getLogger(__name__)
+
+_stream_chunk_adapter: TypeAdapter[StreamChunk | StreamDatasetVersionChunk] = TypeAdapter(
+    StreamChunk | StreamDatasetVersionChunk
+)
+_dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
+
+
+# Server half of the keepalive contract, set in templates/Dockerfile:
+# uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
+_SERVER_PING_INTERVAL_S = 30
+_SERVER_PING_TIMEOUT_S = 10
+# The client pings on that cadence but never times a pong out: a blocked server event loop runs no
+# keepalive of its own, so a client deadline would make it the sole actor and fail evaluations the
+# server goes on to complete.
+_WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
+_WS_PING_TIMEOUT_S = None
+# Silence budget for an established stream. Protocol keepalive cannot detect a peer that stops
+# producing while the socket stays open (lost host, blackholed connection), which leaves the stream
+# blocked forever; this bounds that wait. The budget is generous because a slow evaluation is
+# indistinguishable from a dead one from the client side.
+_WS_IDLE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S"
+_DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
+# Diagnostics must not delay the idle failure while the retry-decorated health request backs off.
+_HEALTH_PROBE_TIMEOUT_S = 5.0
+# Distinguishes "caller passed None to disable" from "caller said nothing".
+_UNSET_WS_IDLE_TIMEOUT: float = -1.0
+_DRAIN_RETRY_WINDOW_S = 60.0
+_DRAIN_RETRY_DELAY_S = 1.0
+
+
+async def _serve_sandbox_call(websocket: Connection, handler: TrackerSandboxHandler, call: SandboxCall) -> None:
+    async for reply in handler.handle(call):
+        await websocket.send(reply.model_dump_json())
+
+
+def _default_ws_idle_timeout_s() -> float | None:
+    """Idle budget from the environment; ``0`` or a negative value disables the watchdog."""
+    raw = os.environ.get(_WS_IDLE_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_WS_IDLE_TIMEOUT_S
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r", _WS_IDLE_TIMEOUT_ENV, raw)
+        return _DEFAULT_WS_IDLE_TIMEOUT_S
+    return parsed if parsed > 0 else None
+
+
+_retry_http = retry(
+    retry=retry_if_exception_type(
+        (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.WriteError,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+        )
+    ),
+    stop=stop_after_attempt(5),
+    wait=wait_random(min=1, max=10),
+    reraise=True,
+)
+
+
+_RecoveryResult = TypeVar("_RecoveryResult")
+
+
+class BenchmarkServiceError(Exception):
+    """Exception raised for benchmark service communication errors.
+
+    ``detail`` is the ``detail`` field of the service's JSON error body, or ``None`` when the
+    response had no JSON ``detail``.
+    """
+
+    status_code: int | None
+    detail: object | None
+
+    def __init__(self, message: str, *, status_code: int | None = None, detail: object | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
+class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
+    """Exception raised when the benchmark service returns 401 — credentials are missing or invalid."""
+
+    def __str__(self) -> str:
+        return "Authentication failed: " + super().__str__()
+
+
+class BenchmarkServiceStreamError(BenchmarkServiceError):
+    """Base class for failures after an evaluation WebSocket is established."""
+
+
+class BenchmarkServiceStreamIdleError(BenchmarkServiceStreamError):
+    """Raised when an established evaluation WebSocket goes silent past the idle budget.
+
+    The socket was never closed, so keepalive and close handling cannot surface the failure.
+    ``health_ok`` records whether the service answered ``/health`` while the stream was silent,
+    which separates a wedged or lost task from a service that is down entirely.
+    """
+
+    idle_s: float
+    health_ok: bool
+
+    def __init__(self, *, idle_s: float, health_ok: bool) -> None:
+        health = "service still reports healthy" if health_ok else "service health check also failing"
+        super().__init__(f"WebSocket idle for {idle_s:.1f}s without an application message ({health})")
+        self.idle_s = idle_s
+        self.health_ok = health_ok
+
+
+class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
+    """Raised when an established evaluation WebSocket closes without a terminal chunk.
+
+    ``idle_s`` counts silence since the last application message, or since connect if none arrived.
+    """
+
+    close_code: int | None
+    close_reason: str | None
+    idle_s: float
+
+    def __init__(self, *, close_code: int | None, close_reason: str | None, idle_s: float) -> None:
+        if close_code is None:
+            detail = "without a close frame"
+        else:
+            reason = f": {close_reason}" if close_reason else ""
+            detail = f"with code {close_code}{reason}"
+        super().__init__(f"WebSocket closed {detail} after {idle_s:.1f}s without an application message")
+        self.close_code = close_code
+        self.close_reason = close_reason
+        self.idle_s = idle_s
+
+
+def _response_detail(response: httpx.Response) -> object | None:
+    try:
+        body: object = response.json()
+    except ValueError:
+        return None
+    return cast(dict[str, object], body).get("detail") if isinstance(body, dict) else None
+
+
+def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
+    detail = _response_detail(response)
+    return BenchmarkServiceUnauthenticatedError(
+        detail if isinstance(detail, str) else response.text,
+        status_code=response.status_code,
+        detail=detail,
+    )
+
+
+def _status_error(response: httpx.Response, operation: str) -> BenchmarkServiceError:
+    return BenchmarkServiceError(
+        f"{operation} failed with status code {response.status_code}, response: {response.text}",
+        status_code=response.status_code,
+        detail=_response_detail(response),
+    )
+
+
+def _require_ok(response: httpx.Response, operation: str) -> None:
+    if response.status_code == 401:
+        raise _unauthenticated_error(response)
+    if response.status_code != 200:
+        raise _status_error(response, operation)
+
+
+class _NoRedirectConnect(ws_connect):
+    def process_redirect(self, exc: Exception) -> Exception:
+        return exc
+
+
+class _TelemetryAuth(httpx.Auth):
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers.update(request_headers(request.headers))
+        yield request
+
+
+class BenchmarkServiceClient:
+    """HTTP/WebSocket client for communicating with a benchmark service."""
+
+    _url: str
+    _headers: dict[str, str]
+    _timeout: int
+    _ws_idle_timeout_s: float | None
+    _sandbox_providers: SandboxProviders
+
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: int = 60,
+        ws_idle_timeout_s: float | None = _UNSET_WS_IDLE_TIMEOUT,
+        *,
+        dataset_version: str | None = None,
+    ):
+        """Initialize the client.
+
+        Args:
+            url: Base URL of the benchmark service.
+            headers: Headers to include in all requests.
+            timeout: Request timeout in seconds.
+            ws_idle_timeout_s: Silence budget for an established evaluation stream, after which
+                the stream fails with ``BenchmarkServiceStreamIdleError``. ``None`` disables the
+                watchdog; omit it to take the value from ``BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S``.
+            dataset_version: Exact dataset version ID to require for this client's lifetime.
+        """
+        self._url = url
+        self._headers = headers.copy()
+        version_headers = [value for key, value in headers.items() if key.lower() == DATASET_VERSION_HEADER.lower()]
+        if len(version_headers) > 1 or (version_headers and dataset_version is not None):
+            raise ValueError("Supply the dataset version once, using dataset_version or its header")
+        selected = version_headers[0] if version_headers else dataset_version
+        self._dataset_version = _dataset_version_id.validate_python(selected) if selected is not None else None
+        if dataset_version is not None:
+            self._headers[DATASET_VERSION_HEADER] = dataset_version
+        self._timeout = timeout
+        idle_timeout = (
+            _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
+        )
+        self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
+        self._sandbox_providers = SandboxProviders()
+        self._http_client = self._new_http_client()
+
+    def _new_http_client(self, *, fresh_connections: bool = False) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            auth=_TelemetryAuth(),
+            timeout=self._timeout,
+            headers=self._headers,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=0 if fresh_connections else 20),
+            event_hooks={"response": [self._check_dataset_version]},
+        )
+
+    async def _http_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        response = await self._http_client.request(method, url, **kwargs)
+        if not is_drain_rejection(response.status_code, response.headers):
+            return response
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        # A fresh pool skips other idle sockets to the old task. The shared
+        # pool stays open because unrelated accepted requests may still use it.
+        async with self._new_http_client(fresh_connections=True) as fresh:
+            while is_drain_rejection(response.status_code, response.headers):
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                # Bound the start of retries, not the duration of accepted work.
+                if time.monotonic() >= deadline:
+                    return response
+                response = await fresh.request(method, url, **kwargs)
+        return response
+
+    async def _check_dataset_version(self, response: httpx.Response) -> None:
+        if self._dataset_version is None or not response.is_success:
+            return
+        if response.request.url.path in {
+            httpx.URL(f"{self._url}/{path}").path for path in ("health", "version", "v1/datasets")
+        }:
+            return
+        if response.headers.get_list(DATASET_VERSION_HEADER) != [self._dataset_version]:
+            raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
+
+    def _sandbox_handler(
+        self, sandbox_provider: SandboxProviderConfig | None, instance_id: str
+    ) -> TrackerSandboxHandler | None:
+        if sandbox_provider is None:
+            return None
+        return TrackerSandboxHandler(partial(self.get_sandbox_provider, sandbox_provider), instance_id)
+
+    def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
+        return self._sandbox_providers.get(provider)
+
+    async def close(self) -> None:
+        """Close the HTTP and sandbox provider clients."""
+        await self._http_client.aclose()
+        await self._sandbox_providers.close()
+
+    async def __aenter__(self) -> "BenchmarkServiceClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    @property
+    def _ws_url(self) -> str:
+        return self._url.replace("http://", "ws://").replace("https://", "wss://")
+
+    async def _connect_websocket(self, path: str, headers: dict[str, str]) -> ClientConnection:
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        while True:
+            try:
+                return await _NoRedirectConnect(
+                    f"{self._ws_url}/ws/{path}",
+                    additional_headers=headers,
+                    open_timeout=60.0,
+                    ping_interval=_WS_PING_INTERVAL_S,
+                    ping_timeout=_WS_PING_TIMEOUT_S,
+                    max_size=10 * 1024 * 1024,
+                )
+            except InvalidStatus as exc:
+                if not is_drain_rejection(exc.response.status_code, exc.response.headers):
+                    raise
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                if time.monotonic() >= deadline:
+                    raise
+
+    async def _websocket_request(
+        self,
+        path: str,
+        request: BaseModel,
+        on_message: Callable[[str], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        sandbox_handler: TrackerSandboxHandler | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
+    ) -> JsonValue:
+        """Send a request over WebSocket and stream the response.
+
+        Args:
+            path: WebSocket endpoint path (appended to /ws/).
+            request: Pydantic model to serialize and send as the initial message.
+            on_message: Optional callback invoked for each intermediate "message" chunk.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
+            on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
+
+        Returns:
+            The data payload from the "result" chunk after the server closes the stream.
+
+        Raises:
+            BenchmarkServiceError: If an "error" chunk is received.
+            BenchmarkServiceStreamClosedError: If the established socket closes
+                abnormally or closes cleanly without a result. Pre-connection failures
+                (DNS, connect, handshake) propagate unwrapped from websockets.connect.
+            BenchmarkServiceStreamIdleError: If the socket stays open but produces no
+                application message within the idle budget.
+        """
+        operation = f"WEBSOCKET /ws/{path}"
+        headers_for_call = self._headers | (
+            remote_grading_authorization.as_headers() if remote_grading_authorization is not None else {}
+        )
+        with websocket_request_span(operation, headers_for_call) as headers:
+            async with await self._connect_websocket(path, headers) as websocket:
+                last_message_at = time.monotonic()
+                acknowledged = self._dataset_version is None
+                result_received = False
+                result: JsonValue = None
+                stream = aiter(websocket)
+                receiving = asyncio.ensure_future(anext(stream))
+                sandbox_calls: set[asyncio.Task[None]] = set()
+
+                try:
+                    await websocket.send(request.model_dump_json())
+
+                    while True:
+                        done, _ = await asyncio.wait(
+                            {receiving, *sandbox_calls},
+                            timeout=None if sandbox_calls else self._ws_idle_timeout_s,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in done - {receiving}:
+                            sandbox_calls.discard(task)
+                            task.result()
+                            last_message_at = time.monotonic()
+                        if receiving not in done:
+                            if done:
+                                continue
+                            raise BenchmarkServiceStreamIdleError(
+                                idle_s=time.monotonic() - last_message_at,
+                                health_ok=await self._health_ok(),
+                            )
+                        try:
+                            message = receiving.result()
+                        except StopAsyncIteration:
+                            break
+
+                        last_message_at = time.monotonic()
+                        chunk = _stream_chunk_adapter.validate_json(message)
+
+                        if isinstance(chunk, StreamDatasetVersionChunk):
+                            if acknowledged or chunk.data.id != self._dataset_version:
+                                raise BenchmarkServiceError(
+                                    "The service sent an unexpected dataset version acknowledgement"
+                                )
+                            acknowledged = True
+                            receiving = asyncio.ensure_future(anext(stream))
+                            continue
+                        if not acknowledged and chunk.type != "error":
+                            raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
+
+                        match chunk.type:
+                            case "error":
+                                raise BenchmarkServiceError(chunk.data, status_code=chunk.status_code)
+                            case "result":
+                                if not result_received:
+                                    result = chunk.data
+                                    result_received = True
+                            case "message":
+                                if on_message:
+                                    on_message(chunk.data)
+                            case "eval_resume_state":
+                                if on_eval_resume_state:
+                                    callback_result = on_eval_resume_state(chunk.data)
+                                    if inspect.isawaitable(callback_result):
+                                        await callback_result
+                            case "sandbox_created":
+                                if on_sandbox_created:
+                                    on_sandbox_created(chunk.data)
+                            case "sandbox_call":
+                                if sandbox_handler is None:
+                                    raise BenchmarkServiceError(
+                                        "The service sent a sandbox call without a Tracker sandbox"
+                                    )
+                                sandbox_calls.add(
+                                    asyncio.create_task(_serve_sandbox_call(websocket, sandbox_handler, chunk.data))
+                                )
+                        receiving = asyncio.ensure_future(anext(stream))
+                except ConnectionClosed as exc:
+                    close_frame = exc.rcvd or exc.sent
+                    raise BenchmarkServiceStreamClosedError(
+                        close_code=close_frame.code if close_frame else None,
+                        close_reason=close_frame.reason if close_frame else None,
+                        idle_s=time.monotonic() - last_message_at,
+                    ) from exc
+                finally:
+                    for task in (receiving, *sandbox_calls):
+                        task.cancel()
+
+                if result_received:
+                    return result
+
+                # The socket closed cleanly, but a stream without a terminal chunk is still broken.
+                raise BenchmarkServiceStreamClosedError(
+                    close_code=websocket.close_code,
+                    close_reason=websocket.close_reason,
+                    idle_s=time.monotonic() - last_message_at,
+                )
+
+    async def _health_ok(self) -> bool:
+        """Best-effort liveness probe used to describe an idle stream failure."""
+        try:
+            response = await asyncio.wait_for(self.health_check(), timeout=_HEALTH_PROBE_TIMEOUT_S)
+            return response.status == "ok"
+        except Exception:
+            return False
+
+    @_retry_http
+    async def health_check(self) -> HealthCheckResponse:
+        """Check if the benchmark service is healthy."""
+        response = await self._http_request("GET", f"{self._url}/health")
+
+        _require_ok(response, "Health check")
+
+        return HealthCheckResponse.model_validate(response.json())
+
+    @_retry_http
+    async def version(self, dataset: str | None = None) -> VersionResponse:
+        """Fetch framework and benchmark service version metadata."""
+        response = (
+            await self._http_request("GET", f"{self._url}/version", params={"dataset": dataset})
+            if dataset is not None
+            else await self._http_request("GET", f"{self._url}/version")
+        )
+
+        _require_ok(response, "Version check")
+
+        return VersionResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_datasets(self) -> ListDatasetsResponse:
+        """List dataset names visible to this caller, independently of a version pin."""
+        response = await self._http_request("GET", f"{self._url}/v1/datasets")
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+        if response.status_code != 200:
+            raise _status_error(response, "Dataset listing")
+        return ListDatasetsResponse.model_validate(response.json())
+
+    @_retry_http
+    async def resolve_dataset(self, dataset: str, version: str | None = None) -> ResolveDatasetResponse:
+        """Resolve a selector once, before constructing a client pinned to the returned ID."""
+        if self._dataset_version is not None:
+            raise ValueError("Resolve a dataset with an unpinned client")
+        body = ResolveDatasetRequest(dataset=dataset, version=version)
+        response = await self._http_request("POST", f"{self._url}/resolve-dataset", json=body.model_dump())
+        _require_ok(response, "Dataset resolution")
+        resolved = ResolveDatasetResponse.model_validate(response.json())
+        if resolved.dataset != dataset:
+            raise BenchmarkServiceError("The service resolved a different dataset")
+        return resolved
+
+    @_retry_http
+    async def verify_task_ids(
+        self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None
+    ) -> VerifyTaskIdsResponse:
+        """Verify that the given task IDs or slice are valid.
+
+        Args:
+            task_ids: List of task IDs to verify, or None.
+            slice_str: Slice string to verify, or None.
+        """
+        params: dict[str, list[str] | str] = {}
+        if task_ids is not None:
+            params["task_ids"] = task_ids
+        if slice_str is not None:
+            params["slice"] = slice_str
+        if dataset is not None:
+            params["dataset"] = dataset
+
+        response = await self._http_request("GET", f"{self._url}/verify-task-ids", params=params)
+
+        _require_ok(response, "Verify task ids")
+
+        return VerifyTaskIdsResponse.model_validate(response.json())
+
+    @_retry_http
+    async def grading_requirements_response(
+        self, task_id: str, dataset: str | None = None
+    ) -> GradingRequirementsResponse:
+        """Retrieve grading models and the service's remote-grader capability."""
+        body = GradingRequirementsRequest(task_id=task_id, dataset=dataset)
+        response = await self._http_request("POST", f"{self._url}/grading-requirements", json=body.model_dump())
+        _require_ok(response, "Grading requirements")
+        return GradingRequirementsResponse.model_validate(response.json())
+
+    async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        """Retrieve the Gateway model keys required to grade this task."""
+        return (await self.grading_requirements_response(task_id, dataset=dataset)).models
+
+    @_retry_http
+    async def monitoring_requirements(
+        self, task_ids: list[str], dataset: str | None = None
+    ) -> MonitoringRequirementsResponse:
+        """Retrieve the rules an external run monitor applies to a run of these tasks."""
+        body = MonitoringRequirementsRequest(task_ids=task_ids, dataset=dataset)
+        response = await self._http_request("POST", f"{self._url}/monitoring-requirements", json=body.model_dump())
+        _require_ok(response, "Monitoring requirements")
+        return MonitoringRequirementsResponse.model_validate(response.json())
+
+    @_retry_http
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
+        """Retrieve a task by ID.
+
+        Args:
+            task_id: The task to retrieve.
+            skip_validation: If True, skip task validation.
+        """
+        params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
+        if dataset is not None:
+            params["dataset"] = dataset
+        response = await self._http_request("GET", f"{self._url}/retrieve-task/", params=params)
+
+        _require_ok(response, "Retrieve task")
+
+        return RetrieveTaskResponse.model_validate(response.json())
+
+    async def run_with_sandbox_recovery(
+        self,
+        task_id: str,
+        run_id: str,
+        operation: Callable[[SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
+        *,
+        dataset: str | None = None,
+        retryable_attempt_errors: tuple[type[Exception], ...] = (),
+        default_max_attempts: int = 1,
+        retry_delay_s: float = 2.0,
+        on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
+        attempt_id: str | None = None,
+        email: str | None = None,
+    ) -> _RecoveryResult:
+        """Run a task attempt with benchmark-declared sandbox-loss recovery.
+
+        Loads the task from this service and delegates to ``benchmark_service.sandbox_recovery.run_with_sandbox_recovery``.
+        """
+        return await run_with_sandbox_recovery(
+            lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+            task_id,
+            run_id,
+            operation,
+            retryable_attempt_errors=retryable_attempt_errors,
+            default_max_attempts=default_max_attempts,
+            retry_delay_s=retry_delay_s,
+            on_retry=on_retry,
+            attempt_id=attempt_id,
+            email=email,
+        )
+
+    async def setup_task(
+        self,
+        task_id: str,
+        instance_id: str,
+        sandbox_provider: SandboxProviderConfig | None = None,
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
+    ) -> SetupTaskResponse:
+        """Set up a task instance via WebSocket.
+
+        Args:
+            task_id: The task to set up.
+            instance_id: The instance to set up.
+            sandbox_provider: Sandbox provider config for the task sandbox.
+            on_message: Optional callback for intermediate progress messages.
+        """
+        sandbox_handler = self._sandbox_handler(sandbox_provider, instance_id)
+        request = SetupTaskRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+            child_egress=child_egress or {},
+            tracker_sandboxes=sandbox_handler is not None,
+        )
+        try:
+            result = await self._websocket_request(
+                "setup-task",
+                request,
+                on_message,
+                sandbox_handler=sandbox_handler,
+                remote_grading_authorization=remote_grading_authorization,
+            )
+        finally:
+            if sandbox_handler is not None:
+                await sandbox_handler.close()
+        return SetupTaskResponse.model_validate(result)
+
+    @_retry_http
+    async def evaluate_response(
+        self,
+        task_id: str,
+        response: str,
+        dataset: str | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+    ) -> Any:
+        """Evaluate a text response without a live sandbox.
+
+        Args:
+            task_id: The task to evaluate.
+            response: The agent's response to evaluate.
+            dataset: Optional dataset name.
+            sandbox_provider: Optional request-scoped provider config when evaluation creates a sandbox.
+        """
+        request = EvaluateResponseRequest(
+            task_id=task_id,
+            response=response,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+            child_egress=child_egress or {},
+        )
+        body = request.model_dump(exclude_none=True)
+
+        resp = await self._http_request(
+            "POST",
+            f"{self._url}/evaluate-response/",
+            json=body,
+            timeout=self._timeout,
+        )
+
+        _require_ok(resp, "Evaluate response")
+
+        return resp.json()
+
+    async def resume_evaluation(
+        self,
+        task_id: str,
+        eval_resume_state: dict[str, Any],
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
+        instance_id: str | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
+    ) -> JsonValue:
+        """Resume evaluation from state previously streamed by the benchmark service.
+
+        ``sandbox_provider`` and ``instance_id`` are request-only. The caller
+        owns admission and cleanup of a supplied sandbox; ``eval_resume_state``
+        remains independently persistable. Awaitable checkpoint callbacks complete
+        before the next stream chunk is received.
+        """
+        request = EvaluateResponseRequest(
+            task_id=task_id,
+            eval_resume_state=eval_resume_state,
+            sandbox_provider=sandbox_provider,
+            instance_id=instance_id,
+            dataset=dataset,
+            grading_token=grading_token,
+            announce_sandboxes=on_sandbox_created is not None,
+            child_egress=child_egress or {},
+        )
+        return await self._websocket_request(
+            "evaluate-response",
+            request,
+            on_message,
+            on_eval_resume_state,
+            on_sandbox_created,
+            remote_grading_authorization=remote_grading_authorization,
+        )
+
+    async def evaluate_instance(
+        self,
+        task_id: str,
+        instance_id: str,
+        sandbox_provider: SandboxProviderConfig | None = None,
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
+    ) -> JsonValue:
+        """Evaluate a task instance via WebSocket.
+
+        Args:
+            task_id: The task to evaluate.
+            instance_id: The instance to evaluate.
+            sandbox_provider: Sandbox provider config for the task sandbox.
+            on_message: Optional callback for intermediate progress messages.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
+            on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
+        """
+        sandbox_handler = self._sandbox_handler(sandbox_provider, instance_id)
+        request = EvaluateInstanceRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+            tracker_sandboxes=sandbox_handler is not None,
+            announce_sandboxes=on_sandbox_created is not None,
+            grading_token=grading_token,
+            child_egress=child_egress or {},
+        )
+        try:
+            return await self._websocket_request(
+                "evaluate-instance",
+                request,
+                on_message,
+                on_eval_resume_state,
+                on_sandbox_created,
+                sandbox_handler,
+                remote_grading_authorization=remote_grading_authorization,
+            )
+        finally:
+            if sandbox_handler is not None:
+                await sandbox_handler.close()
+
+    @_retry_http
+    async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
+        """Compute the final score from evaluation results.
+
+        Args:
+            evaluation_results: Mapping of evaluation results to score.
+        """
+        body: dict[str, Any] = {"evaluation_results": evaluation_results}
+        if dataset is not None:
+            body["dataset"] = dataset
+
+        response = await self._http_request(
+            "POST",
+            f"{self._url}/final-score/",
+            json=body,
+        )
+
+        _require_ok(response, "Final score")
+
+        return FinalScoreResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_tasks(self, dataset: str) -> V1DatasetTasksResponse:
+        """Fetch a dataset's task list via the lab-facing /v1/ surface.
+
+        Auth headers are taken from self._headers as set at
+        construction. Server returns 403 for unauthorized datasets, 404 for
+        unknown datasets, and 501 when the benchmark has not implemented task
+        listing.
+        """
+        response = await self._http_request("GET", f"{self._url}/v1/datasets/{dataset}/tasks")
+
+        _require_ok(response, "List tasks")
+
+        return V1DatasetTasksResponse.model_validate(response.json())
+
+    async def v1_upload_url(
+        self,
+        run_id: str,
+        task_id: str,
+        filename: str,
+        dataset: str | None = None,
+    ) -> V1UploadUrlResponse:
+        """Request an upload URL for one generated task artifact."""
+        request = V1UploadUrlRequest(
+            run_id=run_id,
+            task_id=task_id,
+            dataset=dataset,
+            filename=filename,
+        )
+        with correlation_scope(run_id=run_id, task_id=task_id):
+            response = await self._http_request(
+                "POST",
+                f"{self._url}/v1/submissions/upload-url",
+                json=request.model_dump(mode="json", exclude_none=True),
+            )
+
+        _require_ok(response, "v1 upload URL request")
+
+        return V1UploadUrlResponse.model_validate(response.json())
+
+    async def v1_evaluate(
+        self,
+        run_id: str,
+        task_id: str,
+        payload_data: str,
+        payload_schema: str,
+        payload_type: V1PayloadType,
+        dataset: str | None = None,
+        versions: V1Versions | None = None,
+        attempt_id: str | None = None,
+    ) -> V1EvalResponse:
+        """Evaluate via the /v1/evaluate surface with caller-supplied authentication.
+
+        payload_data is either inline text or an uploaded artifact key, as
+        selected by payload_type. Transport failures are not retried because
+        grading may already have started. ``attempt_id`` names the caller's
+        execution of the task, so the service attributes grading to it.
+        """
+        request = V1EvalRequest(
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            dataset=dataset,
+            payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
+            versions=versions or V1Versions(),
+        )
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
+            response = await self._http_request(
+                "POST",
+                f"{self._url}/v1/evaluate",
+                json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
+            )
+
+        _require_ok(response, "v1 evaluate")
+
+        return V1EvalResponse.model_validate(response.json())
+
+    async def v1_score(
+        self,
+        run_id: str,
+        evaluation_results: dict[str, V1ScoreItem | None],
+        dataset: str | None = None,
+    ) -> V1ScoreResponse:
+        """Score via the lab-facing /v1/score surface without retrying a submitted request."""
+        request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
+        with correlation_scope(run_id=run_id):
+            response = await self._http_request(
+                "POST",
+                f"{self._url}/v1/score",
+                json=request.model_dump(mode="json", exclude_none=True),
+            )
+
+        _require_ok(response, "v1 score")
+
+        return V1ScoreResponse.model_validate(response.json())

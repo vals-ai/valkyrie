@@ -2172,7 +2172,7 @@ class TestRunRecovery:
         )
         database_session.commit()
         monkeypatch.setattr(
-            main_module, "prepare_project_gateway_key", AsyncMock(side_effect=AssertionError("rebound Gateway key"))
+            main_module, "prepare_project_gateway_key", Mock(side_effect=AssertionError("rebound Gateway key"))
         )
         if not active_without_tasks:
             monkeypatch.setattr(main_module, "reset_to_in_progress_status", lambda *_args, **_kwargs: ["task_0"])

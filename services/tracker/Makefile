@@ -1,4 +1,4 @@
-.PHONY: help build run stop clean logs tracker-service local-tracker \
+.PHONY: help build run stop clean logs tracker-service local-tracker dataset-worker prepare-upload-bucket \
         test test-integration-local test-integration-live test-unit test-alembic \
         migrate-gen venv-check
 
@@ -19,6 +19,8 @@ help:
 	@echo "  make logs            - View container logs"
 	@echo "  make tracker-service - Build, run, and view logs for the tracker service"
 	@echo "  make local-tracker [CONFIG=<path>] - Migrate and run host control/Tracker (requires EXECUTOR_BOOTSTRAP_KEY)"
+	@echo "  make dataset-worker [CONFIG=<path>] - Process local dataset uploads (requires a migrated database)"
+	@echo "  make prepare-upload-bucket UPLOAD_BUCKET_ARGS=... - Preview tenant bucket upload rules"
 	@echo "  make migrate-gen     - Generate a new migration from model changes"
 
 # --- Setup ---
@@ -39,7 +41,7 @@ build:
 	@$(COMPOSE) build
 .PHONY: executor-image
 executor-image:
-	docker build --target executor --platform linux/arm64 -t "$(EXECUTOR_IMAGE)" .
+	docker build --target executor --platform linux/arm64 -f Dockerfile -t "$(EXECUTOR_IMAGE)" ../..
 run:
 	@echo "Starting services with docker-compose..."
 	@$(COMPOSE) up -d
@@ -69,6 +71,12 @@ local-tracker: venv-check
 	  control_pid=$$!; \
 	  trap 'kill "$$control_pid"; wait "$$control_pid"' EXIT; \
 	  DATABASE_URL="$(LOCAL_DATABASE_URL)" EXECUTOR_CONTROL_URL=http://127.0.0.1:8002 uv run python -m tracker.serve --config "$(CONFIG)"
+
+dataset-worker: venv-check
+	@DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python -m tracker.dataset_worker --config "$(CONFIG)"
+
+prepare-upload-bucket: venv-check
+	@uv run python -m tracker.prepare_upload_bucket $(UPLOAD_BUCKET_ARGS)
 
 # --- Tests ---
 test: venv-check

@@ -6,7 +6,14 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from valkyrie.sdk.models import NewProjectRequest, ProjectCreateRequest, ProjectResponse, ProjectsResponse, SpendType
+from valkyrie.sdk.models import (
+    NewProjectRequest,
+    ProjectBudget,
+    ProjectCreateRequest,
+    ProjectResponse,
+    ProjectsResponse,
+    SpendType,
+)
 from valkyrie.sdk.resources._path import encode_path_segment
 
 if TYPE_CHECKING:
@@ -54,6 +61,14 @@ class ProjectsResource:
     async def get(self, handle: str) -> ProjectResponse:
         """Return one of the organization's projects by handle, archived ones included."""
         return await self._sdk.request_model("GET", _project_path(handle), ProjectResponse)
+
+    async def budget(self, handle: str) -> ProjectBudget:
+        """Return a project's limit and its all-time spend in total and per cost type.
+
+        `limit_dollars` is None when no limit is set. When the Gateway is unavailable, model spend
+        is left out and `model_spend_available` is false.
+        """
+        return await self._sdk.request_model("GET", f"{_project_path(handle)}/budget", ProjectBudget)
 
     async def update(
         self,

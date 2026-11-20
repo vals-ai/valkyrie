@@ -1255,6 +1255,79 @@
         }
       }
     },
+    "/costs/runs/{run_id}/reported": {
+      "post": {
+        "summary": "Report Run Costs",
+        "description": "Record costs that the benchmark service of a run paid outside the Tracker's view, authenticated by the `X-Valkyrie-Cost-Report-Token` header the Tracker sent that service.\n\nA repeated `source_id` within an attempt replaces the earlier cost.",
+        "operationId": "report_run_costs",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "X-Valkyrie-Cost-Report-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Token the Tracker sent the run's benchmark service.",
+              "title": "X-Valkyrie-Cost-Report-Token"
+            },
+            "description": "Token the Tracker sent the run's benchmark service."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ReportedCost"
+                },
+                "description": "Costs to record against the run.",
+                "title": "Costs"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportedCostsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The cost report token is missing"
+          },
+          "403": {
+            "description": "Only the benchmark service of an unfinished run can report its costs"
+          },
+          "422": {
+            "description": "A cost has a type that can't be reported"
+          }
+        }
+      }
+    },
     "/benchmarks/filter-options": {
       "get": {
         "summary": "Get Filter Options",
@@ -1754,6 +1827,47 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SingleBenchmarkResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/benchmarks/{benchmark_id}/costs": {
+      "get": {
+        "summary": "Get Benchmark Costs",
+        "description": "Return a run's counted dollars in total and per cost type.\n\n`resources` splits each cost type by provider, resource and unit, with the summed quantity.\n\nModel spend comes from the model Gateway as the `model` cost type.\n\nWhen the Gateway is unavailable, model spend is left out and `model_spend_available` is false.\n\n`model_through` is the time the Gateway's usage data runs to.",
+        "operationId": "get_benchmark_costs",
+        "parameters": [
+          {
+            "name": "benchmark_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Benchmark Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunCosts"
                 }
               }
             }
@@ -3188,6 +3302,66 @@
         }
       }
     },
+    "/projects/{handle}/budget": {
+      "get": {
+        "summary": "Get Project Budget",
+        "description": "Return a project's limit and its all-time spend by cost type, archived projects included.\n\nSpend adds Tracker's sandbox, search and reported costs to the Gateway's model spend.\n\n`limit_dollars` is null when no limit is set. When the Gateway is unavailable, model spend is left out and `model_spend_available` is false.",
+        "operationId": "get_project_budget",
+        "parameters": [
+          {
+            "name": "handle",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Handle"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBudget"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization has no project with this handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The project service is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/projects/by-id/{project_id}": {
       "get": {
         "summary": "Get Project By Id",
@@ -3348,6 +3522,16 @@
               }
             }
           },
+          "400": {
+            "description": "The login has no selected organization.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -3387,6 +3571,16 @@
                     "$ref": "#/components/schemas/LimitRequest"
                   },
                   "title": "Response List Limit Requests"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The login has no selected organization.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
                 }
               }
             }
@@ -3450,11 +3644,35 @@
               }
             }
           },
+          "400": {
+            "description": "The login has no selected organization.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "Platform administrator required"
+            "description": "The caller is not a platform administrator.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
           },
           "409": {
-            "description": "Already decided"
+            "description": "The limit request is already decided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -4713,6 +4931,445 @@
         }
       }
     },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/search": {
+      "get": {
+        "summary": "Search Version Tasks",
+        "description": "Search task IDs and source names at a full version digest, ignoring case. Each page scans at most `limit` tasks.\n\nAn empty page can have a continuation cursor. Pass `next_cursor` as `cursor` with the same digest and query to continue.",
+        "operationId": "search_version_tasks",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "title": "Query"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 1000,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetTasksPage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, dataset, or version does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}/files": {
+      "get": {
+        "summary": "List Task Files",
+        "description": "List file paths, sizes, and modes in a task at a full version digest. Pass `next_cursor` as `cursor` for the next page.",
+        "operationId": "list_task_files",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 65535
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetFilesPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The task archive contains an invalid entry or path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Storage denied access to the task archive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, dataset, version, task, or task archive does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Inspection requires more than 32 MiB of reads or 64 storage requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A request parameter is invalid or the task archive cannot be inspected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorMessage"
+                    }
+                  ],
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response 422 List Task Files"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Storage could not read the task archive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The task archive read timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}/preview": {
+      "get": {
+        "summary": "Preview Task File",
+        "description": "Preview up to 64 KiB of one UTF-8 file at a full version digest. Binary files return metadata without content.",
+        "operationId": "preview_task_file",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65535,
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetFilePreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The task archive contains an invalid entry or path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Storage denied access to the task archive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, dataset, version, task, archive, or file does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Inspection requires more than 32 MiB of reads or 64 storage requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A request parameter is invalid or the task archive cannot be inspected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorMessage"
+                    }
+                  ],
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response 422 Preview Task File"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Storage could not read the task archive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The task archive read timed out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/benchmarks/{benchmark}/datasets/{name}/versions/{ref}/tasks/{task_id}": {
       "get": {
         "summary": "Get Version Task",
@@ -4937,6 +5594,839 @@
           },
           "404": {
             "description": "The benchmark, the dataset, the version or the task does not exist"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}": {
+      "put": {
+        "summary": "Create Upload",
+        "description": "Reserve an upload ID for one archive checksum and size. Repeating the same request returns the saved upload.",
+        "operationId": "create_upload",
+        "parameters": [
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DatasetUploadCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller needs an identifiable user or access key with permission for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The benchmark or dataset is archived, the upload ID is already reserved for another request, or the dataset has three active uploads.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The archive exceeds the configured upload size limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Read Upload",
+        "description": "Return the caller's upload status, review summary, and published version digest.",
+        "operationId": "read_upload",
+        "parameters": [
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller needs an identifiable user or access key with permission for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist, or the caller has no upload with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads": {
+      "get": {
+        "summary": "List Uploads",
+        "description": "List the caller's recent uploads for this dataset.",
+        "operationId": "list_uploads",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller needs an identifiable user or access key with permission for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/form": {
+      "post": {
+        "summary": "Upload Form",
+        "description": "Issue a temporary form for the reserved archive. The storage destination enforces its exact size and checksum.",
+        "operationId": "upload_form",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadFormResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Tracker or storage denied access to this upload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, dataset, caller's upload, or storage destination does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The upload storage operation failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Storage cannot issue a form for the reserved archive size.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The upload expired or no longer accepts an archive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This deployment does not support direct archive uploads.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/complete": {
+      "post": {
+        "summary": "Complete Upload",
+        "description": "Queue an uploaded archive for validation.",
+        "operationId": "complete_upload",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Tracker or storage denied access to this upload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark, dataset, caller's upload, or stored archive does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The upload storage operation failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Storage rejected the archive path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The upload expired or ended, or the stored archive size differs from the reservation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/tasks": {
+      "get": {
+        "summary": "Reviewed Tasks",
+        "description": "List the reviewed tasks in task ID order. Publication uses this exact task map.",
+        "operationId": "reviewed_tasks",
+        "parameters": [
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetTasksPage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller needs an identifiable user or access key with permission for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist, or the caller has no upload with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The upload has no validated task map.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/publish": {
+      "post": {
+        "summary": "Publish Upload",
+        "description": "Publish the confirmed review digest and move `latest` to that version. Repeated confirmation returns the saved status.",
+        "operationId": "publish_upload",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DatasetUploadPublishRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks permission to publish or the deployment does not support the upload's custom scoring.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist, or the caller has no upload with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The review digest does not match or the upload is not ready for publication.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/benchmarks/{benchmark}/datasets/{name}/uploads/{upload_id}/cancel": {
+      "post": {
+        "summary": "Cancel Upload",
+        "description": "Cancel the caller's upload before publication starts. Repeated cancellation returns the saved status.",
+        "operationId": "cancel_upload",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "benchmark",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+              "title": "Benchmark"
+            }
+          },
+          {
+            "name": "upload_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Upload Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetUploadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller needs an identifiable user or access key with permission for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The benchmark or dataset does not exist, or the caller has no upload with this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Publication has already started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -7809,6 +9299,96 @@
         ],
         "title": "CreateOrganizationRequest"
       },
+      "DatasetFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "mode": {
+            "type": "integer",
+            "title": "Mode"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "mode"
+        ],
+        "title": "DatasetFile"
+      },
+      "DatasetFilePreview": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          },
+          "binary": {
+            "type": "boolean",
+            "title": "Binary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "content",
+          "truncated",
+          "binary"
+        ],
+        "title": "DatasetFilePreview"
+      },
+      "DatasetFilesPage": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetFile"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "type": "object",
+        "required": [
+          "files"
+        ],
+        "title": "DatasetFilesPage"
+      },
       "DatasetResponse": {
         "properties": {
           "name": {
@@ -7970,6 +9550,224 @@
           "tasks"
         ],
         "title": "DatasetTasksPage"
+      },
+      "DatasetUploadCreateRequest": {
+        "properties": {
+          "archive_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Archive Sha256"
+          },
+          "archive_size": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Archive Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "archive_sha256",
+          "archive_size"
+        ],
+        "title": "DatasetUploadCreateRequest"
+      },
+      "DatasetUploadFormResponse": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Fields"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "fields",
+          "expires_in"
+        ],
+        "title": "DatasetUploadFormResponse"
+      },
+      "DatasetUploadPublishRequest": {
+        "properties": {
+          "review_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Review Digest"
+          }
+        },
+        "type": "object",
+        "required": [
+          "review_digest"
+        ],
+        "title": "DatasetUploadPublishRequest"
+      },
+      "DatasetUploadResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DatasetUploadStatus"
+          },
+          "archive_sha256": {
+            "type": "string",
+            "title": "Archive Sha256"
+          },
+          "archive_size": {
+            "type": "integer",
+            "title": "Archive Size"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "expires_at": {
+            "type": "string",
+            "title": "Expires At"
+          },
+          "review_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Digest"
+          },
+          "task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Count"
+          },
+          "total_task_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Task Bytes"
+          },
+          "metric_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Digest"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "published_version_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Version Digest"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "archive_sha256",
+          "archive_size",
+          "created_at",
+          "updated_at",
+          "expires_at"
+        ],
+        "title": "DatasetUploadResponse"
+      },
+      "DatasetUploadStatus": {
+        "type": "string",
+        "enum": [
+          "UPLOADING",
+          "QUEUED",
+          "VALIDATING",
+          "READY",
+          "PUBLISH_QUEUED",
+          "PUBLISHING",
+          "SUCCEEDED",
+          "CANCELLED",
+          "FAILED",
+          "EXPIRED"
+        ],
+        "title": "DatasetUploadStatus"
+      },
+      "DatasetUploadsResponse": {
+        "properties": {
+          "uploads": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetUploadResponse"
+            },
+            "type": "array",
+            "title": "Uploads"
+          }
+        },
+        "type": "object",
+        "required": [
+          "uploads"
+        ],
+        "title": "DatasetUploadsResponse"
       },
       "DatasetVersion": {
         "properties": {
@@ -9939,6 +11737,74 @@
         "additionalProperties": true,
         "type": "object"
       },
+      "ProjectBudget": {
+        "properties": {
+          "limit_dollars": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Dollars"
+          },
+          "limit_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Reason"
+          },
+          "limit_applied": {
+            "type": "boolean",
+            "title": "Limit Applied"
+          },
+          "total_usd": {
+            "type": "number",
+            "title": "Total Usd"
+          },
+          "by_type_usd": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "By Type Usd"
+          },
+          "model_spend_available": {
+            "type": "boolean",
+            "title": "Model Spend Available"
+          },
+          "model_through": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Through"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit_dollars",
+          "limit_reason",
+          "limit_applied",
+          "total_usd",
+          "by_type_usd",
+          "model_spend_available",
+          "model_through"
+        ],
+        "title": "ProjectBudget"
+      },
       "ProjectCostRow": {
         "properties": {
           "month": {
@@ -10781,6 +12647,93 @@
         ],
         "title": "RemoteGraderStopped"
       },
+      "ReportedCost": {
+        "properties": {
+          "cost_type": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Cost Type",
+            "description": "Kind of cost, such as `cluster_gpu`."
+          },
+          "provider": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Provider",
+            "description": "Provider the service paid, such as `coreweave`."
+          },
+          "source_id": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source Id",
+            "description": "Reporter's key for this cost within the attempt."
+          },
+          "attempt_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Attempt Id",
+            "description": "Attempt the cost belongs to."
+          },
+          "quantity": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Quantity",
+            "description": "Usage measured in `unit`."
+          },
+          "unit": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Unit",
+            "description": "Unit of `quantity`, such as `node_hour`."
+          },
+          "amount_usd": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Amount Usd",
+            "description": "What the service paid for this usage, in USD."
+          },
+          "usage_end": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage End",
+            "description": "When the usage ended. Defaults to the report time."
+          }
+        },
+        "type": "object",
+        "required": [
+          "cost_type",
+          "provider",
+          "source_id",
+          "attempt_id",
+          "quantity",
+          "unit",
+          "amount_usd"
+        ],
+        "title": "ReportedCost"
+      },
+      "ReportedCostsResponse": {
+        "properties": {
+          "recorded": {
+            "type": "integer",
+            "title": "Recorded"
+          }
+        },
+        "type": "object",
+        "required": [
+          "recorded"
+        ],
+        "title": "ReportedCostsResponse"
+      },
       "RescoreBenchmarkResponse": {
         "properties": {
           "benchmark_id": {
@@ -10959,6 +12912,59 @@
         "title": "RunArtifactsResponse",
         "description": "One page of run artifacts."
       },
+      "RunCosts": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Run Id"
+          },
+          "total_usd": {
+            "type": "number",
+            "title": "Total Usd"
+          },
+          "by_type_usd": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "By Type Usd"
+          },
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/RunResourceCost"
+            },
+            "type": "array",
+            "title": "Resources"
+          },
+          "model_spend_available": {
+            "type": "boolean",
+            "title": "Model Spend Available"
+          },
+          "model_through": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Through"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "total_usd",
+          "by_type_usd",
+          "resources",
+          "model_spend_available",
+          "model_through"
+        ],
+        "title": "RunCosts"
+      },
       "RunMonitoring": {
         "properties": {},
         "type": "object",
@@ -11025,6 +13031,65 @@
         ],
         "title": "RunProjectRequest",
         "description": "The handle of the project a run now belongs to."
+      },
+      "RunResourceCost": {
+        "properties": {
+          "cost_type": {
+            "type": "string",
+            "title": "Cost Type"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantity"
+          },
+          "amount_usd": {
+            "type": "number",
+            "title": "Amount Usd"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cost_type",
+          "provider",
+          "resource",
+          "unit",
+          "quantity",
+          "amount_usd"
+        ],
+        "title": "RunResourceCost"
       },
       "RunSettingsResponse": {
         "properties": {
@@ -11095,6 +13160,16 @@
             ],
             "title": "Source Id"
           },
+          "resource": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SandboxResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "kind": {
             "$ref": "#/components/schemas/SandboxRowKind"
           },
@@ -11139,6 +13214,7 @@
         "type": "object",
         "required": [
           "source_id",
+          "resource",
           "kind",
           "placed_at",
           "amount_usd",
@@ -11232,6 +13308,16 @@
           "total_usd"
         ],
         "title": "SandboxDayTotal"
+      },
+      "SandboxResource": {
+        "type": "string",
+        "enum": [
+          "cpu",
+          "memory",
+          "disk",
+          "gpu"
+        ],
+        "title": "SandboxResource"
       },
       "SandboxRowKind": {
         "type": "string",

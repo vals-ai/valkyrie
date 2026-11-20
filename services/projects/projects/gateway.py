@@ -114,6 +114,11 @@ class GatewayClient:
         )
         _ = response.raise_for_status()
 
+    def set_project_archived(self, project_id: UUID, archived: bool) -> None:
+        action = "archive" if archived else "unarchive"
+        response = self._client.post(f"{MACHINE_PATH}/projects/{project_id}/{action}")
+        _ = response.raise_for_status()
+
 
 class SecretStore:
     def __init__(self, client: "SecretsManagerClient", gateway_url: str) -> None:
@@ -153,6 +158,10 @@ def gateway() -> GatewayClient:
 
 def put_project_budget(project: Project, limit: ProjectLimit) -> None:
     gateway().put_project_budget(project, os.environ["VALKYRIE_STAGE"], limit)
+
+
+def set_project_archived(project_id: UUID, archived: bool) -> None:
+    gateway().set_project_archived(project_id, archived)
 
 
 def push_budgets(bound: Engine, project_id: UUID | None = None) -> None:

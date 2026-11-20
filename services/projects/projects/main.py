@@ -32,6 +32,7 @@ from projects.gateway import (
     new_secret,
     push_budgets,
     secret_name,
+    set_project_archived,
     tracker_copy_name,
     VerifierOutcome,
     verifier,
@@ -44,6 +45,7 @@ from projects.schemas import (
     GatewayRequest,
     LimitDecision,
     LimitInput,
+    LimitRecord,
     LimitRequestInput,
     LimitRequestRecord,
     ProjectChanges,
@@ -157,8 +159,9 @@ def list_projects(
         return _list(session, org_id, include_archived, include_deleted)
 
 
-def _project(session: Session, org_id: UUID, project_id: UUID) -> Project:
-    project = session.scalar(select(Project).where(Project.id == project_id, Project.org_id == org_id, LIVE))
+def _project(session: Session, org_id: UUID, project_id: UUID, lock: bool = False) -> Project:
+    query = select(Project).where(Project.id == project_id, Project.org_id == org_id, LIVE)
+    project = session.scalar(query.with_for_update() if lock else query)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
     return project
@@ -215,32 +218,41 @@ def save_project(
 @app.post(
     "/orgs/{org_id}/projects/{project_id}/archive",
     dependencies=[Depends(machine_caller)],
-    description="Archive a project at the time sent unless it is archived already, and return it. "
-    "Returns 404 when the org has no project with that ID.",
+    description="Archive a project at the time sent unless it is archived already, tell the Gateway when it has a key, "
+    "and return it. Returns 404 for an unknown project and 503, saving nothing, when the Gateway fails.",
 )
 def archive_project(
     org_id: UUID, project_id: UUID, body: Archive, bound: Annotated[Engine, Depends(engine)]
 ) -> ProjectRecord:
     with Session(bound) as session:
-        _ = session.execute(
-            update(Project)
-            .where(Project.id == project_id, Project.org_id == org_id, LIVE, Project.archived_at.is_(None))
-            .values(archived_at=body.archived_at)
-        )
-        session.commit()
-        return ProjectRecord.model_validate(_project(session, org_id, project_id))
+        project = _project(session, org_id, project_id, lock=True)
+        if project.archived_at is None:
+            project.archived_at = body.archived_at
+        _send_archived(project, True)
+        return _commit(session, project)
 
 
 @app.post(
     "/orgs/{org_id}/projects/{project_id}/unarchive",
     dependencies=[Depends(machine_caller)],
-    description="Let new runs use an archived project again and return it. Returns 404 when the org has no project with that ID.",
+    description="Let new runs use an archived project again, tell the Gateway when it has a key, and return it. "
+    "Returns 404 when the org has no project with that ID and 503, saving nothing, when the Gateway fails.",
 )
 def unarchive_project(org_id: UUID, project_id: UUID, bound: Annotated[Engine, Depends(engine)]) -> ProjectRecord:
     with Session(bound) as session:
-        project = _project(session, org_id, project_id)
+        project = _project(session, org_id, project_id, lock=True)
         project.archived_at = None
+        _send_archived(project, False)
         return _commit(session, project)
+
+
+def _send_archived(project: Project, archived: bool) -> None:
+    if project.gateway_key_id is None:
+        return
+    try:
+        set_project_archived(project.id, archived)
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=503, detail="The Gateway failed") from error
 
 
 @app.post(
@@ -313,6 +325,26 @@ def set_limit(
         _save_limit(session, project_id, body)
     background.add_task(push_budgets, bound, project_id)
     return body
+
+
+@app.get(
+    "/orgs/{org_id}/projects/{project_id}/limit",
+    dependencies=[Depends(machine_caller)],
+    description="Return a project's limit, null when none is set, and whether the Gateway has applied it. "
+    "Returns 404 when the project is not in this org.",
+)
+def get_limit(org_id: UUID, project_id: UUID, bound: Annotated[Engine, Depends(engine)]) -> LimitRecord:
+    with Session(bound) as session:
+        _ = _project(session, org_id, project_id)
+        row = session.get(ProjectLimit, project_id)
+    if row is None:
+        return LimitRecord(limit_dollars=None, reason=None, applied=False, updated_at=None)
+    return LimitRecord(
+        limit_dollars=row.limit_dollars,
+        reason=row.reason,
+        applied=row.gateway_confirmed_limit == row.limit_dollars,
+        updated_at=row.updated_at,
+    )
 
 
 def _save_limit(session: Session, project_id: UUID, body: LimitInput, *, raise_only: bool = False) -> None:

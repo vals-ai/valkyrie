@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 from botocore.session import get_session
 from botocore.validate import ParamValidator
 
@@ -17,6 +17,7 @@ from tracker.exceptions import (
     SecretRegionError,
     SecretsError,
 )
+from tracker.observability.sentry import _before_send
 
 
 _ORIGINAL_GET = SecretsManagerStore.get
@@ -38,6 +39,8 @@ class FakeAsyncSecretsManagerClient:
         *,
         errors: dict[str, ClientError] | None = None,
         names: list[str] | None = None,
+        description: dict[str, Any] | None = None,
+        describe_error: ClientError | BotoCoreError | None = None,
     ) -> None:
         self.response = response or {}
         self.error = error
@@ -45,6 +48,14 @@ class FakeAsyncSecretsManagerClient:
         self.errors = errors or {}
         self.names = names or []
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.description = description or {}
+        self.describe_error = describe_error
+
+    async def describe_secret(self, **params: Any) -> dict[str, Any]:
+        self._call("DescribeSecret", params)
+        if self.describe_error is not None:
+            raise self.describe_error
+        return self.description
 
     async def get_secret_value(self, *, SecretId: str) -> dict[str, Any]:
         self.secret_ids.append(SecretId)
@@ -193,13 +204,96 @@ async def test_denied_tenant_secret_is_named_without_its_prefix_or_the_provider_
 
     assert isinstance(captured.value, SecretAccessDeniedError)
     assert captured.value.args[0] == (
-        "Valkyrie can't read secret 'daytona': it isn't set for your organization or access to it was denied. "
-        "If it isn't set, run `valkyrie secret set daytona`. "
-        "Otherwise this is a Valkyrie problem and has been reported."
+        "Secret 'daytona' exists, but this run can't read it. "
+        "This is a Valkyrie problem, not your configuration, and has been reported."
     )
     assert not isinstance(captured.value, SecretConfigurationError)
     assert "role/Tenant" not in str(captured.value)
     assert "valkyrie/tenants" not in str(captured.value)
+
+
+@pytest.mark.description(
+    "A denied tenant read uses metadata to distinguish missing, deleting and inaccessible secrets."
+)
+@pytest.mark.parametrize("as_arn", [False, True])
+@pytest.mark.parametrize(
+    ("outcome", "error_type", "message"),
+    [
+        ("ResourceNotFoundException", SecretNotFoundError, "is not set for your organization"),
+        ("deleted", SecretBeingDeletedError, "is being deleted"),
+        ("exists", SecretAccessDeniedError, "exists, but this run can't read it"),
+        ("empty", SecretAccessDeniedError, "exists, but this run can't read it"),
+        ("AccessDeniedException", SecretAccessDeniedError, "isn't set for your organization or access"),
+        ("ThrottlingException", SecretAccessDeniedError, "isn't set for your organization or access"),
+        ("transport", SecretAccessDeniedError, "isn't set for your organization or access"),
+    ],
+)
+async def test_denied_tenant_read_describes_existence(
+    as_arn: bool, outcome: str, error_type: type[SecretsError], message: str
+) -> None:
+    name = "valkyrie/tenants/00000000-0000-0000-0000-000000000001/TOKEN"
+    if as_arn:
+        name = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{name}-AbCd12"
+    description: dict[str, Any] = (
+        {} if outcome == "empty" else {"ARN": "private-arn", "Tags": [{"Value": "private-tag"}]}
+    )
+    if outcome == "deleted":
+        description["DeletedDate"] = 1
+    describe_error = (
+        EndpointConnectionError(endpoint_url="https://private-endpoint")
+        if outcome == "transport"
+        else ClientError({"Error": {"Code": outcome, "Message": "private-provider-detail"}}, "DescribeSecret")
+        if outcome.endswith("Exception")
+        else None
+    )
+    client = FakeAsyncSecretsManagerClient(
+        error=ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetSecretValue"),
+        description=description,
+        describe_error=describe_error,
+    )
+    provider = FakeAsyncClientProvider(FakeAsyncClientContext(client))
+
+    with pytest.raises(SecretsError) as captured:
+        await SecretsManagerStore(cast(AWSClientProvider, provider)).get(name)
+
+    error = captured.value
+    assert type(error) is error_type
+    assert message in str(error)
+    assert client.calls == [("DescribeSecret", {"SecretId": name})]
+    assert all(value not in str(error) for value in ("private-", "arn:", "123456789012", "valkyrie/tenants/"))
+    if isinstance(error, SecretConfigurationError):
+        instruction = (
+            "Set it with `valkyrie secret set` and use the printed reference."
+            if as_arn
+            else "Run `valkyrie secret set TOKEN`."
+        )
+        assert instruction.lower() in str(error).lower()
+        assert _before_send({}, {"exc_info": (type(error), error, error.__traceback__)}) is None
+    else:
+        assert _before_send({}, {"exc_info": (type(error), error, error.__traceback__)}) is not None
+
+
+@pytest.mark.description("Shared names and KMS denials do not trigger tenant metadata probes.")
+@pytest.mark.parametrize(
+    ("name", "detail", "error_type"),
+    [
+        ("TOKEN", "Access denied", SecretAccessDeniedError),
+        ("valkyrie/tenants/org/TOKEN", "kms:Decrypt denied", SecretDecryptionError),
+    ],
+)
+async def test_describe_is_limited_to_tenant_non_kms_denials(
+    name: str, detail: str, error_type: type[SecretsError]
+) -> None:
+    client = FakeAsyncSecretsManagerClient(
+        error=ClientError({"Error": {"Code": "AccessDenied", "Message": detail}}, "GetSecretValue")
+    )
+
+    with pytest.raises(error_type):
+        await SecretsManagerStore(cast(AWSClientProvider, FakeAsyncClientProvider(FakeAsyncClientContext(client)))).get(
+            name
+        )
+
+    assert client.calls == []
 
 
 @pytest.mark.description("Secret reads distinguish Valkyrie permission faults from deletion configuration errors.")
@@ -263,9 +357,10 @@ async def test_get_rejects_wrong_region_arn(stored_name: str) -> None:
     assert "valkyrie/tenants/" not in str(captured.value)
     assert "org-id" not in str(captured.value)
     assert "aB12Cd" not in str(captured.value)
-    assert "Tracker reads region 'us-east-1'" in str(captured.value)
+    assert "Valkyrie reads secrets from region 'us-east-1'" in str(captured.value)
     assert "is in region 'us-west-2'" in str(captured.value)
-    assert "Use a Tracker in region 'us-west-2'." in str(captured.value)
+    assert "Set it with `valkyrie secret set` and use the printed reference." in str(captured.value)
+    assert "Tracker" not in str(captured.value)
     assert not client.secret_ids
 
 

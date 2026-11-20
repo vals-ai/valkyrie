@@ -273,16 +273,18 @@ def test_existing_tenants_and_names_are_refused(monkeypatch: pytest.MonkeyPatch,
     assert set(descope.tenant.tenants) == {"acme"}
 
 
+@pytest.mark.description("A login can create its tenth admin organization but not an eleventh.")
+@pytest.mark.parametrize(("admin_count", "status"), [(9, 201), (10, 403)])
 @pytest.mark.usefixtures("self_serve")
-def test_a_login_can_administer_a_limited_number_of_organizations(
-    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace
+def test_org_creation_counts_only_admin_roles(
+    monkeypatch: pytest.MonkeyPatch, descope: SimpleNamespace, admin_count: int, status: int
 ) -> None:
-    _as(monkeypatch, {f"org-{n}": (ADMIN,) for n in range(5)}, "org-0")
+    _as(monkeypatch, {f"org-{n}": (ADMIN,) for n in range(admin_count)} | {"member-only": ()}, "org-0")
 
     response = _client.post("/orgs", json={"id": "acme"})
 
-    assert response.status_code == 403
-    assert descope.tenant.tenants == {}
+    assert response.status_code == status
+    assert ("acme" in descope.tenant.tenants) == (status == 201)
 
 
 @pytest.mark.parametrize(

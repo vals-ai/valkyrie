@@ -493,14 +493,15 @@ def test_wildcard_egress_entries_are_rejected(egress: list[str], inspect: list[s
 
 
 @pytest.mark.description("Child egress through the proxy has its own credential and policy.")
+@pytest.mark.parametrize("domains", [[], ["example.com", "pypi.org"]])
 async def test_proxy_child_egress_has_its_own_credential_and_policy(
-    control_postgres_session: Session, bound_controls: Callable[..., dict[str, object]]
+    control_postgres_session: Session, bound_controls: Callable[..., dict[str, object]], domains: list[str]
 ) -> None:
     benchmark = make_benchmark(session=control_postgres_session)
     task = _running_task(control_postgres_session, benchmark)
     control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
     egress = EgressProxy(_ENDPOINT, control)
-    profile = ChildPolicy(egress=["example.com", "pypi.org"], inspect=["pypi.org"], models=["a/b"])
+    profile = ChildPolicy(egress=domains, inspect=["pypi.org"], models=["a/b"])
     key_id = child_key_id("attempt-1", "gpu")
 
     async with egress.child_egress(
@@ -508,7 +509,8 @@ async def test_proxy_child_egress_has_its_own_credential_and_policy(
     ) as child_egress:
         stored = control_postgres_session.get(EgressProxyPolicy, key_id)
         assert stored is not None
-        assert (stored.domains, stored.inspect_domains) == (["example.com", "pypi.org"], ["pypi.org"])
+        assert (stored.domains, stored.inspect_domains) == (domains, ["pypi.org"])
+        assert stored.gateway_url == "https://gw.test"
         assert control_postgres_session.get(EgressProxyPolicy, "attempt-1") is None
         token = child_egress.proxy_url.split(":")[2].split("@")[0]
         assert stored.token_sha256 == hashlib.sha256(token.encode()).hexdigest()

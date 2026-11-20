@@ -1,4 +1,5 @@
 import asyncio
+import zipfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Annotated, Any
@@ -18,6 +19,8 @@ from tracker.auth import RequestIdentity, get_current_starter
 from tracker.database.models import Dataset, DatasetVersion
 from tracker.database.session import get_session
 from tracker.services.datasets.digest import DIGEST_PATTERN
+from tracker.clients.archive import ArchiveReadLimitError, ArchiveReadTimeoutError
+from tracker.services.datasets.inspection import file_preview, files_page, inspect_archive
 from tracker.services.datasets.version_ref import LATEST, parse_version_ref, validate_tag
 from tracker.exceptions import AmbiguousDigestError, ManifestMismatchError, ResourceArchivedError, TagExistsError
 from tracker.services.datasets.publish import (
@@ -36,11 +39,14 @@ from tracker.types import (
     BlobDigestsRequest,
     BlobResponse,
     DatasetTaskDownloadResponse,
+    DatasetFilesPage,
+    DatasetFilePreview,
     DatasetTaskResponse,
     DatasetTasksPage,
     DatasetVersionDetailResponse,
     DatasetVersionResponse,
     DatasetVersionsResponse,
+    ErrorMessage,
     ManifestInfo,
     MissingBlobsResponse,
     ResourceName,
@@ -59,6 +65,34 @@ NOT_FOUND: dict[int | str, dict[str, Any]] = {
 STORAGE_ERRORS: dict[int | str, dict[str, Any]] = {
     403: {"description": "Storage permission denied"},
     502: {"description": "Storage operation failed"},
+}
+INSPECTION_ERRORS: dict[int | str, dict[str, Any]] = {
+    400: {"model": ErrorMessage, "description": "The task archive contains an invalid entry or path."},
+    403: {"model": ErrorMessage, "description": "Storage denied access to the task archive."},
+    404: {
+        "model": ErrorMessage,
+        "description": "The benchmark, dataset, version, task, or task archive does not exist.",
+    },
+    413: {
+        "model": ErrorMessage,
+        "description": "Inspection requires more than 32 MiB of reads or 64 storage requests.",
+    },
+    422: {
+        "model": dict[str, object],
+        "description": "A request parameter is invalid or the task archive cannot be inspected.",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "anyOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {"$ref": "#/components/schemas/ErrorMessage"},
+                    ]
+                }
+            }
+        },
+    },
+    502: {"model": ErrorMessage, "description": "Storage could not read the task archive."},
+    504: {"model": ErrorMessage, "description": "The task archive read timed out."},
 }
 PathDigest = Annotated[str, Path(pattern=f"^{DIGEST_PATTERN}$")]
 
@@ -322,6 +356,110 @@ def list_version_tasks(
         for row in rows[:limit]
     ]
     return DatasetTasksPage(tasks=tasks, next_cursor=tasks[-1].task_id if len(rows) > limit else None)
+
+
+@router.get(
+    "/versions/{ref}/search",
+    response_model=DatasetTasksPage,
+    description="Search task IDs and source names at a full version digest, ignoring case. Each page scans at most "
+    "`limit` tasks.\n\nAn empty page can have a continuation cursor. Pass `next_cursor` as `cursor` with the same digest "
+    "and query to continue.",
+    responses={404: {"model": ErrorMessage, "description": "The benchmark, dataset, or version does not exist."}},
+)
+def search_version_tasks(
+    dataset: DatasetDependency,
+    ref: PathDigest,
+    versions: DatasetVersionRepositoryDependency,
+    query: str = Query(min_length=1, max_length=256),
+    cursor: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=1000, ge=1, le=1000),
+) -> DatasetTasksPage:
+    rows = versions.tasks_page(_resolve(versions, dataset, ref).id, cursor, limit + 1)
+    page = rows[:limit]
+    query = query.casefold()
+    tasks = [
+        DatasetTaskResponse(task_id=row.task_id, digest=row.digest, size=row.size_bytes, source_name=row.source_name)
+        for row in page
+        if query in row.task_id.casefold() or query in (row.source_name or "").casefold()
+    ]
+    return DatasetTasksPage(tasks=tasks, next_cursor=page[-1].task_id if len(rows) > limit else None)
+
+
+@contextmanager
+def inspection_errors() -> Generator[None]:
+    with storage_errors("Task archive"):
+        try:
+            yield
+        except ArchiveReadLimitError as error:
+            raise HTTPException(status_code=413, detail=str(error)) from error
+        except ArchiveReadTimeoutError as error:
+            raise HTTPException(status_code=504, detail=str(error)) from error
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail="The task archive cannot be inspected") from error
+        except OSError as error:
+            if isinstance(error, (FileNotFoundError, PermissionError)):
+                raise
+            raise HTTPException(status_code=502, detail="The task archive could not be read") from error
+
+
+def version_task_archive(
+    dataset: DatasetDependency,
+    versions: DatasetVersionRepositoryDependency,
+    ref: PathDigest,
+    task_id: TaskId,
+    session: Session = Depends(get_session),
+) -> tuple[str, int]:
+    task = versions.task(_resolve(versions, dataset, ref).id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found in this version")
+
+    archive = dataset_blob_key(str(dataset.id), task.digest), task.size_bytes
+    session.close()
+    return archive
+
+
+VersionTaskArchiveDependency = Annotated[tuple[str, int], Depends(version_task_archive)]
+
+
+@router.get(
+    "/versions/{ref}/tasks/{task_id}/files",
+    response_model=DatasetFilesPage,
+    description="List file paths, sizes, and modes in a task at a full version digest. Pass `next_cursor` as `cursor` "
+    "for the next page.",
+    responses=INSPECTION_ERRORS,
+)
+async def list_task_files(
+    runtime: AgentLibraryRuntimeDependency,
+    task_archive: VersionTaskArchiveDependency,
+    cursor: str | None = Query(default=None, max_length=65535),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> DatasetFilesPage:
+    key, size = task_archive
+    with inspection_errors():
+        return await inspect_archive(runtime.objects, key, size, lambda archive: files_page(archive, cursor, limit))
+
+
+@router.get(
+    "/versions/{ref}/tasks/{task_id}/preview",
+    response_model=DatasetFilePreview,
+    description="Preview up to 64 KiB of one UTF-8 file at a full version digest. Binary files return metadata without "
+    "content.",
+    responses={
+        **INSPECTION_ERRORS,
+        404: {
+            "model": ErrorMessage,
+            "description": "The benchmark, dataset, version, task, archive, or file does not exist.",
+        },
+    },
+)
+async def preview_task_file(
+    runtime: AgentLibraryRuntimeDependency,
+    task_archive: VersionTaskArchiveDependency,
+    path: str = Query(min_length=1, max_length=65535),
+) -> DatasetFilePreview:
+    key, size = task_archive
+    with inspection_errors():
+        return await inspect_archive(runtime.objects, key, size, lambda archive: file_preview(archive, path))
 
 
 @router.get(

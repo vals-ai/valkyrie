@@ -56,9 +56,11 @@ def inline_identity_database(monkeypatch: pytest.MonkeyPatch) -> None:
 def reset_access_key_state() -> Generator[None, None, None]:
     auth_module._exchange_and_normalize_access_key.cache_clear()
     auth_module._live_user_cache.clear()
+    auth_module._project_roles_cache.clear()
     yield
     auth_module._exchange_and_normalize_access_key.cache_clear()
     auth_module._live_user_cache.clear()
+    auth_module._project_roles_cache.clear()
 
 
 @pytest.fixture
@@ -121,7 +123,9 @@ class TestDescopeIdentityResolution:
 
         assert exc_info.value.status_code == 401
 
-    @pytest.mark.description("A key created at login needs its creator to still be in the tenant.")
+    @pytest.mark.description(
+        "A key created at login, sent directly or as an exchanged session, needs its creator to still be in the tenant."
+    )
     @pytest.mark.parametrize(
         ("user", "status"),
         [
@@ -132,19 +136,33 @@ class TestDescopeIdentityResolution:
             (None, 401),
         ],
     )
+    @pytest.mark.parametrize(
+        "headers", [{"x-api-key": "user-key"}, {"authorization": "Bearer exchanged-key"}], ids=["api-key", "bearer"]
+    )
     async def test_login_created_keys_need_their_creator_in_the_tenant(
-        self, mock_descope: MagicMock, monkeypatch: pytest.MonkeyPatch, user: object, status: int | None
+        self,
+        mock_descope: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        user: object,
+        status: int | None,
+        headers: dict[str, str],
     ) -> None:
         response = descope_access_key_response(user_id="U-alice")
         session_token = response["sessionToken"]
         assert isinstance(session_token, dict)
         session_token["customClaims"] = {"user_id": "U-alice", "valkyrie_user_key": True}
         mock_descope.exchange_access_key.return_value = response
+        mock_descope.validate_session.return_value = {
+            "sub": "K2abc",
+            "tenants": {"test-tenant": {}},
+            "user_id": "U-alice",
+            "valkyrie_user_key": True,
+        }
         load = mock_descope.mgmt.user.load_by_user_id
         load.side_effect = user if isinstance(user, Exception) else None
         load.return_value = {"user": user}
         monkeypatch.setattr(auth_module, "AUTH_REQUIRED", True)
-        request = MagicMock(headers={"x-api-key": "user-key"})
+        request = MagicMock(headers=headers)
 
         with patch("tracker.auth.DESCOPE_MANAGEMENT_KEY", "" if user is None else "mgmt-key"):
             if status is None:

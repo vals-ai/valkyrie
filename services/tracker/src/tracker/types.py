@@ -30,7 +30,14 @@ from pydantic import (
 
 from tracker.aws.runtime import AWSResources
 from tracker.local.resources import LocalResources, reads_secrets_file
-from tracker.domain import BenchmarkStatus, DocentReadingStatus, FailureCategory, SpendType, TaskStatus
+from tracker.domain import (
+    BenchmarkStatus,
+    DatasetUploadStatus,
+    DocentReadingStatus,
+    FailureCategory,
+    SpendType,
+    TaskStatus,
+)
 from tracker.egress import EgressPolicy
 from tracker.runtime.artifacts import TASK_ID_PATTERN
 
@@ -445,6 +452,16 @@ class ProjectLimit(BaseModel):
     reason: str | None = None
 
 
+class ProjectBudget(BaseModel):
+    limit_dollars: float | None
+    limit_reason: str | None
+    limit_applied: bool
+    total_usd: float
+    by_type_usd: dict[str, float]
+    model_spend_available: bool
+    model_through: datetime | None
+
+
 class LimitRequestStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -637,6 +654,62 @@ class DatasetVersionResponse(BaseModel):
 class DatasetTasksPage(BaseModel):
     tasks: list[DatasetTaskResponse]
     next_cursor: str | None = None
+
+
+class DatasetUploadCreateRequest(BaseModel):
+    archive_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    archive_size: int = Field(gt=0)
+
+
+class DatasetUploadPublishRequest(BaseModel):
+    review_digest: Digest
+
+
+class DatasetUploadResponse(BaseModel):
+    id: UUID
+    status: DatasetUploadStatus
+    archive_sha256: str
+    archive_size: int
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+    expires_at: UTCDateTime
+    review_digest: Digest | None = None
+    task_count: int | None = None
+    total_task_bytes: int | None = None
+    metric_digest: Digest | None = None
+    tags: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+    published_version_digest: Digest | None = None
+
+
+class DatasetUploadsResponse(BaseModel):
+    uploads: list[DatasetUploadResponse]
+
+
+class DatasetUploadFormResponse(BaseModel):
+    url: str
+    fields: dict[str, str]
+    expires_in: int
+
+
+class DatasetFile(BaseModel):
+    path: str
+    size: int
+    mode: int
+
+
+class DatasetFilesPage(BaseModel):
+    files: list[DatasetFile]
+    next_cursor: str | None = None
+
+
+class DatasetFilePreview(BaseModel):
+    path: str
+    size: int
+    content: str | None
+    truncated: bool
+    binary: bool
 
 
 class DatasetVersionDetailResponse(DatasetVersionResponse):

@@ -29,6 +29,10 @@ def dataset_file_key(dataset_id: str, digest: str) -> str:
     return f"{DATASETS_PREFIX}/{dataset_id}/files/sha256/{digest.removeprefix('sha256:')}"
 
 
+def dataset_upload_key(dataset_id: str, upload_id: str) -> str:
+    return f"dataset-uploads/{dataset_id}/{upload_id}/archive.zip"
+
+
 def benchmark_agent_bundle_key(benchmark_id: str, agent_name: str) -> str:
     from tracker.agent.schemas import validate_agent_name
 

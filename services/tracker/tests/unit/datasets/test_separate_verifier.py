@@ -98,6 +98,7 @@ async def grade(
     created: list[SandboxCreatedData] | None = None,
     agent_source: SandboxSource = AGENT_SOURCE,
     agent_compose: ComposeRuntime | None = None,
+    gateway_url: str | None = None,
 ) -> dict[str, object]:
     return await grade_separately(
         "task-1",
@@ -113,6 +114,7 @@ async def grade(
         [],
         None,
         created.append if created is not None else None,
+        gateway_url=gateway_url,
     )
 
 
@@ -361,6 +363,26 @@ class TestGradeSeparately:
         await grade(config, FakeProvider([verifier_sandbox()]), tests_dir)
 
         assert applied == [("verifier-1", ["api.example.com"])]
+
+    @pytest.mark.description("A verifier without network starts blocked and then can reach only the run's Gateway.")
+    async def test_a_verifier_that_lists_models_can_reach_only_the_gateway(
+        self, tests_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        applied: list[tuple[str, object]] = []
+
+        async def apply(sandbox: FakeSandbox, policy: object) -> None:
+            applied.append((sandbox.id, policy))
+
+        monkeypatch.setattr(separate_verifier, "apply_egress_policy", apply)
+        provider = FakeProvider([verifier_sandbox()])
+        config = TaskConfig.parse(
+            "[verifier]\nnetwork_mode = 'no-network'\nenvironment_mode = 'separate'\nmodels = ['openai/gpt-4o']"
+        )
+
+        await grade(config, provider, tests_dir, gateway_url="https://gateway.example")
+
+        assert provider.requests[0].network_block_all is True
+        assert applied == [("verifier-1", ["gateway.example"])]
 
     @pytest.mark.description("A failed create is retried under a new name when it may work next time.")
     async def test_a_failed_create_is_retried_under_a_new_name_when_it_may_work_next_time(

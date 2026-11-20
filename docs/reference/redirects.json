@@ -248,6 +248,10 @@
     "destination": "/reference/cli/dataset#push"
   },
   {
+    "source": "/reference/cli/dataset/check",
+    "destination": "/reference/cli/dataset#check"
+  },
+  {
     "source": "/reference/cli/dataset/install",
     "destination": "/reference/cli/dataset#install"
   },
@@ -664,6 +668,10 @@
     "destination": "/reference/sdk/projects#get"
   },
   {
+    "source": "/reference/sdk/projects/budget",
+    "destination": "/reference/sdk/projects#budget"
+  },
+  {
     "source": "/reference/sdk/projects/update",
     "destination": "/reference/sdk/projects#update"
   },
@@ -678,6 +686,10 @@
   {
     "source": "/reference/sdk/costs/project_model",
     "destination": "/reference/sdk/costs#project-model"
+  },
+  {
+    "source": "/reference/sdk/costs/run",
+    "destination": "/reference/sdk/costs#run"
   },
   {
     "source": "/reference/sdk/providers/list",

@@ -79,6 +79,12 @@ class InvalidSandboxConfigurationError(SandboxError):
     transient = False
 
 
+class ModelGatewayConfigurationError(TrackerServiceError):
+    transient = False
+    status_code = 400
+    cause_code = "model_gateway_configuration"
+
+
 class OutputArtifactError(TrackerServiceError):
     transient = False
 
@@ -233,3 +239,7 @@ class AmbiguousDigestError(TrackerServiceError):
 class DatasetNameTakenError(TrackerServiceError):
     def __init__(self, name: str) -> None:
         super().__init__(f"Dataset '{name}' already exists")
+
+
+class DatasetUploadConflictError(ValueError):
+    pass

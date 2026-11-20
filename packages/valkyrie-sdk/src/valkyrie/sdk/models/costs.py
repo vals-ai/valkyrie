@@ -6,6 +6,8 @@ from valkyrie.sdk.models._generated.costs import (
     ProjectCostRow,
     ProjectModelCosts,
     ProjectRun,
+    RunCosts,
+    RunResourceCost,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "ProjectCostRow",
     "ProjectModelCosts",
     "ProjectRun",
+    "RunCosts",
+    "RunResourceCost",
 ]

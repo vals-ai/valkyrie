@@ -20,12 +20,12 @@ service. See the [quickstart](/get-started/quickstart).
 
 ## Generate the project
 
-[create-benchmark-service](https://github.com/vals-ai/create-benchmark-service) supplies the
+[create-benchmark-service](https://github.com/vals-ai/Valkyrie/tree/prod/packages/create-benchmark-service) supplies the
 web service and the protocol Valkyrie speaks, so you write one `BenchmarkService` subclass.
 
 ```bash
 uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false \
-  git+https://github.com/vals-ai/create-benchmark-service.git@main
+  "git+https://github.com/vals-ai/Valkyrie.git@prod#subdirectory=packages/create-benchmark-service"
 
 create-benchmark-service swebench
 

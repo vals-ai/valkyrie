@@ -49,3 +49,25 @@ class ProjectModelCosts(ResponseModel):
     months: list[MonthModelCost]
     unattributed_usd: float
     through: UTCDateTime
+
+
+class RunResourceCost(ResponseModel):
+    """A run's spend of one cost type with one provider, resource and unit, with the summed quantity."""
+
+    cost_type: str
+    provider: str
+    resource: str | None
+    unit: str | None
+    quantity: float | None
+    amount_usd: float
+
+
+class RunCosts(ResponseModel):
+    """A run's spend in total, per cost type and per resource."""
+
+    run_id: UUID
+    total_usd: float
+    by_type_usd: dict[str, float]
+    resources: list[RunResourceCost]
+    model_spend_available: bool
+    model_through: UTCDateTime | None

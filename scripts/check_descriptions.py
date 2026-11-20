@@ -2,7 +2,14 @@ import ast
 import subprocess
 import sys
 
-SKIP = ("services/tracker/src/tracker/database/migrations/", "/vendor/", "infra/")
+SKIP = (
+    "services/tracker/src/tracker/database/migrations/",
+    "packages/create-benchmark-service/",
+    "packages/vals-grading/",
+    "packages/vals-benchmark-service/",
+    "/vendor/",
+    "infra/",
+)
 CAP = 200
 OPTION_CAP = 120
 OPTION_CALLS = ("option", "argument")

@@ -156,6 +156,17 @@ class TestSteps:
         assert report.config is not None
         assert [step.name for step in report.config.steps] == ["first", "second"]
 
+    @pytest.mark.description("A step verifier that lists models can't also set the Gateway variables.")
+    def test_a_step_verifier_that_lists_models_cannot_set_the_gateway_variables(self, tmp_path: Path) -> None:
+        toml = STEPS_TOML.replace("[verifier]\n", "[verifier]\nmodels = ['openai/gpt-4o']\n")
+        valid = validate_task(steps_task(tmp_path / "valid", toml))
+        toml = toml.replace("[verifier]\n", "[verifier]\nenv = { MODEL_GATEWAY_URL = 'https://x' }\n")
+
+        report = validate_task(steps_task(tmp_path / "invalid", toml))
+
+        assert valid.ok, problems(valid)
+        assert "[steps.first.verifier].env can't set MODEL_GATEWAY_URL" in problems(report)
+
     @pytest.mark.description("Every step needs its instruction.")
     def test_every_step_needs_its_instruction(self, tmp_path: Path) -> None:
         task = steps_task(tmp_path)
@@ -412,6 +423,10 @@ class TestNotSupportedYet:
             ("[environment]\nenv = { RUN_ID = 'mine' }", "[environment].env can't set RUN_ID"),
             ("[environment]\nenv = { MODEL_GATEWAY_URL = 'https://x' }", "can't set MODEL_GATEWAY_URL"),
             ("[environment]\nenv = { VALKYRIE_AGENT_MODEL = 'x' }", "can't set VALKYRIE_AGENT_MODEL"),
+            (
+                "[verifier]\nmodels = ['openai/gpt-4o']\nenv = { MODEL_GATEWAY_API_KEY = '${KEY}' }",
+                "[verifier].env can't set MODEL_GATEWAY_API_KEY",
+            ),
         ],
     )
     def test_env_values_that_would_silently_misbehave_are_refused(
@@ -520,6 +535,27 @@ class TestNotSupportedYet:
 
         assert plain.ok and separate.ok
         assert gpus.errors == ("a compose task can't request GPUs",)
+
+    @pytest.mark.description("A compose verifier can list models only when its main service has a network.")
+    @pytest.mark.parametrize(
+        ("toml", "refused"),
+        [
+            ("[environment]\nnetwork_mode = 'no-network'\n[verifier]\nmodels = ['openai/gpt-4o']", True),
+            ("[environment]\nnetwork_mode = 'no-network'", False),
+            ("[verifier]\nmodels = ['openai/gpt-4o']", False),
+        ],
+        ids=["models without network", "no models", "models with network"],
+    )
+    def test_a_compose_verifier_can_list_models_only_when_its_main_service_has_a_network(
+        self, tmp_path: Path, toml: str, refused: bool
+    ) -> None:
+        files = {"environment/docker-compose.yaml": "services:\n  main: {}\n"}
+
+        report = validate_task(write_task(tmp_path, toml, files=files))
+
+        assert report.errors == (
+            ("a compose verifier can't list models while its main service has no network",) if refused else ()
+        )
 
     @pytest.mark.description("A separate verifier that runs compose may not ask for gpus.")
     @pytest.mark.parametrize(

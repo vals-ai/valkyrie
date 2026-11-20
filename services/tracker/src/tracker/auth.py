@@ -167,6 +167,11 @@ _live_user_cache: TLRUCache[tuple[str, DescopeClient | None, str], dict[str, Any
     ttu=lambda _key, user, now: now + _USER_LOOKUP_CACHE_TTL_SECONDS if user is not None else now,
     timer=lambda: time.monotonic(),
 )
+_project_roles_cache: TLRUCache[tuple[str, MGMT], dict[str, Any], float] = TLRUCache(
+    maxsize=_USER_LOOKUP_CACHE_MAX_SIZE,
+    ttu=lambda _key, _roles, now: now + _USER_LOOKUP_CACHE_TTL_SECONDS,
+    timer=lambda: time.monotonic(),
+)
 _live_user_pending: dict[
     tuple[asyncio.AbstractEventLoop, str, DescopeClient | None, str], asyncio.Task[dict[str, Any] | None]
 ] = {}
@@ -459,8 +464,11 @@ async def _get_credentials(request: Request) -> _Credentials | None:
         )
         bound_user_id = _string_claim(claims, "user_id")
         is_access_key = bound_user_id is not None
-        _require_read_method(request, _has_claim(claims, READ_ONLY_KEY_CLAIM))
         user_id = bound_user_id if is_access_key else _string_claim(claims, "sub")
+        if _has_claim(claims, USER_KEY_CLAIM) and not await _is_member(user_id, tenant):
+            raise HTTPException(status_code=401, detail="Invalid session")
+
+        _require_read_method(request, _has_claim(claims, READ_ONLY_KEY_CLAIM))
         return _Credentials(
             tenant_name=tenant,
             access_key_id=_string_claim(claims, "sub") if is_access_key else None,
@@ -534,6 +542,7 @@ def invalidate_user_cache(user_id: str) -> None:
         _membership_cache.invalidate(DESCOPE_PROJECT_ID, user_id)
     finally:
         with _live_user_cache_condition:
+            _project_roles_cache.clear()
             for key in list(_live_user_cache):
                 if key[2] == user_id:
                     _live_user_cache.pop(key, None)
@@ -675,6 +684,15 @@ def primary_login_id(user: Mapping[str, Any]) -> str | None:
     return next(iter(user.get("loginIds") or []), None)
 
 
+@cached(
+    cache=_project_roles_cache,
+    key=lambda management: (DESCOPE_PROJECT_ID, management),
+    condition=_live_user_cache_condition,
+)
+def _load_project_roles(management: MGMT) -> dict[str, Any]:
+    return cast(dict[str, Any], management.role.load_all())
+
+
 async def get_current_login(request: Request) -> LoginIdentity:
     management = descope_management()
     if management is None:
@@ -686,13 +704,23 @@ async def get_current_login(request: Request) -> LoginIdentity:
     if (user := await _live_user(user_id)) is None:
         raise HTTPException(status_code=403, detail=LOGIN_REQUIRED)
     organizations = user_tenant_roles(user)
+    permissions: set[str] = set()
+    if role_names := user.get("roleNames"):
+        with descope_call("load project roles"):
+            response = await _descope_call(_load_project_roles, management)
+            permissions = {
+                permission
+                for role in response["roles"]
+                if not role.get("tenantId") and role["name"] in role_names
+                for permission in role.get("permissionNames") or ()
+            }
     return LoginIdentity(
         user_id=user_id,
         login_id=primary_login_id(user) or user_id,
         email=_string_claim(user, "email", lowercase=True) if user.get("verifiedEmail") is True else None,
         organizations=organizations,
         organization=_chosen_organization(list(organizations), request.headers.get(TENANT_HEADER), claims),
-        permissions=tuple(user.get("permissions") or ()),
+        permissions=tuple(sorted(permissions)),
     )
 
 

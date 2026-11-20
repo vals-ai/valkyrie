@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import re
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.exceptions import S3Error
 from tracker.logging import get_logger
-from tracker.runtime.storage import STREAM_CHUNK_BYTES, ArtifactLocations, StoredObject, StoredObjectCopy
+from tracker.runtime.storage import STREAM_CHUNK_BYTES, ArtifactLocations, StoredObject, StoredObjectCopy, UploadForm
 from tracker.runtime.artifacts import agent_bundle_key, benchmark_agent_bundle_key
 
 logger = get_logger(__name__)
@@ -267,6 +269,35 @@ async def create_presigned_url(s3_key: str, runtime: AWSRuntime, expiration: int
     return presigned_url
 
 
+@handle_s3_error(message="Failed to create an upload form")
+async def create_upload_form(runtime: AWSRuntime, key: str, *, size: int, sha256: str, expires_in: int) -> UploadForm:
+    if not key or "${" in key:
+        raise ValueError("An upload requires an exact object key")
+    if not 1 <= size <= 5 * 1024**3:
+        raise ValueError("An upload must contain between 1 byte and 5 GiB")
+    if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise ValueError("An upload requires a lowercase SHA-256 checksum of its bytes")
+    if expires_in < 1:
+        raise ValueError("An upload form requires a positive lifetime")
+    lifetime = runtime.clients.maximum_presign_ttl(expires_in)
+    fields = {
+        "Content-Type": "application/zip",
+        "success_action_status": "204",
+        "x-amz-checksum-algorithm": "SHA256",
+        "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(sha256)).decode("ascii"),
+    }
+    async with runtime.clients.s3_client(signature_version="s3v4") as client:
+        await client.head_bucket(Bucket=runtime.resources.s3_bucket, **s3_owner_arguments(runtime))
+        result = await client.generate_presigned_post(
+            Bucket=runtime.resources.s3_bucket,
+            Key=key,
+            Fields=fields,
+            Conditions=[*[{name: value} for name, value in fields.items()], ["content-length-range", size, size]],
+            ExpiresIn=lifetime,
+        )
+    return UploadForm(url=result["url"], fields=result["fields"], expires_in=lifetime)
+
+
 def create_console_url(s3_key: str, resources: AWSResources) -> str:
     return (
         f"https://{resources.region}.console.aws.amazon.com/s3/object/{resources.s3_bucket}"
@@ -359,6 +390,34 @@ class S3ObjectStore:
         async with self.read_session() as reader:
             return await reader.get_bytes(key)
 
+    async def get_range(self, key: str, start: int, length: int) -> bytes:
+        if start < 0 or length < 0:
+            raise ValueError("Object ranges must be nonnegative")
+        if length == 0:
+            return b""
+        try:
+            async with self._runtime.clients.s3_client() as client:
+                response = await client.get_object(
+                    Bucket=self._runtime.resources.s3_bucket,
+                    Key=key,
+                    Range=f"bytes={start}-{start + length - 1}",
+                    **s3_owner_arguments(self._runtime),
+                )
+                body = response["Body"]
+                async with body:
+                    content = bytearray()
+                    while len(content) <= length:
+                        chunk = await body.read(length + 1 - len(content))
+                        if not chunk:
+                            break
+                        content.extend(chunk)
+        except (ClientError, BotoCoreError) as error:
+            raise S3Error("Failed to read an object range from S3") from error
+        if len(content) > length:
+            raise S3Error("Storage returned more bytes than the requested range")
+
+        return bytes(content)
+
     async def get_stream(self, key: str) -> AsyncIterator[bytes]:
         try:
             async with self._runtime.clients.s3_client() as client:
@@ -426,6 +485,9 @@ class S3ObjectStore:
 
     async def temporary_download_url(self, key: str, *, expires_in: int) -> str:
         return await create_presigned_url(key, self._runtime, expiration=expires_in)
+
+    async def temporary_upload_form(self, key: str, *, size: int, sha256: str, expires_in: int) -> UploadForm:
+        return await create_upload_form(self._runtime, key, size=size, sha256=sha256, expires_in=expires_in)
 
 
 class S3ArtifactLocations(ArtifactLocations):

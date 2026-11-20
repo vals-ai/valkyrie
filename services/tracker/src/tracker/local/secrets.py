@@ -6,6 +6,7 @@ from benchmark_service import SandboxProviderConfig
 from benchmark_service.sandbox import DaytonaProviderConfig, DaytonaV2ProviderConfig, ModalProviderConfig
 from dotenv import dotenv_values
 
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
 from tracker.exceptions import InvalidSandboxConfigurationError, SecretNotFoundError, SecretsError
 from tracker.runtime.secrets import SecretValue, sandbox_provider_config_from_secret
 
@@ -17,7 +18,7 @@ PROVIDER_SETTING_NAMES = frozenset(
 )
 
 
-GATEWAY_SETTING_NAMES = frozenset({"MODEL_GATEWAY_API_KEY", "MODEL_GATEWAY_URL"})
+GATEWAY_SETTING_NAMES = frozenset({MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL})
 
 
 class InMemorySecretStore:

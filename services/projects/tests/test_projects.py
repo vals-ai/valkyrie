@@ -1,9 +1,11 @@
 from uuid import UUID, uuid4
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from projects import main
 from projects.main import app
 from projects.models import Project
 from sqlalchemy.orm import Session
@@ -152,7 +154,7 @@ class TestProjectRoutes:
         "- An unknown project ID gets 404."
     )
     def test_archive_and_unarchive(self, client: TestClient) -> None:
-        row = _row()
+        row = _row(gateway_key_id=None)
         _create(client, row)
         path = f"/orgs/{ORG}/projects/{row['id']}"
 
@@ -223,6 +225,66 @@ class TestProjectRoutes:
             assert response.status_code == 200
             assert response.json()[field] == first
         assert _project(client, row["id"]) == _stored(row, **{field: first})
+
+
+def _record_archives(monkeypatch: pytest.MonkeyPatch) -> list[tuple[UUID, bool]]:
+    sent: list[tuple[UUID, bool]] = []
+
+    def record(project_id: UUID, archived: bool) -> None:
+        sent.append((project_id, archived))
+
+    monkeypatch.setattr(main, "set_project_archived", record)
+    return sent
+
+
+class TestArchiveGateway:
+    @pytest.mark.description(
+        "Archive and unarchive send the flag to the Gateway only for a project with a key.\n\n"
+        "Test cases:\n"
+        "- A project with a key sends archive, then unarchive.\n"
+        "- A project with no key sends nothing."
+    )
+    def test_sends_flag_only_with_key(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        sent = _record_archives(monkeypatch)
+        keyed, keyless = _row(), _row(handle="keyless", name="Keyless", gateway_key_id=None)
+        for row in (keyed, keyless):
+            _create(client, row)
+            path = f"/orgs/{ORG}/projects/{row['id']}"
+            archived = client.post(f"{path}/archive", json={"archived_at": "2026-11-02T12:00:00Z"}, headers=TOKEN)
+            assert archived.status_code == 200
+            assert client.post(f"{path}/unarchive", headers=TOKEN).status_code == 200
+
+        assert sent == [(UUID(str(keyed["id"])), True), (UUID(str(keyed["id"])), False)]
+
+    @pytest.mark.parametrize(
+        ("suffix", "body", "archived_at"),
+        [
+            ("archive", {"archived_at": "2026-11-03T12:00:00Z"}, None),
+            ("unarchive", None, "2026-11-02T12:00:00+00:00"),
+        ],
+    )
+    @pytest.mark.description(
+        "A Gateway failure on archive or unarchive returns 503 and leaves the archive time as it was."
+    )
+    def test_gateway_failure_returns_503(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        suffix: str,
+        body: dict[str, str] | None,
+        archived_at: str | None,
+    ) -> None:
+        def refuse(_project_id: UUID, _archived: bool) -> None:
+            raise httpx.ConnectError("gateway down")
+
+        monkeypatch.setattr(main, "set_project_archived", refuse)
+        row = _row(archived_at=archived_at)
+        _create(client, row)
+
+        response = client.post(f"/orgs/{ORG}/projects/{row['id']}/{suffix}", json=body, headers=TOKEN)
+
+        assert (response.status_code, response.json()["detail"]) == (503, "The Gateway failed")
+        assert _project(client, row["id"]) == _stored(row)
 
 
 class TestDeletedProjects:

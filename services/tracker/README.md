@@ -110,6 +110,38 @@ Tracker.
 - It doesn't accept overrides for those keys or select a new project's key after a retag.
   Other secret overrides still work.
 
+## Dataset archive worker
+
+The archive worker claims queued uploads from PostgreSQL and processes one job at a time in a separate child process.
+
+- The console submits archives through the [upload API](src/tracker/api/dataset_uploads.py). Publication starts only after the caller reviews and confirms the validated digest.
+- Each job uses its owning organization's storage and the recorded archive checksum.
+- Validation and publication each have a 30-minute deadline. The parent terminates the child when that deadline expires.
+- The worker waits five seconds between polling cycles. Each phase permits at most three processing attempts.
+- After validation or cancellation, cleanup removes the temporary archive. Failed cleanup becomes eligible again after one minute.
+- Temporary archives use `dataset-uploads/`. Published task archives remain under `datasets/`.
+
+Start `make local-tracker` first. In another terminal at `services/tracker`, run:
+
+```bash
+make dataset-worker
+```
+
+- Both targets share default configuration and database values. If you override `CONFIG` or `LOCAL_DATABASE_URL`, use the same values for both targets.
+- File-backed storage does not issue browser upload forms. The [local publication test](tests/integration/local/database/test_dataset_uploads.py) stages archive bytes, queues validation, and reopens the published version.
+- The [infrastructure definition](../../infra/dataset_upload_worker.py) creates one worker per stage with the Tracker image, 2 vCPUs, 4 GiB memory, and 40 GiB temporary storage.
+- The worker receives database credentials and storage permissions for the job's organization. It receives no provider, Gateway, or grading secrets.
+- The infrastructure and tenant bucket definitions set expiry to two days for temporary archives and one day for noncurrent versions. S3 schedules deletion asynchronously.
+- The shared bucket definition permits browser uploads from `https://dashboards.vals.ai`. New tenant buckets use the comma-separated `DATASET_UPLOAD_ORIGINS` environment variable for permitted origins.
+- Before browser uploads, follow [existing tenant bucket updates](../../internal/tracker-operations.md#existing-tenant-upload-storage). Bucket creation leaves recorded tenant buckets unchanged.
+- Lifecycle cleanup covers uploads that finish after job cleanup. A previously issued S3 form can remain usable after cancellation.
+
+For the credential-free archive-to-publication test, run this command from `services/tracker`. The test starts its own database fixture and worker.
+
+```bash
+uv run pytest tests/integration/local/database/test_dataset_uploads.py::TestDatasetUploads::test_archive_to_published_version -q
+```
+
 ## Tests
 
 ```bash

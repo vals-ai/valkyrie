@@ -1,0 +1,1438 @@
+from __future__ import annotations
+
+# pyright: reportPrivateUsage=false
+
+import asyncio
+import ipaddress
+import logging
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
+
+import pytest
+from grpclib import GRPCError, Status
+from grpclib.exceptions import ProtocolError, StreamTerminatedError
+from modal import Sandbox as ModalSdkSandbox
+from modal.exception import ConflictError as ModalConflictError
+from modal.exception import ConnectionError as ModalConnectionError
+from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
+from modal.exception import InvalidError as ModalInvalidError
+from modal.exception import NotFoundError as ModalNotFoundError
+from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
+
+import benchmark_service.sandbox.modal as modal_module
+from benchmark_service.sandbox import sandbox_provider_config_from_mapping
+from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
+from benchmark_service.sandbox.types import (
+    DockerfileSource,
+    ImageSource,
+    Resources,
+    SandboxBuildError,
+    SandboxCommandError,
+    SandboxConnectionError,
+    SandboxCreateRequest,
+    SandboxError,
+    UnsupportedSandboxConfigError,
+    SandboxNotFoundError,
+    SandboxQuery,
+    SnapshotSource,
+    TargetedSnapshotSource,
+    VolumeMount,
+)
+
+
+def _aio(fn: Any) -> SimpleNamespace:
+    return SimpleNamespace(aio=fn)
+
+
+async def _chunks(*chunks: str | bytes) -> AsyncGenerator[str | bytes, None]:
+    for chunk in chunks:
+        yield chunk
+
+
+class FakeProcess:
+    def __init__(self, chunks: list[str] | list[bytes], exit_code: int) -> None:
+        self.stdout = _chunks(*chunks)
+        self.wait = _aio(self._wait)
+        self._exit_code = exit_code
+
+    async def _wait(self) -> int:
+        return self._exit_code
+
+
+class HangingProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__([], 137)
+        self.read_started = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
+        self.stdout = self._stream_until_cancelled()
+
+    async def _stream_until_cancelled(self) -> AsyncGenerator[str, None]:
+        yield "line1\n"
+        self.read_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.read_cancelled.set()
+            raise
+
+
+class ErrorProcess(FakeProcess):
+    def __init__(self, error: ModalError) -> None:
+        super().__init__([], 1)
+        self._error = error
+        self.stdout = self._stream_until_error()
+
+    async def _stream_until_error(self) -> AsyncGenerator[bytes, None]:
+        yield b"partial"
+        raise self._error
+
+
+class FakeFilesystem:
+    def __init__(self, content: bytes = b"", error: ModalError | None = None) -> None:
+        self.content = content
+        self.error = error
+        self.writes: list[tuple[bytes, str]] = []
+        self.reads: list[str] = []
+        self.write_bytes = _aio(self._write_bytes)
+        self.read_bytes = _aio(self._read_bytes)
+
+    async def _write_bytes(self, content: bytes, remote_path: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.writes.append((content, remote_path))
+        self.content = content
+
+    async def _read_bytes(self, remote_path: str) -> bytes:
+        if self.error is not None:
+            raise self.error
+        self.reads.append(remote_path)
+        return self.content
+
+
+class FakeInnerSandbox:
+    def __init__(
+        self,
+        object_id: str = "sb-123",
+        process: FakeProcess | None = None,
+        file_content: bytes = b"",
+        exec_error: ModalError | None = None,
+        file_error: ModalError | None = None,
+        poll_result: int | None = None,
+        poll_results: list[int | ModalError | None] | None = None,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        self.object_id = object_id
+        self.commands: list[tuple[str, ...]] = []
+        self.command_envs: list[dict[str, str | None] | None] = []
+        self.terminated = False
+        self._process = process or FakeProcess([], 0)
+        self._exec_error = exec_error
+        self._poll_result = poll_result
+        self._poll_results = poll_results or []
+        self._tags = dict(tags or {})
+        self.filesystem = FakeFilesystem(file_content, file_error)
+        self.outbound_policies: list[dict[str, list[str] | None]] = []
+        self.exec = _aio(self._exec)
+        self.terminate = _aio(self._terminate)
+        self.poll = _aio(self._poll)
+        self.get_tags = _aio(self._get_tags)
+        self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
+
+    async def _exec(
+        self,
+        *args: str,
+        text: bool = True,
+        env: dict[str, str | None] | None = None,
+    ) -> FakeProcess:
+        if self._exec_error is not None:
+            raise self._exec_error
+        self.commands.append(args)
+        self.command_envs.append(env)
+        return self._process
+
+    async def _terminate(self, *, wait: bool = False) -> None:
+        self.terminated = True
+        self.terminate_wait = wait
+
+    async def _get_tags(self) -> dict[str, str]:
+        return dict(self._tags)
+
+    async def _poll(self) -> int | None:
+        # None means still running, mirroring modal.Sandbox.poll().
+        if self._poll_results:
+            poll_result = self._poll_results.pop(0)
+            if isinstance(poll_result, ModalError):
+                raise poll_result
+            return poll_result
+        return self._poll_result
+
+    async def _set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.outbound_policies.append(
+            {
+                "outbound_cidr_allowlist": outbound_cidr_allowlist,
+                "outbound_domain_allowlist": outbound_domain_allowlist,
+            }
+        )
+
+
+class FlakyExecSandbox(FakeInnerSandbox):
+    def __init__(self) -> None:
+        super().__init__(process=FakeProcess(["ok"], 0))
+        self.exec_attempts = 0
+
+    async def _exec(
+        self,
+        *args: str,
+        text: bool = True,
+        env: dict[str, str | None] | None = None,
+    ) -> FakeProcess:
+        self.exec_attempts += 1
+        if self.exec_attempts == 1:
+            raise ModalConnectionError("modal exec temporarily unavailable")
+        return await super()._exec(*args, text=text, env=env)
+
+
+def _request(
+    source: ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | None = None,
+    resources: Resources | None = None,
+    labels: dict[str, str] | None = None,
+    volumes: list[VolumeMount] | None = None,
+) -> SandboxCreateRequest:
+    return SandboxCreateRequest(
+        source=source or ImageSource(image="python:3.12"),
+        resources=resources or Resources(vcpu=4, memory=8, disk=30),
+        name="task-1",
+        labels={"run_id": "r1"} if labels is None else labels,
+        env_vars={"FOO": "bar"},
+        auto_stop_interval=30,
+        create_timeout=120,
+        volumes=volumes or [],
+    )
+
+
+def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandboxProvider:
+    client = SimpleNamespace(_close=_aio(_noop))
+    app = SimpleNamespace(app_id="ap-1")
+
+    async def from_credentials(token_id: str, token_secret: str) -> Any:
+        return client
+
+    async def lookup(name: str, **kwargs: Any) -> Any:
+        assert kwargs["create_if_missing"] is True
+        return app
+
+    monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
+    monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
+    monkeypatch.setattr(
+        modal_module,
+        "Image",
+        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_dockerfile=_from_dockerfile),
+    )
+    monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
+    return ModalSandboxProvider(_config())
+
+
+async def _noop(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _from_registry(image: str) -> tuple[str, str]:
+    return ("image", image)
+
+
+def _from_id(snapshot: str, **kwargs: Any) -> tuple[str, str]:
+    return ("snapshot", snapshot)
+
+
+def _from_dockerfile(path: str, **kwargs: Any) -> tuple[str, str, dict[str, Any]]:
+    return ("dockerfile", path, kwargs)
+
+
+def _config() -> ModalProviderConfig:
+    return ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
+
+
+def _sandbox(inner: FakeInnerSandbox, name: str | None = None) -> ModalSandbox:
+    return ModalSandbox(cast(ModalSdkSandbox, inner), name=name)
+
+
+def test_modal_config_reads_secrets_manager_shape() -> None:
+    config = sandbox_provider_config_from_mapping(
+        {
+            "type": "modal",
+            "runtime": "vm",
+            "MODAL_TOKEN_ID": "id",
+            "MODAL_TOKEN_SECRET": "secret",
+            "MODAL_ENVIRONMENT": "legacy-ignored",
+        }
+    )
+    assert config == ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
+
+
+def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
+    command = modal_module._command("echo hi", "/workspace", 60)
+    assert command == "{ cd /workspace && timeout 60 sh -c 'echo hi' ; } 2>&1"
+
+
+def test_command_keeps_variable_assignments_and_pipelines_under_the_timeout() -> None:
+    command = modal_module._command('id=$(echo 7); echo "$id" | cat', None, 5)
+    assert command == "{ timeout 5 sh -c 'id=$(echo 7); echo \"$id\" | cat' ; } 2>&1"
+
+
+def test_command_preserves_fractional_timeout() -> None:
+    assert "timeout 1.5 sh -c true" in modal_module._command("true", None, 1.5)
+
+
+async def test_exec_returns_combined_output() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess(["out", "err"], 3))
+    sandbox = _sandbox(inner)
+
+    result = await sandbox.exec("boom", timeout=10)
+
+    assert result.exit_code == 3
+    assert result.stdout == "outerr"
+    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 sh -c boom ; } 2>&1")]
+
+
+async def test_exec_wraps_modal_errors() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(exec_error=ModalError("boom")))
+
+    with pytest.raises(SandboxError):
+        await sandbox.exec("true")
+
+
+async def test_exec_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._start_process).retry, "sleep", _noop)
+    inner = FlakyExecSandbox()
+    sandbox = _sandbox(inner)
+
+    result = await sandbox.exec("true")
+
+    assert result.exit_code == 0
+    assert result.output == "ok"
+    assert inner.exec_attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ProtocolError("bad frame"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "protocol", "socket", "grpc-unavailable", "grpc"],
+)
+async def test_exec_wraps_raw_transport_errors_from_output_stream(
+    error: Exception, expected: type[SandboxError]
+) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+
+    with pytest.raises(expected) as raised:
+        await sandbox.exec("true")
+
+    assert raised.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StreamTerminatedError("Connection lost"), GRPCError(Status.DEADLINE_EXCEEDED, "deadline")],
+    ids=["stream-terminated", "grpc-deadline"],
+)
+async def test_exec_start_transport_error_is_not_retried(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._start_process).retry, "sleep", _noop)
+    inner = FakeInnerSandbox(exec_error=cast(Any, error))
+    attempts = 0
+    raise_error = inner.exec.aio
+
+    async def counted_exec(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await raise_error(*args, **kwargs)
+
+    inner.exec = _aio(counted_exec)
+    sandbox = _sandbox(inner)
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.exec("true")
+
+    assert type(raised.value) is SandboxError
+    assert attempts == 1
+
+
+async def test_upload_wraps_raw_transport_errors() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(file_error=cast(Any, StreamTerminatedError("Connection lost"))))
+
+    with pytest.raises(SandboxConnectionError, match="StreamTerminatedError"):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
+
+
+async def test_file_operations_map_not_found_errors() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(file_error=ModalNotFoundError("sandbox removed")))
+
+    with pytest.raises(SandboxNotFoundError, match="sandbox removed"):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
+
+    with pytest.raises(SandboxNotFoundError, match="sandbox removed"):
+        await sandbox.download_file("/tmp/result.txt")
+
+
+async def test_command_streams_output_and_raises_on_failure() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess(["line1\n", "line2\n"], 7))
+
+    async def delayed_wait() -> int:
+        await asyncio.sleep(0.05)
+        return 7
+
+    inner._process.wait = _aio(delayed_wait)
+    sandbox = _sandbox(inner)
+
+    chunks: list[str] = []
+    with pytest.raises(SandboxCommandError) as exc:
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert chunks == ["line1\n", "line2\n"]
+    assert exc.value.exit_code == 7
+
+
+async def test_command_drains_output_after_process_finishes() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess([], 0))
+
+    async def delayed_output() -> AsyncGenerator[str, None]:
+        yield "first"
+        await asyncio.sleep(0.05)
+        yield "late"
+
+    inner._process.stdout = delayed_output()
+    sandbox = _sandbox(inner)
+
+    assert [chunk async for chunk in sandbox.command("run")] == ["first", "late"]
+
+
+async def test_command_drains_continuous_output_after_process_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.05)
+    inner = FakeInnerSandbox(process=FakeProcess([], 0))
+    expected_chunks = [f"chunk-{index}" for index in range(20)]
+
+    async def continuous_output() -> AsyncGenerator[str, None]:
+        for chunk in expected_chunks:
+            yield chunk
+            await asyncio.sleep(0.01)
+
+    inner._process.stdout = continuous_output()
+    sandbox = _sandbox(inner)
+
+    assert [chunk async for chunk in sandbox.command("run")] == expected_chunks
+
+
+@pytest.mark.parametrize(
+    ("modal_error", "expected_error", "message"),
+    [
+        (ModalConnectionError("command disconnected"), SandboxConnectionError, "command disconnected"),
+        (ModalConflictError("Modal Sandbox is shutting down."), SandboxNotFoundError, "shutting down"),
+    ],
+)
+async def test_command_maps_stream_errors(
+    modal_error: ModalError,
+    expected_error: type[SandboxError],
+    message: str,
+) -> None:
+    inner = FakeInnerSandbox(process=ErrorProcess(modal_error))
+    sandbox = _sandbox(inner)
+    chunks: list[str] = []
+
+    with pytest.raises(expected_error, match=message):
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert chunks == ["b'partial'"]
+
+
+class WaitErrorProcess(FakeProcess):
+    def __init__(self, error: Exception) -> None:
+        super().__init__([], 0)
+        self._error = error
+        self.wait = _aio(self._wait_error)
+
+    async def _wait_error(self) -> int:
+        raise self._error
+
+
+_RAW_TRANSPORT_ERRORS = pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "socket", "grpc-unavailable", "grpc"],
+)
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_stream(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[str] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == ["b'partial'"]
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_wait(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=WaitErrorProcess(error)))
+
+    with pytest.raises(expected) as raised:
+        async for _ in sandbox.command("run"):
+            pass
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+
+
+async def test_command_uses_native_process_environment() -> None:
+    secret = "value with spaces; $(touch /tmp/leaked)"
+    inner = FakeInnerSandbox(process=FakeProcess(["ok"], 0))
+    sandbox = _sandbox(inner)
+
+    chunks = [chunk async for chunk in sandbox.command("run", env_vars={"AGENT_SECRET": secret})]
+
+    assert chunks == ["ok"]
+    assert inner.command_envs == [{"AGENT_SECRET": secret}]
+    assert all(secret not in part for command in inner.commands for part in command)
+
+
+async def test_command_rejects_invalid_environment_names_before_provider_call() -> None:
+    inner = FakeInnerSandbox()
+    sandbox = _sandbox(inner)
+
+    with pytest.raises(ValueError, match="BAD-NAME"):
+        _ = [chunk async for chunk in sandbox.command("run", env_vars={"BAD-NAME": "secret"})]
+
+    assert inner.commands == []
+
+
+async def test_command_maps_terminated_sandbox_to_not_found() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess(["line1\n"], 137), poll_results=[None, None, 137])
+    sandbox = _sandbox(inner)
+    chunks: list[str] = []
+
+    with pytest.raises(SandboxNotFoundError):
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert chunks == ["line1\n"]
+
+
+async def test_command_detects_termination_while_output_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detect remote termination even when Modal leaves the output iterator open.
+
+    Test cases:
+    - A stalled stream raises SandboxNotFoundError after the sandbox poll reports termination.
+    - A transient poll failure is retried without aborting the command first.
+    """
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._raise_if_finished).retry, "sleep", _noop)
+    process = HangingProcess()
+
+    async def pending_wait() -> int:
+        await asyncio.Event().wait()
+        return 137
+
+    process.wait = _aio(pending_wait)
+    sandbox = _sandbox(
+        FakeInnerSandbox(
+            process=process,
+            poll_results=[None, ModalConnectionError("temporary poll failure"), 137],
+        )
+    )
+
+    async def consume_command() -> list[str]:
+        return [chunk async for chunk in sandbox.command("run")]
+
+    with pytest.raises(SandboxNotFoundError, match="poll_result=137"):
+        await asyncio.wait_for(consume_command(), timeout=1)
+
+
+async def test_command_unblocks_when_process_finishes_before_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
+    process = HangingProcess()
+
+    async def finished_wait() -> int:
+        return 137
+
+    process.wait = _aio(finished_wait)
+    sandbox = _sandbox(FakeInnerSandbox(process=process, poll_results=[None, 137]))
+
+    async def consume_command() -> list[str]:
+        return [chunk async for chunk in sandbox.command("run")]
+
+    with pytest.raises(SandboxNotFoundError):
+        await asyncio.wait_for(consume_command(), timeout=1)
+
+    assert process.read_cancelled.is_set()
+
+
+async def test_command_cancels_pending_stream_read() -> None:
+    process = HangingProcess()
+    wait_cancelled = asyncio.Event()
+
+    async def pending_wait() -> int:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+        return 137
+
+    process.wait = _aio(pending_wait)
+    sandbox = _sandbox(FakeInnerSandbox(process=process))
+
+    async def consume_command() -> None:
+        async for _ in sandbox.command("run"):
+            pass
+
+    consumer = asyncio.create_task(consume_command())
+    await asyncio.wait_for(process.read_started.wait(), timeout=1)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert process.read_cancelled.is_set()
+    assert wait_cancelled.is_set()
+
+
+async def test_command_reports_modal_poll_result_when_sandbox_finished() -> None:
+    """Verify finished Modal sandboxes include their poll result in the surfaced error.
+
+    Test cases:
+    - A terminated sandbox poll result is included in the SandboxNotFoundError message.
+    """
+    sandbox = _sandbox(FakeInnerSandbox(process=FakeProcess([], 137), poll_results=[None, 137]))
+
+    with pytest.raises(SandboxNotFoundError, match="poll_result=137"):
+        async for _ in sandbox.command("run"):
+            pass
+
+
+async def test_upload_file_uses_modal_filesystem() -> None:
+    inner = FakeInnerSandbox()
+    sandbox = _sandbox(inner)
+
+    await sandbox.upload_file("/tmp/nested/problem.txt", b"hello")
+
+    assert inner.filesystem.writes == [(b"hello", "/tmp/nested/problem.txt")]
+    assert inner.filesystem.content == b"hello"
+
+
+async def test_file_operations_raise_not_found_when_sandbox_finished() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(poll_result=137))
+
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
+
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.download_file("/tmp/result.txt")
+
+
+async def test_download_file_returns_bytes() -> None:
+    inner = FakeInnerSandbox(file_content=b"data")
+    sandbox = _sandbox(inner)
+
+    assert await sandbox.download_file("/tmp/out.bin") == b"data"
+    assert inner.filesystem.reads == ["/tmp/out.bin"]
+
+
+async def test_stream_download_yields_chunks() -> None:
+    """Verify Modal file downloads stream binary chunks without buffering the whole file.
+
+    Test cases:
+    - Multiple binary chunks are yielded in order.
+    """
+    inner = FakeInnerSandbox(process=FakeProcess([b"hello", b" world"], 0), file_content=b"buffered fallback")
+    sandbox = _sandbox(inner)
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/tmp/out.bin")]
+
+    assert chunks == [b"hello", b" world"]
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_stream_download_maps_raw_transport_errors(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[bytes] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.stream_download("/tmp/out.bin"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == [b"partial"]
+
+
+class ConnectionLostThenApplyPolicySandbox(FakeInnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.policy_attempts = 0
+
+    async def _set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.policy_attempts += 1
+        if self.policy_attempts == 1:
+            raise ModalConnectionError("outbound policy update disconnected")
+        await super()._set_outbound_network_policy(
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+        )
+
+
+async def test_egress_rule_updates_retry_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure while setting the outbound policy is retried by the provider."""
+
+    async def _noop(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._set_outbound_network_policy).retry, "sleep", _noop)
+    inner = ConnectionLostThenApplyPolicySandbox()
+    sandbox = _sandbox(inner)
+
+    await sandbox.block_all_egress()
+
+    assert inner.policy_attempts == 2
+    assert inner.outbound_policies == [{"outbound_cidr_allowlist": [], "outbound_domain_allowlist": []}]
+
+
+async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Modal egress updates call the SDK outbound policy API with CIDRs only.
+
+    Test cases:
+    - Hostnames become the addresses they resolve to here and in the sandbox, plus the sandbox's DNS servers.
+    - An address the allowlist doesn't list stays unreachable and no domain rule is set.
+    - A wildcard hostname, which no address list can express, is refused.
+    - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
+    - Clearing egress rules allows every IPv4 address and never names a domain.
+    """
+
+    async def resolve_ipv4(host: str) -> list[str]:
+        return {"api.openai.com": ["192.0.2.5"]}.get(host, [])
+
+    monkeypatch.setattr(modal_module, "_resolve_ipv4", resolve_ipv4)
+    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n10.0.0.2\n"], 0))
+    sandbox = _sandbox(inner)
+
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": [
+            "203.0.113.10/32",
+            "198.51.100.8/32",
+            "198.51.100.9/32",
+            "10.0.0.2/32",
+            "192.0.2.5/32",
+        ],
+        "outbound_domain_allowlist": [],
+    }
+    allowed = [ipaddress.ip_network(cidr) for cidr in inner.outbound_policies[-1]["outbound_cidr_allowlist"] or []]
+    assert not any(ipaddress.ip_address("93.184.216.34") in network for network in allowed)
+
+    policies = len(inner.outbound_policies)
+    with pytest.raises(ValueError, match="wildcard hostname such as \\*.example.com"):
+        await sandbox.modify_egress_rules(["*.example.com", "203.0.113.10"])
+    assert len(inner.outbound_policies) == policies
+
+    with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
+        await sandbox.modify_egress_rules([])
+
+    await sandbox.block_all_egress()
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": [],
+        "outbound_domain_allowlist": [],
+    }
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": [],
+    }
+
+
+@pytest.mark.parametrize("requires_nested_docker", [False, True])
+async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch, requires_nested_docker: bool) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured["entrypoint"] = args
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request()
+    assert request.requires_nested_docker is False
+    if requires_nested_docker:
+        provider._config = _config().model_copy(update={"runtime": "vm"})
+        request = request.model_copy(update={"requires_nested_docker": True})
+
+    sandbox = await provider.create_sandbox(request)
+
+    assert sandbox.id == "sb-123"
+    assert sandbox.name == "task-1"
+    # No entrypoint args: an argless Modal sandbox idles until timeout.
+    assert captured["entrypoint"] == ()
+    assert captured["image"] == ("image", "python:3.12")
+    assert captured["env"] == {"FOO": "bar"}
+    assert captured["tags"] == {"run_id": "r1"}
+    assert captured["cpu"] == (4, 4)
+    assert captured["memory"] == 8192
+    assert captured["idle_timeout"] == 1800
+    assert captured["timeout"] == 86400
+    assert captured["block_network"] is False
+    assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
+    assert "outbound_domain_allowlist" not in captured
+    assert captured["runtime"] == ("vm" if requires_nested_docker else "gvisor")
+    assert captured["experimental_options"] == (None if requires_nested_docker else {"enable_docker": True})
+    assert captured["gpu"] is None
+
+
+@pytest.mark.parametrize(("runtime", "gpu"), [("gvisor", 0), ("gvisor", 1), ("vm", 1)])
+async def test_nested_docker_rejection_precedes_connection(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, gpu: int
+) -> None:
+    provider = ModalSandboxProvider(_config().model_copy(update={"runtime": runtime}))
+    connect = AsyncMock()
+    monkeypatch.setattr(provider, "_connect", connect)
+    request = _request(resources=Resources(vcpu=1, memory=2, disk=5, gpu=gpu, gpu_type="T4" if gpu else None))
+
+    with pytest.raises(UnsupportedSandboxConfigError) as preflight:
+        provider.validate_sandbox_config(requires_nested_docker=True, resources=request.resources)
+
+    with pytest.raises(UnsupportedSandboxConfigError) as raised:
+        await provider.create_sandbox(request.model_copy(update={"requires_nested_docker": True}))
+
+    assert str(raised.value) == str(preflight.value)
+    assert '"gvisor"' in str(raised.value)
+    assert "daytona" in str(raised.value)
+    if gpu:
+        assert "Modal runs GPU sandboxes" in str(raised.value)
+    else:
+        assert 'Set "runtime": "vm"' in str(raised.value)
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "gpu", "requires_nested_docker"),
+    [
+        ("gvisor", 0, False),
+        ("gvisor", 1, False),
+        ("vm", 0, False),
+        ("vm", 1, False),
+        ("vm", 0, True),
+    ],
+)
+def test_validate_sandbox_config_allows_supported_requirements(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, gpu: int, requires_nested_docker: bool
+) -> None:
+    provider = ModalSandboxProvider(_config().model_copy(update={"runtime": runtime}))
+    connect = AsyncMock()
+    monkeypatch.setattr(provider, "_connect", connect)
+
+    provider.validate_sandbox_config(
+        requires_nested_docker=requires_nested_docker,
+        resources=Resources(vcpu=1, memory=2, disk=5, gpu=gpu, gpu_type="T4" if gpu else None),
+    )
+
+    connect.assert_not_called()
+
+
+async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    dockerfile = str(tmp_path / "Dockerfile")
+
+    await provider.create_sandbox(_request(DockerfileSource(dockerfile=dockerfile)))
+
+    assert captured["image"] == ("dockerfile", dockerfile, {"context_dir": str(tmp_path)})
+
+
+async def test_create_sandbox_waits_for_a_dockerfile_build_on_top_of_the_creation_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    delays: list[float | None] = []
+    timeout = asyncio.timeout
+
+    def recording_timeout(delay: float | None) -> asyncio.Timeout:
+        delays.append(delay)
+        return timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", recording_timeout)
+
+    await provider.create_sandbox(
+        _request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=600))
+    )
+
+    assert delays == [120 + 600]
+
+
+async def test_create_sandbox_reports_a_failed_build_with_modals_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build failed\nstep 2 exited with 1", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+
+    with pytest.raises(SandboxBuildError, match="Modal image build failed") as error:
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    assert error.value.build_log == "Image build failed\nstep 2 exited with 1"
+
+
+async def test_create_sandbox_reports_a_dockerfile_build_timeout_as_a_build_error_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inner = FakeInnerSandbox()
+    finish_build = asyncio.Event()
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        await finish_build.wait()
+
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    timeout = asyncio.timeout
+
+    def short_timeout(_delay: float | None) -> asyncio.Timeout:
+        return timeout(0.01)
+
+    monkeypatch.setattr(asyncio, "timeout", short_timeout)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    finish_build.set()
+    await asyncio.gather(*provider._cleanup_tasks)
+
+    assert inner.terminated is True
+
+
+async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("Modal must not be asked to build a Dockerfile that is missing")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+
+async def test_create_sandbox_maps_a_failed_registry_image_build_to_a_build_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build for im-123 failed", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxBuildError, match="Modal image build failed: Image build for im-123 failed"):
+        await provider.create_sandbox(_request())
+
+
+async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    provider._config.runtime = "vm"
+
+    await provider.create_sandbox(_request())
+
+    assert captured["runtime"] == "vm"
+    assert captured["experimental_options"] is None
+
+
+async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
+
+    assert captured["gpu"] == "H100:2"
+
+
+async def test_create_sandbox_reserves_and_caps_a_fractional_cpu_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=0.5, memory=8, disk=30)))
+
+    assert captured["cpu"] == (0.5, 0.5)
+
+
+async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_knows_by_its_own_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type=["rtx-4090", "nvidia-h100-80gb", "a100"])
+
+    await provider.create_sandbox(_request(resources=resources))
+
+    assert captured["gpu"] == "H100:2"
+
+
+@pytest.mark.parametrize("gpu_type", [{}, {"gpu_type": ""}, {"gpu_type": "  "}, {"gpu_type": [""]}])
+async def test_create_sandbox_requires_gpu_type_for_gpu(
+    monkeypatch: pytest.MonkeyPatch, gpu_type: dict[str, Any]
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="requires gpu_type"):
+        await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1, **gpu_type)))
+
+
+async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request().model_copy(update={"network_block_all": True})
+
+    await provider.create_sandbox(request)
+
+    assert captured["block_network"] is True
+    assert captured["outbound_cidr_allowlist"] is None
+    assert "outbound_domain_allowlist" not in captured
+
+
+async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the requested name while Modal receives a safe allocation name."""
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = SandboxCreateRequest(
+        source=ImageSource(image="python:3.12"),
+        resources=Resources(vcpu=4, memory=8, disk=30),
+        name=f"dataset/task:with/slashes-{'x' * 80}",
+        labels={"run_id": "r1"},
+        env_vars={"FOO": "bar"},
+        auto_stop_interval=30,
+        create_timeout=120,
+    )
+
+    sandbox = await provider.create_sandbox(request)
+
+    assert sandbox.name == request.name
+    assert sandbox.labels == request.labels
+    assert "/" not in captured["name"]
+    assert ":" not in captured["name"]
+    assert len(captured["name"]) <= 64
+
+
+async def test_create_sandbox_does_not_retry_ambiguous_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        nonlocal attempts
+        attempts += 1
+        raise ModalConnectionError("modal create outcome unknown")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxConnectionError, match="outcome unknown"):
+        await provider.create_sandbox(_request())
+    assert attempts == 1
+
+
+async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    sandbox = await provider.create_sandbox(_request(source=SnapshotSource(snapshot="im-123")))
+
+    assert sandbox.id == "sb-123"
+    assert captured["image"] == ("snapshot", "im-123")
+
+
+async def test_create_sandbox_rejects_targeted_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="does not support source type: targeted_snapshot"):
+        await provider.create_sandbox(
+            _request(source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"))
+        )
+
+
+async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        raise ModalNotFoundError(f"missing {instance_id}")
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    with pytest.raises(SandboxNotFoundError):
+        await provider.get_sandbox("sb-missing")
+
+
+async def test_get_sandbox_maps_invalid_id_to_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        raise ModalInvalidError(f"Invalid Sandbox ID: {instance_id!r}")
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    with pytest.raises(SandboxNotFoundError, match="id=sandbox-name"):
+        await provider.get_sandbox("sandbox-name")
+
+
+async def test_get_sandbox_fetches_modal_tags_with_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox(tags={"Id": "benchmark-1", "Task": "task-1"})
+    attempts = 0
+
+    async def get_tags() -> dict[str, str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ModalConnectionError("tags temporarily unavailable")
+        return {"Id": "benchmark-1", "Task": "task-1"}
+
+    inner.get_tags = _aio(get_tags)
+
+    async def from_id(instance_id: str, **kwargs: Any) -> FakeInnerSandbox:
+        return inner
+
+    monkeypatch.setattr(cast(Any, ModalSandboxProvider._fetch_labels).retry, "sleep", _noop)
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    sandbox = await provider.get_sandbox("sb-123")
+
+    assert sandbox.labels == {"Id": "benchmark-1", "Task": "task-1"}
+    assert attempts == 2
+
+
+async def test_get_sandbox_raises_not_found_for_finished_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        return FakeInnerSandbox(object_id=instance_id, poll_result=137)
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    with pytest.raises(SandboxNotFoundError, match="id=sb-finished"):
+        await provider.get_sandbox("sb-finished")
+
+
+async def test_delete_sandbox_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        raise ModalNotFoundError(f"missing {instance_id}")
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    await provider.delete_sandbox("sb-missing")
+
+
+async def test_delete_sandbox_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        assert instance_id == "sb-123"
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    await provider.delete_sandbox("sb-123")
+
+    assert inner.terminated
+    assert inner.terminate_wait is True
+
+
+async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox(tags={"run_id": "r1", "Task": "task-1"})
+    finished = FakeInnerSandbox(object_id="sb-finished", poll_result=137)
+    captured: dict[str, Any] = {}
+
+    def list_sandboxes(**kwargs: Any) -> AsyncGenerator[FakeInnerSandbox, None]:
+        captured.update(kwargs)
+
+        async def iterate() -> AsyncGenerator[FakeInnerSandbox, None]:
+            yield inner
+            yield finished
+
+        return iterate()
+
+    provider = _provider(monkeypatch, SimpleNamespace(list=_aio(list_sandboxes)))
+
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={"run_id": "r1"}))]
+
+    assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
+    assert sandboxes[0].labels == {"run_id": "r1", "Task": "task-1"}
+    assert captured["app_id"] == "ap-1"
+    assert captured["tags"] == {"run_id": "r1"}
+
+
+async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace())
+    query = SandboxQuery(
+        labels={},
+        created_at_lte=datetime(2026, 7, 24, 12, 30, tzinfo=UTC),
+    )
+
+    with pytest.raises(SandboxError, match="does not support filtering by creation time"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
+
+
+async def test_create_sandbox_retries_resource_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    inner = FakeInnerSandbox()
+    create = AsyncMock(side_effect=[ModalResourceExhaustedError("Insufficient capacity to create sandbox."), inner])
+    sleep = AsyncMock()
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+
+    with caplog.at_level(logging.WARNING, logger=modal_module.__name__):
+        sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == inner.object_id
+    assert create.await_count == 2
+    sleep.assert_awaited_once_with(10)
+    assert "capacity exhausted, retrying in 10s" in caplog.text
+
+
+@pytest.mark.parametrize("departure", ["timeout", "cancel"])
+async def test_create_sandbox_stops_capacity_retries_after_caller_leaves(
+    monkeypatch: pytest.MonkeyPatch, departure: str
+) -> None:
+    create = AsyncMock(
+        side_effect=[ModalResourceExhaustedError("Insufficient capacity to create sandbox."), FakeInnerSandbox()]
+    )
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    backoff_started = asyncio.Event()
+    finish_backoff = asyncio.Event()
+
+    async def sleep(_delay: float) -> None:
+        backoff_started.set()
+        await finish_backoff.wait()
+
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+    if departure == "timeout":
+        timeout = asyncio.timeout
+
+        def short_timeout(_delay: float | None) -> asyncio.Timeout:
+            return timeout(0.01)
+
+        monkeypatch.setattr(asyncio, "timeout", short_timeout)
+
+    caller = asyncio.create_task(provider.create_sandbox(_request()))
+    await backoff_started.wait()
+    if departure == "cancel":
+        caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError if departure == "cancel" else SandboxError):
+        await caller
+
+    finish_backoff.set()
+    await asyncio.gather(*provider._cleanup_tasks)
+
+    assert create.await_count == 1
+    assert not provider._cleanup_tasks
+
+
+async def test_create_sandbox_reports_resource_exhaustion_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    exhausted = ModalResourceExhaustedError("Insufficient capacity to create sandbox.")
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        nonlocal attempts
+        attempts += 1
+        raise exhausted
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    sleep = AsyncMock()
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(SandboxError, match="resources exhausted: Insufficient capacity") as error:
+        await provider.create_sandbox(_request().model_copy(update={"create_timeout": 1}))
+    assert error.value.__cause__ is exhausted
+    assert attempts == 6
+    assert [call.args[0] for call in sleep.await_args_list] == [10, 20, 40, 60, 60]
+
+
+async def test_create_sandbox_without_volumes_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default stays byte-identical to pre-volume behaviour."""
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    await provider.create_sandbox(_request())
+
+    assert "volumes" not in captured
+
+
+async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixture too large to bake into an image is mounted, keyed by path."""
+    captured: dict[str, Any] = {}
+    looked_up: list[tuple[str, bool]] = []
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
+        looked_up.append((name, create_if_missing))
+        return f"vol::{name}"
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")]))
+
+    assert captured["volumes"] == {"/vol": "vol::kspbench-steam"}
+    assert looked_up == [("kspbench-steam", False)]
+
+
+async def test_create_sandbox_applies_read_only_and_run_scoped_subpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    mount_options: list[tuple[bool | None, str | None]] = []
+    volume = SimpleNamespace()
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    def with_mount_options(*, read_only: bool | None = None, sub_path: str | None = None) -> Any:
+        mount_options.append((read_only, sub_path))
+        return ("configured-volume", read_only, sub_path)
+
+    volume.with_mount_options = with_mount_options
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> Any:
+        return volume
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(
+        _request(
+            labels={"run-id": "run-123"},
+            volumes=[
+                VolumeMount(
+                    name="fixtures",
+                    mount_path="/fixtures",
+                    read_only=True,
+                    subpath="runs/{run_id}",
+                )
+            ],
+        )
+    )
+
+    assert mount_options == [(True, "runs/run-123")]
+    assert captured["volumes"] == {
+        "/fixtures": ("configured-volume", True, "runs/run-123"),
+    }
+
+
+async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run must not start with an empty directory where its fixture belongs."""
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalNotFoundError("Volume 'absent' not found")
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
+        return f"vol::{name}"
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="volume mount failed") as raised:
+        await provider.create_sandbox(_request(volumes=[VolumeMount(name="absent", mount_path="/vol")]))
+
+    assert type(raised.value) is SandboxError

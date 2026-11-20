@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from tracker import config
+from tracker.clients.model_gateway import machine
 
 
 @pytest.mark.parametrize(
@@ -31,19 +31,19 @@ def test_project_gateway_configuration_at_startup(
     monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", mode)
     monkeypatch.setenv("MODEL_GATEWAY_URL", url)
     monkeypatch.setenv("MODEL_GATEWAY_MACHINE_API_KEY", key)
-    monkeypatch.setattr(config, "VALKYRIE_STAGE", stage)
+    monkeypatch.setattr(machine, "VALKYRIE_STAGE", stage)
 
     if invalid_setting is None:
-        config.validate_enabled_project_gateway()
+        machine.validate_enabled_project_gateway()
     else:
         with pytest.raises(ValueError, match=f"Set {invalid_setting} "):
-            config.validate_enabled_project_gateway()
+            machine.validate_enabled_project_gateway()
 
 
 @pytest.mark.description("`TRACKER_PASSKEY_ORGS` parsing into `PASSKEY_ORGS` and `GATEWAY_KEY_ORGS`.")
 class TestPasskeyOrgs:
     @pytest.mark.description(
-        "Passkey orgs are trimmed and sorted, and each also gets a gateway key along with `vals.ai`."
+        "Passkey orgs are trimmed and sorted, and each also gets a gateway key along with `vals.ai` and `smith-research`."
     )
     def test_listed_orgs_are_trimmed_and_get_gateway_keys(self, tmp_path: Path) -> None:
         result = subprocess.run(
@@ -62,4 +62,4 @@ class TestPasskeyOrgs:
 
         passkey_orgs, gateway_key_orgs = json.loads(result.stdout.splitlines()[-1])
         assert passkey_orgs == ["other", "passkey-org"]
-        assert gateway_key_orgs == ["other", "passkey-org", "vals.ai"]
+        assert gateway_key_orgs == ["other", "passkey-org", "smith-research", "vals.ai"]

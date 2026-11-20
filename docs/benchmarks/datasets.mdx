@@ -29,6 +29,28 @@ Each push makes an immutable version.
 API_KEY = "${ClientConfig#API_KEY}"
 ```
 
+## Call models from a verifier
+
+- List the Model Gateway models that the verifier calls in `[verifier].models`. A step can
+  list its own in `[steps.verifier].models`.
+- When the run has a project with a Gateway key, the verifier gets `MODEL_GATEWAY_URL` and a
+  grading token as `MODEL_GATEWAY_API_KEY`. The token can only query the listed models, and it
+  ends when grading ends.
+- Only the sandbox that runs the verifier can reach the Gateway host, and only while it grades.
+  A separate verifier starts with no network and gets the Gateway host before the verifier
+  runs.
+- A task that lists models fails to grade when the run has no grading token.
+- A compose verifier can't list models while its environment has `network_mode = "no-network"`.
+- To move a verifier from a Gateway secret to `models`, remove `MODEL_GATEWAY_URL` and
+  `MODEL_GATEWAY_API_KEY` from `[verifier].env`. A task that lists models and also sets either
+  name is not valid.
+
+```toml
+[verifier]
+network_mode = "no-network"
+models = ["openai/gpt-4o"]
+```
+
 ## Push a folder
 
 ```bash

@@ -474,14 +474,23 @@ class BenchmarkRepository:
             select(Task).where(col(Task.benchmark) == benchmark_id, col(Task.task_id).in_(task_ids))
         ).all()
 
-    def record_sandbox_link(self, provider: str, sandbox_id: str, benchmark_id: UUID, seen_at: datetime) -> None:
+    def record_sandbox_link(
+        self, provider: str, sandbox_id: str, benchmark_id: UUID, seen_at: datetime, attempt_id: str | None = None
+    ) -> None:
         statement = insert(SandboxRecord).values(
-            provider=provider, sandbox_id=sandbox_id, benchmark_id=benchmark_id, last_seen_at=seen_at
+            provider=provider,
+            sandbox_id=sandbox_id,
+            benchmark_id=benchmark_id,
+            last_seen_at=seen_at,
+            attempt_id=attempt_id,
         )
         self._session.exec(
             statement.on_conflict_do_update(
                 index_elements=["provider", "sandbox_id"],
-                set_={"last_seen_at": later_of(col(SandboxRecord.last_seen_at), statement.excluded.last_seen_at)},
+                set_={
+                    "last_seen_at": later_of(col(SandboxRecord.last_seen_at), statement.excluded.last_seen_at),
+                    "attempt_id": func.coalesce(col(SandboxRecord.attempt_id), statement.excluded.attempt_id),
+                },
                 where=col(SandboxRecord.benchmark_id) == statement.excluded.benchmark_id,
             )
         )

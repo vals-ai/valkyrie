@@ -32,6 +32,7 @@ def script_env(work: Path) -> dict[str, str]:
         "UV_CACHE_DIR": "/tmp/uv-cache",
         "UV_PYTHON_DOWNLOADS": "never",
         "UV_NO_PROGRESS": "1",
+        "UV_EXCLUDE_NEWER": "7 days",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     if WHEEL_DIRECTORY.is_dir():

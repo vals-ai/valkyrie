@@ -14,7 +14,7 @@ from tracker.config import AUTH_REQUIRED, DESCOPE_ORG_ADMIN_ROLE, VALKYRIE_STAGE
 from tracker.exceptions import SecretAccessDeniedError, SecretNotFoundError
 from tracker.local import config as local_config
 from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
-from tracker.project_gateway import automatic_project_gateway
+from tracker.services.gateway.keys import automatic_project_gateway
 from tracker.secret_access import (
     is_generated_project_gateway_secret_name,
     may_use_shared_secrets,
@@ -104,7 +104,7 @@ def secret_store(org: Org) -> SecretsManagerStore:
             resolve_org_aws_runtime(OrgContext(id=org.id, name=org.name, storage_key=org.storage_key)).clients
         )
     if resources.secrets_manager_region is None:
-        raise HTTPException(status_code=400, detail="This Tracker reads secrets from its secrets file")
+        raise HTTPException(status_code=400, detail="This Valkyrie server reads secrets from its secrets file")
     return SecretsManagerStore(AWSClientProvider(resources.secrets_manager_region))
 
 

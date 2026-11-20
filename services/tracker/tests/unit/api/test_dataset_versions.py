@@ -1,16 +1,31 @@
-from typing import Any
+from typing import Any, cast
+import asyncio
 import gzip
+import io
+import zipfile
+from collections.abc import Generator
 from pathlib import Path
+from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
+from sqlalchemy import event
+from sqlmodel import Session
 
 from main import app
-from tests.unit.datasets.support import archive_digest_of, publish_version, zip_bytes
+from tests.unit.datasets.support import TASK, archive_digest_of, publish_version, zip_bytes
 from tests.utils import TEST_ORG_ID
 from tracker import config
+from tracker.auth import get_current_org
+from tracker.database.models import Org
+from tracker.database.session import get_session
+from tracker.clients import archive as archive_client
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
+from tracker.local.storage import FilesystemObjectStore
+from tracker.services.datasets.inspection import MAX_PREVIEW_BYTES
 
 _client = TestClient(app, base_url="http://localhost")
 _DATASETS = "/v1/benchmarks/swe-bench/datasets"
@@ -39,20 +54,139 @@ def _tasks(ref: str = "1") -> list[dict[str, Any]]:
     return _client.get(f"{_BASE}/versions/{ref}/tasks").json()["tasks"]
 
 
+@pytest.mark.description("Native task inspection retains exact versions and bounded pages.")
+class TestInspection:
+    @pytest.mark.description(
+        "Inspection runs database queries off the event loop and releases the transaction before reading storage."
+    )
+    @pytest.mark.parametrize("endpoint", ["files", "preview?path=instruction.md"])
+    def test_storage_reads_release_database(
+        self, database_session: Session, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ) -> None:
+        version = publish_version(_client, _BASE, {"task-a": _archive()})
+        get_range = FilesystemObjectStore.get_range
+        with Session(database_session.get_bind(), expire_on_commit=False) as request_session:
+
+            def require_worker_thread(*_args: object) -> None:
+                with pytest.raises(RuntimeError, match="no running event loop"):
+                    asyncio.get_running_loop()
+
+            event.listen(request_session, "do_orm_execute", require_worker_thread)
+            event.listen(request_session, "after_transaction_end", require_worker_thread)
+
+            def session_dependency() -> Generator[Session, None, None]:
+                yield request_session
+
+            async def read_range(store: FilesystemObjectStore, key: str, start: int, length: int) -> bytes:
+                assert not request_session.in_transaction()
+
+                return await get_range(store, key, start, length)
+
+            monkeypatch.setitem(app.dependency_overrides, get_session, session_dependency)
+            monkeypatch.setattr(FilesystemObjectStore, "get_range", read_range)
+
+            response = _client.get(f"{_BASE}/versions/{version['digest']}/tasks/task-a/{endpoint}")
+
+        assert response.status_code == 200
+
+    @pytest.mark.description("File pages and previews retain the selected digest after latest moves.")
+    def test_files_and_previews_use_exact_versions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = zip_bytes(
+            {
+                "task.toml": b"[environment]\ndocker_image = 'ubuntu:24.04'",
+                "instruction.md": b"old instruction",
+                "tests/test.sh": b"echo 1",
+                "data/binary.bin": b"\x00\xff",
+                "data/large.txt": b"a" * (MAX_PREVIEW_BYTES - 1) + "\u20acrest".encode(),
+            }
+        )
+        buffer = io.BytesIO(body)
+        with zipfile.ZipFile(buffer, "a") as archive:
+            archive.writestr("tests/", b"")
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                archive.writestr("tests/", b"")
+        version = publish_version(_client, _BASE, {"task-a": buffer.getvalue()})
+        publish_version(_client, _BASE, {"task-a": _archive("new instruction")})
+        task = f"{_BASE}/versions/{version['digest']}/tasks/task-a"
+
+        first = _client.get(f"{task}/files", params={"limit": 2}).json()
+        second = _client.get(f"{task}/files", params={"limit": 2, "cursor": first["next_cursor"]}).json()
+        third = _client.get(f"{task}/files", params={"limit": 2, "cursor": second["next_cursor"]}).json()
+
+        assert [entry["path"] for page in [first, second, third] for entry in page["files"]] == [
+            "data/binary.bin",
+            "data/large.txt",
+            "instruction.md",
+            "task.toml",
+            "tests/test.sh",
+        ]
+        assert third["next_cursor"] is None
+        assert _client.get(f"{task}/preview", params={"path": "instruction.md"}).json()["content"] == "old instruction"
+        large = _client.get(f"{task}/preview", params={"path": "data/large.txt"}).json()
+        assert large["content"] == "a" * (MAX_PREVIEW_BYTES - 1)
+        assert large["truncated"] and not large["binary"]
+        binary = _client.get(f"{task}/preview", params={"path": "data/binary.bin"}).json()
+        assert binary["binary"] and binary["content"] is None
+        assert _client.get(f"{task}/preview", params={"path": "../outside"}).status_code == 404
+        assert _client.get(f"{_BASE}/versions/latest/tasks/task-a/files").status_code == 422
+        assert _client.get(f"{_BASE}/versions/{version['digest']}/tasks/missing/files").status_code == 404
+
+        def other_org() -> Org:
+            return Org(id=UUID("00000000-0000-0000-0000-000000000002"), name="other", storage_key="other-bucket")
+
+        monkeypatch.setitem(app.dependency_overrides, get_current_org, other_org)
+
+        assert _client.get(f"{task}/files").status_code == 404
+        assert _client.get(f"{task}/preview", params={"path": "instruction.md"}).status_code == 404
+
+    @pytest.mark.description("The API reports an exhausted inspection budget without returning a partial file list.")
+    def test_inspection_budget_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        version = publish_version(_client, _BASE, {"task-a": _archive()})
+        monkeypatch.setattr(archive_client, "MAX_ARCHIVE_READ_BYTES", 1)
+
+        response = _client.get(f"{_BASE}/versions/{version['digest']}/tasks/task-a/files")
+
+        assert response.status_code == 413
+        assert "files" not in response.json()
+
+    @pytest.mark.description("Search pages advance past nonmatching tasks without reading their archives.")
+    def test_search_pages_continue_after_empty_results(self, datasets_root: Path) -> None:
+        version = publish_version(_client, _BASE, {"task-a": _archive(), "task-b": _archive(), "task-c": _archive()})
+        for archive in datasets_root.glob("*/blobs/sha256/*"):
+            archive.unlink()
+        path = f"{_BASE}/versions/{version['digest']}/search"
+
+        first = _client.get(path, params={"query": "TASK-C", "limit": 2}).json()
+        second = _client.get(path, params={"query": "TASK-C", "limit": 2, "cursor": first["next_cursor"]}).json()
+
+        assert first == {"tasks": [], "next_cursor": "task-b"}
+        assert [task["task_id"] for task in second["tasks"]] == ["task-c"]
+        assert second["next_cursor"] is None
+
+
 @pytest.mark.description("Storing a task's archive under the digest of its files.")
 class TestBlobs:
-    @pytest.mark.description("An archive is stored once under its dataset and digest.")
-    def test_an_archive_is_stored_once_under_its_dataset_and_digest(self, datasets_root: Path) -> None:
-        body = _archive("django__django-11099")
-        digest = archive_digest_of(body)
+    @pytest.mark.description(
+        "Competing uploads of equivalent task archives keep the first archive and report its stored size."
+    )
+    def test_competing_archives_keep_the_first_upload(
+        self, datasets_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        compressed = zip_bytes(TASK)
+        uncompressed = zip_bytes(TASK, zipfile.ZIP_STORED)
+        digest = archive_digest_of(compressed)
+        assert len(compressed) != len(uncompressed)
 
-        created = _client.put(f"{_BASE}/blobs/{digest}", content=body, headers=_ZIP)
-        again = _client.put(f"{_BASE}/blobs/{digest}", content=body, headers=_ZIP)
+        created = cast(Response, _client.put(f"{_BASE}/blobs/{digest}", content=compressed, headers=_ZIP))
+        monkeypatch.setattr(FilesystemObjectStore, "exists", AsyncMock(return_value=False))
+        again = cast(Response, _client.put(f"{_BASE}/blobs/{digest}", content=uncompressed, headers=_ZIP))
 
         assert created.status_code == 201
-        assert created.json() == {"digest": digest, "size": len(body), "warnings": []}
         assert again.status_code == 200
-        assert _blob_files(datasets_root) == [f"{digest.removeprefix('sha256:')}.zip"]
+        assert again.json() == created.json()
+        assert again.json()["size"] == len(compressed)
+        (stored,) = datasets_root.glob(f"*/blobs/sha256/{digest.removeprefix('sha256:')}.zip")
+        assert stored.read_bytes() == compressed
 
     @pytest.mark.description("Missing returns only the digests the dataset does not store.")
     def test_missing_returns_only_the_digests_the_dataset_does_not_store(self) -> None:
@@ -274,6 +408,8 @@ class TestManifest:
 
         assert published["manifest"] == fetched["manifest"] == manifest
         assert [task["source_name"] for task in _tasks()] == ["org/task-a"]
+        searched = _client.get(f"{_BASE}/versions/{published['digest']}/search", params={"query": "ORG/"}).json()
+        assert [task["task_id"] for task in searched["tasks"]] == ["task-a"]
 
     @pytest.mark.description("Tasks are listed in pages in task ID order and the last page has no cursor.")
     def test_tasks_are_listed_in_pages_in_task_id_order_and_the_last_page_has_no_cursor(self) -> None:

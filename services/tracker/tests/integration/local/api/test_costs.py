@@ -13,9 +13,10 @@ from sqlmodel import Session
 from tests.project_service import MockProjectRoutes
 from tests.factories import link_run_project, make_benchmark, make_project
 from tests.utils import TEST_ORG_ID
-from tracker import project_gateway
 import tracker.api.costs as costs_api
-from tracker.clients import gateway_usage
+from tracker.clients.model_gateway import machine
+from tracker.clients.model_gateway.machine import gateway_client
+from tracker.clients.projects import ProjectServiceClient
 from tracker.database.models import (
     BenchmarkStatus,
     Org,
@@ -1367,9 +1368,9 @@ class FakeRunSums:
 @pytest.fixture
 def fake_run_sums(monkeypatch: pytest.MonkeyPatch, database_session: Session) -> FakeRunSums:
     fake = FakeRunSums(database_session)
-    monkeypatch.setattr(gateway_usage, "VALKYRIE_STAGE", "dev")
+    monkeypatch.setattr(machine, "VALKYRIE_STAGE", "dev")
     monkeypatch.setattr(
-        gateway_usage,
+        machine,
         "gateway_client",
         lambda: httpx.AsyncClient(
             base_url="https://model-gateway.example/",
@@ -1590,7 +1591,7 @@ class TestProjectModelCosts:
             "malformed": lambda _request: httpx.Response(200, json={"runs": "none"}),
         }
         if failure == "unconfigured":
-            monkeypatch.setattr(gateway_usage, "gateway_client", project_gateway.gateway_client)
+            monkeypatch.setattr(machine, "gateway_client", gateway_client)
             monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
         else:
             fake_run_sums.answer = answers[failure]
@@ -1606,3 +1607,250 @@ class TestProjectModelCosts:
         [record] = [record for record in caplog.records if record.levelname == "WARNING"]
         assert record.getMessage() == f"Model Gateway is unavailable: {logged}"
         assert MACHINE_KEY not in caplog.text
+
+
+@pytest.mark.description("One run's counted dollars by cost type and resource, with model dollars from the Gateway.")
+class TestRunCosts:
+    @pytest.mark.description(
+        (
+            "A run's costs are summed per cost type and per provider, resource and unit.\n"
+            "\n"
+            "Test cases:\n"
+            "- Sandbox rows of one resource are summed in dollars and quantity.\n"
+            "- A reported cost counts, and an unreported cost of another type does not.\n"
+            "- A reported `model` cost is added to the Gateway's model dollars, never replaced by them.\n"
+            "- Another run's costs are left out.\n"
+            "- Model dollars come from the Gateway as the `model` type, asked for by run alone.\n"
+            "- The database transaction is ended before the Gateway is called."
+        )
+    )
+    def test_sums_costs_by_type_and_resource(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+    ) -> None:
+        utc = ZoneInfo("UTC")
+        project = make_project(project_service, "p")
+        run = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=utc), amounts=[])
+        other = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=utc), amounts=[7.0])
+        link_run_project(database_session, run, project, created_at=datetime(2026, 11, 2, tzinfo=utc))
+        rows = [
+            ("sandbox", "daytona", "cpu", "cpu_seconds", 100.0, 1.0, None),
+            ("sandbox", "daytona", "cpu", "cpu_seconds", 50.0, 0.5, None),
+            ("sandbox", "daytona", "memory", "gib_seconds", 200.0, 0.25, None),
+            ("search", "exa", None, "requests", 3.0, 0.03, None),
+            ("judge", "openai", None, None, None, 0.4, "service"),
+            ("model", "openai", None, None, None, 0.1, "service"),
+            ("modal_unreported", "modal", None, None, None, 9.0, None),
+        ]
+        for cost_type, provider, resource, unit, quantity, amount, reporter in rows:
+            database_session.add(
+                RunCost(
+                    benchmark_id=run,
+                    cost_type=cost_type,
+                    provider=provider,
+                    resource=resource,
+                    unit=unit,
+                    quantity=quantity,
+                    amount_usd=amount,
+                    source_id=str(uuid4()),
+                    attempt_id="a1",
+                    reporter=reporter,
+                )
+            )
+        database_session.commit()
+        fake_run_sums.returns(runs={run: "2.5", other: "99"}, project_key=[])
+
+        response = client.get(f"/benchmarks/{run}/costs", headers={"X-Api-Key": "fake"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["by_type_usd"] == pytest.approx({"sandbox": 1.75, "search": 0.03, "judge": 0.4, "model": 2.6})
+        assert body["total_usd"] == pytest.approx(4.78)
+        assert [
+            (r["cost_type"], r["provider"], r["resource"], r["unit"], r["quantity"], r["amount_usd"])
+            for r in body["resources"]
+        ] == [
+            ("judge", "openai", None, None, None, pytest.approx(0.4)),
+            ("model", "openai", None, None, None, pytest.approx(0.1)),
+            ("sandbox", "daytona", "cpu", "cpu_seconds", 150.0, pytest.approx(1.5)),
+            ("sandbox", "daytona", "memory", "gib_seconds", 200.0, pytest.approx(0.25)),
+            ("search", "exa", None, "requests", 3.0, pytest.approx(0.03)),
+        ]
+        assert (body["model_spend_available"], body["model_through"]) == (True, "2026-11-16T12:00:00Z")
+        assert [(call["run_ids"], call["project_id"]) for call in fake_run_sums.calls] == [([str(run)], None)]
+        assert fake_run_sums.open_transactions == [False]
+
+    @pytest.mark.parametrize("failure", ["status", "unconfigured"])
+    @pytest.mark.description("When the Gateway fails or is not configured, Tracker's own costs still come back.")
+    def test_gateway_failure_leaves_out_model_spend(
+        self,
+        client: TestClient,
+        database_session: Session,
+        fake_run_sums: FakeRunSums,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: str,
+    ) -> None:
+        run = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=ZoneInfo("UTC")), amounts=[2.0])
+        if failure == "unconfigured":
+            monkeypatch.setattr(machine, "gateway_client", gateway_client)
+            monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
+        else:
+            fake_run_sums.answer = lambda _request: httpx.Response(503, json={"detail": "down"})
+
+        response = client.get(f"/benchmarks/{run}/costs", headers={"X-Api-Key": "fake"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert (body["total_usd"], body["by_type_usd"], body["model_spend_available"], body["model_through"]) == (
+            2.0,
+            {"sandbox": 2.0},
+            False,
+            None,
+        )
+
+    @pytest.mark.description("Another organization's run is 404, and a run with no costs reads as zero.")
+    def test_scoped_to_the_org_and_empty_runs(
+        self, client: TestClient, database_session: Session, fake_run_sums: FakeRunSums
+    ) -> None:
+        theirs_org = Org(name="theirs")
+        database_session.add(theirs_org)
+        database_session.commit()
+        theirs = _tagged_run(
+            database_session,
+            started_at=datetime(2026, 11, 2, tzinfo=ZoneInfo("UTC")),
+            amounts=[5.0],
+            org_id=theirs_org.id,
+        )
+        empty = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=ZoneInfo("UTC")), amounts=[])
+        fake_run_sums.returns(runs={}, project_key=[])
+
+        assert client.get(f"/benchmarks/{theirs}/costs", headers={"X-Api-Key": "fake"}).status_code == 404
+        body = client.get(f"/benchmarks/{empty}/costs", headers={"X-Api-Key": "fake"}).json()
+        assert (body["total_usd"], body["by_type_usd"], body["resources"]) == (0.0, {"model": 0.0}, [])
+
+
+def _report(session: Session, run: UUID, cost_type: str, amount: float) -> None:
+    session.add(
+        RunCost(
+            benchmark_id=run,
+            cost_type=cost_type,
+            provider="service",
+            amount_usd=amount,
+            source_id=str(uuid4()),
+            attempt_id="a1",
+            reporter="service",
+        )
+    )
+
+
+@pytest.mark.description("A project's limit from the project service and its all-time spend by cost type.")
+class TestProjectBudget:
+    @pytest.mark.description(
+        (
+            "A budget joins the limit with Tracker's counted dollars and the Gateway's model dollars.\n"
+            "\n"
+            "Test cases:\n"
+            "- Sandbox and reported dollars on the project's runs count, whenever the run finished.\n"
+            "- A reported `model` cost is added to the Gateway's model dollars, never replaced by them.\n"
+            "- The project key's spend outside any run counts as model spend.\n"
+            "- A run moved to another project and another project's run are left out."
+        )
+    )
+    def test_joins_the_limit_with_spend_by_type(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+    ) -> None:
+        utc = ZoneInfo("UTC")
+        project = make_project(project_service, "p")
+        other = make_project(project_service, "other")
+        project_service.limits[str(project.id)] = {
+            "limit_dollars": "250",
+            "reason": "full rerun",
+            "applied": True,
+            "updated_at": "2026-11-18T10:00:00Z",
+        }
+        old = _tagged_run(database_session, started_at=datetime(2024, 1, 5, tzinfo=utc), amounts=[1.0])
+        recent = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=utc), amounts=[2.0])
+        moved = _tagged_run(database_session, started_at=datetime(2026, 11, 3, tzinfo=utc), amounts=[50.0])
+        theirs = _tagged_run(database_session, started_at=datetime(2026, 11, 3, tzinfo=utc), amounts=[70.0])
+        _report(database_session, recent, "model", 0.5)
+        _report(database_session, recent, "judge", 0.25)
+        for run in (old, recent, moved):
+            link_run_project(database_session, run, project, created_at=datetime(2024, 1, 1, tzinfo=utc))
+        link_run_project(database_session, moved, other, created_at=datetime(2026, 11, 4, tzinfo=utc))
+        link_run_project(database_session, theirs, other, created_at=datetime(2026, 11, 4, tzinfo=utc))
+        database_session.commit()
+        fake_run_sums.returns(runs={old: "4", recent: "6"}, project_key=[(None, "0.75")])
+
+        response = client.get("/projects/p/budget", headers={"X-Api-Key": "fake"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert (body["limit_dollars"], body["limit_reason"], body["limit_applied"]) == (250.0, "full rerun", True)
+        assert body["by_type_usd"] == pytest.approx({"sandbox": 3.0, "judge": 0.25, "model": 11.25})
+        assert body["total_usd"] == pytest.approx(14.5)
+        assert (body["model_spend_available"], body["model_through"]) == (True, "2026-11-16T12:00:00Z")
+        assert [sorted(call["run_ids"]) for call in fake_run_sums.calls] == [sorted([str(old), str(recent)])]
+
+    @pytest.mark.description("With no limit and no runs, the budget reads a null limit and zero spend.")
+    def test_no_limit_and_no_runs(
+        self, client: TestClient, project_service: MockProjectRoutes, fake_run_sums: FakeRunSums
+    ) -> None:
+        _ = make_project(project_service, "p")
+
+        body = client.get("/projects/p/budget", headers={"X-Api-Key": "fake"}).json()
+
+        assert (body["limit_dollars"], body["limit_applied"], body["total_usd"]) == (None, False, 0.0)
+
+    @pytest.mark.description("When the Gateway fails, Tracker's own spend and the limit still come back.")
+    def test_gateway_failure_leaves_out_model_spend(
+        self,
+        client: TestClient,
+        database_session: Session,
+        project_service: MockProjectRoutes,
+        fake_run_sums: FakeRunSums,
+    ) -> None:
+        project = make_project(project_service, "p")
+        run = _tagged_run(database_session, started_at=datetime(2026, 11, 2, tzinfo=ZoneInfo("UTC")), amounts=[2.0])
+        link_run_project(database_session, run, project, created_at=datetime(2026, 11, 2, tzinfo=ZoneInfo("UTC")))
+        database_session.commit()
+        fake_run_sums.answer = lambda _request: httpx.Response(503, json={"detail": "down"})
+
+        response = client.get("/projects/p/budget", headers={"X-Api-Key": "fake"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert (body["by_type_usd"], body["model_spend_available"], body["model_through"]) == (
+            {"sandbox": 2.0},
+            False,
+            None,
+        )
+
+    @pytest.mark.description("An archived project still reports its budget, and an unknown handle is 404.")
+    def test_archived_and_unknown_projects(
+        self, client: TestClient, project_service: MockProjectRoutes, fake_run_sums: FakeRunSums
+    ) -> None:
+        project = make_project(project_service, "p")
+        project_service.rows[str(project.id)]["archived_at"] = "2026-11-10T00:00:00Z"
+
+        assert client.get("/projects/p/budget", headers={"X-Api-Key": "fake"}).status_code == 200
+        assert client.get("/projects/nope/budget", headers={"X-Api-Key": "fake"}).status_code == 404
+
+    @pytest.mark.description("A project service outage on the limit is 503.")
+    def test_project_service_outage(
+        self, client: TestClient, project_service: MockProjectRoutes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ = make_project(project_service, "p")
+
+        def unavailable(_client: ProjectServiceClient, _org_id: UUID, project_id: UUID) -> None:
+            raise httpx.ConnectError(f"refused for {project_id}")
+
+        monkeypatch.setattr(ProjectServiceClient, "limit", unavailable)
+
+        assert client.get("/projects/p/budget", headers={"X-Api-Key": "fake"}).status_code == 503

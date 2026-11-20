@@ -38,6 +38,9 @@ To run benchmarks on your machine without AWS, see
 | `src/valkyrie` | The CLI and TUI | This guide |
 | `packages/valkyrie-sdk` | The Python SDK, published to PyPI as `valkyrie-sdk` | This guide |
 | `services/tracker` | The Tracker, the server the CLI and SDK talk to | [services/tracker/README.md](services/tracker/README.md) |
+| `packages/create-benchmark-service` | The benchmark service framework and its scaffold CLI, released as `cbs-v<version>` tags | [packages/create-benchmark-service/README.md](packages/create-benchmark-service/README.md) |
+| `packages/vals-grading` | Judge-model grading helpers for benchmark services, released as `vals-grading-v<version>` tags | [packages/vals-grading/README.md](packages/vals-grading/README.md) |
+| `packages/vals-benchmark-service` | The Vals AI hosting layer for benchmark services, released as `vals-benchmark-service-v<version>` tags | [packages/vals-benchmark-service/README.md](packages/vals-benchmark-service/README.md) |
 | `docs` | The site at [docs.valkyrie.vals.ai](https://docs.valkyrie.vals.ai) | [docs/README.md](docs/README.md) |
 
 ## Make a change
@@ -51,6 +54,7 @@ To run benchmarks on your machine without AWS, see
   - [AGENTS.md](AGENTS.md) has the full writing rules.
 - Never edit generated files by hand.
 - A change under `packages/valkyrie-sdk` needs an SDK version bump.
+- A change to the public surface of `packages/create-benchmark-service` needs a framework version bump, as its [Development](packages/create-benchmark-service/docs/DEVELOPMENT.md#versioning) page describes.
 
 To regenerate the SDK models after a Tracker model change:
 

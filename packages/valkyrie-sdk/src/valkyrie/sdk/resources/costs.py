@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from valkyrie.sdk.models.costs import CostsByProjectResponse, ProjectModelCosts
+from uuid import UUID
+
+from valkyrie.sdk.models.costs import CostsByProjectResponse, ProjectModelCosts, RunCosts
 
 if TYPE_CHECKING:
     from valkyrie.sdk.client import ValkyrieClient
@@ -41,3 +43,11 @@ class CostsResource:
             ProjectModelCosts,
             params={"project": project, "start": start.isoformat(), "end": end.isoformat()},
         )
+
+    async def run(self, run_id: UUID | str) -> RunCosts:
+        """Return one run's spend in total, per cost type and per provider, resource and unit.
+
+        Model spend from the Gateway appears as the `model` cost type. When the Gateway is
+        unavailable it is left out and `model_spend_available` is false.
+        """
+        return await self._sdk.request_model("GET", f"/benchmarks/{run_id}/costs", RunCosts)

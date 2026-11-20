@@ -100,7 +100,7 @@ class TestProjectServiceWrites:
         identity = RequestIdentity(org=tracker_database.get_one(Org, TEST_ORG_ID), email="alice@vals.ai")
         request_id = uuid4()
 
-        def request_key(*_: object) -> UUID:
+        async def request_key(*_: object) -> UUID:
             return request_id
 
         def requests_key(_: Org) -> bool:

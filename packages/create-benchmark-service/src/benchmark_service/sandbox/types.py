@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import re
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator, Mapping
+from datetime import datetime
+from pathlib import PurePosixPath
+from string import Formatter
+from typing import Annotated, Literal, Self
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+
+
+class ImageSource(BaseModel):
+    type: Literal["image"] = "image"
+    image: str
+
+
+class SnapshotSource(BaseModel):
+    type: Literal["snapshot"] = "snapshot"
+    snapshot: str
+
+
+class TargetedSnapshotSource(BaseModel):
+    type: Literal["targeted_snapshot"] = "targeted_snapshot"
+    snapshot: str
+    target: str = Field(min_length=1)
+
+
+class DockerfileSource(BaseModel):
+    type: Literal["dockerfile"] = "dockerfile"
+    dockerfile: str = Field(
+        min_length=1,
+        description="Absolute path of the Dockerfile on the machine that creates the sandbox; "
+        "the folder that holds it is the build context",
+    )
+    build_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds the build may take, on top of create_timeout; None builds within create_timeout",
+    )
+
+    @model_validator(mode="after")
+    def _validate_dockerfile(self) -> Self:
+        if not PurePosixPath(self.dockerfile).is_absolute():
+            raise ValueError(f"dockerfile must be an absolute path, got {self.dockerfile!r}")
+        return self
+
+
+BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+
+
+class ComposeSource(BaseModel):
+    type: Literal["compose"] = "compose"
+    outer: BaseSandboxSource
+    service: str = "main"
+    compose_command: str = "docker compose"
+
+
+SandboxSource = Annotated[
+    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource,
+    Field(discriminator="type"),
+]
+
+
+MAX_SANDBOX_LIFETIME_SECONDS = 167 * 60 * 60
+
+_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
+_VOLUME_SUBPATH_FORMATTER = Formatter()
+_VOLUME_SUBPATH_RUN_ID_FIELD = "run_id"
+
+
+def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
+    env = dict(env_vars or {})
+    invalid_names = [name for name in env if _ENV_VAR_NAME.fullmatch(name) is None]
+    if invalid_names:
+        raise ValueError(f"Invalid environment variable names: {', '.join(invalid_names)}")
+    reserved_names = sorted(env.keys() & _RESERVED_COMMAND_ENV_NAMES)
+    if reserved_names:
+        raise ValueError(f"Reserved command environment variable names: {', '.join(reserved_names)}")
+    return env
+
+
+def _validate_rendered_volume_subpath(subpath: str) -> None:
+    path = PurePosixPath(subpath)
+    if path.is_absolute() or str(path) == "." or ".." in path.parts:
+        raise ValueError(f"subpath must be a non-empty relative path without '..', got {subpath!r}")
+
+
+def _volume_subpath_fields(template: str) -> list[str]:
+    fields: list[str] = []
+    try:
+        parsed = _VOLUME_SUBPATH_FORMATTER.parse(template)
+        for _, field_name, format_spec, conversion in parsed:
+            if field_name is None:
+                continue
+            if field_name != _VOLUME_SUBPATH_RUN_ID_FIELD or format_spec or conversion:
+                raise ValueError("subpath supports only the {run_id} placeholder")
+            fields.append(field_name)
+    except ValueError as exc:
+        raise ValueError(f"invalid volume subpath template: {exc}") from exc
+    return fields
+
+
+class Resources(BaseModel):
+    vcpu: int | float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Logical sandbox CPU count; a provider that allocates whole CPUs rounds a fraction up",
+    )
+    memory: int = Field(gt=0, description="Sandbox memory")
+    disk: int = Field(gt=0, description="Sandbox ephemeral disk")
+    gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
+    gpu_type: str | list[str] | None = Field(
+        default=None,
+        description="GPU type to allocate, e.g. 'H100' (provider-specific), or acceptable types in order of preference",
+    )
+
+    @model_validator(mode="after")
+    def _validate_gpu(self) -> Self:
+        if self.acceptable_gpu_types and self.gpu < 1:
+            raise ValueError("gpu_type requires gpu >= 1")
+        return self
+
+    @property
+    def acceptable_gpu_types(self) -> list[str]:
+        if isinstance(self.gpu_type, list):
+            return self.gpu_type
+        return [self.gpu_type] if self.gpu_type is not None else []
+
+
+class ResourceCapacity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    total: FiniteFloat = Field(ge=0)
+    used: FiniteFloat = Field(ge=0)
+
+    @property
+    def available(self) -> float:
+        return max(0.0, self.total - self.used)
+
+
+class SandboxCapacity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    cpu: ResourceCapacity
+    memory: ResourceCapacity
+    disk: ResourceCapacity
+    gpu: ResourceCapacity | None = None
+    allowed_gpu_types: tuple[str, ...] | None = None
+
+
+class SandboxCapacityDomain(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    target_id: str = Field(min_length=1)
+    sandbox_class: str = Field(min_length=1)
+    capacity: SandboxCapacity
+
+
+class SandboxReservationDemand(BaseModel):
+    """Quota charge in one capacity domain, not the resources sent to creation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    target_id: str = Field(min_length=1)
+    sandbox_class: str = Field(min_length=1)
+    vcpu: FiniteFloat = Field(ge=0)
+    memory: FiniteFloat = Field(ge=0)
+    disk: FiniteFloat = Field(ge=0)
+    gpu: FiniteFloat = Field(ge=0)
+
+
+class VolumeMount(BaseModel):
+    """A named, persistent volume attached to a sandbox at a fixed path.
+
+    Distinct from the ephemeral disk in Resources: a volume outlives the sandbox
+    and is shared by every sandbox that mounts it. Benchmarks whose fixture is
+    far larger than their code need this — baking multi-gigabyte assets into an
+    image makes every cold start pay for them, and rebuilding the image on any
+    change is slow enough to discourage changing them at all.
+    """
+
+    name: str = Field(min_length=1, description="Provider-side volume name")
+    mount_path: str = Field(min_length=1, description="Absolute path inside the sandbox")
+    read_only: bool = Field(default=False, description="Mount without write access")
+    create_if_missing: bool = Field(
+        default=False,
+        description="Create the volume when absent rather than failing; leave off for "
+        "fixtures a run must not silently start without",
+    )
+    subpath: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Relative directory within the volume to mount; {run_id} is resolved from "
+        "the sandbox run-id or run_id label. A read-only subpath must already exist.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> Self:
+        if not self.mount_path.startswith("/"):
+            raise ValueError(f"mount_path must be absolute, got {self.mount_path!r}")
+        if self.subpath is not None:
+            _volume_subpath_fields(self.subpath)
+            _validate_rendered_volume_subpath(self.subpath.format(run_id="run"))
+        return self
+
+
+class SandboxCreateRequest(BaseModel):
+    source: SandboxSource
+    requires_nested_docker: bool = False
+    resources: Resources
+    name: str
+    labels: dict[str, str]
+    env_vars: dict[str, str]
+    auto_stop_interval: int
+    create_timeout: int
+    network_block_all: bool = False
+    sandbox_secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description="Provider-managed secret references keyed by environment variable name",
+    )
+    volumes: list[VolumeMount] = Field(
+        default_factory=list,
+        description="Persistent volumes to attach; empty keeps existing behaviour",
+    )
+
+    @property
+    def provider_timeout(self) -> float:
+        """Seconds a provider may take to build the image, when the source has a build, and start the sandbox."""
+        build = self.source.build_timeout if isinstance(self.source, DockerfileSource) else None
+        return self.create_timeout + (build or 0)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> Self:
+        validate_command_env(self.sandbox_secrets)
+        blank_secret_names = sorted(name for name, reference in self.sandbox_secrets.items() if not reference.strip())
+        if blank_secret_names:
+            raise ValueError(f"provider secret references cannot be blank: {', '.join(blank_secret_names)}")
+        overlapping_env = sorted(self.env_vars.keys() & self.sandbox_secrets.keys())
+        if overlapping_env:
+            raise ValueError(
+                f"environment variables cannot be both plaintext and provider-managed secrets: {', '.join(overlapping_env)}"
+            )
+
+        seen: set[str] = set()
+        for volume in self.volumes:
+            if volume.mount_path in seen:
+                raise ValueError(f"duplicate volume mount_path: {volume.mount_path}")
+            seen.add(volume.mount_path)
+        return self
+
+
+class SandboxQuery(BaseModel):
+    labels: dict[str, str]
+    page_size: int = 10
+    created_at_lte: AwareDatetime | None = Field(
+        default=None,
+        description="Inclusive creation-time upper bound; providers must apply it or raise SandboxError",
+    )
+
+
+class MissingSandboxConfigError(ValueError):
+    pass
+
+
+class SandboxError(Exception):
+    pass
+
+
+class UnsupportedSandboxConfigError(SandboxError):
+    pass
+
+
+class SandboxBuildError(SandboxError):
+    def __init__(self, message: str, build_log: str = "") -> None:
+        self.build_log = build_log
+        super().__init__(message)
+
+
+def resolve_volume_subpath(mount: VolumeMount, labels: Mapping[str, str]) -> str | None:
+    """Resolve a mount's run-scoped subpath without silently sharing unlabeled runs."""
+    if mount.subpath is None:
+        return None
+
+    fields = _volume_subpath_fields(mount.subpath)
+    run_id = labels.get("run-id") or labels.get("run_id")
+    if _VOLUME_SUBPATH_RUN_ID_FIELD in fields and not run_id:
+        raise SandboxError(f"Volume {mount.name!r} subpath requires a non-empty 'run-id' or 'run_id' sandbox label")
+
+    rendered = mount.subpath.format(run_id=run_id)
+    try:
+        _validate_rendered_volume_subpath(rendered)
+    except ValueError as exc:
+        raise SandboxError(f"Invalid resolved subpath for volume {mount.name!r}: {exc}") from exc
+    return rendered
+
+
+class SandboxNotFoundError(SandboxError):
+    pass
+
+
+class SandboxConnectionError(SandboxError):
+    pass
+
+
+class SandboxCommandError(SandboxError):
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        super().__init__(f"Command failed with exit code {exit_code}")
+
+
+class ExecResult(BaseModel):
+    exit_code: int
+    output: str = ""
+
+    @property
+    def stdout(self) -> str:
+        return self.output
+
+
+class Sandbox(ABC):
+    @property
+    @abstractmethod
+    def id(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def state(self) -> str: ...
+
+    @property
+    def labels(self) -> Mapping[str, str] | None:
+        """Provider-reported labels, or None when unavailable."""
+        return getattr(self, "_labels", None)
+
+    @labels.setter
+    def labels(self, value: Mapping[str, str] | None) -> None:
+        self._labels = value
+
+    @property
+    def created_at(self) -> datetime | None:
+        """Provider-reported creation time in UTC, or None when unavailable."""
+        return getattr(self, "_created_at", None)
+
+    @created_at.setter
+    def created_at(self, value: datetime | None) -> None:
+        self._created_at = value
+
+    @property
+    def provider_metadata(self) -> Mapping[str, str]:
+        """Provider-reported attributes (runner id, image revision, ...) useful for debugging allocation."""
+        return {}
+
+    @property
+    def has_ended(self) -> bool:
+        """True once the provider reports the sandbox stopped or deleted, so its lifetime is final."""
+        return False
+
+    def cost_usd(self, ended_at: datetime) -> float | None:
+        """Cost from ``created_at`` to ``ended_at`` at the provider's published rates.
+
+        None when the provider isn't priced from rates or the sandbox lacks the fields to price it.
+        """
+        return None
+
+    @abstractmethod
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> ExecResult: ...
+
+    @abstractmethod
+    def command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
+    ) -> AsyncGenerator[str, None]: ...
+
+    @abstractmethod
+    async def upload_file(self, remote_path: str, content: bytes) -> None: ...
+
+    @abstractmethod
+    async def download_file(self, remote_path: str) -> bytes: ...
+
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        """Stream a file's content in chunks without buffering the whole file in memory.
+
+        Providers that support chunked reads should override this; the default falls back
+        to a full in-memory download.
+        """
+        yield await self.download_file(remote_path)
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
+    async def block_all_egress(self) -> None:
+        raise SandboxError("Sandbox provider does not support blocking all egress")
+
+    async def clear_egress_rules(self) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
+
+class SandboxProvider(ABC):
+    def validate_sandbox_config(self, *, requires_nested_docker: bool, resources: Resources) -> None:
+        """Raise UnsupportedSandboxConfigError for unsupported requirements without provisioning."""
+
+    @property
+    def admission_pool_id(self) -> str | None:
+        return None
+
+    async def check_admission(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> bool:
+        return True
+
+    async def reservable_demand(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> SandboxReservationDemand:
+        """Return the exact quota charge and domain for queued provider admission."""
+        raise NotImplementedError
+
+    async def get_capacity(self) -> SandboxCapacity | None:
+        return None
+
+    async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
+        return None
+
+    @abstractmethod
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox: ...
+
+    @abstractmethod
+    async def get_sandbox(self, instance_id: str) -> Sandbox: ...
+
+    @abstractmethod
+    async def delete_sandbox(self, instance_id: str) -> None: ...
+
+    @abstractmethod
+    def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]: ...
+
+    async def close(self) -> None:
+        pass
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.close()

@@ -9,6 +9,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 certifi = false
+valkyrie-sdk = false
 
 [[package]]
 name = "aioboto3"
@@ -315,6 +316,9 @@ wheels = [
 s3 = [
     { name = "mypy-boto3-s3" },
 ]
+sts = [
+    { name = "mypy-boto3-sts" },
+]
 
 [[package]]
 name = "botocore"
@@ -497,8 +501,8 @@ wheels = [
 
 [[package]]
 name = "create-benchmark-service"
-version = "0.77.1"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.77.1#1ed9e4432e17a8a23376b899d61593f3fed2e1cb" }
+version = "0.78.2"
+source = { editable = "../../packages/create-benchmark-service" }
 dependencies = [
     { name = "aiodocker" },
     { name = "certifi" },
@@ -516,6 +520,45 @@ dependencies = [
     { name = "starlette" },
     { name = "tenacity" },
     { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiodocker", specifier = ">=0.26,<1" },
+    { name = "boto3", marker = "extra == 'vals-ai'", specifier = ">=1.34" },
+    { name = "certifi", specifier = ">=2026.10.19" },
+    { name = "click", specifier = ">=8.1.3" },
+    { name = "daytona", specifier = ">=0.203.0,<2" },
+    { name = "daytona-api-client-async", specifier = ">=0.203.0,<2" },
+    { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.3" },
+    { name = "grpclib", specifier = ">=0.4.9" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "jinja2", specifier = ">=3.1.6" },
+    { name = "modal", specifier = ">=1.6.0" },
+    { name = "opentelemetry-api", specifier = ">=1.20.0" },
+    { name = "pydantic", specifier = ">=2.12" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "sentry-sdk", extras = ["fastapi"], marker = "extra == 'vals-ai'", specifier = ">=2.58.0,<3.0" },
+    { name = "starlette", specifier = ">=1.0.1" },
+    { name = "tenacity", specifier = ">=8.3.0" },
+    { name = "websockets", specifier = ">=15.0.1" },
+]
+provides-extras = ["vals-ai"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "basedpyright", specifier = ">=1.39.0" },
+    { name = "create-benchmark-service", extras = ["vals-ai"], editable = "../../packages/create-benchmark-service" },
+    { name = "cryptography", specifier = ">=44.0.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "httpx2", specifier = ">=2.16.0" },
+    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.61b0,<0.62" },
+    { name = "opentelemetry-sdk", specifier = ">=1.20.0" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "ruff", specifier = ">=0.15.9" },
+    { name = "types-pyyaml", specifier = ">=6.0.12" },
 ]
 
 [[package]]
@@ -880,6 +923,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/88/1ce4eed3d70627c95f49ca017f6bbbf2ddcc4b0c601d293259de7689bc20/fastar-0.11.0-cp312-cp312-win32.whl", hash = "sha256:35f23c11b556cc4d3704587faacbc0037f7bdf6c4525cd1d09c70bda4b1c6809", size = 454198, upload-time = "2026-04-13T17:11:45.168Z" },
     { url = "https://files.pythonhosted.org/packages/8f/1d/26ce92f4331cd61a69840db9ca6115829805eec24f285481a854f578e917/fastar-0.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:920bc56c3c0b8a8ca492904941d1883c1c947c858cd93343356c29122a38f44c", size = 486697, upload-time = "2026-04-13T17:11:31.084Z" },
     { url = "https://files.pythonhosted.org/packages/ed/96/e6eda4480559c69b05d466e7b5ea9170e81fef3795a73e059959a3258319/fastar-0.11.0-cp312-cp312-win_arm64.whl", hash = "sha256:395248faf89e8a6bd5dc1fd544c8465113b627cb6d7c8b296796b60ebea33593", size = 462591, upload-time = "2026-04-13T17:11:20.577Z" },
+]
+
+[[package]]
+name = "filelock"
+version = "3.32.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/59/e19834834cb01a32febfbb0f8a23a9088088f5d45991824ff2bc3b5e8acb/filelock-3.32.7.tar.gz", hash = "sha256:37b8a3d9811b0f9aef7e5ec5c71bb320de52df51e6ca9bcd6f5ad81187660da7", size = 225154, upload-time = "2026-09-16T00:24:20.907Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/df/31098c5aeb4d966b553641472bd55fcf5fdfac953549894b8a765ba44e91/filelock-3.32.7-py3-none-any.whl", hash = "sha256:65ff0d0190ea42038b32bda4b77834fb05be2cad4c5b9b01aa4dfb3614536e52", size = 100157, upload-time = "2026-09-16T00:24:19.543Z" },
 ]
 
 [[package]]
@@ -1271,6 +1323,15 @@ wheels = [
 ]
 
 [[package]]
+name = "mypy-boto3-sts"
+version = "1.42.91"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ab/d6/6cf777480c814908f34dfa587f9ff547517caa16086c0b4a3ee60cb4c37e/mypy_boto3_sts-1.42.91.tar.gz", hash = "sha256:f22da0a91c193441924aa5e24c574abe7ca6cb2131a90caeb74256fa14a06878", size = 16780, upload-time = "2026-04-17T19:33:09.903Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/19/9957ef28d1c2597f92dd6fb5aae23c282b218ca4bbcd7d308692bba8ebe4/mypy_boto3_sts-1.42.91-py3-none-any.whl", hash = "sha256:4e141e7d1f14a4a2f8a83462ffb33b11a271fb4d351a5591d73469e742df989f", size = 20865, upload-time = "2026-04-17T19:33:07.486Z" },
+]
+
+[[package]]
 name = "nodejs-wheel-binaries"
 version = "24.14.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1487,6 +1548,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/df/de/0d2b39fb4af88a0258f3bac87dfcbb48e73fbdea4a2ed0e2213f9a4c2f9a/packaging-26.1.tar.gz", hash = "sha256:f042152b681c4bfac5cae2742a55e103d27ab2ec0f3d88037136b6bfe7c9c5de", size = 215519, upload-time = "2026-04-14T21:12:49.362Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/c2/920ef838e2f0028c8262f16101ec09ebd5969864e5a64c4c05fad0617c56/packaging-26.1-py3-none-any.whl", hash = "sha256:5d9c0669c6285e491e0ced2eee587eaf67b670d94a19e94e3984a481aba6802f", size = 95831, upload-time = "2026-04-14T21:12:47.56Z" },
+]
+
+[[package]]
+name = "pathspec"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/82/42f767fc1c1143d6fd36efb827202a2d997a375e160a71eb2888a925aac1/pathspec-1.1.1.tar.gz", hash = "sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a", size = 135180, upload-time = "2026-04-27T01:46:08.907Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189", size = 57328, upload-time = "2026-04-27T01:46:07.06Z" },
 ]
 
 [[package]]
@@ -2119,7 +2189,7 @@ dependencies = [
     { name = "aiobotocore" },
     { name = "anyio" },
     { name = "boto3" },
-    { name = "boto3-stubs", extra = ["s3"] },
+    { name = "boto3-stubs", extra = ["s3", "sts"] },
     { name = "cachetools" },
     { name = "create-benchmark-service" },
     { name = "cryptography" },
@@ -2135,6 +2205,7 @@ dependencies = [
     { name = "sentry-sdk", extra = ["fastapi"] },
     { name = "starlette" },
     { name = "tenacity" },
+    { name = "valkyrie-sdk" },
 ]
 
 [package.dev-dependencies]
@@ -2162,9 +2233,9 @@ requires-dist = [
     { name = "aiobotocore", specifier = ">=3.4.0" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "boto3", specifier = ">=1.42.20" },
-    { name = "boto3-stubs", extras = ["s3"] },
+    { name = "boto3-stubs", extras = ["s3", "sts"] },
     { name = "cachetools", specifier = ">=7.1.1,<8" },
-    { name = "create-benchmark-service", git = "https://github.com/vals-ai/create-benchmark-service.git?tag=v0.77.1" },
+    { name = "create-benchmark-service", editable = "../../packages/create-benchmark-service" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "descope", specifier = ">=0.9.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
@@ -2178,6 +2249,7 @@ requires-dist = [
     { name = "sentry-sdk", extras = ["fastapi"], specifier = "==2.58.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tenacity", specifier = ">=9.0.0" },
+    { name = "valkyrie-sdk", specifier = ">=0.36.0,<1" },
 ]
 
 [package.metadata.requires-dev]
@@ -2325,6 +2397,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5f/6f/e62b4dfc7ad6518e7eff2516f680d02a0f6eb62c0c212e152ca708a0085e/uvloop-0.22.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7b5b1ac819a3f946d3b2ee07f09149578ae76066d70b44df3fa990add49a82e4", size = 4426307, upload-time = "2025-10-16T22:16:32.917Z" },
     { url = "https://files.pythonhosted.org/packages/90/60/97362554ac21e20e81bcef1150cb2a7e4ffdaf8ea1e5b2e8bf7a053caa18/uvloop-0.22.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e047cc068570bac9866237739607d1313b9253c3051ad84738cbb095be0537b2", size = 4131970, upload-time = "2025-10-16T22:16:34.015Z" },
     { url = "https://files.pythonhosted.org/packages/99/39/6b3f7d234ba3964c428a6e40006340f53ba37993f46ed6e111c6e9141d18/uvloop-0.22.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:512fec6815e2dd45161054592441ef76c830eddaad55c8aa30952e6fe1ed07c0", size = 4296343, upload-time = "2025-10-16T22:16:35.149Z" },
+]
+
+[[package]]
+name = "valkyrie-sdk"
+version = "0.36.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "httpx" },
+    { name = "pathspec" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3a/f3/e17c3a5d5530be36b6de33a61eb5bde9dd5a71c425302eb96d3be452070b/valkyrie_sdk-0.36.0.tar.gz", hash = "sha256:498d583488358001d4077112df1f48f5967eb1311c03192dfc636aa4a90cf6a1", size = 68817, upload-time = "2026-11-13T19:46:09.749Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/53/310ae0c880c8cea9da69408479d41b23a444a86d16ccfdb3597eed51a923/valkyrie_sdk-0.36.0-py3-none-any.whl", hash = "sha256:e3ad78d4bd22c3e18ccf10f918c9abe0fac4761c8a2cbf34207a9725f4327437", size = 96033, upload-time = "2026-11-13T19:46:08.052Z" },
 ]
 
 [[package]]

@@ -69,7 +69,9 @@ class EgressProxy:
     async def child_egress(
         self, name: str, profile: ChildPolicy, attempt: RunAttempt, gateway: ScopedGateway | None
     ) -> AsyncGenerator[ChildEgress]:
-        proxy = resolve_child_egress_proxy(profile, child_key_id(attempt.attempt_id, name), attempt.gateway_url)
+        proxy = resolve_child_egress_proxy(
+            profile, child_key_id(attempt.attempt_id, name), gateway.url if gateway else attempt.gateway_url
+        )
         await self._control.grant_egress_policy(proxy, attempt)
         try:
             yield ChildEgress(

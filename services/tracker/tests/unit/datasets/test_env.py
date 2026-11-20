@@ -209,7 +209,7 @@ async def test_candidate_decryption_faults_surface(fallback: str | None, fault_i
 
 
 @pytest.mark.description(
-    "A denied tenant candidate allows shared fallback and defaults but wins when resolution fails."
+    "Denied candidates allow fallbacks and defaults while a confirmed missing tenant remains a configuration error."
 )
 @pytest.mark.parametrize("fallback", [None, "shared-value"])
 @pytest.mark.parametrize("default", [None, "default"])
@@ -239,11 +239,14 @@ async def test_denied_candidates_allow_fallback_and_default(
         assert await resolve_env({"KEY": template}, read, "[verifier].env") == ({"KEY": default}, [])
         assert calls == candidates
     else:
-        with pytest.raises(SecretAccessDeniedError) as captured:
+        error_type = SecretAccessDeniedError if denied_index == 0 else SecretNotFoundError
+        with pytest.raises(error_type) as captured:
             await resolve_env({"KEY": template}, read, "[verifier].env")
         assert calls == candidates
         assert "[verifier].env sets KEY" in str(captured.value)
-        assert "Valkyrie cannot read TOKEN." in str(captured.value)
+        assert ("Valkyrie cannot read TOKEN." if denied_index == 0 else "TOKEN is missing.") in str(captured.value)
+        if denied_index == 1:
+            assert "Valkyrie cannot read TOKEN." not in str(captured.value)
         assert "Checked names: TOKEN." in str(captured.value)
         assert prefix not in str(captured.value)
 

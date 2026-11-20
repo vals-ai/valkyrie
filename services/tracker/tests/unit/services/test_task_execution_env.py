@@ -2,17 +2,21 @@ import asyncio
 from dataclasses import asdict
 import json
 import threading
+import subprocess
+import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import httpx
+from cachetools import TTLCache
 import pytest
 from benchmark_service import (
     CreditedGeneration,
@@ -29,6 +33,7 @@ from sqlmodel import Session, select
 
 import tracker.executor.control_task_api as control_task_api
 import tracker.services.tasks.execute as utils_module
+import tracker.sandbox as sandbox_module
 from tests.unit.services.task_execution_support import (
     TEST_ORG,
     create_task_environment,
@@ -41,10 +46,16 @@ from tracker.runtime.services import RuntimeServices
 from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.task_logs import TaskLogBuffer
 from tracker.generation_plan import GenerationPlan
-from tracker.external_service_gateway import ExternalServiceGatewayClient, GenerationAccountingSummary
+from tracker.egress import EgressPolicy
+from tracker.external_service_gateway import (
+    ExternalServiceDeadlineController,
+    ExternalServiceGatewayClient,
+    GenerationAccountingSummary,
+)
 from tracker.database.models import (
     Benchmark,
     ErrorResult,
+    EgressProxyPolicy,
     ExecutorDispatch,
     Task,
     TaskBreakdown,
@@ -60,8 +71,12 @@ from tracker.sandbox import SandboxCreationState, create_sandbox
 from tracker.scheduler.admission import SandboxQueueContext
 import tracker.egress_proxy.run_stage as proxy_run_stage
 
-import tracker.runtime.model_gateway as model_gateway_module
+from tracker.clients.model_gateway import tenant
 from tracker.egress_proxy.settings import EgressProxyEndpoint
+
+_GATEWAY_HOST = "gateway.example.test"
+_GENERATION_PROXY_HOST = "generation.benchmark-tracker-dev.vals.ai"
+_EGRESS_PROXY_CIDR = "192.0.2.1/32"
 
 
 def _install_gateway(
@@ -69,9 +84,16 @@ def _install_gateway(
     minted: list[dict[str, Any]],
     mint_requests: list[httpx.Request] | None = None,
     on_revoke: Callable[[], Awaitable[None]] | None = None,
+    registry_models: dict[str, object] | None = None,
 ) -> None:
 
     async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/registry":
+            return (
+                httpx.Response(503)
+                if registry_models is None
+                else httpx.Response(200, json={"models": registry_models})
+            )
         if request.url.path == "/service-auth":
             if mint_requests is not None:
                 mint_requests.append(request)
@@ -84,7 +106,8 @@ def _install_gateway(
             await on_revoke()
         return httpx.Response(200, json={"revoked": 1})
 
-    monkeypatch.setattr(model_gateway_module, "_client", httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(tenant, "_registry_cache", TTLCache(maxsize=128, ttl=60))
+    monkeypatch.setattr(tenant, "_client", httpx.AsyncClient(transport=httpx.MockTransport(handle)))
 
 
 @asynccontextmanager
@@ -314,6 +337,7 @@ class TestQueuedTaskSource:
 
 @pytest.mark.description("Tracker-owned environment variables passed to agent tasks.")
 class TestProcessTaskEnvironment:
+    @pytest.mark.parametrize("gateway_model", [True, False])
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_process_task_injects_tracker_owned_attribution_env(
         self,
@@ -322,12 +346,17 @@ class TestProcessTaskEnvironment:
         bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
+        gateway_model: bool,
     ) -> None:
         contract = contract.model_copy(
             update={
                 "model": "provider/model",
                 "kwargs": {"variant": "xhigh"},
-                "secrets": {"UNRELATED_SECRET": "secret-name"},
+                "secrets": {
+                    "UNRELATED_SECRET": "secret-name",
+                    "MODEL_GATEWAY_URL": "gateway-url",
+                    "MODEL_GATEWAY_API_KEY": "gateway-key",
+                },
                 "inference_settings_attested": True,
             }
         )
@@ -351,7 +380,7 @@ class TestProcessTaskEnvironment:
         )
         captured_env_vars: list[dict[str, str]] = []
         minted: list[dict[str, Any]] = []
-        _install_gateway(monkeypatch, minted)
+        _install_gateway(monkeypatch, minted, registry_models=None if gateway_model else {})
 
         async def _mock_resolve_secrets(*_args: Any, **_kwargs: Any) -> dict[str, str]:
             return {
@@ -388,6 +417,11 @@ class TestProcessTaskEnvironment:
             "email": "starter@example.com",
         }
         assert env_vars["UNRELATED_SECRET"] == "secret-value"
+        if not gateway_model:
+            assert "MODEL_GATEWAY_URL" not in env_vars
+            assert "MODEL_GATEWAY_API_KEY" not in env_vars
+            assert minted == []
+            return
         assert env_vars["MODEL_GATEWAY_URL"] == "https://gateway.example.test"
         assert env_vars["MODEL_GATEWAY_API_KEY"] == "mgwt_scoped"
         assert minted == [
@@ -408,6 +442,7 @@ class TestProcessTaskEnvironment:
 
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize("allowance", [None, 10.0], ids=["unbounded-generation", "credited-generation"])
+    @pytest.mark.parametrize("run_through_proxy", [False, True], ids=["proxy-off", "proxy-on"])
     async def test_eligible_task_mints_native_bearer_and_persists_terminal_counter(
         self,
         contract: AgentContractRequest,
@@ -416,6 +451,7 @@ class TestProcessTaskEnvironment:
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         allowance: float | None,
+        run_through_proxy: bool,
     ) -> None:
         credit_cap_seconds = 5.0
         contract = contract.model_copy(
@@ -441,6 +477,7 @@ class TestProcessTaskEnvironment:
         control_postgres_session.commit()
         task_response = make_retrieve_task_response().model_copy(
             update={
+                "egress": BenchmarkEgressPlan(run_through_proxy=run_through_proxy),
                 "agent_timeout": allowance,
                 "credited_generation": (
                     CreditedGeneration(allowance_seconds=allowance, stage_protocol=None)
@@ -490,6 +527,14 @@ class TestProcessTaskEnvironment:
             on_external_service_finalized: Callable[[GenerationAccountingSummary], Awaitable[None]],
             **_kwargs: Any,
         ) -> tuple[None, float]:
+            assert _kwargs["generation_gateway_url"] == "http://local-gateway"
+            assert ("HTTPS_PROXY" in _kwargs["extra_env"]) is run_through_proxy
+            if run_through_proxy:
+                assert "local-gateway" not in _kwargs["extra_env"]["NO_PROXY"]
+            policies = control_postgres_session.exec(
+                select(EgressProxyPolicy).where(EgressProxyPolicy.benchmark_id == benchmark_id)
+            ).all()
+            assert len(policies) == int(run_through_proxy)
             deadline_controller.begin_generation(now=100.0)
             await deadline_controller.refresh()
             assert deadline_controller.effective_allowance_seconds() == (
@@ -506,6 +551,14 @@ class TestProcessTaskEnvironment:
             return None, 1.0
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
+        monkeypatch.setattr(
+            utils_module,
+            "EGRESS_PROXY",
+            EgressProxyEndpoint(("proxy.test",), 3128, ("192.0.2.1/32",), "ca"),
+        )
+        monkeypatch.setattr(proxy_run_stage, "apply_egress_policy", AsyncMock())
+        monkeypatch.setattr(proxy_run_stage, "install_proxy_ca", AsyncMock())
+        monkeypatch.setattr(proxy_run_stage, "start_proxy_tunnel", AsyncMock(return_value=True))
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", resolve_secrets)
         monkeypatch.setattr(
             utils_module,
@@ -566,6 +619,155 @@ class TestProcessTaskEnvironment:
         assert getattr(breakdown, "external_service_credit_applied_seconds") == credit_cap_seconds
         assert getattr(breakdown, "external_service_credit_revision") == 3
         assert getattr(breakdown, "generation_elapsed_seconds") == 4.0
+
+    @pytest.mark.description(
+        "The selected generation proxy inherits the original Gateway host's native egress grant.\n"
+        "\n"
+        "Test cases:\n"
+        "- A mismatched upstream keeps its original Gateway and does not accrue proxy accounting.\n"
+        "- A disabled route or a policy that denies the Gateway does not add a host.\n"
+        "- Install, setup, evaluation, and proxied egress keep their declared access."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize(
+        ("run_egress", "route", "expected_run_egress"),
+        [
+            pytest.param(
+                [_GATEWAY_HOST, "assets.example.test"],
+                "native",
+                [_GATEWAY_HOST, "assets.example.test", _GENERATION_PROXY_HOST],
+                id="direct",
+            ),
+            pytest.param(
+                [f"https://{_GATEWAY_HOST}/v1"],
+                "native",
+                [f"https://{_GATEWAY_HOST}/v1", _GENERATION_PROXY_HOST],
+                id="gateway-url",
+            ),
+            pytest.param([_GATEWAY_HOST], "disabled", [_GATEWAY_HOST], id="disabled"),
+            pytest.param([_GATEWAY_HOST], "different-upstream", [_GATEWAY_HOST], id="different-upstream"),
+            pytest.param("*", "different-upstream", "*", id="unrestricted-different-upstream"),
+            pytest.param([_GATEWAY_HOST], "different-proxy", [_GATEWAY_HOST], id="different-proxy"),
+            pytest.param([], "native", [], id="blocked"),
+            pytest.param(["assets.example.test"], "native", ["assets.example.test"], id="unrelated-host"),
+            pytest.param(["*.example.test"], "native", ["*.example.test"], id="domain-wildcard"),
+            pytest.param("*", "native", "*", id="unrestricted"),
+            pytest.param([_GATEWAY_HOST], "proxied", [_EGRESS_PROXY_CIDR], id="proxied"),
+        ],
+    )
+    async def test_generation_proxy_alias_is_limited_to_native_generation(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Callable[..., dict[str, object]],
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        run_egress: EgressPolicy,
+        route: str,
+        expected_run_egress: EgressPolicy,
+    ) -> None:
+        install_egress = ["packages.example.test", _GATEWAY_HOST]
+        setup_egress = ["setup.example.test", _GATEWAY_HOST]
+        evaluation_egress = ["grading.example.test", _GATEWAY_HOST]
+        upstream_url = f"https://{_GATEWAY_HOST}"
+        proxy_url = f"https://{_GENERATION_PROXY_HOST}"
+        generation_url = "https://other-proxy.example.test" if route == "different-proxy" else proxy_url
+        expected_generation_url = None if route in {"disabled", "different-upstream"} else generation_url
+        run_through_proxy = route == "proxied"
+        contract = contract.model_copy(
+            update={
+                "model": "provider/model",
+                "inference_settings_attested": True,
+                "allow_provider_tools": False,
+                "install_egress": install_egress,
+            }
+        )
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        task_data = make_retrieve_task_response().model_copy(
+            update={
+                "credited_generation": CreditedGeneration(allowance_seconds=10.0, stage_protocol=None),
+                "egress": BenchmarkEgressPlan(
+                    setup_task=setup_egress,
+                    run=run_egress,
+                    evaluation=evaluation_egress,
+                    run_through_proxy=run_through_proxy,
+                ),
+            }
+        )
+        minted: list[dict[str, Any]] = []
+        _install_gateway(monkeypatch, minted)
+        monkeypatch.setattr(
+            utils_module,
+            "resolve_secrets",
+            AsyncMock(return_value={"MODEL_GATEWAY_URL": upstream_url, "MODEL_GATEWAY_API_KEY": "gateway-key"}),
+        )
+        monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", generation_url)
+        monkeypatch.setattr(
+            utils_module, "EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN", None if route == "disabled" else "tracker-control"
+        )
+        monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", 5.0)
+        monkeypatch.setattr(utils_module, "GENERATION_PROXY_BASE_URL", proxy_url)
+        monkeypatch.setattr(
+            utils_module,
+            "UPSTREAM_MODEL_GATEWAY_URL",
+            f"{upstream_url}/other" if route == "different-upstream" else upstream_url,
+        )
+        monkeypatch.setattr(
+            utils_module,
+            "EGRESS_PROXY",
+            EgressProxyEndpoint(("proxy.test",), 3128, (_EGRESS_PROXY_CIDR,), "ca"),
+        )
+        monkeypatch.setattr(proxy_run_stage, "install_proxy_ca", AsyncMock())
+        monkeypatch.setattr(proxy_run_stage, "start_proxy_tunnel", AsyncMock(return_value=True))
+        monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", AsyncMock(return_value=task_data))
+
+        applied: list[EgressPolicy] = []
+        sandbox = AsyncMock()
+        sandbox.id = sandbox.name = "mock-sandbox"
+        sandbox.modify_egress_rules.side_effect = applied.append
+        sandbox.block_all_egress.side_effect = lambda: applied.append([])
+        sandbox.clear_egress_rules.side_effect = lambda: applied.append("*")
+
+        @asynccontextmanager
+        async def create_sandbox(
+            *_args: Any, env_vars: dict[str, str], **_kwargs: Any
+        ) -> AsyncGenerator[AsyncMock, None]:
+            assert env_vars["MODEL_GATEWAY_URL"] == upstream_url
+            yield sandbox
+
+        async def generate(
+            *_args: Any,
+            generation_gateway_url: str | None,
+            deadline_controller: ExternalServiceDeadlineController,
+            on_external_service_finalized: Callable[[GenerationAccountingSummary], Awaitable[None]],
+            **_kwargs: Any,
+        ) -> tuple[None, float]:
+            assert generation_gateway_url == expected_generation_url
+            assert applied == [install_egress, setup_egress, expected_run_egress]
+            if run_through_proxy:
+                policy = control_postgres_session.exec(
+                    select(EgressProxyPolicy).where(EgressProxyPolicy.benchmark_id == benchmark_id)
+                ).one()
+                assert policy.domains == [_GATEWAY_HOST]
+
+            summary = deadline_controller.summary()
+            assert (summary.accounting_id is not None) is (expected_generation_url is not None)
+            await on_external_service_finalized(summary)
+
+            return None, 0.0
+
+        monkeypatch.setattr(utils_module, "create_sandbox", create_sandbox)
+        monkeypatch.setattr(utils_module, "apply_egress_policy", sandbox_module.apply_egress_policy)
+        monkeypatch.setattr("tracker.runtime.run_egress.apply_egress_policy", sandbox_module.apply_egress_policy)
+        monkeypatch.setattr(utils_module, "run_agent", generate)
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": {"status": "success", "score": 1.0}}
+        assert applied == [install_egress, setup_egress, expected_run_egress, evaluation_egress]
+        assert minted[0]["egress"] == run_egress
 
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize("handoff", ["stop", "retry"])
@@ -780,19 +982,19 @@ class TestProcessTaskEnvironment:
             control_postgres_session.add(task_row)
             control_postgres_session.commit()
         task_response = make_retrieve_task_response().model_copy(update={"agent_timeout": allowance})
-        observed: list[tuple[float | None, Any, str | None]] = []
+        observed: list[tuple[float | None, Any]] = []
+        captured_env: list[dict[str, str]] = []
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             return task_response
 
         async def capture_run_agent(*_args: Any, **kwargs: Any) -> tuple[None, float]:
-            observed.append(
-                (kwargs["plan"].allowance_seconds, kwargs["deadline_controller"], kwargs["generation_gateway_url"])
-            )
+            observed.append((kwargs["plan"].allowance_seconds, kwargs["deadline_controller"]))
             return await _complete_base_only_agent(**kwargs)
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
         monkeypatch.setattr(utils_module, "run_agent", capture_run_agent)
+        monkeypatch.setattr(utils_module, "create_sandbox", partial(_capture_sandbox_environment, captured_env))
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_URL", None)
         monkeypatch.setattr(utils_module, "EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS", None)
 
@@ -800,11 +1002,12 @@ class TestProcessTaskEnvironment:
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert len(observed) == 1
-        selected_allowance, deadline, generation_gateway_url = observed[0]
+        selected_allowance, deadline = observed[0]
         assert selected_allowance == allowance
         assert deadline.base_allowance_seconds == allowance
         assert deadline.client is None
-        assert generation_gateway_url is None
+        assert len(captured_env) == 1
+        assert "MODEL_GATEWAY_URL" not in captured_env[0]
         control_postgres_session.refresh(task_row)
         assert task_row.credited_wall_deadline_at is not None
         if original_deadline is not None:
@@ -1148,6 +1351,7 @@ class TestProcessTaskEnvironment:
 
     @pytest.mark.usefixtures("process_benchmark_env")
     @pytest.mark.parametrize("run_through_proxy", [True, False])
+    @pytest.mark.parametrize("gateway_model", [True, False])
     async def test_only_a_task_that_asks_goes_through_the_proxy(
         self,
         contract: AgentContractRequest,
@@ -1156,6 +1360,7 @@ class TestProcessTaskEnvironment:
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
         run_through_proxy: bool,
+        gateway_model: bool,
     ) -> None:
         secrets = {
             "MODEL_GATEWAY_URL": "https://gateway.example.test",
@@ -1182,7 +1387,9 @@ class TestProcessTaskEnvironment:
             return task_response
 
         captured_env: list[dict[str, str]] = []
-        _install_gateway(monkeypatch, [])
+        _install_gateway(monkeypatch, [], registry_models=None if gateway_model else {})
+        grant_policy = AsyncMock(wraps=control.grant_egress_policy)
+        monkeypatch.setattr(control, "grant_egress_policy", grant_policy)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
         monkeypatch.setattr(
             utils_module, "EGRESS_PROXY", EgressProxyEndpoint(("proxy.test",), 3128, ("192.0.2.1/32",), "ca")
@@ -1192,7 +1399,15 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr(proxy_run_stage, "install_proxy_ca", AsyncMock())
         monkeypatch.setattr(proxy_run_stage, "start_proxy_tunnel", AsyncMock(return_value=True))
         monkeypatch.setattr(utils_module, "create_sandbox", partial(_capture_sandbox_environment, captured_env))
-        monkeypatch.setattr(utils_module, "run_agent", _complete_base_only_agent)
+
+        async def capture_run_agent(*args: Any, **kwargs: Any) -> tuple[None, float]:
+            policies = control_postgres_session.exec(
+                select(EgressProxyPolicy).where(EgressProxyPolicy.benchmark_id == benchmark_id)
+            ).all()
+            assert len(policies) == int(run_through_proxy)
+            return await _complete_base_only_agent(*args, **kwargs)
+
+        monkeypatch.setattr(utils_module, "run_agent", capture_run_agent)
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", AsyncMock(return_value=secrets))
 
         result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
@@ -1202,6 +1417,14 @@ class TestProcessTaskEnvironment:
         if not run_through_proxy:
             assert env["OPENAI_API_KEY"] == "sk-real"
             limit_to_proxy.assert_not_awaited()
+            return
+        grant_policy.assert_awaited_once()
+        assert grant_policy.await_args is not None
+        assert grant_policy.await_args.args[1].gateway_url == (secrets["MODEL_GATEWAY_URL"] if gateway_model else None)
+        if not gateway_model:
+            assert "MODEL_GATEWAY_URL" not in env
+            assert "MODEL_GATEWAY_API_KEY" not in env
+            assert env["OPENAI_API_KEY"] == "sk-real"
             return
         assert env["OPENAI_API_KEY"] == env["MODEL_GATEWAY_API_KEY"] == "mgwt_scoped"
         assert env["OPENAI_BASE_URL"] == "https://gateway.example.test/passthrough/openai/v1"
@@ -1519,6 +1742,7 @@ class TestProcessTaskEnvironment:
         assert "MODEL_GATEWAY_API_KEY" not in env_vars
 
     @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize("direct_provider", [False, True])
     async def test_process_task_forwards_native_secret_references_without_resolving_values(
         self,
         contract: AgentContractRequest,
@@ -1526,8 +1750,19 @@ class TestProcessTaskEnvironment:
         bound_controls: Any,
         monkeypatch: pytest.MonkeyPatch,
         runtime_services: RuntimeServices,
+        direct_provider: bool,
+        tmp_path: Path,
     ) -> None:
-        contract = contract.model_copy(update={"secrets": {"LEGACY_API_KEY": "aws-secret"}})
+        secret_references = {"LEGACY_API_KEY": "aws-secret"}
+        resolved_secrets = {"LEGACY_API_KEY": "legacy-value"}
+        if direct_provider:
+            secret_references.update({"MODEL_GATEWAY_URL": "gateway-url", "MODEL_GATEWAY_API_KEY": "gateway-key"})
+            resolved_secrets.update(
+                {"MODEL_GATEWAY_URL": "https://gateway.example.test", "MODEL_GATEWAY_API_KEY": "gateway-key"}
+            )
+        contract = contract.model_copy(
+            update={"secrets": secret_references, "model": "direct-provider-model", "inference_settings_attested": True}
+        )
         start_benchmark_request, task_row, benchmark_id, control = create_task_environment(
             contract,
             control_postgres_session,
@@ -1538,7 +1773,7 @@ class TestProcessTaskEnvironment:
 
         async def _mock_resolve_secrets(secrets: dict[str, str], *_args: Any, **_kwargs: Any) -> dict[str, str]:
             resolved_inputs.append(secrets)
-            return {"LEGACY_API_KEY": "legacy-value"}
+            return resolved_secrets
 
         @asynccontextmanager
         async def _capture_sandbox(*_args: Any, **kwargs: Any) -> AsyncGenerator[SimpleNamespace, None]:
@@ -1554,14 +1789,44 @@ class TestProcessTaskEnvironment:
         monkeypatch.setattr("tracker.services.tasks.execute.resolve_secrets", _mock_resolve_secrets)
         monkeypatch.setattr(utils_module, "create_sandbox", _capture_sandbox)
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", _mock_retrieve_task)
+        _install_gateway(monkeypatch, [], registry_models={})
+        run_agent = AsyncMock(wraps=_complete_base_only_agent)
+        redactor = Mock(wraps=utils_module.create_agent_error_redactor)
+        monkeypatch.setattr(utils_module, "run_agent", run_agent)
+        monkeypatch.setattr(utils_module, "create_agent_error_redactor", redactor)
 
         result = await run_process_task(start_benchmark_request, task_row, benchmark_id, runtime_services, control)
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
-        assert resolved_inputs == [{"LEGACY_API_KEY": "aws-secret"}]
+        assert resolved_inputs == [secret_references]
         assert captured["sandbox_secrets"] == {"TAVILY_API_KEY": "daytona-tavily"}
         assert captured["env_vars"]["LEGACY_API_KEY"] == "legacy-value"
         assert "TAVILY_API_KEY" not in captured["env_vars"]
+        assert "MODEL_GATEWAY_API_KEY" not in captured["env_vars"]
+        assert "MODEL_GATEWAY_URL" not in captured["env_vars"]
+        assert redactor.call_args_list[0].args[0] == ["legacy-value"]
+        assert run_agent.call_args is not None
+        names = run_agent.call_args.kwargs["secret_env_names"]
+        assert names == ("LEGACY_API_KEY", "TAVILY_API_KEY")
+        error_path = tmp_path / "agent-error.txt"
+        error_path.write_text("ValueError: legacy-value native-value")
+        masked = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                sandbox_module._MASK_PROVIDER_ERROR_SCRIPT,
+                str(error_path),
+                "8192",
+                *names,
+            ],
+            env={**captured["env_vars"], "TAVILY_API_KEY": "native-value"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert run_agent.call_args.kwargs["redact_error"](masked.stdout) == "ValueError: [REDACTED] [REDACTED]"
 
     @pytest.mark.usefixtures("process_benchmark_env")
     async def test_stopped_task_output_is_fenced_while_sibling_keeps_dispatch_active(

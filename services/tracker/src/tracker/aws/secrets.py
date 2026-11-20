@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from tracker.aws.clients import AWSClientProvider
 from tracker.exceptions import (
@@ -13,7 +13,7 @@ from tracker.exceptions import (
     SecretRegionError,
     SecretsError,
 )
-from tracker.runtime.secrets import SecretValue, secret_display_name, secret_set_instruction
+from tracker.runtime.secrets import TENANT_SECRET_ROOT, SecretValue, secret_display_name, secret_set_instruction
 
 
 def _error_code(error: ClientError) -> str:
@@ -30,15 +30,17 @@ class SecretsManagerStore:
         self._clients = clients
 
     async def get(self, name: str) -> SecretValue:
-        display = secret_display_name(name)
-        set_instruction = secret_set_instruction(name)
         region = self._clients.region
         arn = name.split(":", 6)
+        stored_name = arn[6] if len(arn) == 7 and arn[0] == "arn" and arn[2] == "secretsmanager" else name
+        display_name = re.sub(r"-[A-Za-z0-9]{6}$", "", stored_name) if stored_name != name else name
+        display = secret_display_name(display_name)
+        set_instruction = secret_set_instruction(name)
         if len(arn) == 7 and arn[0] == "arn" and arn[2] == "secretsmanager" and arn[3] != region:
             display = secret_display_name(re.sub(r"-[A-Za-z0-9]{6}$", "", arn[6]))
             raise SecretRegionError(
-                f"Secret '{display}' is in region '{arn[3]}', but the Tracker reads region '{region}'. "
-                f"Use a Tracker in region '{arn[3]}'."
+                f"Secret '{display}' is in region '{arn[3]}', but Valkyrie reads secrets from region '{region}'. "
+                f"{set_instruction}"
             )
         async with self._clients.secretsmanager_async_client() as client:
             try:
@@ -63,6 +65,27 @@ class SecretsManagerStore:
                         "This is a Valkyrie problem, not your configuration, and has been reported."
                     ) from error
                 if error_code in {"AccessDenied", "AccessDeniedException"}:
+                    if stored_name.startswith(TENANT_SECRET_ROOT):
+                        try:
+                            description = await client.describe_secret(SecretId=name)
+                        except (ClientError, BotoCoreError) as describe_error:
+                            if (
+                                isinstance(describe_error, ClientError)
+                                and _error_code(describe_error) == "ResourceNotFoundException"
+                            ):
+                                raise SecretNotFoundError(
+                                    f"Secret '{display}' is not set for your organization. {set_instruction}"
+                                ) from describe_error
+                        else:
+                            if description.get("DeletedDate") is not None:
+                                raise SecretBeingDeletedError(
+                                    f"Secret '{display}' is being deleted. Wait for the deletion to finish, then "
+                                    f"{set_instruction[0].lower()}{set_instruction[1:]}"
+                                ) from error
+                            raise SecretAccessDeniedError(
+                                f"Secret '{display}' exists, but this run can't read it. "
+                                "This is a Valkyrie problem, not your configuration, and has been reported."
+                            ) from error
                     raise SecretAccessDeniedError(
                         f"Valkyrie can't read secret '{display}': it isn't set for your organization or access to it was denied. "
                         f"If it isn't set, {set_instruction[0].lower()}{set_instruction[1:]} "

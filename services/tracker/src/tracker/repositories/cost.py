@@ -6,12 +6,13 @@ from uuid import UUID, uuid4
 
 from dataclasses import dataclass
 
-from sqlalchemy import JSON, ColumnElement, and_, case, extract, func, or_, type_coerce, update
+from sqlalchemy import JSON, ColumnElement, case, delete, extract, func, or_, type_coerce, update
 from sqlalchemy.dialects.postgresql import insert
 from fastapi import Depends
 from sqlmodel import Session, col, select
 
 from tracker.database.session import get_session
+from tracker.domain import SandboxResource
 from tracker.search_cost import SearchCharge, attempt_totals
 from tracker.repositories.project import ProjectRepository
 from tracker.database.models import (
@@ -21,6 +22,7 @@ from tracker.database.models import (
     ExecutorDispatch,
     Project,
     RunCost,
+    RunCostReportToken,
     RunProject,
     SandboxCostCursor,
     SandboxUnmatchedUsage,
@@ -29,23 +31,19 @@ from tracker.database.models import (
 )
 
 SANDBOX_COST_TYPE = "sandbox"
+_RESOURCE_UNITS = {
+    SandboxResource.CPU: "vcpu_second",
+    SandboxResource.MEMORY: "gib_second",
+    SandboxResource.DISK: "gib_second",
+    SandboxResource.GPU: "gpu_second",
+}
+_DAYTONA_USD_PER_SECOND = {
+    SandboxResource.CPU: 0.0504 / 3600,
+    SandboxResource.MEMORY: 0.0162 / 3600,
+    SandboxResource.DISK: 0.000108 / 3600,
+}
 SEARCH_COST_TYPE = "search"
-SANDBOX_CPU_COST_TYPE = "sandbox_cpu"
-SANDBOX_MEMORY_COST_TYPE = "sandbox_memory"
-SANDBOX_DISK_COST_TYPE = "sandbox_disk"
-SANDBOX_GPU_COST_TYPE = "sandbox_gpu"
-EXECUTOR_COST_TYPE = "executor"
-EGRESS_COST_TYPE = "egress"
-STORAGE_COST_TYPE = "storage"
-PROJECT_COST_TYPES = (
-    SANDBOX_COST_TYPE,
-    SANDBOX_CPU_COST_TYPE,
-    SANDBOX_MEMORY_COST_TYPE,
-    SANDBOX_DISK_COST_TYPE,
-    SANDBOX_GPU_COST_TYPE,
-    SEARCH_COST_TYPE,
-)
-EXCLUDED_COST_TYPES = (EXECUTOR_COST_TYPE, EGRESS_COST_TYPE, STORAGE_COST_TYPE)
+PROJECT_COST_TYPES = (SANDBOX_COST_TYPE, SEARCH_COST_TYPE)
 _HOUR = timedelta(hours=1)
 _LAST_MOMENT_OF_HOUR = _HOUR - timedelta(microseconds=1)
 _SANDBOX_HOUR_COST_BATCH = 1000
@@ -92,6 +90,7 @@ class PlacedCostRow(NamedTuple):
 
 class SandboxCostRow(NamedTuple):
     source_id: str | None
+    resource: str | None
     hourly: bool | None
     placed_at: datetime
     amount_usd: float
@@ -124,6 +123,19 @@ class ProjectRunCostRow(NamedTuple):
     cost_usd: float
 
 
+class RunResourceCostRow(NamedTuple):
+    cost_type: str
+    provider: str
+    resource: str | None
+    unit: str | None
+    quantity: float | None
+    amount_usd: float
+
+
+def _counted() -> ColumnElement[bool]:
+    return col(RunCost.cost_type).in_(PROJECT_COST_TYPES) | col(RunCost.reporter).is_not(None)
+
+
 class UnpricedSandbox(NamedTuple):
     org_id: UUID
     provider: str
@@ -144,6 +156,26 @@ class SandboxUsage:
     sandbox_id: str
     total_price: float
     last_end: datetime | None
+    cpu_seconds: float = 0.0
+    memory_gib_seconds: float = 0.0
+    disk_gib_seconds: float = 0.0
+    gpu_seconds: float = 0.0
+
+
+def daytona_resource_costs(usage: SandboxUsage) -> dict[SandboxResource, tuple[float | None, float]]:
+    seconds = {
+        SandboxResource.CPU: usage.cpu_seconds,
+        SandboxResource.MEMORY: usage.memory_gib_seconds,
+        SandboxResource.DISK: usage.disk_gib_seconds,
+    }
+    list_usd = {resource: used * _DAYTONA_USD_PER_SECOND[resource] for resource, used in seconds.items() if used > 0}
+    listed = sum(list_usd.values())
+    gpu_usd = max(usage.total_price - listed, 0.0) if usage.gpu_seconds > 0 else 0.0
+    shared_usd = usage.total_price - gpu_usd
+    costs = {r: (seconds[r], shared_usd * usd / listed) for r, usd in list_usd.items()} if listed else {}
+    if usage.gpu_seconds > 0:
+        costs[SandboxResource.GPU] = (usage.gpu_seconds, gpu_usd)
+    return costs or {SandboxResource.CPU: (None, usage.total_price)}
 
 
 _EPOCH_DAY = date(1970, 1, 1)
@@ -304,6 +336,7 @@ class CostRepository:
             self._placed_sandbox_costs(
                 cast(Any, select)(
                     col(RunCost.source_id).label("source_id"),
+                    col(RunCost.resource).label("resource"),
                     _is_hourly_source().label("hourly"),
                     placed_at.label("placed_at"),
                     col(RunCost.amount_usd).label("amount_usd"),
@@ -325,6 +358,7 @@ class CostRepository:
         return [
             SandboxCostRow(
                 row.source_id,
+                row.resource,
                 row.hourly,
                 row.placed_at,
                 row.amount_usd,
@@ -399,13 +433,23 @@ class CostRepository:
             .select_from(current)
             .outerjoin(
                 RunCost,
-                (col(RunCost.benchmark_id) == current.c.benchmark_id) & col(RunCost.cost_type).in_(PROJECT_COST_TYPES),
+                (col(RunCost.benchmark_id) == current.c.benchmark_id) & _counted(),
             )
             .where(current.c.project_id == project_id)
             .group_by(current.c.benchmark_id, col(RunCost.cost_type))
             .order_by(current.c.benchmark_id, col(RunCost.cost_type))
         )
         return cast(Sequence[ProjectRunCostRow], cast(Any, self._session.exec(statement)).all())
+
+    def run_resource_costs(self, run_id: UUID) -> Sequence[RunResourceCostRow]:
+        group = (col(RunCost.cost_type), col(RunCost.provider), col(RunCost.resource), col(RunCost.unit))
+        statement = (
+            cast(Any, select)(*group, func.sum(col(RunCost.quantity)), func.sum(col(RunCost.amount_usd)))
+            .where(col(RunCost.benchmark_id) == run_id, _counted())
+            .group_by(*group)
+            .order_by(*group)
+        )
+        return [RunResourceCostRow(*row) for row in cast(Any, self._session.exec(statement)).all()]
 
     def project_runs(self, org_id: UUID, project_id: UUID, start: datetime, end: datetime) -> dict[UUID, datetime]:
         current = self._current_projects(org_id)
@@ -446,29 +490,46 @@ class CostRepository:
         self, *, provider: str, hour: datetime, usages: Sequence[tuple[UUID, SandboxUsage]]
     ) -> int:
         last_moment = hour + _LAST_MOMENT_OF_HOUR
+        attempts = self._sandbox_attempts(provider, [usage.sandbox_id for _, usage in usages])
         rows = [
             {
                 "benchmark_id": benchmark_id,
+                "attempt_id": attempts.get(usage.sandbox_id),
                 "cost_type": SANDBOX_COST_TYPE,
+                "resource": resource.value,
                 "source_id": sandbox_hour_source_id(usage.sandbox_id, hour),
                 "provider": provider,
-                "amount_usd": usage.total_price,
+                "amount_usd": amount_usd,
+                "quantity": quantity,
+                "unit": None if quantity is None else _RESOURCE_UNITS[resource],
                 "usage_end": min(usage.last_end, last_moment) if usage.last_end else last_moment,
             }
             for benchmark_id, usage in usages
+            for resource, (quantity, amount_usd) in daytona_resource_costs(usage).items()
         ]
+        return self._add_resource_costs(rows)
+
+    def _add_resource_costs(self, rows: list[dict[str, Any]]) -> int:
         written = 0
         for batch in batched(rows, _SANDBOX_HOUR_COST_BATCH):
             result = self._session.exec(
                 insert(RunCost)
                 .values(list(batch))
                 .on_conflict_do_nothing(
-                    index_elements=["provider", "source_id"],
+                    index_elements=["provider", "source_id", "resource"],
                     index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
                 )
             )
             written += result.rowcount
         return written
+
+    def _sandbox_attempts(self, provider: str, sandbox_ids: list[str]) -> dict[str, str | None]:
+        rows = self._session.exec(
+            select(SandboxRecord.sandbox_id, SandboxRecord.attempt_id).where(
+                col(SandboxRecord.provider) == provider, col(SandboxRecord.sandbox_id).in_(sandbox_ids)
+            )
+        )
+        return dict(rows.all())
 
     def add_sandbox_cost(
         self, *, benchmark_id: UUID, provider: str, sandbox_id: str, amount_usd: float, usage_end: datetime
@@ -477,6 +538,7 @@ class CostRepository:
             insert(RunCost)
             .values(
                 benchmark_id=benchmark_id,
+                attempt_id=self._sandbox_attempts(provider, [sandbox_id]).get(sandbox_id),
                 cost_type=SANDBOX_COST_TYPE,
                 source_id=sandbox_id,
                 provider=provider,
@@ -484,7 +546,7 @@ class CostRepository:
                 usage_end=usage_end,
             )
             .on_conflict_do_nothing(
-                index_elements=["provider", "source_id"],
+                index_elements=["provider", "source_id", "resource"],
                 index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
             )
         )
@@ -495,6 +557,7 @@ class CostRepository:
     ) -> bool:
         statement = insert(RunCost).values(
             benchmark_id=benchmark_id,
+            attempt_id=self._sandbox_attempts(provider, [sandbox_id]).get(sandbox_id),
             cost_type=SANDBOX_COST_TYPE,
             source_id=sandbox_id,
             provider=provider,
@@ -503,7 +566,7 @@ class CostRepository:
         )
         result = self._session.exec(
             statement.on_conflict_do_update(
-                index_elements=["provider", "source_id"],
+                index_elements=["provider", "source_id", "resource"],
                 index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
                 set_={"amount_usd": statement.excluded.amount_usd, "usage_end": statement.excluded.usage_end},
                 where=col(RunCost.usage_end) < statement.excluded.usage_end,
@@ -511,24 +574,30 @@ class CostRepository:
         )
         return result.rowcount == 1
 
-    def upsert_modal_run_cost(self, *, benchmark_id: UUID, amount_usd: float, usage_end: datetime) -> bool:
-        result = self._session.exec(
-            insert(RunCost)
-            .values(
-                benchmark_id=benchmark_id,
-                cost_type=SANDBOX_COST_TYPE,
-                source_id=str(benchmark_id),
-                provider=MODAL_PROVIDER,
-                amount_usd=amount_usd,
-                usage_end=usage_end,
-            )
-            .on_conflict_do_update(
-                index_elements=["provider", "source_id"],
-                index_where=col(RunCost.cost_type) == SANDBOX_COST_TYPE,
-                set_={"amount_usd": amount_usd, "usage_end": usage_end},
+    def replace_modal_run_costs(
+        self, *, benchmark_id: UUID, costs: dict[tuple[str | None, SandboxResource], float], usage_end: datetime
+    ) -> bool:
+        self._session.exec(
+            delete(RunCost).where(
+                col(RunCost.benchmark_id) == benchmark_id,
+                col(RunCost.provider) == MODAL_PROVIDER,
+                col(RunCost.cost_type) == SANDBOX_COST_TYPE,
             )
         )
-        return result.rowcount == 1
+        rows = [
+            {
+                "benchmark_id": benchmark_id,
+                "attempt_id": attempt_id,
+                "cost_type": SANDBOX_COST_TYPE,
+                "resource": resource.value,
+                "source_id": attempt_id or str(benchmark_id),
+                "provider": MODAL_PROVIDER,
+                "amount_usd": amount_usd,
+                "usage_end": usage_end,
+            }
+            for (attempt_id, resource), amount_usd in (costs or {(None, SandboxResource.CPU): 0.0}).items()
+        ]
+        return self._add_resource_costs(rows) > 0
 
     def add_search_costs(self, *, benchmark_id: UUID, attempt_id: str, charges: list[SearchCharge]) -> int:
         totals = attempt_totals(charges, attempt_id)
@@ -558,6 +627,26 @@ class CostRepository:
         )
         return result.rowcount
 
+    def cost_report_token_run(self, token_hash: str) -> UUID | None:
+        return self._session.exec(
+            select(RunCostReportToken.benchmark_id).where(col(RunCostReportToken.token_hash) == token_hash)
+        ).first()
+
+    def upsert_reported_costs(self, rows: Sequence[dict[str, Any]]) -> int:
+        statement = insert(RunCost).values([{"id": uuid4(), **row} for row in rows])
+        result = self._session.exec(
+            statement.on_conflict_do_update(
+                index_elements=["benchmark_id", "attempt_id", "provider", "source_id", "cost_type"],
+                index_where=col(RunCost.reporter).is_not(None),
+                set_={
+                    column: statement.excluded[column]
+                    for column in ("amount_usd", "quantity", "unit", "usage_end", "reporter")
+                },
+            )
+        )
+        self._session.commit()
+        return result.rowcount
+
     def modal_runs_to_price(self) -> list[Benchmark]:
         used_modal = select(SandboxRecord.benchmark_id).where(col(SandboxRecord.provider) == MODAL_PROVIDER)
         latest_dispatch_finish = (
@@ -568,23 +657,18 @@ class CostRepository:
         effective_finish = func.coalesce(col(Benchmark.finished_at), latest_dispatch_finish)
         rows = self._session.exec(
             cast(Any, select)(Benchmark, effective_finish.label("effective_finish"))
-            .outerjoin(
-                RunCost,
-                and_(
-                    col(RunCost.benchmark_id) == col(Benchmark.id),
-                    col(RunCost.cost_type) == SANDBOX_COST_TYPE,
-                    col(RunCost.provider) == MODAL_PROVIDER,
-                ),
-            )
             .where(col(Benchmark.id).in_(used_modal))
             .where(col(Benchmark.status).in_(FINISHED_BENCHMARK_STATUSES))
             .where(effective_finish.is_not(None))
             .where(
-                or_(
-                    col(RunCost.id).is_(None),
-                    col(RunCost.usage_end).is_(None),
-                    col(RunCost.usage_end) < effective_finish,
+                ~select(RunCost.id)
+                .where(
+                    col(RunCost.benchmark_id) == col(Benchmark.id),
+                    col(RunCost.cost_type) == SANDBOX_COST_TYPE,
+                    col(RunCost.provider) == MODAL_PROVIDER,
+                    col(RunCost.usage_end) >= effective_finish,
                 )
+                .exists()
             )
         ).all()
         runs: list[Benchmark] = []

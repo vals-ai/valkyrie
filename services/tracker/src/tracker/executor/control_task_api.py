@@ -63,7 +63,7 @@ from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.cost import CostRepository
 from tracker.repositories.egress_policy import EgressPolicyRepository
 from tracker.repositories.remote_grader import RemoteGraderRepository
-from tracker.runtime.model_gateway import GATEWAY_TOKEN_TTL_SECONDS
+from tracker.services.gateway.tokens import GATEWAY_TOKEN_TTL_SECONDS
 from tracker.search_cost import search_cost_source_id
 
 router = APIRouter(prefix="/executor-control/v1")
@@ -559,7 +559,7 @@ def record_link(
     if body.benchmark_id != benchmark.id:
         raise HTTPException(status_code=403)
     BenchmarkRepository(session).record_sandbox_link(
-        body.provider, body.sandbox_id, body.benchmark_id, body.seen_at or datetime.now(UTC)
+        body.provider, body.sandbox_id, body.benchmark_id, body.seen_at or datetime.now(UTC), body.attempt_id
     )
     session.commit()
     return complete_response(session, TaskDecision(accepted=True))

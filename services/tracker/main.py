@@ -37,6 +37,7 @@ from tracker.api.benchmarks_status import router as benchmarks_status_router
 from tracker.api.dependencies import TrackedBenchmarkId, bind_benchmark_id, get_agent_library_runtime
 from tracker.api.dependencies import RunBenchmarkDependency, RunRuntimeDependency
 from tracker.api.costs import router as costs_router
+from tracker.api.cost_reports import router as cost_reports_router
 from tracker.api.project_service import router as project_service_router
 from tracker.api.filter_options import router as filter_options_router
 from tracker.api.logs import monitor_router
@@ -51,6 +52,7 @@ from tracker.api.remote_grader import router as remote_grader_router
 from tracker.api.run_settings import router as run_settings_router, user_run_settings
 from tracker.api.benchmark_definitions import router as benchmark_definitions_router
 from tracker.api.dataset_versions import router as dataset_versions_router
+from tracker.api.dataset_uploads import router as dataset_uploads_router
 from tracker.api.datasets import router as datasets_router
 from tracker.repositories.benchmark import BenchmarkRepository, BenchmarkRepositoryDependency, Order
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
@@ -92,7 +94,7 @@ from tracker.aws.s3 import (
     s3_object_exists,
 )
 from tracker.aws.runtime import AWSResources, AWSRuntime
-from tracker.project_gateway import prepare_project_gateway_key, selects_project_gateway_key
+from tracker.services.gateway.keys import prepare_project_gateway_key, selects_project_gateway_key
 from tracker.repositories.benchmark_definition import BenchmarkDefinitionRepository
 from tracker.repositories.dataset import DatasetRepository
 from tracker.repositories.dataset_version import DatasetVersionRepository
@@ -104,6 +106,7 @@ from tracker.runtime.artifacts import (
     copy_agent_to_benchmark,
 )
 from tracker.runtime.secrets import resolve_secrets
+from tracker.services.gateway.tokens import validate_gateway_models
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.storage import ObjectStore, StoredObjectCopy
 from tracker.agent.releases import resolve_agent_release
@@ -115,8 +118,9 @@ from tracker.config import (
     BenchmarkServiceDestination,
     classify_benchmark_service_destination,
     create_benchmark_service_url,
-    validate_enabled_project_gateway,
 )
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
+from tracker.clients.model_gateway.machine import validate_enabled_project_gateway
 from tracker.types import AgentContractRequest, AgentReleaseSelection, AgentExecutionAttempt
 from tracker.database.models import (
     Benchmark,
@@ -154,6 +158,7 @@ from tracker.docent_analysis import (
 from tracker.exceptions import (
     AmbiguousDigestError,
     InvalidSandboxConfigurationError,
+    ModelGatewayConfigurationError,
     LambdaError,
     ProjectNotFoundError,
     RunLimitExceededError,
@@ -185,8 +190,9 @@ from tracker.middleware import (
     RunRequestSizeLimitMiddleware,
 )
 from tracker.observability import configure_observability
-from tracker.secret_access import may_use_shared_secrets, resolve_secret_name, validate_secret_names
+from tracker.secret_access import OrgSecretStore, may_use_shared_secrets, resolve_secret_name, validate_secret_names
 from tracker.run_access_keys import IssuedKeys, IssuedRunKey, run_service_key
+from tracker.services.cost_reports import issued_cost_report_tokens, with_cost_report_token
 from tracker.sandbox_cost import AutomaticSandboxCost
 from tracker.outbound_security import (
     validate_custom_service_destination,
@@ -320,6 +326,7 @@ app.include_router(organizations_router)
 app.include_router(benchmark_services_router)
 app.include_router(benchmarks_status_router)
 app.include_router(costs_router)
+app.include_router(cost_reports_router)
 app.include_router(project_service_router)
 app.include_router(filter_options_router)
 app.include_router(logs_router)
@@ -338,6 +345,7 @@ v1 = APIRouter(prefix="/v1")
 v1.include_router(benchmark_definitions_router)
 v1.include_router(datasets_router)
 v1.include_router(dataset_versions_router)
+v1.include_router(dataset_uploads_router)
 app.include_router(v1)
 
 
@@ -747,7 +755,7 @@ def _authorize_secret_names(request: StartBenchmarkRequest, org: Org) -> StartBe
 async def _with_project_gateway_secrets(
     request: StartBenchmarkRequest, project: Project, org: Org, bind: Engine | Connection
 ) -> StartBenchmarkRequest:
-    references = await prepare_project_gateway_key(bind, project, org, secret_store(org))
+    references = await asyncio.to_thread(prepare_project_gateway_key, bind, project, org, secret_store(org))
     return request.model_copy(
         update={"contract": request.contract.model_copy(update={"secrets": request.contract.secrets | references})}
     )
@@ -827,7 +835,7 @@ def _commit_start(
                 "queue_pool_id": queue_pool_id,
                 "dataset_ref": request.dataset_ref,
                 "selected_project_gateway_secret_ref": (
-                    request.contract.secrets["MODEL_GATEWAY_API_KEY"] if selected_project_gateway_root else None
+                    request.contract.secrets[MODEL_GATEWAY_API_KEY] if selected_project_gateway_root else None
                 ),
             }
         )
@@ -846,6 +854,7 @@ def _commit_start(
             repository.add_tasks(benchmark.org_id, benchmark.id, task_ids)
             payload = _process_benchmark_kwargs(benchmark, request, task_ids)
             repository.save(*(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark.id) for key in issued_keys))
+            repository.save(*issued_cost_report_tokens(benchmark.id, request.service_headers))
             if project_id is not None:
                 repository.save(
                     RunProject(
@@ -1114,6 +1123,7 @@ async def start_benchmark(
         _reject_docker_with_hosted_service(request.sandbox_provider, destination)
         run_key = await run_service_key(http_request, run_starter.org, destination, service_headers, issued_keys)
         service_headers = forward_tracker_api_key(service_headers, run_key, destination=destination)
+        service_headers = with_cost_report_token(service_headers)
     request = request.model_copy(
         update={
             **({"properties": aws_runtime.resources} if aws_runtime is not None else {}),
@@ -1201,6 +1211,45 @@ async def start_benchmark(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not reads_secrets_file(request.properties):
             request = _authorize_secret_names(request, run_starter.org)
+
+    if request.contract.inference_settings_attested and request.contract.model:
+        gateway_secrets = {
+            name: reference
+            for name, reference in request.contract.secrets.items()
+            if name in {MODEL_GATEWAY_URL, MODEL_GATEWAY_API_KEY}
+        }
+        if len(gateway_secrets) == 2:
+            try:
+                gateway_env = await resolve_secrets(
+                    gateway_secrets,
+                    OrgSecretStore(
+                        runtime.secrets,
+                        request.contract.secrets.values(),
+                        org_id=run_starter.org.id,
+                        org_name=run_starter.org.name,
+                        auth_required=True,
+                    )
+                    if AUTH_REQUIRED and request.environment != "local"
+                    else runtime.secrets,
+                )
+            except Exception:
+                logger.warning("Model Gateway credentials unavailable for start-time model validation")
+            else:
+                try:
+                    await validate_gateway_models(
+                        gateway_env,
+                        attested_model=request.contract.model,
+                        companion_models=request.contract.kwargs.get("companion_models"),
+                        org_name=run_starter.org.name,
+                    )
+                except ModelGatewayConfigurationError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from None
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid {MODEL_GATEWAY_URL} setting for this Valkyrie run. "
+                        "Set it to a valid Model Gateway service URL.",
+                    ) from None
 
     logger.info("Starting benchmark run - contract: %s, benchmark: %s", request.contract.name, request.benchmark_name)
 
@@ -2382,6 +2431,7 @@ async def retry_or_resume_benchmark(
         _reject_docker_with_hosted_service(preparation.sandbox_provider, destination)
         run_key = await run_service_key(http_request, org, destination, service_headers, issued_keys)
         effective_headers = forward_tracker_api_key(service_headers, run_key, destination=destination)
+        effective_headers = with_cost_report_token(effective_headers)
     verified_task_ids = list(preparation.state.task_ids) if preparation.state is not None else []
     if verified_task_ids and not preparation.queued_recovery:
         if preparation.dataset_ref is None:
@@ -2560,6 +2610,7 @@ def _commit_regrade(
                 payload_key,
             )
             repository.save(*(RunAccessKey(key_id=key.key_id, benchmark_id=run.id) for key in issued_keys))
+            repository.save(*issued_cost_report_tokens(run.id, service_headers))
             session.commit()
         except ReleaseControlError as exc:
             session.rollback()
@@ -2606,6 +2657,7 @@ async def regrade_benchmark(
     _reject_docker_with_hosted_service(arguments.sandbox_provider, destination)
     run_key = await run_service_key(http_request, org, destination, request.service_headers, issued_keys)
     service_headers = forward_tracker_api_key(request.service_headers, run_key, destination=destination)
+    service_headers = with_cost_report_token(service_headers)
     benchmark_url = source.run.custom_benchmark_service or create_benchmark_service_url(source.run.name)
     service = create_benchmark_service_client(
         benchmark_url, service_headers, None, sandbox_provider=arguments.sandbox_provider
@@ -2719,7 +2771,7 @@ def _apply_recovery(
             secrets = {
                 env_name: name
                 for env_name, name in secrets.items()
-                if env_name not in {"MODEL_GATEWAY_API_KEY", "MODEL_GATEWAY_URL"}
+                if env_name not in {MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL}
             }
     secrets = {env_name: _resolve_secret_name(name, org) for env_name, name in secrets.items()}
 
@@ -2922,7 +2974,7 @@ def _apply_recovery(
                 and not reads_secrets_file(benchmark_row.arguments.properties)
             ):
                 replacement_secrets = dict(replacement_contract.secrets)
-                for name in ("MODEL_GATEWAY_URL", "MODEL_GATEWAY_API_KEY"):
+                for name in (MODEL_GATEWAY_URL, MODEL_GATEWAY_API_KEY):
                     replacement_secrets.pop(name, None)
                     if name in benchmark_row.arguments.contract.secrets:
                         replacement_secrets[name] = benchmark_row.arguments.contract.secrets[name]
@@ -3032,6 +3084,7 @@ def _apply_recovery(
         BenchmarkRepository(session).save(
             *(RunAccessKey(key_id=key.key_id, benchmark_id=benchmark_row.id) for key in issued_keys)
         )
+        BenchmarkRepository(session).save(*issued_cost_report_tokens(benchmark_row.id, resume_request.service_headers))
         session.commit()
     except ReleaseControlError as exc:
         session.rollback()

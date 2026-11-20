@@ -98,6 +98,18 @@ class FilesystemObjectStore:
     async def get_bytes(self, key: str) -> bytes:
         return await asyncio.to_thread(lambda: local_path(self.root, key).read_bytes())
 
+    async def get_range(self, key: str, start: int, length: int) -> bytes:
+        if start < 0 or length < 0:
+            raise ValueError("Object ranges must be nonnegative")
+
+        def read() -> bytes:
+            with local_path(self.root, key).open("rb") as stream:
+                stream.seek(start)
+
+                return stream.read(length)
+
+        return await asyncio.to_thread(read)
+
     async def get_stream(self, key: str) -> AsyncIterator[bytes]:
         stream = await asyncio.to_thread(local_path(self.root, key).open, "rb")
         try:
@@ -163,6 +175,9 @@ class FilesystemObjectStore:
         return entries, None
 
     async def temporary_download_url(self, key: str, *, expires_in: int) -> None:
+        return None
+
+    async def temporary_upload_form(self, key: str, *, size: int, sha256: str, expires_in: int) -> None:
         return None
 
     def object_location(self, key: str) -> str:

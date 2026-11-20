@@ -81,6 +81,13 @@ class LimitInput(BaseModel):
     reason: str | None = None
 
 
+class LimitRecord(BaseModel):
+    limit_dollars: Decimal | None
+    reason: str | None
+    applied: bool
+    updated_at: UTCDateTime | None
+
+
 class LimitRequestInput(BaseModel):
     limit_dollars: Decimal = Field(gt=0)
     reason: str = Field(min_length=1)

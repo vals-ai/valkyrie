@@ -75,6 +75,7 @@ What the check does:
 - `.gitattributes` `export-ignore` rules decide what `public-sync.yaml` copies from `prod` to the public
   `vals-ai/Valkyrie` mirror. Vals AI-only code and notes go under `internal/`.
 - Layout: `src/valkyrie` is the CLI and TUI, `packages/valkyrie-sdk` the SDK, and `services/tracker` the Tracker.
+- Benchmark services build on `packages/create-benchmark-service`, with grading helpers in `packages/vals-grading`. The framework README has the diagram of how they fit with the Tracker.
 - Side services are `services/run-monitor`, `services/egress_proxy` and `services/projects`, and the CDK stacks are
   `infra` and `internal/operations-infra`. `docs` is the public site.
 - `CONTRIBUTING.md` has the client import boundaries.

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
-from tracker.services.datasets.extract import UnsafeArchiveError, check_archive, extract
+from tracker.services.datasets.extract import UnsafeArchiveError, extract
 from tracker.services.datasets.folder import (
     COMPOSE_FILE,
     CONFIG_FILE,
@@ -109,7 +109,6 @@ class ArchiveSource:
     def _unpack(archive_path: Path, task_dir: Path, parts: Collection[str]) -> None:
         try:
             with zipfile.ZipFile(archive_path) as archive:
-                check_archive(archive)
                 extract(archive, parts, task_dir)
         except zipfile.BadZipFile as error:
             raise UnsafeArchiveError(f"The task archive is not a readable zip file: {error}") from error

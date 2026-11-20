@@ -34,6 +34,7 @@ from benchmark_service import (
 from benchmark_service.client import BenchmarkServiceError
 from benchmark_service.remote_grading import RemoteGradingAuthorization
 from benchmark_service.grading_spec import resolve_grading_spec
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.schemas import EgressPolicy
 
 from tracker.runtime.lifecycle import finish_cleanup
@@ -41,7 +42,8 @@ from tracker.runtime.logs import task_log_stream_name
 from tracker.runtime.secrets import resolve_secrets
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.artifacts import step_folder, step_output_name, task_artifact_key
-from tracker.runtime.model_gateway import (
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
+from tracker.services.gateway.tokens import (
     GatewayTokenRotation,
     child_gateway_token,
     grading_gateway_token,
@@ -62,6 +64,8 @@ from tracker.config import (
     EXTERNAL_SERVICE_GATEWAY_CREDIT_CAP_SECONDS,
     EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN,
     EXTERNAL_SERVICE_GATEWAY_URL,
+    GENERATION_PROXY_BASE_URL,
+    UPSTREAM_MODEL_GATEWAY_URL,
     VALKYRIE_STAGE,
 )
 from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, FailurePhase, TaskStatus
@@ -118,6 +122,7 @@ from tracker.observability.tracing import observability_span
 from tracker.secret_access import selected_project_gateway_reference
 from tracker.remote_grader_services import WORKER_SERVICE_FOR_BENCHMARK
 from tracker.sandbox import (
+    MODAL_ATTEMPT_TAG,
     DependencySetupMode,
     SandboxCreationState,
     apply_egress_policy,
@@ -543,6 +548,30 @@ async def commit_task_status_transition(
         return accepted
 
 
+def _configured_generation_proxy(generation_gateway_url: str) -> tuple[httpx.URL, httpx.URL] | None:
+    if GENERATION_PROXY_BASE_URL is not None and UPSTREAM_MODEL_GATEWAY_URL is not None:
+        proxy = httpx.URL(generation_gateway_url)
+        if proxy == httpx.URL(GENERATION_PROXY_BASE_URL):
+            return proxy, httpx.URL(UPSTREAM_MODEL_GATEWAY_URL)
+    return None
+
+
+def _generation_egress_policy(policy: EgressPolicy, generation_gateway_url: str | None) -> EgressPolicy:
+    if policy == "*" or not policy or generation_gateway_url is None:
+        return policy
+    route = _configured_generation_proxy(generation_gateway_url)
+    if route is None:
+        return policy
+    proxy, upstream = route
+    try:
+        _, domains = resolve_allowed_addresses(policy)
+    except ValueError:
+        return policy
+    if upstream.host in domains and proxy.host not in domains:
+        return [*policy, proxy.host]
+    return policy
+
+
 async def _create_generation_deadline_controller(
     contract: AgentContractRequest,
     plan: GenerationPlan,
@@ -555,12 +584,19 @@ async def _create_generation_deadline_controller(
         and contract.inference_settings_attested
         and contract.model
         and contract.model.strip()
-        and resolved_secrets.get("MODEL_GATEWAY_URL")
-        and resolved_secrets.get("MODEL_GATEWAY_API_KEY")
+        and resolved_secrets.get(MODEL_GATEWAY_URL)
+        and resolved_secrets.get(MODEL_GATEWAY_API_KEY)
+        and scoped_env_vars.get(MODEL_GATEWAY_API_KEY)
     ):
         return ExternalServiceDeadlineController(base_allowance_seconds=plan.allowance_seconds)
 
-    accounting_id = sha256(scoped_env_vars["MODEL_GATEWAY_API_KEY"].encode()).hexdigest()
+    route = _configured_generation_proxy(EXTERNAL_SERVICE_GATEWAY_URL)
+    if route is not None:
+        _, upstream = route
+        if httpx.URL(scoped_env_vars[MODEL_GATEWAY_URL].rstrip("/")) != upstream:
+            return ExternalServiceDeadlineController(base_allowance_seconds=plan.allowance_seconds)
+
+    accounting_id = sha256(scoped_env_vars[MODEL_GATEWAY_API_KEY].encode()).hexdigest()
     client = ExternalServiceGatewayClient(
         EXTERNAL_SERVICE_GATEWAY_URL, control_token=EXTERNAL_SERVICE_GATEWAY_CONTROL_TOKEN
     )
@@ -831,7 +867,11 @@ async def _process_task_attempt(
     streamed_sandboxes: list[tuple[SandboxLink, str]] = []
 
     def on_sandbox_created(created: SandboxCreatedData) -> None:
-        link = SandboxLink(benchmark_id=benchmark_id, provider=created.provider)
+        link = SandboxLink(
+            benchmark_id=benchmark_id,
+            provider=created.provider,
+            attempt_id=task_attempt_id(task_row.id, attempt_started_at),
+        )
         streamed_sandboxes.append((link, created.sandbox_id))
         save_sighting(link, created.sandbox_id, sighting_time())
 
@@ -872,14 +912,14 @@ async def _process_task_attempt(
         remote_grading_authorization = RemoteGradingAuthorization(issuer=VALKYRIE_STAGE, token=grant)
 
     @asynccontextmanager
-    async def grading_credentials(secrets: dict[str, str] | None) -> AsyncGenerator[str | None]:
+    async def grading_credentials(secrets: dict[str, str] | None) -> AsyncGenerator[ScopedGateway | None]:
         if gateway_reference is None or remote_grading_authorization is not None:
             yield None
             return
         if secrets is None:
             references = start_benchmark_request.contract.secrets
             secrets = await resolve_secrets(
-                {name: references[name] for name in ("MODEL_GATEWAY_URL", "MODEL_GATEWAY_API_KEY")},
+                {name: references[name] for name in (MODEL_GATEWAY_URL, MODEL_GATEWAY_API_KEY)},
                 runtime.secrets,
             )
         try:
@@ -902,8 +942,8 @@ async def _process_task_attempt(
             attempt_id=attempt_id,
             identity={**identity, "agent_name": "grader"},
             org_name=org.name,
-        ) as token:
-            yield token
+        ) as gateway:
+            yield gateway
 
     child_egress: dict[str, ChildEgress] = {}
 
@@ -941,7 +981,7 @@ async def _process_task_attempt(
 
     async def resume_evaluation_with_wall(state: dict[str, Any]) -> Any:
         async with enforce_wall_deadline(task_row.credited_wall_deadline_at), resumed_child_egress() as grants:
-            async with grading_credentials(None) as grading_token:
+            async with grading_credentials(None) as grading_gateway:
                 result = await until_stream_ends(
                     run_benchmark_service_websocket(
                         benchmark_service.resume_evaluation(
@@ -953,7 +993,7 @@ async def _process_task_attempt(
                             dataset=start_benchmark_request.dataset,
                             sandbox_provider=sandbox_provider_config,
                             child_egress=grants,
-                            grading_token=grading_token,
+                            grading_token=grading_gateway.token if grading_gateway is not None else None,
                             remote_grading_authorization=remote_grading_authorization,
                         )
                     )
@@ -1315,6 +1355,7 @@ async def _process_task_attempt(
             "Benchmark": start_benchmark_request.benchmark_name,
             "Id": str(benchmark_id),
             "run-id": str(benchmark_id),
+            MODAL_ATTEMPT_TAG: attempt_id,
             "Task": task_row.task_id,
         }
 
@@ -1325,6 +1366,7 @@ async def _process_task_attempt(
             resolved_secrets = await resolve_secrets(start_benchmark_request.contract.secrets, runtime.secrets)
 
         deadline_controller: ExternalServiceDeadlineController
+        sandbox_gateway_url: str | None = None
 
         task_env = folder.env if folder is not None else {}
         task_secret_values = [task_env[name] for name in folder.secret_env] if folder is not None else []
@@ -1342,9 +1384,7 @@ async def _process_task_attempt(
             **recovery_attempt.environment,
         }
         redact_error: Callable[[str], str] | None = None
-        secret_env_names = (
-            (*start_benchmark_request.contract.secrets, *task_data.sandbox_secrets) if task_data.sandbox_secrets else ()
-        )
+        secret_env_names: tuple[str, ...] = ()
 
         async def persist_generation_accounting_summary(summary: GenerationAccountingSummary) -> None:
             await _persist_generation_accounting_summary(summary, control=control, attempt=task_row.ref)
@@ -1360,7 +1400,8 @@ async def _process_task_attempt(
 
         @asynccontextmanager
         async def sandbox_context() -> AsyncGenerator[Sandbox]:
-            nonlocal deadline_controller, start_sandbox_build_time, redact_error, phase
+            nonlocal deadline_controller, start_sandbox_build_time, redact_error, phase, sandbox_gateway_url
+            nonlocal secret_env_names
             start_sandbox_build_time = time.perf_counter()
             sandbox_name = (
                 task_row.task_id if queue_context is None else queued_sandbox_name(task_row.id, attempt_started_at)
@@ -1387,13 +1428,28 @@ async def _process_task_attempt(
                 deadline_controller = await _create_generation_deadline_controller(
                     contract, plan, resolved_secrets, scoped_env_vars
                 )
-                gateway_url = scoped_gateway_url(env_vars, attested_model=attested_model, org_name=org.name)
+                sandbox_gateway_url = scoped_gateway_url(
+                    scoped_env_vars, attested_model=attested_model, org_name=org.name
+                )
                 sandbox_environment = stage_egress.sandbox_environment(
                     SandboxEnvironment(scoped_env_vars, task_data.sandbox_secrets or {}),
-                    ScopedGateway(gateway_url, scoped_env_vars["MODEL_GATEWAY_API_KEY"]) if gateway_url else None,
+                    ScopedGateway(sandbox_gateway_url, scoped_env_vars[MODEL_GATEWAY_API_KEY])
+                    if sandbox_gateway_url
+                    else None,
                 )
                 redact_error = create_agent_error_redactor(
-                    [*(scoped_env_vars[name] for name in contract.secrets), *task_secret_values]
+                    [
+                        *(scoped_env_vars[name] for name in contract.secrets if name in scoped_env_vars),
+                        *task_secret_values,
+                    ]
+                )
+                secret_env_names = (
+                    (
+                        *(name for name in contract.secrets if name in sandbox_environment.env_vars),
+                        *sandbox_environment.secrets,
+                    )
+                    if sandbox_environment.secrets
+                    else ()
                 )
                 phase = FailurePhase.SANDBOX
 
@@ -1414,7 +1470,9 @@ async def _process_task_attempt(
                     creation_semaphore=creation_semaphore,
                     creation_state=creation_state,
                     unique_name=queue_context is None,
-                    sandbox_link=SandboxLink(benchmark_id=benchmark_id, provider=sandbox_provider_config.type),
+                    sandbox_link=SandboxLink(
+                        benchmark_id=benchmark_id, provider=sandbox_provider_config.type, attempt_id=attempt_id
+                    ),
                     record_sandbox=control.record_sandbox,
                     record_sandbox_cost=control.record_sandbox_cost,
                 ) as sandbox:
@@ -1551,7 +1609,7 @@ async def _process_task_attempt(
                         task_row.id,
                         attempt_id,
                         task_row.credited_wall_deadline_at,
-                        gateway_url=scoped_gateway_url(env_vars, attested_model=attested_model, org_name=org.name),
+                        gateway_url=sandbox_gateway_url,
                     )
 
                 if egress_proxy is not None:
@@ -1608,8 +1666,13 @@ async def _process_task_attempt(
                 ) -> tuple[AgentCausedExitReason | None, float]:
                     nonlocal agent_attempt_started, phase, redact_error
                     run_egress = stage_policy(run_egress, "run", step_name, "run" if step_name else None)
+                    generation_gateway_url = (
+                        EXTERNAL_SERVICE_GATEWAY_URL if run_controller.snapshot is not None else None
+                    )
                     run_access = RunStageAccess()
                     if not unrestricted_docker:
+                        if not task_data.egress.run_through_proxy:
+                            run_egress = _generation_egress_policy(run_egress, generation_gateway_url)
                         run_access = await sandbox_stack.enter_async_context(
                             stage_egress.run_stage(
                                 agent_sandbox,
@@ -1638,9 +1701,6 @@ async def _process_task_attempt(
                         redact_error = redact_with_egress_secrets
                     agent_attempt_started = True
                     phase = FailurePhase.AGENT
-                    generation_gateway_url = (
-                        EXTERNAL_SERVICE_GATEWAY_URL if run_controller.snapshot is not None else None
-                    )
                     try:
                         exit_reason, agent_run_time = await run_agent(
                             agent_sandbox,
@@ -1669,7 +1729,7 @@ async def _process_task_attempt(
                             on_search_costs=lambda charges: save_search_costs(charges, step_name),
                         )
                     except AgentRunFailedError as agent_error:
-                        gateway_url = generation_gateway_url or resolved_secrets.get("MODEL_GATEWAY_URL")
+                        gateway_url = generation_gateway_url or resolved_secrets.get(MODEL_GATEWAY_URL)
                         gateway_host = urlsplit(gateway_url).hostname if gateway_url else None
                         if gateway_host and not await sandbox_resolves(agent_sandbox, gateway_host):
                             raise SandboxDNSResolutionError(
@@ -1773,6 +1833,7 @@ async def _process_task_attempt(
                             set_phase=set_phase,
                             redact=lambda text: redact_error(text) if redact_error is not None else text,
                             restrict_egress=restrict_egress,
+                            grading_gateway=lambda: grading_credentials(resolved_secrets),
                         ),
                         deadline_controller,  # noqa: F821
                     )
@@ -1828,23 +1889,31 @@ async def _process_task_attempt(
                             )
 
                     try:
-                        async with grading_credentials(resolved_secrets) as grading_token:
-                            evaluation_result = await until_stream_ends(
-                                run_benchmark_service_websocket(
-                                    benchmark_service.evaluate_instance(
-                                        task_row.task_id,
-                                        sandbox.id,
-                                        on_message=task_logs.write_line,
-                                        on_eval_resume_state=on_eval_resume_state,
-                                        on_sandbox_created=on_evaluation_sandbox_created,
-                                        dataset=start_benchmark_request.dataset,
-                                        sandbox_provider=sandbox_provider_config,
-                                        child_egress=child_egress,
-                                        grading_token=grading_token,
-                                        remote_grading_authorization=remote_grading_authorization,
-                                    )
+                        async with grading_credentials(resolved_secrets) as grading_gateway:
+                            evaluation = (
+                                benchmark_service.evaluate_instance(
+                                    task_row.task_id,
+                                    sandbox.id,
+                                    sandbox_provider_config,
+                                    on_message=task_logs.write_line,
+                                    on_sandbox_created=on_evaluation_sandbox_created,
+                                    grading_gateway=grading_gateway,
+                                )
+                                if isinstance(benchmark_service, DatasetTaskService)
+                                else benchmark_service.evaluate_instance(
+                                    task_row.task_id,
+                                    sandbox.id,
+                                    on_message=task_logs.write_line,
+                                    on_eval_resume_state=on_eval_resume_state,
+                                    on_sandbox_created=on_evaluation_sandbox_created,
+                                    dataset=start_benchmark_request.dataset,
+                                    sandbox_provider=sandbox_provider_config,
+                                    child_egress=child_egress,
+                                    grading_token=grading_gateway.token if grading_gateway is not None else None,
+                                    remote_grading_authorization=remote_grading_authorization,
                                 )
                             )
+                            evaluation_result = await until_stream_ends(run_benchmark_service_websocket(evaluation))
                     finally:
                         for failure in await asyncio.gather(*grading_releases, return_exceptions=True):
                             if failure is not None:

@@ -37,7 +37,7 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 import tracker.sandbox as sandbox_module
-import tracker.runtime.model_gateway as model_gateway
+from tracker.clients.model_gateway import tenant
 import tracker.services.runs.start as run_orchestration_module
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
@@ -1318,6 +1318,8 @@ class TestBenchmarkServiceFailures:
             contract = contract.model_copy(update={"model": "openai/gpt-4o", "inference_settings_attested": True})
 
             def gateway_response(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/registry":
+                    return httpx.Response(503)
                 if request.url.path == "/service-auth":
                     return httpx.Response(
                         200,
@@ -1331,7 +1333,7 @@ class TestBenchmarkServiceFailures:
                 return httpx.Response(200)
 
             gateway_client = httpx.AsyncClient(transport=httpx.MockTransport(gateway_response))
-            monkeypatch.setattr(model_gateway, "_client", gateway_client)
+            monkeypatch.setattr(tenant, "_client", gateway_client)
         if secret_source in {"provider", "provider_and_contract"}:
             task_data = make_retrieve_task_response().model_copy(
                 update={"sandbox_secrets": {"PROVIDER_TOKEN": "provider-key-reference"}}

@@ -4,6 +4,7 @@ import traceback
 from collections.abc import Generator
 from typing import Protocol
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic, sleep
@@ -28,6 +29,7 @@ from tracker.database.models import (
     DescopeMembership,
     ExecutorDispatch,
     ExecutorRelease,
+    Org,
     Project,
     RunProject,
     Task,
@@ -36,6 +38,11 @@ from tracker.domain import BenchmarkStatus, ExecutorDispatchKind, SpendType, Tas
 from tracker.local.resources import LocalResources
 from tracker.types import AgentContractRequest, AWSBenchmarkArguments, LocalBenchmarkArguments
 from tracker.repositories.project import ProjectRepository
+from tracker.repositories.benchmark_definition import BenchmarkDefinitionRepository
+from tracker.repositories.dataset import DatasetRepository
+from tracker.repositories.dataset_upload import DatasetUploadRepository
+from tracker.repositories.dataset_version import DatasetVersionRepository
+from tracker.domain import DatasetUploadStatus
 
 _TRACKER_ROOT = Path(__file__).resolve().parents[4]
 _ALEMBIC_INI = _TRACKER_ROOT / "alembic.ini"
@@ -69,6 +76,43 @@ _UNIQUE_PROJECT_NAME_PREDECESSOR = "3222f9e0a6ce"
 _DROP_PROJECT_REVISION = "f1d3b5a7c9e2"
 _DROP_PROJECT_PREDECESSOR = "d3e4f5a6b7c8"
 _PRE_PROJECT_COPY_REVISION = "a4c70e9d133f"
+
+
+@pytest.mark.description("The upload migration stores jobs and reverses without changing existing dataset versions.")
+def test_dataset_upload_migration_round_trip(migration_database_url: str) -> None:
+    result = _run_alembic(migration_database_url, "upgrade", "d4a8c1e7f3b2")
+    assert result.returncode == 0, result.stderr
+    engine = create_engine(migration_database_url)
+    try:
+        with Session(engine) as session:
+            org = Org(name="upload-migration")
+            session.add(org)
+            session.commit()
+            benchmark = BenchmarkDefinitionRepository(session).create(org.id, "bench", "", None)
+            dataset_id = DatasetRepository(session).create(benchmark.id, "data", "", None).id
+            version, _ = DatasetVersionRepository(session).publish(
+                dataset_id, {"task-a": ("sha256:" + "a" * 64, 100)}, [], None
+            )
+            version_id = version.id
+        before = _schema_snapshot(engine)
+        result = _run_alembic(migration_database_url, "upgrade", "a83d67c12e49")
+        assert result.returncode == 0, result.stderr
+        with Session(engine) as session:
+            repository = DatasetUploadRepository(session)
+            upload = repository.create_upload(dataset_id, uuid4(), "user:author", "b" * 64, 100, None)
+            assert upload.status == DatasetUploadStatus.UPLOADING
+            assert upload.created_at.utcoffset() == timedelta(0)
+            assert upload.warnings == []
+        result = _run_alembic(migration_database_url, "downgrade", "d4a8c1e7f3b2")
+        assert result.returncode == 0, result.stderr
+        assert _schema_snapshot(engine) == before
+        result = _run_alembic(migration_database_url, "upgrade", "a83d67c12e49")
+        assert result.returncode == 0, result.stderr
+        with Session(engine) as session:
+            assert DatasetVersionRepository(session).list_all(dataset_id)[0].id == version_id
+            assert DatasetUploadRepository(session).list_uploads(dataset_id, "user:author") == []
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.description("The project cutover marker upgrades, persists completion, downgrades and upgrades again.")
@@ -1983,4 +2027,134 @@ def test_project_table_drop_refuses_incomplete_copy(
         assert set(connection.execute(text("SELECT id FROM project")).scalars()) == set(project_ids)
     current = _run_alembic(migration_database_url, "current", "")
     assert current.returncode == 0, current.stderr
+    engine.dispose()
+
+
+_COST_COLUMNS_PREDECESSOR = "e8b2d4f6a1c3"
+_PROJECT_TOTALS = text(
+    "WITH ranked AS ("
+    " SELECT benchmark_id, project_id,"
+    " row_number() OVER (PARTITION BY benchmark_id ORDER BY id DESC) AS newest FROM run_project"
+    ") "
+    "SELECT ranked.project_id, run_cost.cost_type, round(sum(run_cost.amount_usd)::numeric, 9) "
+    "FROM run_cost JOIN ranked ON ranked.benchmark_id = run_cost.benchmark_id AND ranked.newest = 1 "
+    "GROUP BY ranked.project_id, run_cost.cost_type"
+)
+
+
+def _project_totals(engine: Engine) -> dict[tuple[str, str], str]:
+    with engine.connect() as connection:
+        rows = connection.execute(_PROJECT_TOTALS).all()
+    return {(str(project_id), cost_type): str(total) for project_id, cost_type, total in rows}
+
+
+def _project_sums(engine: Engine) -> dict[str, Decimal]:
+    sums: dict[str, Decimal] = {}
+    for (project_id, _), total in _project_totals(engine).items():
+        sums[project_id] = sums.get(project_id, Decimal(0)) + Decimal(total)
+    return sums
+
+
+def _seed_dev_costs(engine: Engine) -> list[str]:
+    org_id, project_id = uuid4(), uuid4()
+    runs = [str(uuid4()) for _ in range(2)]
+    arguments = AWSBenchmarkArguments(
+        contract=AgentContractRequest(name="agent", install_cmd="true", run_cmd="true"), concurrency=1
+    ).model_dump_json()
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO org (id, name) VALUES (:id, 'costs')"), {"id": org_id})
+        for run_id in runs:
+            connection.execute(
+                text(
+                    "INSERT INTO benchmark (id, org_id, name, started_at, finished_at, status, arguments) "
+                    "VALUES (:id, :org, 'costs', now(), now(), 'FINISHED', CAST(:arguments AS json))"
+                ),
+                {"id": run_id, "org": org_id, "arguments": arguments},
+            )
+            connection.execute(
+                text("INSERT INTO run_project (benchmark_id, project_id, created_at) VALUES (:run, :project, now())"),
+                {"run": run_id, "project": project_id},
+            )
+        for run_id, cost_type, provider, source_id, amount in [
+            (runs[0], "sandbox", "daytona", "sb-1:2026-11-03T04:00:00+00:00", 0.123456789),
+            (runs[0], "sandbox", "modal", runs[0], 1.75),
+            (runs[0], "search", "tavily", "task-1:attempt-1", 0.008),
+            (runs[1], "search", "tavily", "task-1:attempt-1", 0.008),
+        ]:
+            connection.execute(
+                text(
+                    "INSERT INTO run_cost (id, benchmark_id, cost_type, provider, source_id, amount_usd) "
+                    "VALUES (:id, :run, :type, :provider, :source, :amount)"
+                ),
+                {
+                    "id": uuid4(),
+                    "run": run_id,
+                    "type": cost_type,
+                    "provider": provider,
+                    "source": source_id,
+                    "amount": amount,
+                },
+            )
+    return runs
+
+
+@pytest.mark.description(
+    "The cost columns migration keeps every existing run cost and keys sandbox rows by resource as well as source.\n"
+    "\n"
+    "Test cases:\n"
+    "- Per-project totals by cost type are equal before and after the upgrade.\n"
+    "- Existing rows read with no attempt, resource or usage.\n"
+    "- A resource row written twice is stored once, and an old whole-life row stays unique per source.\n"
+    "- The downgrade keeps every row and each project's total, and the old conflict target works again."
+)
+def test_cost_columns_migration_is_additive(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", _COST_COLUMNS_PREDECESSOR)
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    runs = _seed_dev_costs(engine)
+    before = _project_totals(engine)
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "head")
+    assert upgrade.returncode == 0, upgrade.stderr
+    assert _project_totals(engine) == before
+    with engine.connect() as connection:
+        existing = connection.execute(text("SELECT DISTINCT attempt_id, resource, quantity, unit FROM run_cost")).all()
+    assert existing == [(None, None, None, None)]
+
+    insert = text(
+        "INSERT INTO run_cost (id, benchmark_id, cost_type, resource, provider, source_id, amount_usd) "
+        "VALUES (gen_random_uuid(), :run, 'sandbox', :resource, 'daytona', :source, 0.5) "
+        "ON CONFLICT (provider, source_id, resource) WHERE cost_type = 'sandbox' DO NOTHING"
+    )
+    attempts = [
+        ("cpu", "sb-1:2026-11-01T00"),
+        ("cpu", "sb-1:2026-11-01T00"),
+        ("memory", "sb-1:2026-11-01T00"),
+        (None, "sb-1:2026-11-03T04:00:00+00:00"),
+    ]
+    with engine.begin() as connection:
+        written = [
+            connection.execute(insert, {"run": runs[0], "resource": resource, "source": source}).rowcount
+            for resource, source in attempts
+        ]
+    assert written == [1, 0, 1, 0]
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT count(*) FROM run_cost")).scalar_one()
+    totals = _project_sums(engine)
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", _COST_COLUMNS_PREDECESSOR)
+    assert downgrade.returncode == 0, downgrade.stderr
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT count(*) FROM run_cost")).scalar_one() == rows
+        old_target = connection.execute(
+            text(
+                "INSERT INTO run_cost (id, benchmark_id, cost_type, provider, source_id, amount_usd) "
+                "VALUES (gen_random_uuid(), :run, 'sandbox', 'daytona', 'sb-1:2026-11-03T04:00:00+00:00', 1) "
+                "ON CONFLICT (provider, source_id) WHERE cost_type = 'sandbox' DO NOTHING"
+            ),
+            {"run": runs[0]},
+        )
+        assert old_target.rowcount == 0
+    assert _project_sums(engine) == totals
+    assert "resource" not in {column["name"] for column in inspect(engine).get_columns("run_cost")}
     engine.dispose()

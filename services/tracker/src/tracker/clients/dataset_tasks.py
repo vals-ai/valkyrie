@@ -1,6 +1,6 @@
 import posixpath
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar
 
@@ -19,6 +19,7 @@ from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.remote_grading import RemoteGradingAuthorization
 from benchmark_service.sandbox.types import Sandbox, SandboxSource
 from benchmark_service.schemas import (
+    EgressPolicy,
     ChildEgress,
     GradingRequirementsResponse,
     JsonValue,
@@ -30,6 +31,7 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
 )
 
+from tracker.clients.model_gateway import MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_URL
 from tracker.services.datasets.compose import start_compose_runtime
 from tracker.services.datasets.config import MAIN_SERVICE, StepConfig, TaskConfig, VerifierConfig
 from tracker.services.datasets.artifacts import (
@@ -53,7 +55,12 @@ from tracker.services.datasets.healthcheck import wait_until_healthy
 from tracker.services.datasets.image_config import dockerfile_base_image, image_workdir
 from tracker.services.datasets.oracle import SOLUTION_DIR, SOLUTION_REMOTE, SOLVE_SCRIPT
 from tracker.services.datasets.ref import DatasetRef, LocalDataset
-from tracker.services.datasets.retrieve_task import TaskFolderResponse, retrieve_task_response
+from tracker.services.datasets.retrieve_task import (
+    TaskFolderResponse,
+    retrieve_task_response,
+    stage_egress,
+    with_gateway,
+)
 from tracker.services.datasets.rewards import extract_rewards
 from tracker.services.datasets.separate_verifier import Layers, compose_verifier_resources, grade_separately
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, TaskSource
@@ -71,9 +78,15 @@ from tracker.services.datasets.steps import (
     step_verifier,
 )
 from tracker.services.datasets.validate import validate_task
+from tracker.runtime.run_egress import ScopedGateway
 from tracker.runtime.storage import ObjectStore
 from tracker.exceptions import InvalidSandboxConfigurationError
-from tracker.sandbox import create_agent_error_redactor, runtime_sandbox, working_directory_command
+from tracker.sandbox import (
+    apply_egress_policy,
+    create_agent_error_redactor,
+    runtime_sandbox,
+    working_directory_command,
+)
 
 _Result = TypeVar("_Result")
 TESTS_PART = "tests"
@@ -106,6 +119,7 @@ class ResolvedTask(NamedTuple):
     secret_values: list[str]
     compose_verifier_resources: list[Resources]
     steps: dict[str, ResolvedStep]
+    grading_models: list[str]
 
 
 class DatasetTaskService:
@@ -165,9 +179,12 @@ class DatasetTaskService:
                     )
                     secret_values.extend(env[name] for name in secret_env)
                     steps: dict[str, ResolvedStep] = {}
+                    grading_models = dict.fromkeys(report.config.verifier.models)
                     for step in report.config.steps:
+                        verifier = step_verifier(report.config, step)
+                        grading_models.update(dict.fromkeys(verifier.models))
                         step_env, step_sandbox_env, step_secrets = await self._resolve_grader(
-                            f"Task {task_id!r} step {step.name!r}", step_verifier(report.config, step)
+                            f"Task {task_id!r} step {step.name!r}", verifier
                         )
                         instruction = read_instruction(step_dir(task_dir, step) / INSTRUCTION_FILE)
                         steps[step.name] = ResolvedStep(instruction, step_env, step_sandbox_env)
@@ -181,6 +198,7 @@ class DatasetTaskService:
                         secret_values,
                         compose_verifier_resources(report.config, task_dir),
                         steps,
+                        list(grading_models),
                     )
                     self._build_contexts.push_async_exit(pending.pop_all())
         return self._tasks[task_id]
@@ -356,6 +374,7 @@ class DatasetTaskService:
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        grading_gateway: ScopedGateway | None = None,
     ) -> StepOutcome:
         provider = self._provider(sandbox_provider)
         outer = await provider.get_sandbox(instance_id)
@@ -382,6 +401,7 @@ class DatasetTaskService:
                         folder=f"{STEPS_DIR}/{step.name}/artifacts",
                         reset_tests=True,
                         layers=step_layers(config, step, task_dir),
+                        gateway=grading_gateway,
                     )
                 except VerifierResultError as error:
                     return StepOutcome(step.name, None, problem=str(error))
@@ -390,12 +410,12 @@ class DatasetTaskService:
         return StepOutcome(step.name, rewards, stopped, metadata=result.get("metadata"))
 
     async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
-        return []
+        return list((await self._task(task_id)).grading_models)
 
     async def grading_requirements_response(
         self, task_id: str, dataset: str | None = None
     ) -> GradingRequirementsResponse:
-        return GradingRequirementsResponse(models=[])
+        return GradingRequirementsResponse(models=await self.grading_requirements(task_id, dataset))
 
     async def monitoring_requirements(
         self, task_ids: list[str], dataset: str | None = None
@@ -414,12 +434,8 @@ class DatasetTaskService:
         instance_id: str,
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
-        dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
-        child_egress: dict[str, ChildEgress] | None = None,
-        grading_token: str | None = None,
-        remote_grading_authorization: RemoteGradingAuthorization | None = None,
+        grading_gateway: ScopedGateway | None = None,
     ) -> JsonValue:
         provider = self._provider(sandbox_provider)
         outer = await provider.get_sandbox(instance_id)
@@ -439,6 +455,7 @@ class DatasetTaskService:
                 provider,
                 on_message,
                 on_sandbox_created,
+                gateway=grading_gateway,
             )
 
     async def _grade(
@@ -457,12 +474,25 @@ class DatasetTaskService:
         folder: str = "artifacts",
         reset_tests: bool = False,
         layers: Layers | None = None,
+        gateway: ScopedGateway | None = None,
     ) -> dict[str, Any]:
         def say(message: str) -> None:
             if on_message is not None:
                 on_message(message)
 
-        redact = create_agent_error_redactor(task.secret_values)
+        secret_values = task.secret_values
+        if not config.verifier.models:
+            gateway = None
+        elif gateway is None:
+            raise InvalidSandboxConfigurationError(
+                f"Task {task_id!r} lists [verifier].models, but this run has no Model Gateway grading token. "
+                "Start the run in a project that has a Gateway key."
+            )
+        else:
+            verifier_env = verifier_env | {MODEL_GATEWAY_URL: gateway.url, MODEL_GATEWAY_API_KEY: gateway.token}
+            secret_values = [*secret_values, gateway.token]
+
+        redact = create_agent_error_redactor(secret_values)
         services = _services(outer, task.response.source, config)
         sandbox = services[MAIN_SERVICE]
 
@@ -482,16 +512,17 @@ class DatasetTaskService:
                 await upload_artifacts(task_id, services, staged, self._artifact_sink, say, folder)
             if not config.verifier.is_separate:
                 await discard_staged(services, staged)
-                return await grade_task(
-                    task_id,
-                    config,
-                    verifier_env,
-                    tests_dir,
-                    sandbox,
-                    on_message,
-                    redact=redact,
-                    reset_tests=reset_tests,
-                )
+                async with _open_to_gateway(outer, stage_egress(config.verifier, config.environment), gateway):
+                    return await grade_task(
+                        task_id,
+                        config,
+                        verifier_env,
+                        tests_dir,
+                        sandbox,
+                        on_message,
+                        redact=redact,
+                        reset_tests=reset_tests,
+                    )
             return await grade_separately(
                 task_id,
                 config,
@@ -508,6 +539,7 @@ class DatasetTaskService:
                 on_created,
                 redact,
                 layers,
+                gateway.url if gateway is not None else None,
             )
         finally:
             await discard_staged(services, staged)
@@ -519,6 +551,21 @@ class DatasetTaskService:
 
     async def _sandbox(self, instance_id: str, config: SandboxProviderConfig | None) -> Sandbox:
         return await self._provider(config).get_sandbox(instance_id)
+
+
+@asynccontextmanager
+async def _open_to_gateway(
+    sandbox: Sandbox, policy: EgressPolicy | None, gateway: ScopedGateway | None
+) -> AsyncIterator[None]:
+    if gateway is None or not isinstance(policy, list):
+        yield
+        return
+
+    await apply_egress_policy(sandbox, with_gateway(policy, gateway.url))
+    try:
+        yield
+    finally:
+        await apply_egress_policy(sandbox, policy)
 
 
 def _find_step(config: TaskConfig, name: str) -> StepConfig:

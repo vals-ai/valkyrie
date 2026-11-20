@@ -2,6 +2,7 @@
 
 from valkyrie.sdk.models._generated.projects import (
     NewProjectRequest,
+    ProjectBudget,
     ProjectCreateRequest,
     ProjectResponse,
     ProjectsResponse,
@@ -11,6 +12,7 @@ from valkyrie.sdk.models._generated.projects import (
 __all__ = [
     "SPEND_SUBCATEGORIES",
     "NewProjectRequest",
+    "ProjectBudget",
     "ProjectCreateRequest",
     "ProjectResponse",
     "ProjectsResponse",

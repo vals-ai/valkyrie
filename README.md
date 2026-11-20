@@ -73,6 +73,8 @@ The [quickstart guide](https://docs.valkyrie.vals.ai/get-started/quickstart) wal
 | Starting, monitoring, and managing runs | [runs/start](https://docs.valkyrie.vals.ai/runs/start) |
 | Results and output artifacts | [runs/results-and-outputs](https://docs.valkyrie.vals.ai/runs/results-and-outputs) |
 | Publishing your own tasks as a dataset | [benchmarks/datasets](https://docs.valkyrie.vals.ai/benchmarks/datasets) |
+| Building a benchmark service | [benchmarks/convert-a-benchmark](https://docs.valkyrie.vals.ai/benchmarks/convert-a-benchmark) |
+| How the benchmark service framework works | [packages/create-benchmark-service](packages/create-benchmark-service/README.md) |
 | Every CLI command | [reference/cli/index](https://docs.valkyrie.vals.ai/reference/cli/index) |
 | Python SDK | [sdk/quickstart](https://docs.valkyrie.vals.ai/sdk/quickstart) |
 | Running Tracker locally without AWS | [self-hosting/local-tracker](https://docs.valkyrie.vals.ai/self-hosting/local-tracker) |

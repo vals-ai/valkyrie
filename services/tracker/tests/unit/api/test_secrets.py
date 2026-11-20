@@ -188,7 +188,7 @@ def test_local_runs_have_no_secret_storage(monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert (response.status_code, response.json()["detail"]) == (
         400,
-        "This Tracker reads secrets from its secrets file",
+        "This Valkyrie server reads secrets from its secrets file",
     )
 
 

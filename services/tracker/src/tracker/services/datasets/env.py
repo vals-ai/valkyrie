@@ -7,7 +7,7 @@ from tracker.exceptions import (
     SecretDecryptionError,
     SecretNotFoundError,
 )
-from tracker.runtime.secrets import SecretStore, secret_display_name, secret_set_instruction
+from tracker.runtime.secrets import TENANT_SECRET_ROOT, SecretStore, secret_display_name, secret_set_instruction
 
 TEMPLATE = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
 
@@ -55,7 +55,18 @@ def secret_reader(store: SecretStore, stored_names: Callable[[str], list[str]]) 
             return str(value)
         detail = " ".join(dict.fromkeys(str(error.args[0]) for error in failures))
         checked = ", ".join(dict.fromkeys(secret_display_name(candidate) for candidate in candidates))
-        primary = next((error for error in failures if isinstance(error, SecretAccessDeniedError)), None)
+        primary: SecretConfigurationError | SecretAccessDeniedError | None = next(
+            (error for error in failures if isinstance(error, SecretAccessDeniedError)), None
+        )
+        if (
+            len(candidates) == 2
+            and candidates[0].startswith(TENANT_SECRET_ROOT)
+            and candidates[1] == name
+            and isinstance(failures[0], SecretNotFoundError)
+            and isinstance(failures[1], (SecretNotFoundError, SecretAccessDeniedError))
+        ):
+            primary = failures[0]
+            detail = str(primary.args[0])
         if primary is None:
             primary = next(
                 (error for error in failures if not isinstance(error, SecretNotFoundError)),

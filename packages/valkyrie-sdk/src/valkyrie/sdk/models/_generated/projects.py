@@ -1,10 +1,22 @@
 from __future__ import annotations
+from valkyrie.sdk.models._base import ResponseModel, UTCDateTime
 from enum import Enum
 from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 from decimal import Decimal
 from uuid import UUID
-from valkyrie.sdk.models._base import ResponseModel, UTCDateTime
+
+
+class ProjectBudget(ResponseModel):
+    """A project's limit and its all-time spend in total and per cost type."""
+
+    limit_dollars: float | None
+    limit_reason: str | None
+    limit_applied: bool
+    total_usd: float
+    by_type_usd: dict[str, float]
+    model_spend_available: bool
+    model_through: UTCDateTime | None
 
 
 class SpendType(str, Enum):

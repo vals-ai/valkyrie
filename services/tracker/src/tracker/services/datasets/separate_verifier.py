@@ -34,7 +34,7 @@ from tracker.services.datasets.compose import ComposeRuntime, compose_runtime, c
 from tracker.services.datasets.config import MAIN_SERVICE, EnvironmentConfig, TaskConfig
 from tracker.services.datasets.folder import COMPOSE_FILE, DOCKERFILE
 from tracker.services.datasets.grading import ARTIFACTS_DIR, OPEN_LOG_DIRS, VERIFIER_DIR, grade_task, keep
-from tracker.services.datasets.retrieve_task import sandbox_resources, stage_egress
+from tracker.services.datasets.retrieve_task import sandbox_resources, stage_egress, with_gateway
 from tracker.services.datasets.steps import step_config, step_layers
 from tracker.sandbox import apply_egress_policy, runtime_sandbox
 from tracker.egress import select_policy
@@ -319,6 +319,7 @@ async def grade_separately(
     on_created: Callable[[SandboxCreatedData], None] | None = None,
     redact: Callable[[str], str] = keep,
     layers: Layers | None = None,
+    gateway_url: str | None = None,
 ) -> dict[str, Any]:
     environment = verifier_environment(task_id, tests_dir, config, agent_source, agent_compose, layers)
     source = environment.source
@@ -330,6 +331,8 @@ async def grade_separately(
         "evaluation",
         phase="separate_verifier",
     )
+    if gateway_url is not None:
+        policy = with_gateway(policy, gateway_url)
     with _collect_announcements(on_created is not None) as announced:
         verifier = await _create_sandbox(provider, task_id, config, source, sandbox_env, labels)
     try:
