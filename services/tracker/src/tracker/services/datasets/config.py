@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     FiniteFloat,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -21,7 +22,6 @@ HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 IPV4_RANGE = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}/[0-9]{1,2}")
 SERVICE_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
 MAIN_SERVICE = "main"
-MAX_ARTIFACTS = 20
 MAX_STEPS = 100
 MAX_NAME_PART_BYTES = 200
 MAX_NAME_BYTES = 700
@@ -35,6 +35,13 @@ COOKIE_HEADERS = {"cookie", "set-cookie"}
 STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 PACKAGE_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*")
 SIZE_UNITS = {"G": 1024.0, "M": 1.0, "K": 1 / 1024}
+SNAPSHOT_REFERENCE = re.compile(r"\S+")
+IMAGE_PATH_PART = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+DOCKER_IMAGE = re.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::[0-9]{1,5})?/)?"
+    rf"{IMAGE_PATH_PART}(?:/{IMAGE_PATH_PART})*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,})?"
+)
 
 
 class NetworkMode(StrEnum):
@@ -196,7 +203,7 @@ class MCPServerConfig(BaseModel):
         return self
 
 
-def _check_user(value: Any) -> Any:
+def check_user(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ValueError("a user is a name or a numeric UID.")
     user = str(value)
@@ -205,7 +212,7 @@ def _check_user(value: Any) -> Any:
     return user
 
 
-SandboxUser = Annotated[str, BeforeValidator(_check_user)]
+SandboxUser = Annotated[str, BeforeValidator(check_user)]
 
 
 def _check_service(name: str | None) -> str | None:
@@ -279,6 +286,8 @@ class EnvironmentConfig(NetworkSettings):
     network_mode: NetworkMode | None = None
     build_timeout_sec: float = 600.0
     docker_image: str | None = None
+    snapshot: str | None = None
+    snapshot_target: str | None = None
     os: TaskOS = TaskOS.LINUX
     cpus: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     memory_mb: int | None = Field(default=None, gt=0)
@@ -290,6 +299,30 @@ class EnvironmentConfig(NetworkSettings):
     healthcheck: HealthcheckConfig | None = None
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     workdir: str | None = None
+
+    @field_validator("docker_image")
+    @classmethod
+    def check_docker_image(cls, image: str | None) -> str | None:
+        if image is not None and not DOCKER_IMAGE.fullmatch(image):
+            raise ValueError(f"docker_image must be an image reference like 'ubuntu:24.04'. Got: {image!r}")
+        return image
+
+    @field_validator("snapshot", "snapshot_target")
+    @classmethod
+    def check_snapshot_reference(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None and not SNAPSHOT_REFERENCE.fullmatch(value):
+            raise ValueError(f"{info.field_name} must be a name or ID without spaces. Got: {value!r}")
+        return value
+
+    @model_validator(mode="after")
+    def a_snapshot_is_the_only_source(self) -> Self:
+        if self.snapshot_target is not None and self.snapshot is None:
+            raise ValueError("snapshot_target is only valid with snapshot.")
+        if self.snapshot is not None and self.docker_image is not None:
+            raise ValueError("snapshot and docker_image are both sandbox sources. Set only one.")
+        if self.snapshot is not None and self.gpus:
+            raise ValueError("a snapshot sandbox can't request gpus.")
+        return self
 
     @field_validator("mcp_servers")
     @classmethod
@@ -391,18 +424,10 @@ class TaskConfig(BaseModel):
 
     @model_validator(mode="after")
     def artifacts_are_distinct(self) -> Self:
-        task_names = [artifact.name for artifact in self.artifacts]
         for artifacts in (self.artifacts, *(step.artifacts for step in self.steps)):
             names = [artifact.name for artifact in artifacts]
-            if len(names) > MAX_ARTIFACTS:
-                raise ValueError(f"a task or a step may name at most {MAX_ARTIFACTS} artifacts.")
             if len(set(names)) != len(names):
                 raise ValueError("two artifacts would be stored under the same name.")
-        for step in self.steps:
-            if len({*task_names, *(artifact.name for artifact in step.artifacts)}) > MAX_ARTIFACTS:
-                raise ValueError(
-                    f"step {step.name!r} would collect more than {MAX_ARTIFACTS} artifacts with the task's."
-                )
         return self
 
     @model_validator(mode="after")

@@ -5,8 +5,9 @@ from vals_benchmark_service.app import _grading_provider_config  # pyright: igno
 
 
 def test_grading_provider_selects_v2_only_when_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET"):
+    for name in ("DAYTONA_API_KEY", "DAYTONA_TARGET"):
         monkeypatch.setenv(name, "v0")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://app.daytona.io/api")
     monkeypatch.delenv("GRADING_SANDBOX_PROVIDER", raising=False)
     assert isinstance(_grading_provider_config(), DaytonaProviderConfig)
 

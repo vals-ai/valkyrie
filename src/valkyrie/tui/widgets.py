@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Mapping
-from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
 from rich.text import Text
@@ -15,7 +14,8 @@ from textual.widgets import DataTable
 
 from valkyrie.display import terminal_safe
 from valkyrie.sdk.models import BenchmarkStatus, FailureCategory, TaskStatus
-from valkyrie.tui.theme import BRAND, palette
+from valkyrie.palette import BRAND, STATUSES
+from valkyrie.tui.theme import palette
 from valkyrie.tui.source import Environment
 
 if TYPE_CHECKING:
@@ -26,25 +26,10 @@ def shown(text: str) -> str:
     return terminal_safe(text, preserve_newlines=True)
 
 
-RUN_STATUS = {
-    BenchmarkStatus.IN_PROGRESS: ("●", "running"),
-    BenchmarkStatus.STOPPING: ("◍", "warning"),
-    BenchmarkStatus.STOPPED: ("■", "stopped"),
-    BenchmarkStatus.FINISHED: ("✓", "finished"),
-    BenchmarkStatus.ERROR: ("✗", "error"),
-}
-TASK_STATUS = {
-    TaskStatus.PENDING: ("◌", "faint"),
-    TaskStatus.BUILDING: ("◔", "running"),
-    TaskStatus.IN_PROGRESS: ("●", "running"),
-    TaskStatus.EVALUATING: ("◑", "warning"),
-    TaskStatus.FINISHED: ("✓", "finished"),
-    TaskStatus.ERROR: ("✗", "error"),
-    TaskStatus.STOPPED: ("■", "stopped"),
-}
 CATEGORY_LABEL = {
     FailureCategory.INFRASTRUCTURE: "infra",
     FailureCategory.BENCHMARK_SERVICE: "service",
+    FailureCategory.DATASET: "dataset",
     FailureCategory.AGENT: "agent",
     FailureCategory.CANCELLED: "cancelled",
     FailureCategory.UNKNOWN: "unknown",
@@ -57,13 +42,8 @@ BAR_SEGMENTS = [
 ]
 
 
-def run_glyph(status: BenchmarkStatus) -> tuple[str, str]:
-    glyph, role = RUN_STATUS[status]
-    return glyph, getattr(palette(), role)
-
-
-def task_glyph(status: TaskStatus) -> tuple[str, str]:
-    glyph, role = TASK_STATUS[status]
+def status_glyph(status: BenchmarkStatus | TaskStatus) -> tuple[str, str]:
+    glyph, role = STATUSES[status.value]
     return glyph, getattr(palette(), role)
 
 
@@ -72,12 +52,8 @@ def short_id(value: object) -> str:
 
 
 def run_status(status: BenchmarkStatus) -> Text:
-    glyph, color = run_glyph(status)
+    glyph, color = status_glyph(status)
     return Text(glyph, style=color)
-
-
-def status_label(status: BenchmarkStatus | TaskStatus) -> str:
-    return status.value.replace("_", " ").lower()
 
 
 def progress_bar(counts: Mapping[str, int], total: int, width: int) -> Text:
@@ -92,17 +68,6 @@ def progress_bar(counts: Mapping[str, int], total: int, width: int) -> Text:
         used += cells
     bar.append("━" * (width - used), style=palette().track)
     return bar
-
-
-def ago(moment: datetime, now: datetime, *, compact: bool = False) -> str:
-    seconds = max(int((now - moment).total_seconds()), 0)
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h" if compact else f"{seconds // 3600}h {seconds % 3600 // 60:02}m"
-    return f"{seconds // 86400}d"
 
 
 def keys_text(*pairs: tuple[str, str]) -> Text:

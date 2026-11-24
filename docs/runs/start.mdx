@@ -50,7 +50,7 @@ To pick tasks by ID, export the dataset's task IDs, edit the file, and pass it b
 ```bash
 valkyrie benchmark tasks swebench --output tasks.txt
 
-valkyrie run start --agent my-agent --benchmark swebench --task-ids-file tasks.txt
+valkyrie run start --agent my-agent --benchmark swebench --task-ids @tasks.txt
 ```
 
 `--task-ids` takes a comma-separated list instead.
@@ -125,38 +125,13 @@ A CLI start names a project by its handle with `--project`.
   creates the first time.
 - If your organization requires a project, the Tracker refuses a start without one and says
   so.
-- The handle is lowercase letters, digits and hyphens, such as `google-report-xyz`, and it
-  never changes.
-- The name, such as `Google Report XYZ`, is the label people read.
-- The project holds the spend type, subcategory, customer and extra tags, so you set them
-  once when you create it.
-- Valkyrie saves the project with the run, so failed and stopped runs keep it, and cost
-  reports can group spend by it.
+- Valkyrie saves the project with the run, so failed and stopped runs keep it.
 
 ```bash
-valkyrie project create google-report-xyz --name "Google Report XYZ" \
-  --spend-type customer --subcategory report --customer google --tag engagement=q4 \
-  --budget 300 --budget-reason "3 runs, about 100 each"
-valkyrie run start --agent my-agent --benchmark swebench --project google-report-xyz
+valkyrie run start --agent my-agent --benchmark swebench --project my-project
 ```
 
-| `--spend-type` | Display name | Stored `--subcategory` value | `--customer` |
-| --- | --- | --- | --- |
-| `development` | New Benchmark Generation | `new_benchmark_generation` | optional |
-| `development` | New Benchmark Launch Runs | `new_benchmark_launch_runs` | optional |
-| `development` | Post-Launch Benchmark Update | `post_launch_benchmark_update` | optional |
-| `customer` | Report | `report` | required |
-| `customer` | Paid Run | `paid_run` | required |
-| `customer` | Eval Server | `eval_server` | required |
-| `customer` | Platform | `platform` | required |
-| `internal` | Unpaid Leaderboard Run | `unpaid_leaderboard_run` | optional |
-| `internal` | Other Unpaid Run | `other_unpaid_run` | optional |
-| `internal` | Fellows/Interns | `fellows_interns` | optional |
-| `internal` | Blog | `blog` | optional |
-| `internal` | Miscellaneous | `miscellaneous` | optional |
-
-`--name`, `--spend-type` and `--subcategory` are required. `--tag key=value` adds extra
-tags and can be repeated. List your organization's projects:
+To create a project, see [`valkyrie project create`](/reference/cli/project#create). List your organization's projects:
 
 ```bash
 valkyrie project list
@@ -168,16 +143,16 @@ valkyrie project list
 - Runs already in the project keep it, and its spend stays in cost reports.
 
 To move a run to another project later, in any run state, retag it. Retagging adds a new
-link and keeps the earlier ones, and `valkyrie run fetch` shows the newest:
+link and keeps the earlier ones, and `valkyrie run show` shows the newest:
 
 ```bash
-valkyrie run retag RUN_ID --project google-report-xyz
+valkyrie run update RUN_ID --project my-project
 ```
 
 ## Watch the run as it starts
 
-`--connect` streams progress until the run finishes. Without it, attach later with
-`valkyrie run fetch RUN_ID --connect`, where *`RUN_ID`* is the ID that `run start`
+`--follow` streams progress until the run finishes. Without it, attach later with
+`valkyrie run show RUN_ID --follow`, where *`RUN_ID`* is the ID that `run start`
 printed.
 
 See [Monitor runs](/runs/monitor).
@@ -192,7 +167,7 @@ valkyrie run start --agent my-agent --benchmark swebench --count 3
 
 - The Valkyrie CLI stops at the first start that fails, so if one fails, check
   `valkyrie run list` before you start the rest again.
-- `--connect` can't be combined with `--count`.
+- `--follow` can't be combined with `--count`.
 
 <Warning>
 

@@ -23,6 +23,7 @@ from tracker.executor.release_control import share_executor_admission
 from tracker.repositories.benchmark import BenchmarkRepository
 from tracker.repositories.executor_dispatch import ExecutorDispatchRepository
 from tracker.repositories.remote_grader import RemoteGraderRepository
+from tracker.repositories.scheduler import SchedulerRepository
 from tracker.run_access_keys import delete_finished_run_keys
 
 _ECS_MISSING_GRACE = timedelta(minutes=10)
@@ -210,6 +211,37 @@ def report_unowned_pending_tasks_in(session: Session) -> None:
             ", ".join(task_ids),
             extra={"event": "pending_tasks_without_executor", "benchmark_id": str(benchmark_id)},
         )
+
+
+def recover_interrupted_local_dispatches() -> int:
+    with Session(engine) as session:
+        scheduler = SchedulerRepository(session)
+        dispatches = [
+            dispatch
+            for dispatch in ExecutorDispatchRepository(session).list_active()
+            if dispatch.executor_artifact_uri.startswith("source:///")
+        ]
+        for dispatch in dispatches:
+            scheduler.handoff_dispatch_phases(dispatch.id)
+        recovered = sum(
+            record_dispatch_failure(
+                session,
+                benchmark_id=dispatch.benchmark_id,
+                dispatch_id=dispatch.id,
+                task_ids=dispatch.assigned_task_ids or [],
+                error_message="Local Tracker stopped before the run finished",
+                producer="executor_dispatch",
+                operation="dispatch_reconciliation",
+                error_type="LocalTrackerInterrupted",
+                category=FailureCategory.INFRASTRUCTURE,
+                cause_code="LOCAL_TRACKER_INTERRUPTED",
+                failure_reason="LOCAL_TRACKER_INTERRUPTED",
+                dispatch_status=dispatch.status,
+            )
+            for dispatch in dispatches
+        )
+        session.commit()
+    return recovered
 
 
 def reconcile_dispatches_once() -> int:

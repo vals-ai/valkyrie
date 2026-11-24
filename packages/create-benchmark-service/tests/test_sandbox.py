@@ -12,8 +12,9 @@ from typing import Any, Awaitable, Callable, cast
 import pytest
 from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo, web
 from aiohttp.test_utils import TestServer
-from daytona import DaytonaConfig, GpuType, SandboxState
-from daytona.common.errors import (
+from daytona import DaytonaConfig
+from daytona.v0 import GpuType, SandboxState
+from daytona.v0.common.errors import (
     SOURCE_API,
     SOURCE_DAEMON,
     SOURCE_PROXY,
@@ -21,10 +22,12 @@ from daytona.common.errors import (
     DaytonaConnectionError,
     DaytonaError,
     DaytonaNotFoundError,
+    DaytonaQueueTimeoutError,
     DaytonaRateLimitError,
+    DaytonaSpotEvictedError,
     DaytonaTimeoutError,
 )
-from daytona.common.pty import PtyResult, PtySize
+from daytona.v0.common.pty import PtyResult, PtySize
 from daytona_api_client import VolumeState
 from daytona_api_client_async import GpuType as ApiGpuType
 from daytona_api_client_async import Region, RegionType, SandboxClass
@@ -37,6 +40,7 @@ from yarl import URL
 import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.sandbox import (
+    SandboxAccountRejectedError,
     ComposeSource,
     ComposeSandbox,
     DockerfileSource,
@@ -50,6 +54,7 @@ from benchmark_service.sandbox import (
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -66,6 +71,7 @@ from benchmark_service.sandbox.daytona import (
     _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
+    _error_kind,  # pyright: ignore[reportPrivateUsage]
     _is_ambiguous_pty_create_error,  # pyright: ignore[reportPrivateUsage]
     _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
@@ -73,6 +79,13 @@ from benchmark_service.sandbox.daytona import (
     DaytonaSandboxProvider,
     daytona_retry_after_seconds,
 )
+
+
+def _root_client(create: Callable[..., object]) -> Callable[..., SimpleNamespace]:
+    def build(*, config: DaytonaConfig) -> SimpleNamespace:
+        return SimpleNamespace(v0=create(config=config))
+
+    return build
 
 
 _SENSITIVE_RETRY_SENTINEL = "SENSITIVE_RETRY_SENTINEL"
@@ -83,7 +96,7 @@ def _client_response_error(
     status: int,
     message: str,
     *,
-    url: str = "https://daytona.example.test",
+    url: str = "https://app.daytona.io/api",
     headers: Mapping[str, str] | None = None,
 ) -> ClientResponseError:
     request_url = URL(url)
@@ -827,6 +840,9 @@ class InnerSandbox:
     warm_pool_id: str | None = None
     snapshot: str | None = "snap-name"
     target: str | None = "us-west-3"
+    error_reason: str | None = None
+    spot_evicted_at: str | None = None
+    last_activity_at: str | None = None
 
     def __init__(self) -> None:
         self.labels: dict[str, str] = {}
@@ -1031,7 +1047,7 @@ class DaytonaRegionsClient:
         self.close_attempts = 0
 
     def create_api_client(self, configuration: Any) -> "DaytonaRegionsClient":
-        assert configuration.host == "https://daytona.example.test"
+        assert configuration.host == "https://app.daytona.io/api"
         assert configuration.access_token == "test-key"
         return self
 
@@ -1171,13 +1187,13 @@ def _inventory_provider(
         assert config.target == target
         return daytona
 
-    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_daytona)
+    monkeypatch.setattr(daytona_module, "DaytonaClient", _root_client(create_daytona))
     monkeypatch.setattr(daytona_module, "DaytonaApiClient", regions_client.create_api_client)
     monkeypatch.setattr(daytona_module, "OrganizationsApi", regions_client.create_organizations_api)
     provider = DaytonaSandboxProvider(
         DaytonaProviderConfig(
             DAYTONA_API_KEY="test-key",
-            DAYTONA_API_URL="https://daytona.example.test",
+            DAYTONA_API_URL="https://app.daytona.io/api",
             DAYTONA_TARGET=target,
         )
     )
@@ -1226,7 +1242,7 @@ def _usage_row(**updates: object) -> SimpleNamespace:
 def _configured_daytona_provider(**updates: object) -> DaytonaSandboxProvider:
     values = {
         "DAYTONA_API_KEY": "secret",
-        "DAYTONA_API_URL": "https://daytona.example/api",
+        "DAYTONA_API_URL": "https://app.daytona.io/api",
         "DAYTONA_TARGET": "us",
         "DAYTONA_ORGANIZATION_ID": "org-1",
     }
@@ -1330,8 +1346,10 @@ def _targeted_admission_case(
 
 
 def test_daytona_pool_id_is_stable_nonsecret_and_capacity_account_scoped() -> None:
-    first = _configured_daytona_provider(DAYTONA_API_KEY="first-secret", DAYTONA_API_URL="https://d.test/")
-    rotated = _configured_daytona_provider(DAYTONA_API_KEY="rotated-secret", DAYTONA_API_URL="https://d.test")
+    first = _configured_daytona_provider(DAYTONA_API_KEY="first-secret", DAYTONA_API_URL="https://app.daytona.io/api")
+    rotated = _configured_daytona_provider(
+        DAYTONA_API_KEY="rotated-secret", DAYTONA_API_URL="https://app.daytona.io/api"
+    )
     pool_id = first.admission_pool_id
 
     assert pool_id is not None
@@ -1339,21 +1357,19 @@ def test_daytona_pool_id_is_stable_nonsecret_and_capacity_account_scoped() -> No
     assert (
         pool_id
         == _configured_daytona_provider(
-            DAYTONA_API_URL="https://d.test", DAYTONA_TARGET="canonical-region-id"
+            DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="canonical-region-id"
         ).admission_pool_id
     )
-    assert (
-        len(
-            {
-                pool_id,
-                _configured_daytona_provider(DAYTONA_ORGANIZATION_ID="org-2").admission_pool_id,
-                _configured_daytona_provider(DAYTONA_API_URL="https://other.example/api").admission_pool_id,
-            }
-        )
-        == 3
-    )
+    assert pool_id != _configured_daytona_provider(DAYTONA_ORGANIZATION_ID="org-2").admission_pool_id
     assert _configured_daytona_provider(DAYTONA_ORGANIZATION_ID=None).admission_pool_id is None
     assert all(value not in pool_id for value in ("first-secret", "rotated-secret", "d.test"))
+
+
+def test_daytona_config_rejects_custom_api_url() -> None:
+    with pytest.raises(ValidationError, match="DAYTONA_API_URL"):
+        DaytonaProviderConfig(
+            DAYTONA_API_KEY="k", DAYTONA_API_URL="https://self-hosted.example/api", DAYTONA_TARGET="us"
+        )
 
 
 _ADMISSION_IMAGE = ImageSource(image="img")
@@ -1908,27 +1924,44 @@ async def test_daytona_reservable_demand_preserves_snapshot_metadata_validation(
 
 
 @pytest.mark.parametrize(
-    "error",
-    [TimeoutError(), DaytonaError("temporary", status_code=503), DaytonaError("not found", status_code=404)],
+    ("error", "transient"),
+    [
+        (TimeoutError(), True),
+        (DaytonaError("temporary", status_code=503), True),
+        (DaytonaError("not found", status_code=404), False),
+    ],
     ids=["timeout", "transient", "not_found"],
 )
 async def test_daytona_reservable_demand_preserves_snapshot_error_classification(
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
+    transient: bool,
 ) -> None:
     provider, _targets, _snapshots = _demand_provider(monkeypatch, error)
 
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError) as caught:
         await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
-async def test_daytona_reservable_demand_preserves_region_error_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    error = ApiException(status=403, reason="denied")
+@pytest.mark.parametrize(
+    ("status", "message", "transient"),
+    [
+        (403, "rejected the admission metadata request", False),
+        (429, "admission metadata is unavailable", True),
+        (507, "admission metadata is unavailable", True),
+    ],
+)
+async def test_daytona_reservable_demand_preserves_region_error_classification(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str, transient: bool
+) -> None:
+    error = ApiException(status=status, reason="denied")
     provider, _targets, _snapshots = _demand_provider(monkeypatch, AssertionError("image"), regions=error)
 
-    with pytest.raises(SandboxError, match="rejected the target metadata request") as caught:
+    with pytest.raises(SandboxError, match=message) as caught:
         await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
     assert caught.value.__cause__ is error
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
 async def test_daytona_reservable_demand_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2713,6 +2746,22 @@ def test_daytona_other_conflicts_and_unrelated_in_progress_errors_are_not_transi
     assert not _is_transient_daytona_error(exc)
 
 
+@pytest.mark.parametrize(
+    ("exc", "kind"),
+    [
+        (DaytonaQueueTimeoutError("Sandbox waited 5 minutes for a runner"), SandboxConnectionError),
+        (DaytonaSpotEvictedError("Sandbox was evicted by spot preemption"), SandboxNotFoundError),
+        (DaytonaError("Total CPU limit exceeded. Maximum allowed: 2500", status_code=403), SandboxConnectionError),
+        (DaytonaError("Your organization is suspended", status_code=403), SandboxAccountRejectedError),
+        (DaytonaError("SandboxState.BUILD_FAILED: manifest HEAD: 403 Forbidden"), SandboxRejectedError),
+        (DaytonaError("SandboxState.BUILD_FAILED: no space left on device"), SandboxError),
+        (DaytonaError("Invalid request", status_code=400), SandboxError),
+    ],
+)
+def test_daytona_error_kind(exc: DaytonaError, kind: type[SandboxError]) -> None:
+    assert _error_kind(exc) is kind
+
+
 def test_daytona_not_found_classification_uses_structured_code_and_status_fallback() -> None:
     assert _is_not_found_error(DaytonaError("sandbox missing", code="NOT_FOUND"))
     assert _is_not_found_error(DaytonaError("sandbox missing", status_code=404))
@@ -2818,7 +2867,7 @@ async def test_daytona_exec_logs_each_rate_limit_retry(
             _client_response_error(
                 503,
                 f"provider message {_SENSITIVE_RETRY_SENTINEL}",
-                url=f"https://daytona.example.test/{_SENSITIVE_RETRY_SENTINEL}",
+                url=f"https://app.daytona.io/api/{_SENSITIVE_RETRY_SENTINEL}",
                 headers={"x-sensitive": _SENSITIVE_RETRY_SENTINEL},
             ),
             503,
@@ -3850,6 +3899,26 @@ async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -
     assert inner.refresh_count == 1
 
 
+@pytest.mark.description(
+    "A Daytona sandbox found destroyed reports the error reason and eviction time Daytona recorded."
+)
+async def test_daytona_removed_sandbox_reports_last_seen_reason() -> None:
+    inner = InnerSandbox()
+    inner.process = CreatePtyFailureProcess()
+    inner.state = SandboxState.DESTROYED
+    inner.error_reason = "runner unreachable"
+    inner.spot_evicted_at = "2026-11-21T23:30:00Z"
+    sandbox = _daytona_sandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError) as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert str(exc_info.value) == (
+        "Sandbox not found: name=sandbox-name, id=sandbox-id. Last seen: state=destroyed, "
+        "error_reason=runner unreachable, spot_evicted_at=2026-11-21T23:30:00Z."
+    )
+
+
 async def test_daytona_command_keeps_error_state_as_sandbox_error() -> None:
     """Non-removal dead states should still report a generic sandbox failure.
 
@@ -4228,9 +4297,9 @@ async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypat
         clients[config.target] = client
         return client
 
-    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_client)
+    monkeypatch.setattr(daytona_module, "DaytonaClient", _root_client(create_client))
     provider = DaytonaSandboxProvider(
-        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
+        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us")
     )
 
     await provider.create_sandbox(_request("normal", source=SnapshotSource(snapshot="normal-snapshot")))
@@ -4278,9 +4347,9 @@ async def test_targeted_snapshot_recovers_name_conflict_with_target_client(
     def create_client(*, config: Any) -> DaytonaClient:
         return targeted_client if config.target == "us-west-3" else default_client
 
-    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_client)
+    monkeypatch.setattr(daytona_module, "DaytonaClient", _root_client(create_client))
     provider = DaytonaSandboxProvider(
-        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
+        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us")
     )
 
     sandbox = await provider.create_sandbox(
@@ -4486,6 +4555,47 @@ async def test_daytona_provider_create_maps_not_found_errors() -> None:
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create sandbox: Snapshot snap not found. Did you add it through the Daytona Dashboard?",
+        "Failed to create sandbox: Organization is suspended: Depleted credits",
+    ],
+)
+async def test_daytona_create_reports_permanent_refusals_as_rejected(message: str) -> None:
+    class RejectingDaytonaClient(CreateFailureDaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            raise DaytonaError(message, status_code=404)
+
+    daytona = RejectingDaytonaClient(InnerSandbox())
+
+    with pytest.raises(SandboxRejectedError, match="Daytona rejected the sandbox request"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name"))
+    assert daytona.create_attempts == 1
+
+
+async def test_daytona_create_retries_an_exhausted_org_quota() -> None:
+    class QuotaThenFreeDaytonaClient(DaytonaClient):
+        create_attempts = 0
+
+        async def create(self, *args: object, **kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            if self.create_attempts == 1:
+                raise DaytonaError(
+                    "Failed to create sandbox: Total CPU limit exceeded. Maximum allowed: 2500", status_code=400
+                )
+            return await super().create(*args, **kwargs)
+
+    inner = InnerSandbox()
+    daytona = QuotaThenFreeDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.create_attempts == 2
+
+
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:
     with pytest.raises(ValueError):
         SandboxQuery(labels={"Benchmark": "vcb"}, created_at_lte=datetime(2026, 7, 24, 12, 30))
@@ -4629,7 +4739,7 @@ def test_daytona_provider_rejects_blank_target() -> None:
         DaytonaSandboxProvider(
             DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://daytona.example.test",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="   ",
             )
         )
@@ -4958,7 +5068,7 @@ def test_daytona_config_from_headers_reads_optional_organization_id(
     config = DaytonaProviderConfig.from_headers(
         {
             "x-api-key": "key-1",
-            "x-api-url": "https://daytona.example",
+            "x-api-url": "https://app.daytona.io/api",
             "x-target": "us",
             **organization_headers,
         }
@@ -4969,14 +5079,14 @@ def test_daytona_config_from_headers_reads_optional_organization_id(
         config.DAYTONA_API_URL,
         config.DAYTONA_TARGET,
         config.DAYTONA_ORGANIZATION_ID,
-    ) == ("key-1", "https://daytona.example", "us", expected)
+    ) == ("key-1", "https://app.daytona.io/api", "us", expected)
 
 
 def test_daytona_config_from_headers_reads_legacy_required_fields() -> None:
     config = DaytonaProviderConfig.from_headers(
         {
             "daytona_api_key": "legacy-key",
-            "daytona_api_url": "https://legacy.daytona.example",
+            "daytona_api_url": "https://app.daytona.io/api",
             "daytona_target": "legacy-target",
             "x-organization-id": "org-primary",
         }
@@ -4987,34 +5097,34 @@ def test_daytona_config_from_headers_reads_legacy_required_fields() -> None:
         config.DAYTONA_API_URL,
         config.DAYTONA_TARGET,
         config.DAYTONA_ORGANIZATION_ID,
-    ) == ("legacy-key", "https://legacy.daytona.example", "legacy-target", "org-primary")
+    ) == ("legacy-key", "https://app.daytona.io/api", "legacy-target", "org-primary")
 
 
 def test_daytona_config_normalizes_api_url() -> None:
     config = DaytonaProviderConfig(
         DAYTONA_API_KEY="key-1",
-        DAYTONA_API_URL="https://daytona.example///",
+        DAYTONA_API_URL="https://app.daytona.io/api///",
         DAYTONA_TARGET="us",
     )
 
-    assert config.DAYTONA_API_URL == "https://daytona.example"
+    assert config.DAYTONA_API_URL == "https://app.daytona.io/api"
 
 
 def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DAYTONA_API_KEY", "key-1")
-    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://app.daytona.io/api")
     monkeypatch.setenv("DAYTONA_TARGET", "us")
     monkeypatch.setenv("DAYTONA_ORGANIZATION_ID", "org-1")
     config = DaytonaProviderConfig.from_env()
     assert config.DAYTONA_API_KEY == "key-1"
-    assert config.DAYTONA_API_URL == "https://daytona.example"
+    assert config.DAYTONA_API_URL == "https://app.daytona.io/api"
     assert config.DAYTONA_TARGET == "us"
     assert config.DAYTONA_ORGANIZATION_ID == "org-1"
 
 
 def test_daytona_config_from_env_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
-    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://app.daytona.io/api")
     monkeypatch.setenv("DAYTONA_TARGET", "us")
     with pytest.raises(MissingSandboxConfigError, match="DAYTONA_API_KEY"):
         DaytonaProviderConfig.from_env()

@@ -50,7 +50,7 @@ def test_project_create_update_and_delete_round_trip(cli_runner: CliRunner) -> N
     updated = cli_runner.invoke(cli, ["project", "update", "local-project", "--name", "Renamed Project"])
     assert updated.exit_code == 0, updated.output
 
-    listed = cli_runner.invoke(cli, ["project", "list", "--format", "json"])
+    listed = cli_runner.invoke(cli, ["project", "list", "--json"])
     assert listed.exit_code == 0, listed.output
 
     (project,) = json.loads(listed.output)["projects"]
@@ -62,7 +62,7 @@ def test_project_create_update_and_delete_round_trip(cli_runner: CliRunner) -> N
     replaced = cli_runner.invoke(cli, ["project", "update", "local-project", "--tag", "team=platform"])
     assert replaced.exit_code == 0, replaced.output
 
-    after_replacement = cli_runner.invoke(cli, ["project", "list", "--format", "json"])
+    after_replacement = cli_runner.invoke(cli, ["project", "list", "--json"])
     assert after_replacement.exit_code == 0, after_replacement.output
     (project,) = json.loads(after_replacement.output)["projects"]
     assert project["name"] == "Renamed Project"
@@ -71,7 +71,7 @@ def test_project_create_update_and_delete_round_trip(cli_runner: CliRunner) -> N
     deleted = cli_runner.invoke(cli, ["project", "delete", "local-project"], input="y\n")
     assert deleted.exit_code == 0, deleted.output
 
-    after_delete = cli_runner.invoke(cli, ["project", "list", "--format", "json"])
+    after_delete = cli_runner.invoke(cli, ["project", "list", "--json"])
     assert after_delete.exit_code == 0, after_delete.output
     assert json.loads(after_delete.output)["projects"] == []
 
@@ -107,12 +107,12 @@ def test_agent_library_round_trip(
     assert result.exit_code == 0, result.output
     assert "alias" in result.output
 
-    result = cli_runner.invoke(cli, ["agent", "list", "--format", "json"])
+    result = cli_runner.invoke(cli, ["agent", "list", "--json"])
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == {"agents": [{"name": "alias", "last_modified": None}]}
 
-    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output-dir", str(output)])
+    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output", str(output)])
 
     assert result.exit_code == 0, result.output
     assert (output / "alias" / "run.py").read_text() == "first version"
@@ -123,12 +123,12 @@ def test_agent_library_round_trip(
 
     assert result.exit_code == 0, result.output
 
-    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output-dir", str(output)])
+    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output", str(output)])
 
     assert result.exit_code == 1
     assert (output / "alias" / "run.py").read_text() == "first version"
 
-    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output-dir", str(output), "--overwrite"])
+    result = cli_runner.invoke(cli, ["agent", "download", "alias", "--output", str(output), "--overwrite"])
 
     assert result.exit_code == 0, result.output
     assert (output / "alias" / "run.py").read_text() == "replacement"
@@ -146,7 +146,7 @@ def test_agent_library_round_trip(
     missing = cli_runner.invoke(cli, ["agent", "remove", "alias"], input="y\n")
 
     assert missing.exit_code == 1
-    assert "404" in missing.output
+    assert "not found" in missing.output
 
 
 @pytest.mark.description(
@@ -211,7 +211,7 @@ def test_cli_updates_active_run_concurrency_through_tracker(
         assert result.exit_code == 0, result.output
         assert result.output == "✓ Run concurrency updated to 4.\n"
 
-    fetch_result = cli_runner.invoke(cli, ["run", "fetch", str(running.id), "--format", "json"])
+    fetch_result = cli_runner.invoke(cli, ["run", "show", str(running.id), "--json"])
 
     assert fetch_result.exit_code == 0, fetch_result.output
     assert json.loads(fetch_result.output)["metadata"]["benchmark_arguments"]["concurrency"] == 4
@@ -234,7 +234,6 @@ def test_cli_rejects_concurrency_update_for_finished_run(
     result = cli_runner.invoke(cli, ["run", "update", str(finished.id), "--concurrency", "4"])
 
     assert result.exit_code == 1
-    assert "Valkyrie API request failed (409)" in result.output
     assert "currently in the FINISHED state." in result.output
 
     database_session.expire_all()
@@ -260,7 +259,7 @@ def test_cli_exports_tracker_results_without_private_contract_values(
     _running, finished = seeded_runs
     output_path = tmp_path / "results.json"
 
-    result = cli_runner.invoke(cli, ["run", "results", str(finished.id), "--path", str(output_path)])
+    result = cli_runner.invoke(cli, ["run", "results", str(finished.id), "--output", str(output_path)])
 
     assert result.exit_code == 0, result.output
     saved_payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -312,13 +311,27 @@ def test_cli_downloads_run_artifacts_through_tracker(
         return httpx.Response(200, content=b"result")
 
     monkeypatch.setattr(httpx.ASGITransport, "handle_async_request", download)
-    listing = cli_runner.invoke(cli, ["run", "artifacts", str(running.id), "--format", "json"])
+    listing = cli_runner.invoke(cli, ["run", "files", str(running.id), "--json"])
     assert listing.exit_code == 0, listing.output
     assert json.loads(listing.output)["artifacts"][0]["path"] == "task/result.txt"
     destination = tmp_path / "download"
-    result = cli_runner.invoke(cli, ["run", "output", str(running.id), "task", "-o", str(destination)])
+    result = cli_runner.invoke(cli, ["run", "download", str(running.id), "task", "-o", str(destination)])
     assert result.exit_code == 0, result.output
     assert (destination / "task/result.txt").read_text() == "result"
+
+    selected = tmp_path / "selected"
+    result = cli_runner.invoke(
+        cli, ["run", "download", str(running.id), "task", "--task-ids", "task", "-o", str(selected)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (selected / "task/result.txt").read_text() == "result"
+    empty = tmp_path / "empty"
+    result = cli_runner.invoke(
+        cli, ["run", "download", str(running.id), "task", "--task-ids", "other", "-o", str(empty)]
+    )
+    assert result.exit_code == 1
+    assert "No artifacts found" in result.output
+    assert not empty.exists()
 
 
 @pytest.mark.description("The CLI starts and retries a run with the same saved agent version.")
@@ -428,7 +441,7 @@ def test_cli_selects_and_retries_exact_agent(
     objects["agent-releases/exact/A1/release.json"] = receipt.replace(digest.encode(), b"0" * 64)
     retried = cli_runner.invoke(cli, ["run", "retry", str(benchmark.id)])
     assert retried.exit_code == 0, retried.output
-    inspected = cli_runner.invoke(cli, ["run", "fetch", str(benchmark.id), "--format", "json"])
+    inspected = cli_runner.invoke(cli, ["run", "show", str(benchmark.id), "--json"])
     assert inspected.exit_code == 0, inspected.output
     snapshot = json.loads(inspected.output)["metadata"]["benchmark_arguments"]
     assert snapshot["contract"]["agent_release"]["reference"] == "A1"

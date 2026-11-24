@@ -6,7 +6,7 @@ from uuid import UUID
 import httpx
 from click.testing import CliRunner
 
-from valkyrie.cli.run.retag import retag
+from valkyrie.cli.run.update import update as retag
 
 from tests.unit.cli.conftest import MockTracker
 
@@ -24,7 +24,7 @@ _INTERNAL_BLOG = {
 }
 
 
-@pytest.mark.description("`run retag --project` sends the handle and prints the run's new project.")
+@pytest.mark.description("`run update --project` sends the handle and prints the run's new project.")
 def test_retag_sends_the_project_handle_and_prints_it(cli_runner: CliRunner, tracker: MockTracker) -> None:
     tracker.reply("POST", f"/benchmarks/{_RUN_ID}/project", httpx.Response(200, json=_INTERNAL_BLOG))
 
@@ -35,12 +35,12 @@ def test_retag_sends_the_project_handle_and_prints_it(cli_runner: CliRunner, tra
     assert result.output == f"✓ Run {_RUN_ID} is now in project internal-blog.\n"
 
 
-@pytest.mark.description("`run retag` without `--project` exits 2 with an example handle and sends nothing.")
+@pytest.mark.description("`run update` without `--project` exits 2 with an example handle and sends nothing.")
 def test_retag_without_project_names_the_flag_and_an_example(cli_runner: CliRunner, tracker: MockTracker) -> None:
     result = cli_runner.invoke(retag, [str(_RUN_ID)])
 
     assert result.exit_code == 2
-    assert "Missing option '--project'. Name the project this run is for, e.g. router-bench." in result.output
+    assert "Provide --concurrency or --project." in result.output
     assert tracker.requests == []
 
 

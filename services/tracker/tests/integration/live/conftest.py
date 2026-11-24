@@ -18,6 +18,8 @@ from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import Benchmark
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest
 from tests.factories import make_benchmark
+from tests.integration.live_dataset import LIVE_DATASET_NAME
+from tracker.services.datasets.ref import LocalDataset
 
 
 @pytest.fixture
@@ -76,9 +78,13 @@ def live_deployment(live_aws_runtime: AWSRuntime, monkeypatch: pytest.MonkeyPatc
 
 @pytest.fixture
 def example_benchmark_object(
-    contract: AgentContractRequest, live_aws_runtime: AWSRuntime, daytona_secret_name: str, live_deployment: None
+    contract: AgentContractRequest,
+    live_aws_runtime: AWSRuntime,
+    daytona_secret_name: str,
+    live_dataset: LocalDataset,
+    live_deployment: None,
 ) -> Benchmark:
-    benchmark = make_benchmark(contract=contract, concurrency=5)
+    benchmark = make_benchmark(LIVE_DATASET_NAME, contract=contract, concurrency=5, dataset_ref=live_dataset)
     assert isinstance(benchmark.arguments, AWSBenchmarkArguments)
     benchmark.arguments.properties = live_aws_runtime.resources
     benchmark.arguments.sandbox_provider = "daytona"

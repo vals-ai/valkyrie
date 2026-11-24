@@ -12,6 +12,7 @@ from textual.binding import Binding
 from textual.notifications import SeverityLevel
 from textual.screen import Screen
 
+from valkyrie.palette import DARK, LIGHT, PALETTES
 from valkyrie.tui.run import RunCache
 from valkyrie.tui.runs import RunsScreen
 from valkyrie.sdk import ValkyrieConfigError
@@ -40,9 +41,9 @@ class ValkyrieApp(App[None]):
         self.cache = RunCache()
 
     def on_mount(self) -> None:
-        for palette in theme.PALETTES.values():
-            self.register_theme(palette.theme())
-        self.theme = theme.DARK.name
+        for palette in PALETTES.values():
+            self.register_theme(theme.textual_theme(palette))
+        self.theme = DARK.name
         self.push_screen(RunsScreen(self.source))
 
     def watch_theme(self, name: str) -> None:
@@ -52,7 +53,7 @@ class ValkyrieApp(App[None]):
                 screen.restyle()
 
     def action_toggle_theme(self) -> None:
-        self.theme = theme.LIGHT.name if self.theme == theme.DARK.name else theme.DARK.name
+        self.theme = LIGHT.name if self.theme == DARK.name else DARK.name
 
     def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
         return (command for command in super().get_system_commands(screen) if command.title != "Theme")

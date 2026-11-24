@@ -1,8 +1,16 @@
 import math
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import httpx
-from benchmark_service import ComposeSource, DockerfileSource, ImageSource, MCPServer, Resources
+from benchmark_service import (
+    ComposeSource,
+    DockerfileSource,
+    ImageSource,
+    MCPServer,
+    Resources,
+    SnapshotSource,
+    TargetedSnapshotSource,
+)
 from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, RetrieveTaskResponse
 from pydantic import BaseModel, Field
 
@@ -15,6 +23,7 @@ from tracker.services.datasets.config import (
     NetworkSettings,
     TaskConfig,
 )
+from tracker.services.datasets.dockerfile import final_stage
 from tracker.services.datasets.folder import (
     COMPOSE_FILE,
     DOCKERFILE,
@@ -46,26 +55,13 @@ class TaskFolderResponse(RetrieveTaskResponse):
     env: dict[str, str] = Field(default_factory=dict)
     secret_env: list[str] = Field(default_factory=list)
     agent_user: str | None = None
+    image_user: str | None = None
     healthcheck: HealthcheckConfig | None = None
     compose: ComposeRuntime | None = None
     steps: list[StepPlan] = Field(default_factory=list)
     reward_strategy: MultiStepRewardStrategy = MultiStepRewardStrategy.MEAN
     cwd_from_image: bool = False
-
-
-def dockerfile_workdir(dockerfile: Path) -> str | None:
-    if not dockerfile.is_file():
-        return None
     workdir: str | None = None
-    for line in dockerfile.read_text().splitlines():
-        instruction, _, value = line.strip().partition(" ")
-        value = value.strip()
-        keyword = instruction.upper()
-        if keyword == "FROM":
-            workdir = None
-        elif keyword == "WORKDIR" and value:
-            workdir = value if value.startswith("/") else str(PurePosixPath(workdir or "/") / value)
-    return workdir
 
 
 def stage_egress(stage: NetworkSettings, environment: EnvironmentConfig) -> EgressPolicy | None:
@@ -89,20 +85,28 @@ def with_gateway(policy: EgressPolicy, gateway_url: str) -> EgressPolicy:
     return policy if host in policy else [*policy, host]
 
 
-def sandbox_source(task_dir: Path, config: TaskConfig) -> ImageSource | DockerfileSource | ComposeSource:
+FolderSource = ImageSource | DockerfileSource | ComposeSource | SnapshotSource | TargetedSnapshotSource
+
+
+def sandbox_source(task_dir: Path, config: TaskConfig) -> FolderSource:
+    environment = config.environment
     match sandbox_kind(task_dir, config):
+        case SandboxKind.SNAPSHOT if snapshot := environment.snapshot:
+            if target := environment.snapshot_target:
+                return TargetedSnapshotSource(snapshot=snapshot, target=target)
+            return SnapshotSource(snapshot=snapshot)
         case SandboxKind.COMPOSE:
             return compose_source(task_dir.name, config)
-        case SandboxKind.IMAGE if image := config.environment.docker_image:
+        case SandboxKind.IMAGE if image := environment.docker_image:
             return ImageSource(image=image)
         case SandboxKind.DOCKERFILE:
             return DockerfileSource(
                 dockerfile=str((task_dir / ENVIRONMENT_DIR / DOCKERFILE).absolute()),
-                build_timeout=config.environment.build_timeout_sec,
+                build_timeout=environment.build_timeout_sec,
             )
         case _:
             raise UnsupportedTaskError(
-                f"Task {task_dir.name!r} has no docker_image, {ENVIRONMENT_DIR}/{DOCKERFILE} "
+                f"Task {task_dir.name!r} has no snapshot, docker_image, {ENVIRONMENT_DIR}/{DOCKERFILE} "
                 f"or {ENVIRONMENT_DIR}/{COMPOSE_FILE} to run"
             )
 
@@ -125,7 +129,7 @@ def retrieve_task_response(task_dir: Path, config: TaskConfig) -> TaskFolderResp
     environment = config.environment
     source = sandbox_source(task_dir, config)
     compose = isinstance(source, ComposeSource)
-    workdir = environment.workdir or dockerfile_workdir(task_dir / ENVIRONMENT_DIR / DOCKERFILE)
+    workdir = environment.workdir or final_stage(task_dir / ENVIRONMENT_DIR / DOCKERFILE).workdir
     cwd = workdir or DEFAULT_CWD
     return TaskFolderResponse(
         source=source,
@@ -153,7 +157,19 @@ def retrieve_task_response(task_dir: Path, config: TaskConfig) -> TaskFolderResp
             for step in config.steps
         ],
         reward_strategy=config.reward_strategy,
-        cwd_from_image=workdir is None and isinstance(source, (ImageSource, DockerfileSource)),
+        cwd_from_image=workdir is None and not compose,
+        workdir=workdir,
         mcp_servers=[MCPServer.model_validate(server.model_dump()) for server in environment.mcp_servers],
         skills_dir=environment.skills_dir,
+    )
+
+
+def with_image_user(response: TaskFolderResponse, user: str, source: DockerfileSource) -> TaskFolderResponse:
+    return response.model_copy(
+        update={
+            "source": source,
+            "image_user": user,
+            "agent_user": response.agent_user or user,
+            "steps": [step.model_copy(update={"agent_user": step.agent_user or user}) for step in response.steps],
+        }
     )

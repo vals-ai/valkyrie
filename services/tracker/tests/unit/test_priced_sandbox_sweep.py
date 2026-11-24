@@ -177,11 +177,19 @@ def test_recording_a_link_moves_last_seen_forward(database_session: Session) -> 
     repository.record_sandbox_link(PROVIDER, "sb-new", benchmark_id, LAST_SEEN)
     database_session.commit()
     assert _last_seen(database_session, "sb-new") == LAST_SEEN
+    created_at = database_session.exec(
+        select(SandboxRecord.created_at).where(SandboxRecord.sandbox_id == "sb-new")
+    ).one()
+    assert created_at is not None
 
     repository.record_sandbox_link(PROVIDER, "sb-new", benchmark_id, NOW)
     repository.record_sandbox_link(PROVIDER, "sb-new", benchmark_id, LAST_SEEN)
     database_session.commit()
     assert _last_seen(database_session, "sb-new") == NOW
+    assert (
+        database_session.exec(select(SandboxRecord.created_at).where(SandboxRecord.sandbox_id == "sb-new")).one()
+        == created_at
+    )
 
 
 @pytest.mark.description("A sandbox linked without an attempt takes the first attempt a later link gives and keeps it.")
@@ -210,16 +218,11 @@ async def test_short_verifier_is_billed_to_its_stream_end(database_session: Sess
     )
     database_session.commit()
     sandbox = DaytonaV2Sandbox(
-        {
-            "id": "sb-verifier",
-            "status": "deleted",
-            "cpu": 2,
-            "memory_mib": 4096,
-            "region_id": "us",
-            "spot": False,
-            "created_at": created.isoformat(),
-        },
+        Mock(id="sb-verifier", state="destroyed", cpu=2, memory=4, region="us", spot=False),
         Mock(),
+        Mock(),
+        None,
+        created,
     )
 
     @asynccontextmanager

@@ -239,7 +239,7 @@ def mock_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
     async def get(_self: object, _name: str) -> dict[str, str]:
         return {
             "DAYTONA_API_KEY": "test-key",
-            "DAYTONA_API_URL": "http://localhost:8001",
+            "DAYTONA_API_URL": "https://app.daytona.io/api",
             "DAYTONA_ORGANIZATION_ID": "test-organization",
             "DAYTONA_TARGET": "us",
         }

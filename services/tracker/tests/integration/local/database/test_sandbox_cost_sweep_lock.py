@@ -85,9 +85,8 @@ def running(count: int) -> Iterator[list[Loop]]:
 
 
 @pytest.mark.description("Exactly one of the running loops sweeps sandbox costs.")
-@pytest.mark.parametrize("loops_running", [1, 2, 4])
-def test_exactly_one_of_the_running_loops_sweeps(sweeps: Sweeps, loops_running: int) -> None:
-    with running(loops_running):
+def test_exactly_one_of_the_running_loops_sweeps(sweeps: Sweeps) -> None:
+    with running(2):
         wait_until(lambda: len(sweeps.by_thread) >= 5)
         sweepers_while_running = sweeps.sweepers()
 

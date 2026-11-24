@@ -318,10 +318,23 @@ class TestLocalFolderStart:
         run = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
         assert run is not None
         assert run.arguments.dataset_ref == LocalDataset(path=str(folder))
+        metadata = _client.get(f"/fetch-benchmark-metadata/{run.id}")
+        assert metadata.status_code == 200, metadata.text
+        assert metadata.json()["benchmark_arguments"]["dataset"] == str(folder)
         assert {task.task_id for task in database_session.exec(select(Task).where(Task.benchmark == run.id))} == {
             "alpha",
             "beta",
         }
+
+    @pytest.mark.description("Invalid TOML in a selected local task is rejected with the task name before launch.")
+    def test_malformed_task_config_is_rejected(self, contract: AgentContractRequest, tmp_path: Path) -> None:
+        folder = _folder(tmp_path / "tasks", ["alpha", "beta"])
+        (folder / "beta" / "task.toml").write_text("[environment\n")
+
+        response = _client.post("/start-benchmark", json=_start(contract, LocalDataset(path=str(folder))))
+
+        assert response.status_code == 400
+        assert "Task 'beta' is not valid: task.toml is not valid TOML" in response.json()["detail"]
 
     @pytest.mark.description("A missing folder is refused.")
     def test_a_missing_folder_is_refused(self, contract: AgentContractRequest, tmp_path: Path) -> None:

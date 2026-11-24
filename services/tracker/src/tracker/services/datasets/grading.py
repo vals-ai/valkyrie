@@ -17,7 +17,7 @@ VERIFIER_DIR = "/logs/verifier"
 AGENT_LOG_DIR = "/logs/agent"
 ARTIFACTS_DIR = "/logs/artifacts"
 LOG_DIRS = (AGENT_LOG_DIR, VERIFIER_DIR, ARTIFACTS_DIR)
-OPEN_LOG_DIRS = f"mkdir -p {' '.join(LOG_DIRS)} && chmod 777 {' '.join(LOG_DIRS)}"
+OPEN_LOG_DIRS = f"mkdir -p {' '.join(LOG_DIRS)} && chmod 777 {' '.join(LOG_DIRS)} && chmod 1777 /logs"
 RESET_STEP_LOG_DIRS = f"find {AGENT_LOG_DIR} {ARTIFACTS_DIR} -mindepth 1 -delete"
 TEST_SCRIPT_PATH = f"{TESTS_DIR}/test.sh"
 REWARD_TEXT_PATH = f"{VERIFIER_DIR}/reward.txt"
@@ -121,30 +121,29 @@ async def grade_task(
     redact: Callable[[str], str] = keep,
     upload_tests: bool = True,
     reset_tests: bool = False,
+    cwd: str | None = None,
+    default_user: str | None = None,
 ) -> dict[str, Any]:
     def say(message: str) -> None:
         if on_message is not None:
             on_message(message)
 
     grader = config.verifier.environment if config.verifier.is_separate else None
-    cwd = (grader or config.environment).workdir or config.environment.workdir
+    workdir = (grader or config.environment).workdir or cwd
+    user = config.verifier.user or default_user
 
     if upload_tests:
         if reset_tests:
             await sandbox.exec(f"rm -rf {shlex.quote(TESTS_DIR)}")
         await upload_dir(sandbox, tests_dir, TESTS_DIR)
     await sandbox.exec(f"chmod +x {shlex.quote(TEST_SCRIPT_PATH)}")
-    await make_directories(sandbox, [VERIFIER_DIR, *([cwd] if cwd else [])])
-    await sandbox.exec(f"find {shlex.quote(VERIFIER_DIR)} -mindepth 1 -delete; chmod 755 {shlex.quote(VERIFIER_DIR)}")
-    if config.verifier.user is not None:
-        await sandbox.exec(
-            f"chmod -R a+rX {shlex.quote(TESTS_DIR)}; chown -R {shlex.quote(config.verifier.user)} {shlex.quote(VERIFIER_DIR)}"
-        )
+    await make_directories(sandbox, [VERIFIER_DIR, *([workdir] if workdir else [])])
+    await sandbox.exec(f"find {shlex.quote(VERIFIER_DIR)} -mindepth 1 -delete; chmod 777 {shlex.quote(VERIFIER_DIR)}")
+    if user is not None:
+        await sandbox.exec(f"chmod -R a+rX {shlex.quote(TESTS_DIR)}")
 
     say(f"Running the verifier for {task_id}")
-    result = await sandbox.exec(
-        verifier_command(env, config.verifier.user), cwd=cwd, timeout=config.verifier.timeout_sec
-    )
+    result = await sandbox.exec(verifier_command(env, user), cwd=workdir, timeout=config.verifier.timeout_sec)
     try:
         rewards, source = await download_rewards(sandbox, redact)
     except FileNotFoundError as error:

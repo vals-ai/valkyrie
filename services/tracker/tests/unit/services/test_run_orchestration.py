@@ -379,6 +379,7 @@ async def test_queued_coordinator_prepares_backlog_only_for_reserved_queues(
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", Mock(return_value=sandbox_provider))
     monkeypatch.setattr("tracker.services.runs.start.asyncio.sleep", controlled_sleep)
     monkeypatch.setattr("tracker.services.runs.start._SANDBOX_CREATION_CAP", 10)
+    monkeypatch.setattr("tracker.services.runs.start.TaskMonitor.track_tasks", AsyncMock())
     authority_kwargs = bound_controls(benchmark, session=control_postgres_session)
     run = asyncio.create_task(
         process_benchmark(execution_context_json=_context(request, benchmark, task_ids), **authority_kwargs)

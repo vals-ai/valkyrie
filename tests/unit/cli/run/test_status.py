@@ -7,7 +7,7 @@ import pytest
 from click.testing import CliRunner, Result
 from valkyrie.sdk.models import BenchmarkStatus, BenchmarkStatusEntry, BenchmarkStatusResponse
 
-from valkyrie.cli.run.status import status_runs
+from valkyrie.cli.run.fetch import show as status_runs
 
 from tests.unit.cli.conftest import MockTracker
 from tests.unit.cli.factories import ok
@@ -43,9 +43,7 @@ def test_status_json_deduplicates_and_restores_requested_order(tracker: MockTrac
     first = make_entry(0)
     second = make_entry(1, status=BenchmarkStatus.FINISHED)
 
-    result = invoke_with_entries(
-        tracker, [second, first], ["--ids", f" {first.id}, {second.id}, {first.id} ", "--format", "json"]
-    )
+    result = invoke_with_entries(tracker, [second, first], [str(first.id), str(second.id), str(first.id), "--json"])
 
     assert result.exit_code == 0, result.output
     assert len(result.stdout.splitlines()) == 1
@@ -61,7 +59,7 @@ def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker)
     found = make_entry(0)
     missing = UUID(int=2)
 
-    result = invoke_with_entries(tracker, [found], ["--ids", f"{found.id},{missing}", "--format", "json"])
+    result = invoke_with_entries(tracker, [found], [str(found.id), str(missing), "--json"])
 
     assert result.exit_code != 0
     assert [entry["id"] for entry in json.loads(result.stdout)["entries"]] == [str(found.id)]
@@ -72,9 +70,7 @@ def test_status_json_reports_missing_ids_and_exits_nonzero(tracker: MockTracker)
 def test_status_json_chunks_large_id_sets(tracker: MockTracker) -> None:
     entries = [make_entry(index) for index in range(51)]
 
-    result = invoke_with_entries(
-        tracker, entries, ["--ids", ",".join(str(entry.id) for entry in entries), "--format", "json"]
-    )
+    result = invoke_with_entries(tracker, entries, [*(str(entry.id) for entry in entries), "--json"])
 
     assert result.exit_code == 0, result.output
     assert [len(ids) for ids in _requested_ids(tracker)] == [50, 1]
@@ -84,8 +80,8 @@ def test_status_json_chunks_large_id_sets(tracker: MockTracker) -> None:
 @pytest.mark.description("A malformed `--ids` value fails with an error naming the flag before any request.")
 @pytest.mark.parametrize("ids_value", ["", " , ", "not-a-uuid"])
 def test_status_rejects_invalid_ids_before_any_request(tracker: MockTracker, ids_value: str) -> None:
-    result = CliRunner().invoke(status_runs, ["--ids", ids_value, "--format", "json"])
+    result = CliRunner().invoke(status_runs, [ids_value, "--json"])
 
     assert result.exit_code == 2
-    assert "--ids" in result.output
+    assert "RUN_IDS" in result.output
     assert tracker.requests == []

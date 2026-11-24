@@ -1,4 +1,5 @@
 import hashlib
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -32,6 +33,7 @@ def tenant_bucket_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def s3(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     client = MagicMock()
+    client.get_bucket_policy.side_effect = ClientError({"Error": {"Code": "NoSuchBucketPolicy"}}, "GetBucketPolicy")
     monkeypatch.setattr(tenant_storage.boto3, "client", MagicMock(return_value=client))
     return client
 
@@ -90,6 +92,22 @@ def test_new_tenant_gets_a_configured_bucket_recorded_on_its_org(database_sessio
     assert bucket == tenant_bucket_name("acme.example")
     s3.create_bucket.assert_called_once_with(Bucket=bucket, CreateBucketConfiguration={"Tags": [org_tag]})
     owner = {"Bucket": bucket, "ExpectedBucketOwner": "123456789012"}
+    s3.get_bucket_policy.assert_called_once_with(**owner)
+    written_policy = s3.put_bucket_policy.call_args.kwargs
+    assert {key: written_policy[key] for key in owner} == owner
+    assert json.loads(written_policy["Policy"]) == {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "DenyInsecureTransport",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+                "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+            }
+        ],
+    }
     s3.put_bucket_versioning.assert_called_once_with(VersioningConfiguration={"Status": "Enabled"}, **owner)
     rule = s3.put_bucket_lifecycle_configuration.call_args.kwargs["LifecycleConfiguration"]["Rules"][0]
     assert rule["AbortIncompleteMultipartUpload"] == {"DaysAfterInitiation": 1}
@@ -153,6 +171,8 @@ def test_bucket_setup_requests_match_the_s3_api(
             {"TagSet": [{"Key": "valkyrie:org-id", "Value": str(org.id)}]},
             {"Bucket": bucket, "ExpectedBucketOwner": "123456789012"},
         )
+        stubber.add_client_error("get_bucket_policy", service_error_code="NoSuchBucketPolicy")
+        stubber.add_response("put_bucket_policy", {})
         stubber.add_response("put_bucket_versioning", {})
         stubber.add_response("put_bucket_lifecycle_configuration", {})
         stubber.add_response("put_bucket_cors", {})
@@ -164,6 +184,64 @@ def test_bucket_setup_requests_match_the_s3_api(
 
         assert ensure_org_bucket(database_session, org) == bucket
         stubber.assert_no_pending_responses()
+
+
+@pytest.mark.description("Bucket setup keeps the existing policy statements when it adds the HTTP deny.")
+@pytest.mark.parametrize("single_statement", [True, False])
+def test_https_deny_preserves_existing_policy(database_session: Session, s3: MagicMock, single_statement: bool) -> None:
+    org = _org(database_session, "acme.example")
+    bucket = tenant_bucket_name(org.name)
+    existing = {
+        "Sid": "RequireConditionalWrites",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:PutObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*",
+        "Condition": {"Null": {"s3:if-none-match": "true"}},
+    }
+    s3.get_bucket_tagging.return_value = {"TagSet": [{"Key": "valkyrie:org-id", "Value": str(org.id)}]}
+    s3.get_bucket_policy.side_effect = None
+    s3.get_bucket_policy.return_value = {
+        "Policy": json.dumps({"Version": "2012-10-17", "Statement": existing if single_statement else [existing]})
+    }
+
+    assert ensure_org_bucket(database_session, org) == bucket
+
+    policy = json.loads(s3.put_bucket_policy.call_args.kwargs["Policy"])
+    assert len(policy["Statement"]) == 2
+    assert existing in policy["Statement"]
+
+
+@pytest.mark.description("Bucket setup preserves the existing HTTP deny and rejects a conflict without rewriting it.")
+@pytest.mark.parametrize("secure_transport", ["false", "true"])
+def test_https_deny_is_not_duplicated(database_session: Session, s3: MagicMock, secure_transport: str) -> None:
+    org = _org(database_session, "acme.example")
+    bucket = tenant_bucket_name(org.name)
+    s3.get_bucket_policy.side_effect = None
+    s3.get_bucket_policy.return_value = {
+        "Policy": json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "DenyInsecureTransport",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:*",
+                        "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+                        "Condition": {"Bool": {"aws:SecureTransport": secure_transport}},
+                    }
+                ],
+            }
+        )
+    }
+
+    if secure_transport == "false":
+        assert ensure_org_bucket(database_session, org) == bucket
+    else:
+        with pytest.raises(TenantBucketError, match="conflicting HTTPS policy statement"):
+            ensure_org_bucket(database_session, org)
+    s3.put_bucket_policy.assert_not_called()
 
 
 @pytest.mark.description("An existing tenant bucket gets the org tag only when it is missing.")
@@ -208,6 +286,7 @@ def test_bucket_tagged_for_another_org_is_refused(database_session: Session, s3:
         ensure_org_bucket(database_session, org)
 
     s3.tag_resource.assert_not_called()
+    s3.put_bucket_policy.assert_not_called()
     s3.put_bucket_abac.assert_not_called()
     database_session.expire_all()
     stored = database_session.get(Org, org.id)
@@ -221,6 +300,8 @@ def test_bucket_tagged_for_another_org_is_refused(database_session: Session, s3:
         "create_bucket",
         "get_bucket_tagging",
         "tag_resource",
+        "get_bucket_policy",
+        "put_bucket_policy",
         "put_bucket_versioning",
         "put_bucket_lifecycle_configuration",
         "put_bucket_cors",

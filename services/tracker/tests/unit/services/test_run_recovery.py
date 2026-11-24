@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import anyio
@@ -44,6 +44,7 @@ from tracker.database.models import (
     EvaluationResult,
     Project,
     RunProject,
+    ExecutorAdmission,
     ExecutorDispatch,
     ExecutorDispatchPayload,
     ExecutorRelease,
@@ -693,7 +694,7 @@ class TestRunRecovery:
                 OrgContext(id=self._test_org.id, name=self._test_org.name, storage_key=self._test_org.storage_key),
                 sandbox_provider_config=DaytonaProviderConfig(
                     DAYTONA_API_KEY="key",
-                    DAYTONA_API_URL="url",
+                    DAYTONA_API_URL="https://app.daytona.io/api",
                     DAYTONA_TARGET="target",
                 ),
                 sandbox_provider=cast(SandboxProvider, MockSubsetSandboxProvider([])),
@@ -1394,7 +1395,7 @@ class TestRunRecovery:
 
         sandbox_provider_config = DaytonaProviderConfig(
             DAYTONA_API_KEY="key",
-            DAYTONA_API_URL="url",
+            DAYTONA_API_URL="https://app.daytona.io/api",
             DAYTONA_TARGET="target",
         )
 
@@ -1540,7 +1541,7 @@ class TestRunRecovery:
                 OrgContext(id=self._test_org.id, name=self._test_org.name, storage_key=self._test_org.storage_key),
                 sandbox_provider_config=DaytonaProviderConfig(
                     DAYTONA_API_KEY="key",
-                    DAYTONA_API_URL="url",
+                    DAYTONA_API_URL="https://app.daytona.io/api",
                     DAYTONA_TARGET="target",
                 ),
                 sandbox_provider=cast(SandboxProvider, MockSubsetSandboxProvider([])),
@@ -2132,14 +2133,16 @@ class TestRunRecovery:
         assert benchmark_row.arguments.contract.secrets == admitted_request["contract"]["secrets"]
 
     @pytest.mark.description(
-        "Automatic recovery queues the contract secrets the run started with, even after the gateway secret is retagged."
+        "Retry and resume of a retagged project-key run dispatch with the newest project's Gateway key."
     )
     @pytest.mark.parametrize("saved_gateway", [False, True])
     @pytest.mark.parametrize("active_without_tasks", [False, True])
-    async def test_automatic_recovery_keeps_original_gateway_secrets_after_retag(
+    @pytest.mark.parametrize("retry", [True, False], ids=["retry", "resume"])
+    async def test_recovery_rebinds_project_gateway_key_after_retag(
         self,
         saved_gateway: bool,
         active_without_tasks: bool,
+        retry: bool,
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
@@ -2154,6 +2157,9 @@ class TestRunRecovery:
         benchmark.status = BenchmarkStatus.IN_PROGRESS if active_without_tasks else BenchmarkStatus.STOPPED
         saved_secrets = {"EXISTING_API_KEY": "existing-secret"}
         if saved_gateway:
+            benchmark.arguments.selected_project_gateway_secret_ref = (
+                f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-original-key"
+            )
             saved_secrets.update(
                 MODEL_GATEWAY_URL=f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-original-url",
                 MODEL_GATEWAY_API_KEY=f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-original-key",
@@ -2164,6 +2170,10 @@ class TestRunRecovery:
         project_service.seed(original_project, current_project)
         database_session.add_all([org, benchmark])
         database_session.flush()
+        if not active_without_tasks:
+            database_session.add(
+                Task(org_id=org.id, benchmark=benchmark.id, task_id="task_0", status=TaskStatus.STOPPED)
+            )
         database_session.add_all(
             [
                 RunProject(benchmark_id=benchmark.id, project_id=original_project.id),
@@ -2171,34 +2181,160 @@ class TestRunRecovery:
             ]
         )
         database_session.commit()
+        current_ref = f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-retagged-key"
+        admission_locks: list[ExecutorAdmission] = []
+        lock_admission = main_module.lock_executor_admission
+
+        def record_lock(session: Session) -> ExecutorAdmission:
+            admission_locks.append(lock_admission(session))
+            return admission_locks[-1]
+
+        def collect_key(*_args: object) -> dict[str, str]:
+            assert admission_locks == [], "collected the Gateway key under the admission lock"
+            return {"MODEL_GATEWAY_URL": current_ref, "MODEL_GATEWAY_API_KEY": current_ref}
+
+        prepare = Mock(side_effect=collect_key)
+        monkeypatch.setattr(main_module, "prepare_project_gateway_key", prepare)
+        monkeypatch.setattr(main_module, "lock_executor_admission", record_lock)
         monkeypatch.setattr(
-            main_module, "prepare_project_gateway_key", Mock(side_effect=AssertionError("rebound Gateway key"))
+            BenchmarkServiceClient,
+            "verify_task_ids",
+            AsyncMock(return_value=VerifyTaskIdsResponse(task_ids=["task_0"])),
         )
-        if not active_without_tasks:
-            monkeypatch.setattr(main_module, "reset_to_in_progress_status", lambda *_args, **_kwargs: ["task_0"])
 
         response = client.post(
-            f"/retry-or-resume-benchmark/{benchmark.id}?retry=true",
+            f"/retry-or-resume-benchmark/{benchmark.id}?retry={str(retry).lower()}",
             json={
                 "secrets": {
                     "MODEL_GATEWAY_URL": "other-tenant/foreign-url",
                     "MODEL_GATEWAY_API_KEY": "other-tenant/foreign-key",
                     "EXISTING_API_KEY": "rotated-secret",
                 }
-            },
+            }
+            if retry
+            else {},
         )
 
         assert response.status_code == 200, response.text
-        expected_secrets = saved_secrets | {"EXISTING_API_KEY": "rotated-secret"}
+        expected_secrets = saved_secrets | ({"EXISTING_API_KEY": "rotated-secret"} if retry else {})
+        rebound = saved_gateway and not active_without_tasks
+        if rebound:
+            expected_secrets |= {"MODEL_GATEWAY_URL": current_ref, "MODEL_GATEWAY_API_KEY": current_ref}
         database_session.expire_all()
         stored = database_session.get(Benchmark, benchmark.id)
         assert stored is not None
         assert stored.arguments.contract.secrets == expected_secrets
+        assert stored.arguments.selected_project_gateway_secret_ref == expected_secrets.get("MODEL_GATEWAY_API_KEY")
+        assert [call.args[1].id for call in prepare.call_args_list] == ([current_project.id] if rebound else [])
         if active_without_tasks:
             assert mock_launcher.queued_calls == []
         else:
             queued_request = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]
             assert queued_request["contract"]["secrets"] == expected_secrets
+
+    @pytest.mark.description(
+        "Recovery refuses with 409 when a retag commits after it collected the key and before it locks the run."
+    )
+    async def test_recovery_refuses_retag_committed_after_key_collection(
+        self,
+        example_benchmark_object: Benchmark,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+        mock_launcher: MockLauncher,
+        project_service: MockProjectRoutes,
+    ) -> None:
+        monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+        org = database_session.get(Org, TEST_ORG_ID)
+        assert org is not None
+        org.name = "vals.ai"
+        benchmark = example_benchmark_object
+        benchmark.status = BenchmarkStatus.STOPPED
+        original_ref = f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-{uuid4()}"
+        benchmark.arguments.contract.secrets = {
+            "MODEL_GATEWAY_URL": original_ref,
+            "MODEL_GATEWAY_API_KEY": original_ref,
+        }
+        benchmark.arguments.selected_project_gateway_secret_ref = original_ref
+        first = Project(org_id=org.id, handle="first", name="First", spend_type=SpendType.INTERNAL)
+        second = Project(org_id=org.id, handle="second", name="Second", spend_type=SpendType.INTERNAL)
+        project_service.seed(first, second)
+        database_session.add_all([org, benchmark])
+        database_session.flush()
+        database_session.add(RunProject(benchmark_id=benchmark.id, project_id=first.id))
+        database_session.commit()
+        new_ref = f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-{uuid4()}"
+        prepare = Mock(return_value={"MODEL_GATEWAY_URL": new_ref, "MODEL_GATEWAY_API_KEY": new_ref})
+        lock_admission = main_module.lock_executor_admission
+        run_id = benchmark.id
+
+        def retag_before_lock(session: Session) -> ExecutorAdmission:
+            response = client.post(f"/benchmarks/{run_id}/project", json={"project": second.handle})
+            assert response.status_code == 200, response.text
+
+            return lock_admission(session)
+
+        monkeypatch.setitem(app.dependency_overrides, main_module.get_current_starter, lambda: RequestIdentity(org=org))
+        monkeypatch.setattr(main_module, "prepare_project_gateway_key", prepare)
+        monkeypatch.setattr(main_module, "lock_executor_admission", retag_before_lock)
+        monkeypatch.setattr(main_module, "reset_to_in_progress_status", lambda *_args, **_kwargs: ["task_0"])
+
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}?retry=true")
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "Run changed project during recovery; retry the request."
+        database_session.expire_all()
+        stored = database_session.get(Benchmark, benchmark.id)
+        assert stored is not None
+        assert stored.status == BenchmarkStatus.STOPPED
+        assert stored.arguments.contract.secrets["MODEL_GATEWAY_API_KEY"] == original_ref
+        assert stored.arguments.selected_project_gateway_secret_ref == original_ref
+        assert [call.args[1].id for call in prepare.call_args_list] == [first.id]
+        assert mock_launcher.queued_calls == []
+
+    @pytest.mark.description(
+        "Resizing a running retagged run keeps its saved Gateway key and never collects the new project's key."
+    )
+    async def test_running_resize_after_retag_keeps_gateway_key(
+        self,
+        example_benchmark_object: Benchmark,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+        mock_launcher: MockLauncher,
+        project_service: MockProjectRoutes,
+    ) -> None:
+        monkeypatch.setenv("MODEL_GATEWAY_PROJECT_KEYS_MODE", "automatic")
+        org = database_session.get(Org, TEST_ORG_ID)
+        assert org is not None
+        org.name = "vals.ai"
+        benchmark = example_benchmark_object
+        benchmark.status = BenchmarkStatus.IN_PROGRESS
+        original_ref = f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-{uuid4()}"
+        benchmark.arguments.contract.secrets = {
+            "MODEL_GATEWAY_URL": original_ref,
+            "MODEL_GATEWAY_API_KEY": original_ref,
+        }
+        benchmark.arguments.selected_project_gateway_secret_ref = original_ref
+        project = Project(org_id=org.id, handle="retagged", name="Retagged", spend_type=SpendType.INTERNAL)
+        project_service.seed(project)
+        database_session.add_all([org, benchmark])
+        database_session.flush()
+        database_session.add(RunProject(benchmark_id=benchmark.id, project_id=project.id))
+        database_session.commit()
+        monkeypatch.setattr(
+            main_module,
+            "prepare_project_gateway_key",
+            Mock(side_effect=AssertionError("collected a Gateway key for a resize")),
+        )
+
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark.id}?concurrency=3")
+
+        assert response.status_code == 200, response.text
+        database_session.expire_all()
+        stored = database_session.get(Benchmark, benchmark.id)
+        assert stored is not None
+        assert stored.arguments.concurrency == 3
+        assert stored.arguments.selected_project_gateway_secret_ref == original_ref
+        assert mock_launcher.queued_calls == []
 
     @pytest.mark.description(
         (

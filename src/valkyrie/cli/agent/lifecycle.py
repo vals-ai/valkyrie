@@ -6,7 +6,7 @@ import click
 from valkyrie.display import terminal_safe
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, local_time, paginate_cli_pages
+from valkyrie.cli.display import emit, json_option, format_table, local_time, paginate_cli_pages, confirm, done, empty
 
 
 @click.command(name="install", help="Install a GitHub agent through Tracker, replacing an existing alias.")
@@ -18,9 +18,12 @@ from valkyrie.cli.display import format_option, format_table, local_time, pagina
     required=False,
     help="Agent name (defaults to the contract name).",
 )
-def install(github_url: str, name: str | None):
+@json_option()
+def install(github_url: str, name: str | None, output_format: str):
     entry = call(lambda client: client.agents.install(github_url, name=name))
-    click.echo(click.style(f"✓ Agent '{entry.name}' installed successfully!", fg="green", bold=True))
+    if emit(entry, output_format):
+        return
+    done(f"Agent '{entry.name}' installed successfully!")
 
 
 @click.command(name="push", help="Upload a local agent through Tracker, replacing an existing alias.")
@@ -32,65 +35,78 @@ def install(github_url: str, name: str | None):
     required=False,
     help="Agent name (defaults to the contract name).",
 )
-def push(agent_path: Path, name: str | None):
+@json_option()
+def push(agent_path: Path, name: str | None, output_format: str):
     entry = call(lambda client: client.agents.push(agent_path, name=name or None))
-    click.echo(click.style(f"✓ Agent '{entry.name}' pushed successfully!", fg="green", bold=True))
+    if emit(entry, output_format):
+        return
+    done(f"Agent '{entry.name}' pushed successfully!")
 
 
 @click.command(name="remove", help="Remove an installed agent.")
 @click.argument("agent_name", type=str)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def agent_remove(agent_name: str, yes: bool):
-    if not yes and not click.confirm(f"Are you sure you want to remove agent '{agent_name}'?"):
-        click.echo("Cancelled.")
+@json_option()
+def agent_remove(agent_name: str, yes: bool, output_format: str):
+    if not confirm(f"Are you sure you want to remove agent '{agent_name}'?", yes=yes):
+        click.echo("Cancelled.", err=True)
         return
 
     call(lambda client: client.agents.remove(agent_name))
-    click.echo(click.style(f"✓ Agent '{agent_name}' removed successfully!", fg="green", bold=True))
+    if emit({"removed": agent_name}, output_format):
+        return
+    done(f"Agent '{agent_name}' removed successfully!")
 
 
 @click.command(name="download", help="Download an installed agent.")
 @click.argument("agent_name", type=str)
 @click.option(
-    "--output-dir",
+    "--output",
     "-o",
+    "output_dir",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
     default=None,
     required=False,
     help="Output directory for downloaded agent (default: current directory).",
 )
 @click.option("--overwrite", is_flag=True, help="Replace an existing agent directory after validating the download.")
-def download(agent_name: str, output_dir: Path | None, overwrite: bool):
-    call(lambda client: client.agents.download(agent_name, output_dir, overwrite=overwrite))
-    click.echo(click.style(f"✓ Agent '{agent_name}' downloaded successfully!", fg="green", bold=True))
+@json_option()
+def download(agent_name: str, output_dir: Path | None, overwrite: bool, output_format: str):
+    destination = call(lambda client: client.agents.download(agent_name, output_dir, overwrite=overwrite))
+    if emit({"agent": agent_name, "path": destination}, output_format):
+        return
+    done(f"Agent '{agent_name}' downloaded successfully!")
 
 
 @click.command(name="list", help="List installed agents.")
 @click.option("--all", "all_agents", is_flag=True, help="Show every agent without interactive paging.")
-@format_option("Output format. JSON includes every agent without interactive paging.")
+@json_option()
 def list_installed_agents(all_agents: bool, output_format: str):
 
-    response = call(lambda client: client.agents.list())
     if output_format == "json":
-        click.echo(response.model_dump_json())
+        emit(call(lambda client: client.agents.list()))
         return
 
+    if not all_agents:
+        paginate_agents()
+        return
+
+    agents = _installed_agents()
+    if not agents:
+        empty("No agents found.")
+        return
+    _format_agents_response(agents, 1, 1, len(agents))
+
+
+def _installed_agents() -> list[tuple[str, datetime | None]]:
+    response = call(lambda client: client.agents.list())
     try:
-        agents = [
+        return [
             (agent.name, datetime.fromisoformat(agent.last_modified) if agent.last_modified else None)
             for agent in response.agents
         ]
     except ValueError as error:
         raise click.ClickException(terminal_safe(str(error), preserve_newlines=True)) from error
-
-    if not agents:
-        click.echo(click.style("No agents found.", fg="yellow"))
-        return
-
-    if all_agents:
-        _format_agents_response(agents, 1, 1, len(agents))
-    else:
-        paginate_agents(agents)
 
 
 def _format_agents_response(
@@ -107,10 +123,14 @@ def _format_agents_response(
     format_table(rows, ["Agent", "Last Modified"], current_page, total_pages, total_count, "agent")
 
 
-def paginate_agents(agents: list[tuple[str, datetime | None]], limit: int = 10) -> None:
+def paginate_agents(limit: int = 10) -> None:
+    def load_page(offset: int, page_limit: int) -> tuple[int, list[tuple[str, datetime | None]]]:
+        agents = _installed_agents()
+        return len(agents), agents[offset : offset + page_limit]
+
     paginate_cli_pages(
-        lambda offset, page_limit: (len(agents), agents[offset : offset + page_limit]),
+        load_page,
         _format_agents_response,
         limit=limit,
-        render_empty=lambda: click.echo(click.style("No agents found.", fg="yellow")),
+        render_empty=lambda: empty("No agents found."),
     )

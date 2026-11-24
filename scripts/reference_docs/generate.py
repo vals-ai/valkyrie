@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .model import DOCS_ROOT, GENERATED_MARKER, REFERENCE_ROOT
 from .render import render_reference
+from .collect import collect_completion
 
 _MAX_DIFF_LINES = 80
 
@@ -69,6 +70,16 @@ def main(argv: Sequence[str] | None = None, docs_root: Path = DOCS_ROOT) -> int:
     )
     parser.add_argument("--check", action="store_true", help="Check generated files without writing them.")
     arguments = parser.parse_args(argv)
+    if docs_root == DOCS_ROOT:
+        from valkyrie.cli.completion import COMPLETION_FILE
+
+        expected = collect_completion()
+        if arguments.check:
+            if not COMPLETION_FILE.exists() or COMPLETION_FILE.read_text() != expected:
+                print("Completion reference is stale. Run make docs-reference.")
+                return 1
+        else:
+            COMPLETION_FILE.write_text(expected)
     if arguments.check:
         diagnostics = check_reference(docs_root)
         if diagnostics:

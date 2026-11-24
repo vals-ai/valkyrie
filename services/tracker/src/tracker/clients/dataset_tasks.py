@@ -1,4 +1,8 @@
+import asyncio
+import logging
 import posixpath
+import tempfile
+from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -36,9 +40,11 @@ from tracker.services.datasets.compose import start_compose_runtime
 from tracker.services.datasets.config import MAIN_SERVICE, StepConfig, TaskConfig, VerifierConfig
 from tracker.services.datasets.artifacts import (
     CONVENTION_ARTIFACT,
+    SAVED_ARTIFACTS_RUN,
     ArtifactSink,
     discard_staged,
     run_collect_hooks,
+    saved_artifacts,
     stage_artifacts,
     upload_artifacts,
 )
@@ -50,9 +56,17 @@ from tracker.services.datasets.folder import (
     read_instruction,
     sandbox_kind,
 )
-from tracker.services.datasets.grading import ARTIFACTS_DIR, OPEN_LOG_DIRS, VerifierResultError, grade_task, upload_dir
+from tracker.services.datasets.grading import (
+    ARTIFACTS_DIR,
+    OPEN_LOG_DIRS,
+    GradingSandbox,
+    VerifierResultError,
+    grade_task,
+    upload_dir,
+)
 from tracker.services.datasets.healthcheck import wait_until_healthy
-from tracker.services.datasets.image_config import dockerfile_base_image, image_workdir
+from tracker.services.datasets.dockerfile import final_stage
+from tracker.services.datasets.image_config import ImageConfig, image_config
 from tracker.services.datasets.oracle import SOLUTION_DIR, SOLUTION_REMOTE, SOLVE_SCRIPT
 from tracker.services.datasets.ref import DatasetRef, LocalDataset
 from tracker.services.datasets.retrieve_task import (
@@ -60,7 +74,9 @@ from tracker.services.datasets.retrieve_task import (
     retrieve_task_response,
     stage_egress,
     with_gateway,
+    with_image_user,
 )
+from tracker.services.datasets.user import non_root_user, root_source
 from tracker.services.datasets.rewards import extract_rewards
 from tracker.services.datasets.separate_verifier import Layers, compose_verifier_resources, grade_separately
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, TaskSource
@@ -71,7 +87,6 @@ from tracker.services.datasets.steps import (
     below_min_reward,
     merged_tests,
     prepare_step,
-    step_agent,
     step_config,
     step_dir,
     step_layers,
@@ -87,6 +102,8 @@ from tracker.sandbox import (
     runtime_sandbox,
     working_directory_command,
 )
+
+logger = logging.getLogger(__name__)
 
 _Result = TypeVar("_Result")
 TESTS_PART = "tests"
@@ -131,7 +148,8 @@ class DatasetTaskService:
         self._read_secret = read_secret
         self._artifact_sink = artifact_sink
         self._tasks: dict[str, ResolvedTask] = {}
-        self._image_workdirs: dict[str, str | None] = {}
+        self._image_configs: dict[str, ImageConfig] = {}
+        self._image_config_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._build_contexts = AsyncExitStack()
 
     async def verify_task_ids(
@@ -155,6 +173,19 @@ class DatasetTaskService:
             return VerifyTaskIdsResponse(task_ids=selected)
         return VerifyTaskIdsResponse(task_ids=available)
 
+    async def validate_local_tasks(self, task_ids: list[str]) -> None:
+        if not isinstance(self.source, LocalFolderSource):
+            return
+
+        def validate(source: LocalFolderSource) -> None:
+            folders = source.task_folders()
+            for task_id in task_ids:
+                if task_id not in folders:
+                    raise FileNotFoundError(f"Task {task_id!r} is no longer in the dataset")
+                self._config(task_id, folders[task_id])
+
+        await asyncio.to_thread(validate, self.source)
+
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
@@ -163,25 +194,35 @@ class DatasetTaskService:
     async def _task(self, task_id: str) -> ResolvedTask:
         if task_id not in self._tasks:
             async with self.source.open_task(task_id) as task_dir:
-                report = validate_task(task_dir)
-                if report.config is None or not report.ok:
-                    raise InvalidTaskError(f"Task {task_id!r} is not valid: {'; '.join(report.errors)}")
+                config = self._config(task_id, task_dir)
                 build_dir = task_dir
                 async with AsyncExitStack() as pending:
-                    if sandbox_kind(task_dir, report.config) in (SandboxKind.DOCKERFILE, SandboxKind.COMPOSE):
+                    if sandbox_kind(task_dir, config) in (SandboxKind.DOCKERFILE, SandboxKind.COMPOSE):
                         build_dir = await pending.enter_async_context(self.source.open_task(task_id, [ENVIRONMENT_DIR]))
-                    response = retrieve_task_response(build_dir, report.config)
+                    response = retrieve_task_response(build_dir, config)
+                    if isinstance(response.source, (ImageSource, DockerfileSource)) and (
+                        user := await self._image_user(task_id, response.source)
+                    ):
+                        response = with_image_user(
+                            response,
+                            user,
+                            root_source(
+                                response.source,
+                                Path(pending.enter_context(tempfile.TemporaryDirectory())),
+                                config.environment.build_timeout_sec,
+                            ),
+                        )
                     env, secret_env = await resolve_env(
                         response.env, self._read_secret, f"Task {task_id!r} [environment].env"
                     )
                     verifier_env, sandbox_env, secret_values = await self._resolve_grader(
-                        f"Task {task_id!r}", report.config.verifier
+                        f"Task {task_id!r}", config.verifier
                     )
                     secret_values.extend(env[name] for name in secret_env)
                     steps: dict[str, ResolvedStep] = {}
-                    grading_models = dict.fromkeys(report.config.verifier.models)
-                    for step in report.config.steps:
-                        verifier = step_verifier(report.config, step)
+                    grading_models = dict.fromkeys(config.verifier.models)
+                    for step in config.steps:
+                        verifier = step_verifier(config, step)
                         grading_models.update(dict.fromkeys(verifier.models))
                         step_env, step_sandbox_env, step_secrets = await self._resolve_grader(
                             f"Task {task_id!r} step {step.name!r}", verifier
@@ -196,7 +237,7 @@ class DatasetTaskService:
                         verifier_env,
                         sandbox_env,
                         secret_values,
-                        compose_verifier_resources(report.config, task_dir),
+                        compose_verifier_resources(config, task_dir),
                         steps,
                         list(grading_models),
                     )
@@ -218,8 +259,56 @@ class DatasetTaskService:
             [*(env[name] for name in from_secrets), *(sandbox_env[name] for name in sandbox_secrets)],
         )
 
-    async def resume_evaluation(self, task_id: str, **_options: Any) -> Any:
-        raise InvalidSandboxConfigurationError(f"Task {task_id} of a dataset has no evaluation to resume")
+    async def regrade(
+        self,
+        task_id: str,
+        eval_resume_state: Mapping[str, Any],
+        *,
+        objects: ObjectStore,
+        labels: Mapping[str, str],
+        sandbox_provider: SandboxProviderConfig | None,
+        on_message: Callable[[str], None] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        grading_gateway: ScopedGateway | None = None,
+    ) -> JsonValue:
+        run_id = eval_resume_state.get(SAVED_ARTIFACTS_RUN)
+        if not isinstance(run_id, str):
+            raise InvalidSandboxConfigurationError(f"Task {task_id} of a dataset has no saved artifacts to regrade")
+        task = await self._task(task_id)
+        async with self.source.open_task(task_id, [TESTS_PART]) as task_dir:
+            config = self._config(task_id, task_dir)
+            if config.steps or not config.verifier.is_separate:
+                raise InvalidTaskError(
+                    f"Task {task_id!r} has steps or grades in the agent's sandbox, so it can't be regraded"
+                )
+            if task.response.cwd_from_image and any(
+                not artifact.source.startswith("/") for artifact in config.artifacts
+            ):
+                raise InvalidTaskError(
+                    f"Task {task_id!r} has a relative artifact path and takes its working directory from its image"
+                )
+            staged, skipped = await saved_artifacts(objects, run_id, task_id, config.artifacts, task.response.cwd)
+            verifier_env, redact, gateway = _grading_gateway(task_id, config, task, task.verifier_env, grading_gateway)
+            return await grade_separately(
+                task_id,
+                config,
+                verifier_env,
+                task.verifier_sandbox_env,
+                task_dir / TESTS_PART,
+                labels,
+                task.response.source,
+                task.response.compose,
+                self._provider(sandbox_provider),
+                staged,
+                skipped,
+                on_message,
+                on_sandbox_created,
+                redact,
+                None,
+                gateway.url if gateway is not None else None,
+                task.response.image_user,
+                self._image_workdir,
+            )
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
         return self._sandbox_providers.get(provider)
@@ -292,30 +381,63 @@ class DatasetTaskService:
         task = await self._task(task_id)
         if not task.response.cwd_from_image:
             return task.response
-        result = await (await self._sandbox(instance_id, sandbox_provider)).exec(PROCESS_CWD_COMMAND)
-        image_cwd = result.output.strip() if result.exit_code == 0 else ""
-        if image_cwd in UNREADABLE_IMAGE_CWDS:
-            image_cwd = await self._registry_workdir(task.response.source) or ""
-        cwd = image_cwd if image_cwd not in UNDECLARED_IMAGE_CWDS else task.response.cwd
+        workdir = await self._image_workdir(await self._sandbox(instance_id, sandbox_provider), task.response.source)
+        cwd = workdir or task.response.cwd
         response = task.response.model_copy(
-            update={"cwd": cwd, "problem_path": f"{cwd}/{INSTRUCTION_FILE}", "cwd_from_image": False}
+            update={
+                "cwd": cwd,
+                "problem_path": f"{cwd}/{INSTRUCTION_FILE}",
+                "cwd_from_image": False,
+                "workdir": workdir,
+            }
         )
         self._tasks[task_id] = task._replace(response=response)
         return response
+
+    async def _image_workdir(self, sandbox: GradingSandbox, source: SandboxSource) -> str | None:
+        if isinstance(source, DockerfileSource) and (declared := final_stage(Path(source.dockerfile)).workdir):
+            return declared
+        result = await sandbox.exec(PROCESS_CWD_COMMAND)
+        image_cwd = result.output.strip() if result.exit_code == 0 else ""
+        if image_cwd in UNDECLARED_IMAGE_CWDS:
+            image_cwd = await self._registry_workdir(source) or ""
+        return image_cwd if image_cwd not in UNREADABLE_IMAGE_CWDS else None
 
     async def _registry_workdir(self, source: SandboxSource) -> str | None:
         match source:
             case ImageSource(image=image):
                 pass
             case DockerfileSource(dockerfile=dockerfile):
-                image = dockerfile_base_image(Path(dockerfile))
+                image = final_stage(Path(dockerfile)).base
             case _:
                 image = None
+        config = await self._image_config(image)
+        return config.workdir if config is not None else None
+
+    async def _image_user(self, task_id: str, source: ImageSource | DockerfileSource) -> str | None:
+        if isinstance(source, DockerfileSource):
+            stage = final_stage(Path(source.dockerfile))
+            declared, image = stage.user, stage.base
+        else:
+            declared, image = None, source.image
+        if declared is None:
+            config = await self._image_config(image)
+            if config is None:
+                return None
+            declared = config.user
+        try:
+            return non_root_user(declared)
+        except ValueError as error:
+            logger.warning("Task %r runs as its image's default user because its USER is not valid: %s", task_id, error)
+            return None
+
+    async def _image_config(self, image: str | None) -> ImageConfig | None:
         if image is None:
             return None
-        if image not in self._image_workdirs:
-            self._image_workdirs[image] = await image_workdir(image)
-        return self._image_workdirs[image]
+        async with self._image_config_locks[image]:
+            if image not in self._image_configs and (config := await image_config(image)) is not None:
+                self._image_configs[image] = config
+        return self._image_configs.get(image)
 
     async def prepare_step(
         self,
@@ -337,7 +459,7 @@ class DatasetTaskService:
                 task.steps[step.name].instruction,
                 task.response.problem_path,
                 task.response.cwd,
-                step_agent(config, step).user,
+                next(plan.agent_user for plan in task.response.steps if plan.name == step.name),
                 lambda message: on_message(message) if on_message is not None else None,
             )
 
@@ -480,19 +602,7 @@ class DatasetTaskService:
             if on_message is not None:
                 on_message(message)
 
-        secret_values = task.secret_values
-        if not config.verifier.models:
-            gateway = None
-        elif gateway is None:
-            raise InvalidSandboxConfigurationError(
-                f"Task {task_id!r} lists [verifier].models, but this run has no Model Gateway grading token. "
-                "Start the run in a project that has a Gateway key."
-            )
-        else:
-            verifier_env = verifier_env | {MODEL_GATEWAY_URL: gateway.url, MODEL_GATEWAY_API_KEY: gateway.token}
-            secret_values = [*secret_values, gateway.token]
-
-        redact = create_agent_error_redactor(secret_values)
+        verifier_env, redact, gateway = _grading_gateway(task_id, config, task, verifier_env, gateway)
         services = _services(outer, task.response.source, config)
         sandbox = services[MAIN_SERVICE]
 
@@ -509,7 +619,7 @@ class DatasetTaskService:
             for artifact in skipped:
                 say(f"Artifact {artifact.source} was skipped: {artifact.reason}")
             if self._artifact_sink is not None:
-                await upload_artifacts(task_id, services, staged, self._artifact_sink, say, folder)
+                await upload_artifacts(task_id, staged, skipped, self._artifact_sink, say, folder)
             if not config.verifier.is_separate:
                 await discard_staged(services, staged)
                 async with _open_to_gateway(outer, stage_egress(config.verifier, config.environment), gateway):
@@ -522,6 +632,8 @@ class DatasetTaskService:
                         on_message,
                         redact=redact,
                         reset_tests=reset_tests,
+                        cwd=task.response.workdir,
+                        default_user=task.response.image_user,
                     )
             return await grade_separately(
                 task_id,
@@ -529,7 +641,7 @@ class DatasetTaskService:
                 verifier_env,
                 verifier_sandbox_env,
                 tests_dir,
-                services,
+                services[MAIN_SERVICE].labels or {},
                 task.response.source,
                 task.response.compose,
                 provider,
@@ -540,6 +652,8 @@ class DatasetTaskService:
                 redact,
                 layers,
                 gateway.url if gateway is not None else None,
+                task.response.image_user,
+                self._image_workdir,
             )
         finally:
             await discard_staged(services, staged)
@@ -581,6 +695,23 @@ def _services(outer: Sandbox, source: SandboxSource, config: TaskConfig) -> dict
     named = {MAIN_SERVICE, *(hook.service for hook in config.verifier.collect)}
     named |= {artifact.service for artifact in config.artifacts if artifact.service}
     return {name: ComposeSandbox(outer, source.model_copy(update={"service": name})) for name in named}
+
+
+def _grading_gateway(
+    task_id: str, config: TaskConfig, task: ResolvedTask, verifier_env: dict[str, str], gateway: ScopedGateway | None
+) -> tuple[dict[str, str], Callable[[str], str], ScopedGateway | None]:
+    if not config.verifier.models:
+        return verifier_env, create_agent_error_redactor(task.secret_values), None
+    if gateway is None:
+        raise InvalidSandboxConfigurationError(
+            f"Task {task_id!r} lists [verifier].models, but this run has no Model Gateway grading token. "
+            "Start the run in a project that has a Gateway key."
+        )
+    return (
+        verifier_env | {MODEL_GATEWAY_URL: gateway.url, MODEL_GATEWAY_API_KEY: gateway.token},
+        create_agent_error_redactor([*task.secret_values, gateway.token]),
+        gateway,
+    )
 
 
 def dataset_service(

@@ -1,8 +1,9 @@
 import io
 import logging
 import os
+from functools import partial
 import tarfile
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
@@ -27,7 +28,7 @@ from tracker import egress
 from tracker.services.datasets.artifacts import SkippedArtifact, StagedArtifact, stage_artifacts
 from tracker.services.datasets.compose import ComposeRuntime
 from tracker.services.datasets.config import ArtifactConfig, TaskConfig
-from tracker.services.datasets.grading import OPEN_LOG_DIRS, REWARD_TEXT_PATH, VerifierResultError
+from tracker.services.datasets.grading import OPEN_LOG_DIRS, REWARD_TEXT_PATH, GradingSandbox, VerifierResultError
 from tracker.services.datasets.separate_verifier import (
     SeparateVerifierError,
     VerifierEnvironment,
@@ -99,6 +100,9 @@ async def grade(
     agent_source: SandboxSource = AGENT_SOURCE,
     agent_compose: ComposeRuntime | None = None,
     gateway_url: str | None = None,
+    default_user: str | None = None,
+    image_workdir: Callable[[GradingSandbox, SandboxSource], Awaitable[str | None]] | None = None,
+    staged: Sequence[StagedArtifact] = (),
 ) -> dict[str, object]:
     return await grade_separately(
         "task-1",
@@ -106,15 +110,17 @@ async def grade(
         {},
         {},
         tests_dir,
-        {"main": cast(Sandbox, agent or labelled_agent())},
+        (agent or labelled_agent()).labels or {},
         agent_source,
         agent_compose,
         cast(Any, provider),
-        [],
+        staged,
         [],
         None,
         created.append if created is not None else None,
         gateway_url=gateway_url,
+        default_user=default_user,
+        image_workdir=image_workdir,
     )
 
 
@@ -305,9 +311,21 @@ class TestGradeSeparately:
         assert provider.requests[0].requires_nested_docker is True
         assert provider.deleted == ["verifier-1"]
 
-    @pytest.mark.description("The tests run in the verifiers workdir and otherwise the environments.")
-    async def test_the_tests_run_in_the_verifiers_workdir_and_otherwise_the_environments(self, tests_dir: Path) -> None:
-        own, inherited = verifier_sandbox(), verifier_sandbox()
+    @pytest.mark.description(
+        "The tests run in the verifier's workdir, else the environment's in a copy of it, else the verifier image's own."
+        " The image's workdir is read before an artifact replaces that folder."
+    )
+    async def test_the_tests_run_in_the_verifiers_workdir_and_otherwise_the_environments(
+        self, tests_dir: Path, tmp_path: Path
+    ) -> None:
+        own, inherited, image = verifier_sandbox(), verifier_sandbox(), verifier_sandbox()
+        archive = tmp_path / "srv.tar.gz"
+        write_archive(archive, {"srv/out.txt": b"x"})
+
+        async def image_workdir(_sandbox: GradingSandbox, source: SandboxSource) -> str | None:
+            if any("tar -xzf" in command for command in image.commands):
+                return "/srv (deleted)"
+            return "/srv" if source == ImageSource(image="grader:1") else "/elsewhere"
 
         await grade(
             TaskConfig.parse("[environment]\nworkdir = '/app'\n[verifier.environment]\nworkdir = '/grader'"),
@@ -319,8 +337,44 @@ class TestGradeSeparately:
             FakeProvider([inherited]),
             tests_dir,
         )
+        await grade(
+            TaskConfig.parse("[environment]\nworkdir = '/app'\n[verifier.environment]\ndocker_image = 'grader:1'"),
+            FakeProvider([image]),
+            tests_dir,
+            image_workdir=image_workdir,
+            staged=[
+                StagedArtifact(
+                    "srv.tar.gz",
+                    "/srv",
+                    str(archive),
+                    "main",
+                    partial(FakeSandbox(files={str(archive): archive.read_bytes()}).stream_download, str(archive)),
+                )
+            ],
+        )
 
-        assert (own.cwds, inherited.cwds) == (["/grader"], ["/app"])
+        assert (own.cwds, inherited.cwds, image.cwds) == (["/grader"], ["/app"], ["/srv"])
+        assert any("tar -xzf" in command for command in image.commands)
+
+    @pytest.mark.description(
+        "A verifier in a copy of the agent's sandbox runs as the image user, and one in its own image runs as that image's."
+    )
+    @pytest.mark.parametrize(
+        ("toml", "switched"),
+        [
+            ("[verifier]\nenvironment_mode = 'separate'", True),
+            ("[verifier.environment]\ndocker_image = 'grader:1'", False),
+        ],
+        ids=["agent-copy", "own-image"],
+    )
+    async def test_the_verifier_runs_as_the_image_user_only_in_a_copy_of_the_agents_sandbox(
+        self, tests_dir: Path, toml: str, switched: bool
+    ) -> None:
+        verifier = verifier_sandbox()
+
+        await grade(TaskConfig.parse(toml), FakeProvider([verifier]), tests_dir, default_user="agent")
+
+        assert any("getent passwd agent" in command for command in verifier.commands) is switched
 
     @pytest.mark.description("The agent environments tests are uploaded only when they are not baked in.")
     async def test_the_agent_environments_tests_are_uploaded_only_when_they_are_not_baked_in(
@@ -434,7 +488,7 @@ class TestGradeSeparately:
                 {},
                 {},
                 tests_dir,
-                {"main": cast(Sandbox, labelled_agent())},
+                labelled_agent().labels or {},
                 AGENT_SOURCE,
                 None,
                 cast(Any, provider),
@@ -489,13 +543,11 @@ def write_archive(
             archive.addfile(info, io.BytesIO(content))
 
 
-def clean(archive: Path, name: str, scratch: Path) -> Path:
-    return clean_archive(archive, name, f"/work/{name}", scratch)
-
-
 @pytest.mark.description("What the agent leaves is carried to the verifier without trusting the archive.")
 class TestCarryArtifacts:
-    @pytest.mark.description("A folder arrives at its declared path with its modes.")
+    @pytest.mark.description(
+        "A folder arrives at its declared path with its contents' modes, and the folder is open to every user."
+    )
     async def test_a_folder_arrives_at_its_declared_path_with_its_modes(self, shell: Sandbox, tmp_path: Path) -> None:
         out = tmp_path / "out"
         (out / "nested").mkdir(parents=True)
@@ -508,11 +560,42 @@ class TestCarryArtifacts:
             path.unlink() if path.is_file() or path.is_symlink() else path.rmdir()
         out.rmdir()
 
-        await _carry_artifacts({"main": shell}, shell, staged, skipped)
+        await _carry_artifacts(shell, staged, skipped)
 
         assert (out / "result.txt").read_text() == "42"
         assert os.access(out / "nested" / "run.sh", os.X_OK)
+        assert out.stat().st_mode & 0o777 == 0o777
         assert (out / "alias").is_symlink() and os.readlink(out / "alias") == "result.txt"
+
+    @pytest.mark.description("A carried folder replaces what the verifier image already had at that path.")
+    async def test_a_carried_folder_replaces_what_was_there(self, shell: Sandbox, tmp_path: Path) -> None:
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "kept.py").write_text("agent")
+        staged, skipped = await stage_artifacts({"main": shell}, [ArtifactConfig(source=str(out))], str(tmp_path))
+        (out / "deleted.py").write_text("image")
+
+        await _carry_artifacts(shell, staged, skipped)
+
+        assert sorted(path.name for path in out.iterdir()) == ["kept.py"]
+
+    @pytest.mark.description("A single file lands in its folder, which opens to every user and keeps its sticky bit.")
+    async def test_a_single_file_opens_its_folder_and_keeps_its_sticky_bit(
+        self, shell: Sandbox, tmp_path: Path
+    ) -> None:
+        box = tmp_path / "box"
+        box.mkdir()
+        (box / "report.txt").write_text("42")
+        staged, skipped = await stage_artifacts(
+            {"main": shell}, [ArtifactConfig(source=str(box / "report.txt"))], str(tmp_path)
+        )
+        (box / "report.txt").unlink()
+        box.chmod(0o1755)
+
+        await _carry_artifacts(shell, staged, skipped)
+
+        assert (box / "report.txt").read_text() == "42"
+        assert box.stat().st_mode & 0o7777 == 0o1777
 
     @pytest.mark.description("An artifact the agent never wrote is carried as nothing.")
     async def test_an_artifact_the_agent_never_wrote_is_carried_as_nothing(
@@ -522,16 +605,16 @@ class TestCarryArtifacts:
             {"main": shell}, [ArtifactConfig(source=str(tmp_path / "nope"))], str(tmp_path)
         )
 
-        await _carry_artifacts({"main": shell}, shell, staged, skipped)
+        await _carry_artifacts(shell, staged, skipped)
 
         assert not (tmp_path / "nope").exists()
 
     @pytest.mark.description("An artifact that could not be staged is an error not a zero.")
     async def test_an_artifact_that_could_not_be_staged_is_an_error_not_a_zero(self, shell: Sandbox) -> None:
-        skipped = [SkippedArtifact("/app/big", "it is over 5 bytes", absent=False)]
+        skipped = [SkippedArtifact("/app/big", "it is over 5 bytes", absent=False, name="app/big")]
 
         with pytest.raises(SeparateVerifierError, match="/app/big can't be carried: it is over 5 bytes"):
-            await _carry_artifacts({"main": shell}, shell, [], skipped)
+            await _carry_artifacts(shell, [], skipped)
 
     @pytest.mark.description("The artifacts folder that cannot be carried is reported and grading goes on.")
     async def test_the_artifacts_folder_that_cannot_be_carried_is_reported_and_grading_goes_on(self) -> None:
@@ -539,10 +622,9 @@ class TestCarryArtifacts:
         messages: list[str] = []
 
         await _carry_artifacts(
-            {"main": cast(Sandbox, FakeSandbox())},
             cast(Sandbox, verifier),
             [],
-            [SkippedArtifact("/logs/artifacts", "it holds too many files", False)],
+            [SkippedArtifact("/logs/artifacts", "it holds too many files", False, "logs/artifacts")],
             messages.append,
         )
 
@@ -552,7 +634,7 @@ class TestCarryArtifacts:
     async def test_the_reward_folder_is_wiped_after_the_artifacts_land(self) -> None:
         verifier = FakeSandbox(id="verifier-1")
 
-        await _carry_artifacts({"main": cast(Sandbox, FakeSandbox())}, cast(Sandbox, verifier), [], [])
+        await _carry_artifacts(cast(Sandbox, verifier), [], [])
 
         assert verifier.commands[-2:] == ["rm -rf /logs/verifier", OPEN_LOG_DIRS]
 
@@ -580,10 +662,13 @@ class TestCarryArtifacts:
     ) -> None:
         archive = tmp_path / "hostile.tar.gz"
         write_archive(archive, members, links, hardlinks)
-        staged = [StagedArtifact("out.tar.gz", str(tmp_path / "work" / "out"), str(archive), "main")]
+        path = str(archive)
+        staged = [
+            StagedArtifact("out.tar.gz", f"{tmp_path}/work/out", path, "main", partial(shell.stream_download, path))
+        ]
 
         with pytest.raises(SeparateVerifierError, match=complaint):
-            await _carry_artifacts({"main": shell}, shell, staged, [])
+            await _carry_artifacts(shell, staged, [])
 
         assert not (tmp_path / "work").exists()
 
@@ -594,7 +679,7 @@ class TestCarryArtifacts:
         scratch = tmp_path / "scratch"
         scratch.mkdir()
 
-        rebuilt = clean_archive(archive, "out", "/work/out", scratch)
+        rebuilt, _folder = clean_archive(archive, "out", "/work/out", scratch)
 
         with tarfile.open(rebuilt) as tar:
             members = {member.name: member for member in tar.getmembers() if member.isfile()}
@@ -634,7 +719,10 @@ class TestCarryArtifacts:
         monkeypatch.setattr(separate_verifier, "MAX_ARTIFACT_BYTES", 100)
         big = tmp_path / "big.tar.gz"
         big.write_bytes(os.urandom(1000))
-        staged = [StagedArtifact("out.tar.gz", str(tmp_path / "work" / "out"), str(big), "main")]
+        path = str(big)
+        staged = [
+            StagedArtifact("out.tar.gz", f"{tmp_path}/work/out", path, "main", partial(shell.stream_download, path))
+        ]
 
         with pytest.raises(SeparateVerifierError, match="is over 100 bytes"):
-            await _carry_artifacts({"main": shell}, shell, staged, [])
+            await _carry_artifacts(shell, staged, [])

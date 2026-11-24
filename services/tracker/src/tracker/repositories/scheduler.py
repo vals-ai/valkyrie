@@ -844,6 +844,7 @@ class SchedulerRepository:
             .where(col(Task.benchmark).in_(queued_benchmarks))
             .values(
                 status=TaskStatus.PENDING,
+                last_log_at=None,
                 started_at=case(
                     (col(Task.started_at) >= now, col(Task.started_at) + timedelta(microseconds=1)),
                     else_=now,
@@ -1097,6 +1098,7 @@ class SchedulerRepository:
             .where(col(Task.id).not_in(unhanded_reservations))
             .values(
                 status=TaskStatus.PENDING,
+                last_log_at=None,
                 started_at=case(
                     (col(Task.started_at) >= now, col(Task.started_at) + timedelta(microseconds=1)),
                     else_=now,

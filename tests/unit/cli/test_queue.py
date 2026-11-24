@@ -121,8 +121,7 @@ def test_status_json_preserves_entries_and_limits(
 
     result = invoke_queue(
         handler,
-        "--format",
-        "JSON",
+        "--json",
         "--waiting-limit",
         "1",
         "--active-limit",
@@ -159,7 +158,7 @@ def test_status_escapes_terminal_controls(invoke_queue: Callable[..., Result], o
         return httpx.Response(200, json=snapshot.model_dump(mode="json"))
 
     text_result = invoke_queue(handler)
-    json_result = invoke_queue(handler, "--format", "json")
+    json_result = invoke_queue(handler, "--json")
 
     assert text_result.exit_code == json_result.exit_code == 0
     assert "\x1b" not in text_result.output

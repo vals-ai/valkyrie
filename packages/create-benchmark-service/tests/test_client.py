@@ -53,7 +53,9 @@ from benchmark_service.v1_schemas import (
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
-DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
+DAYTONA_CONFIG = DaytonaProviderConfig(
+    DAYTONA_API_KEY="key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="target"
+)
 
 
 class RetryableSetupError(Exception):
@@ -901,7 +903,7 @@ async def test_resume_evaluation_with_eval_resume_state(
         "sandbox_provider": {
             "type": "daytona",
             "DAYTONA_API_KEY": "key",
-            "DAYTONA_API_URL": "url",
+            "DAYTONA_API_URL": "https://app.daytona.io/api",
             "DAYTONA_TARGET": "target",
         },
         "dataset": "mydata",
@@ -1129,7 +1131,7 @@ async def test_websocket_request_includes_provider_config() -> None:
             "sandbox_provider": {
                 "type": "daytona",
                 "DAYTONA_API_KEY": "key",
-                "DAYTONA_API_URL": "url",
+                "DAYTONA_API_URL": "https://app.daytona.io/api",
                 "DAYTONA_TARGET": "target",
             },
             "dataset": None,

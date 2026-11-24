@@ -129,15 +129,17 @@ def test_tracker_validation_errors_reach_the_user(fake_tracker: FakeTracker) -> 
     result = CliRunner().invoke(cli, ["benchmark", "service", "set", "swebench", "my-tunnel.ngrok.io"])
 
     assert result.exit_code == 1
-    assert result.output == "Error: url: Value error, Invalid benchmark service URL (422)\n"
+    assert result.output == (
+        "error: url: Value error, Invalid benchmark service URL\n  try: valkyrie benchmark service set --help\n"
+    )
 
 
 @pytest.mark.description("A 401 on a settings command exits 1 and tells the user to log in.")
 @pytest.mark.parametrize(
     ("api_key", "output"),
     [
-        ("test-key", "Error: The Tracker rejected your credentials. Run `valkyrie login`.\n"),
-        (None, "Error: You are not logged in. Run `valkyrie login`.\n"),
+        ("test-key", "error: The Tracker rejected your credentials.\n  try: valkyrie login\n"),
+        (None, "error: You are not logged in.\n  try: valkyrie login\n"),
     ],
 )
 @pytest.mark.parametrize("arguments", [["provider", "list"], ["benchmark", "service", "set", "swebench", "https://x"]])

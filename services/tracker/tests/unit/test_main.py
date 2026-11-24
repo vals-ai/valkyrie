@@ -3295,6 +3295,44 @@ class TestTrackerAPI:
             queued["custom_benchmark_service"],
         ) == (provider, f"{_TENANT_SECRETS}{secret}", url)
 
+    @pytest.mark.description(
+        "A run on a split benchmark with no provider or priority picks a split provider, and other runs keep theirs."
+    )
+    @pytest.mark.parametrize(
+        ("fields", "expected"),
+        [
+            pytest.param({}, ("modal", "ModalSecrets"), id="split"),
+            pytest.param({"sandbox_provider": "daytona"}, ("daytona", "provider-secret"), id="explicit"),
+            pytest.param({"benchmark_name": "terminal-bench"}, ("daytona", "provider-secret"), id="not-split"),
+            pytest.param({"priority": 1}, ("daytona", "provider-secret"), id="priority"),
+        ],
+    )
+    async def test_start_splits_listed_benchmarks_across_providers(
+        self,
+        contract: AgentContractRequest,
+        monkeypatch: MonkeyPatch,
+        mock_launcher: Any,
+        fields: dict[str, Any],
+        expected: tuple[str, str],
+    ) -> None:
+        def last(providers: list[str]) -> str:
+            return providers[-1]
+
+        _as_user(monkeypatch, None)
+        monkeypatch.setattr(config, "PROVIDER_SPLIT_BENCHMARKS", frozenset({"swebench"}))
+        monkeypatch.setattr("tracker.types.random.choice", last)
+        monkeypatch.setattr("main.SANDBOX_QUEUE_ENABLED", "priority" in fields, raising=False)
+
+        response = client.post("/start-benchmark", json=_start_body(contract, **fields))
+
+        assert response.status_code == 200, response.text
+        provider, secret = expected
+        queued = mock_launcher.queued_calls[0]["execution_context_json"]["start_benchmark_request"]
+        assert (queued["sandbox_provider"], queued["sandbox_provider_secret_name"]) == (
+            provider,
+            f"{_TENANT_SECRETS}{secret}",
+        )
+
     @pytest.mark.description("A run start without a provider secret returns 400.")
     async def test_start_without_a_provider_secret_is_a_400(
         self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session

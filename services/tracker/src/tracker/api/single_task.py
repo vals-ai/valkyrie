@@ -78,6 +78,7 @@ def get_single_task(
         status=task.status,
         started_at=task.started_at,
         finished_at=task.finished_at,
+        last_log_at=task.last_log_at,
         error_message=error[0] if error else None,
         failure_category=error[1] if error else None,
         evaluation_result=eval_row.result if eval_row else None,

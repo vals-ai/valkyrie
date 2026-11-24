@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import httpx
@@ -48,7 +48,7 @@ def test_tasks_text_shows_category_column_and_blank_for_legacy_rows(tracker: Moc
 
     assert result.exit_code == 0, result.output
     header, *body = [line for line in result.output.splitlines() if line.strip()]
-    assert header.split() == ["Task", "Status", "Category", "Error", "Started", "Finished"]
+    assert header.split() == ["Task", "Status", "Category", "Error", "Started", "Last", "log", "Finished"]
     category_start = header.index("Category")
     error_start = header.index("Error")
     rows = {line.split()[0]: line[category_start:error_start].strip() for line in body if line.startswith("task-")}
@@ -64,8 +64,27 @@ def test_tasks_json_emits_failure_category(tracker: MockTracker) -> None:
         total_count=2,
     )
 
-    result = _invoke(tracker, response, "--format", "json")
+    result = _invoke(tracker, response, "--json")
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert [task["failure_category"] for task in payload["tasks"]] == ["infrastructure", None]
+
+
+@pytest.mark.description("Task listings sort by the last log and show an age in text or a timestamp in JSON.")
+@pytest.mark.parametrize("arguments", [(), ("--json",)])
+def test_tasks_last_log(tracker: MockTracker, arguments: tuple[str, ...]) -> None:
+    last_log_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    task = _summary(0)
+    task.last_log_at = last_log_at
+    response = TasksResponse(tasks=[task, _summary(1)], total_count=2)
+
+    result = _invoke(tracker, response, "--sort", "last_log_at", *arguments)
+
+    assert result.exit_code == 0, result.output
+    assert tracker.requests[0].url.params["sort"] == "last_log_at"
+    if arguments:
+        assert [row["last_log_at"] for row in json.loads(result.output)["tasks"]] == [last_log_at.isoformat(), None]
+    else:
+        assert "Last log" in result.output
+        assert "3m ago" in result.output

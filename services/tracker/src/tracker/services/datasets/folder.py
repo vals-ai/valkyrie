@@ -28,10 +28,13 @@ class SandboxKind(StrEnum):
     IMAGE = "image"
     DOCKERFILE = "dockerfile"
     COMPOSE = "compose"
+    SNAPSHOT = "snapshot"
 
 
 def sandbox_kind(task_dir: Path, config: TaskConfig) -> SandboxKind | None:
     environment = task_dir / ENVIRONMENT_DIR
+    if config.environment.snapshot:
+        return SandboxKind.SNAPSHOT
     if (environment / COMPOSE_FILE).is_file():
         return SandboxKind.COMPOSE
     if config.environment.docker_image:

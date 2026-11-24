@@ -2,7 +2,7 @@ import click
 
 from valkyrie.cli.client import call
 from valkyrie.cli.resource import INCLUDE_ARCHIVED, RESOURCE_NAME, list_resources, show_resource
-from valkyrie.cli.display import format_option, one_line
+from valkyrie.cli.display import emit, json_option, one_line, confirm, done
 
 
 @click.command(
@@ -16,14 +16,17 @@ from valkyrie.cli.display import format_option, one_line
 )
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--description", default="", help="What the benchmark covers.")
-def create_benchmark(name: str, description: str) -> None:
+@json_option()
+def create_benchmark(name: str, description: str, output_format: str) -> None:
     created = call(lambda client: client.benchmark_definitions.create(name, description=description))
-    click.echo(click.style(f"✓ Benchmark created: {one_line(created.name)}", fg="green", bold=True))
+    if emit(created, output_format):
+        return
+    done(f"Benchmark created: {one_line(created.name)}")
 
 
 @click.command(name="list", help="List your organization's benchmarks.")
 @INCLUDE_ARCHIVED
-@format_option()
+@json_option()
 def list_benchmarks(include_archived: bool, output_format: str) -> None:
     response = call(lambda client: client.benchmark_definitions.list(include_archived=include_archived))
     list_resources(response, response.benchmarks, output_format, "benchmark")
@@ -31,10 +34,10 @@ def list_benchmarks(include_archived: bool, output_format: str) -> None:
 
 @click.command(name="show", help="Show one benchmark, archived or not.")
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
-@format_option()
+@json_option()
 def show_benchmark(name: str, output_format: str) -> None:
     found = call(lambda client: client.benchmark_definitions.get(name))
-    show_resource(found, output_format)
+    show_resource(found, output_format, "Benchmark")
 
 
 @click.command(
@@ -47,9 +50,12 @@ def show_benchmark(name: str, output_format: str) -> None:
 )
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--description", required=True, help="The description the benchmark now has.")
-def update_benchmark(name: str, description: str) -> None:
+@json_option()
+def update_benchmark(name: str, description: str, output_format: str) -> None:
     updated = call(lambda client: client.benchmark_definitions.update(name, description=description))
-    click.echo(click.style(f"✓ Benchmark updated: {one_line(updated.name)}", fg="green", bold=True))
+    if emit(updated, output_format):
+        return
+    done(f"Benchmark updated: {one_line(updated.name)}")
 
 
 @click.command(
@@ -58,16 +64,22 @@ def update_benchmark(name: str, description: str) -> None:
 )
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def remove_benchmark(name: str, yes: bool) -> None:
-    if not yes and not click.confirm(f"Archive benchmark '{name}'?"):
-        click.echo("Cancelled.")
+@json_option()
+def remove_benchmark(name: str, yes: bool, output_format: str) -> None:
+    if not confirm(f"Archive benchmark '{name}'?", yes=yes):
+        click.echo("Cancelled.", err=True)
         return
     call(lambda client: client.benchmark_definitions.remove(name))
-    click.echo(click.style(f"✓ Benchmark '{name}' archived.", fg="green", bold=True))
+    if emit({"archived": name}, output_format):
+        return
+    done(f"Benchmark '{name}' archived.")
 
 
 @click.command(name="restore", help="Restore an archived benchmark so it can change again.")
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
-def restore_benchmark(name: str) -> None:
+@json_option()
+def restore_benchmark(name: str, output_format: str) -> None:
     restored = call(lambda client: client.benchmark_definitions.restore(name))
-    click.echo(click.style(f"✓ Benchmark restored: {one_line(restored.name)}", fg="green", bold=True))
+    if emit(restored, output_format):
+        return
+    done(f"Benchmark restored: {one_line(restored.name)}")

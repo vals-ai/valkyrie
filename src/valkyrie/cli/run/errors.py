@@ -4,16 +4,22 @@ import click
 from valkyrie.sdk.models import FinalViewResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, one_line, status_label
+from valkyrie.cli.display import emit, echo, json_option, one_line
+from valkyrie.palette import status_label
 from valkyrie.display import group_task_errors, terminal_safe
 
 _TASK_ID_PREVIEW_LIMIT = 5
 
 
-def _display_error_message(message: str) -> str:
+def _display_error_message(message: str, full: bool) -> str:
     if message == "":
         return "(empty error message)"
-    return terminal_safe(message, preserve_newlines=True)
+    safe = terminal_safe(message, preserve_newlines=True)
+    if full:
+        return safe
+    if "Traceback (most recent call last):" in safe:
+        return next(line for line in reversed(safe.split("\n")) if line.strip())
+    return " ".join(safe.split("\n"))
 
 
 def _indent_message(message: str) -> str:
@@ -31,28 +37,29 @@ def _format_task_id_preview(task_ids: tuple[str, ...]) -> str:
     return f"{preview} (+{omitted_count} more)" if omitted_count else preview
 
 
-def format_run_errors_text(response: FinalViewResponse) -> None:
+def format_run_errors_text(response: FinalViewResponse, *, full: bool = False) -> None:
     task_errors = response.task_errors or {}
     groups = group_task_errors(task_errors, response.task_failure_categories)
 
-    click.echo(click.style("Run Errors", bold=True))
+    echo(("Run Errors", "bold"), err=False)
     click.echo(f"{'Run ID:':<12}{response.benchmark_id}")
     click.echo(f"{'Benchmark:':<12}{one_line(response.benchmark_name)}")
     click.echo(f"{'Status:':<12}{status_label(response.status.value)}")
 
     if response.error_message is not None:
         click.echo()
-        click.echo(click.style("Stored run error", bold=True))
-        click.echo(_indent_message(_display_error_message(response.error_message)))
+        echo(("Stored run error", "bold"), err=False)
+        click.echo(_indent_message(_display_error_message(response.error_message, full)))
 
     if groups:
         click.echo()
-        click.echo(
-            click.style(
+        echo(
+            (
                 f"Task errors ({_count_label(len(task_errors), 'task')}, "
                 f"{_count_label(len(groups), 'distinct message')})",
-                bold=True,
-            )
+                "bold",
+            ),
+            err=False,
         )
 
         for category, message, task_ids in groups:
@@ -61,7 +68,7 @@ def format_run_errors_text(response: FinalViewResponse) -> None:
             if category is not None:
                 label = f"{label}, {category.value}"
             click.echo(f"[{label}] {_format_task_id_preview(task_ids)}")
-            click.echo(_indent_message(_display_error_message(message)))
+            click.echo(_indent_message(_display_error_message(message, full)))
     elif response.error_message is None:
         click.echo()
         click.echo("No current error messages recorded.")
@@ -69,17 +76,17 @@ def format_run_errors_text(response: FinalViewResponse) -> None:
 
 @click.command(
     help=(
-        "Show stored run and current task error messages.\n"
+        "Show stored run and current task error messages, one line each. Add `-v` for full tracebacks.\n"
         "\n"
         "Example:\n"
         "    valkyrie run errors 123e4567-e89b-12d3-a456-426614174000"
     ),
 )
 @click.argument("run_id", type=UUID)
-@format_option()
+@json_option()
 def errors(run_id: UUID, output_format: str) -> None:
     response = call(lambda client: client.runs.results(run_id))
     if output_format == "json":
-        click.echo(response.model_dump_json())
+        emit(response)
     else:
-        format_run_errors_text(response)
+        format_run_errors_text(response, full=bool(click.get_current_context().find_root().params.get("verbose")))

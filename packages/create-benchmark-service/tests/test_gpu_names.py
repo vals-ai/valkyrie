@@ -9,9 +9,9 @@ asks for, and what a resource request may say about GPU types.
 from collections.abc import Callable
 
 import pytest
-from daytona import GpuType
+from daytona.v0 import GpuType
 
-from benchmark_service.sandbox.gpu import GpuModel, daytona_gpu_type, modal_gpu_type, normalize_gpu_name
+from benchmark_service.sandbox.gpu import MODAL_GPU_TYPES, daytona_gpu_type, modal_gpu_type, normalize_gpu_name
 from benchmark_service.sandbox.types import Resources, SandboxError
 
 
@@ -84,6 +84,9 @@ class TestModalGpuType:
     def test_a_name_in_any_common_form_maps_to_modals_type(self, name: str, native: str) -> None:
         assert modal_gpu_type([name]) == native
 
+    def test_every_type_modal_offers_is_accepted_by_its_own_name(self) -> None:
+        assert [modal_gpu_type([name]) for name in MODAL_GPU_TYPES] == list(MODAL_GPU_TYPES)
+
     def test_types_modal_does_not_offer_are_refused_with_what_it_does(self) -> None:
         with pytest.raises(SandboxError, match=r"Unsupported Modal GPU type: rtx-4090, rtx-5090\. Supported types: T4"):
             modal_gpu_type(["rtx-4090", "rtx-5090"])
@@ -93,11 +96,6 @@ class TestModalGpuType:
 
 
 class TestGpuModel:
-    def test_every_type_daytona_offers_has_a_model(self) -> None:
-        offered = {member for member in GpuType if member is not GpuType.UNKNOWN_DEFAULT_OPEN_API}
-
-        assert {model.daytona for model in GpuModel if model.daytona} == offered
-
     @pytest.mark.parametrize("provider_gpu_type", [daytona_gpu_type, modal_gpu_type])
     def test_an_unknown_name_is_refused_the_same_way_by_every_provider(
         self, provider_gpu_type: Callable[[list[str]], object]

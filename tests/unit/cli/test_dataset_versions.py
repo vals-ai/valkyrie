@@ -34,7 +34,7 @@ def test_versions_lists_each_revision_with_its_tags_or_says_there_are_none(track
 
     tracker.reply("GET", f"{_URL}/versions", httpx.Response(200, json={"versions": [_VERSION, _FIRST]}))
     text = _invoke("versions", "swe-bench/verified")
-    as_json = _invoke("versions", "swe-bench/verified", "--format", "json")
+    as_json = _invoke("versions", "swe-bench/verified", "--json")
 
     assert text.exit_code == 0, text.output
     assert "efefefefefef" in text.output and "latest, stable" in text.output
@@ -125,11 +125,11 @@ def test_show_prints_the_latest_version_and_the_dataset_toml_it_was_published_wi
     result = _invoke("show", "swe-bench", "verified")
 
     assert result.exit_code == 0, result.output
-    assert "Version:     @2 (efefefefefef), 3 task(s), tags latest, stable" in result.output
-    assert "Source:      acme/verified 1.0" in result.output
-    assert "Authors:     Ada <ada@example.com>, Grace" in result.output
-    assert "Keywords:    code, swe" in result.output
-    assert 'Metadata:    {"difficulty": "hard", "source": "https://example.test"}' in result.output
+    assert "Version @2 (efefefefefef), 3 task(s), tags latest, stable" in " ".join(result.output.split())
+    assert "Source acme/verified 1.0" in " ".join(result.output.split())
+    assert "Authors Ada <ada@example.com>, Grace" in " ".join(result.output.split())
+    assert "Keywords code, swe" in " ".join(result.output.split())
+    assert 'Metadata {"difficulty": "hard", "source": "https://example.test"}' in " ".join(result.output.split())
 
 
 @pytest.mark.description("Show says when nothing is published and when there is no dataset toml.")
@@ -139,19 +139,19 @@ def test_show_says_when_nothing_is_published_and_when_there_is_no_dataset_toml(t
 
     nothing = _invoke("show", "swe-bench", "verified")
 
-    assert "Version:     none published" in nothing.output
+    assert "Version none published" in " ".join(nothing.output.split())
 
     tracker.reply("GET", f"{_URL}/versions/latest", httpx.Response(200, json=_VERSION))
     plain = _invoke("show", "swe-bench", "verified")
 
-    assert "Version:     @2" in plain.output and "Source:" not in plain.output
+    assert "Version @2" in " ".join(plain.output.split()) and "Source" not in plain.output
 
 
 @pytest.mark.description("Show as json stays the dataset.")
 def test_show_as_json_stays_the_dataset(tracker: MockTracker) -> None:
     tracker.reply("GET", _URL, httpx.Response(200, json=_DATASET))
 
-    result = _invoke("show", "swe-bench", "verified", "--format", "json")
+    result = _invoke("show", "swe-bench", "verified", "--json")
 
     assert json.loads(result.output)["name"] == "verified"
     assert tracker.requested("GET", f"{_URL}/versions/latest") == []

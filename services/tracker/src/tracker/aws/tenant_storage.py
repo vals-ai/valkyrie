@@ -1,4 +1,5 @@
 import hashlib
+import json
 from typing import TYPE_CHECKING, cast
 
 import boto3
@@ -64,6 +65,39 @@ def _ensure_org_tag(s3: "S3Client", bucket: str, org: Org, account_id: str) -> N
     )
 
 
+def _enforce_https(s3: "S3Client", bucket: str, account_id: str) -> None:
+    try:
+        policy: dict[str, object] = json.loads(
+            s3.get_bucket_policy(Bucket=bucket, ExpectedBucketOwner=account_id)["Policy"]
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "NoSuchBucketPolicy":
+            raise
+        policy = {"Version": "2012-10-17", "Statement": []}
+
+    statements = policy["Statement"]
+    existing = (
+        cast("list[dict[str, object]]", statements)
+        if isinstance(statements, list)
+        else [cast("dict[str, object]", statements)]
+    )
+    bucket_arn = f"arn:aws:s3:::{bucket}"
+    deny = {
+        "Sid": "DenyInsecureTransport",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [bucket_arn, f"{bucket_arn}/*"],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }
+    if deny in existing:
+        return
+    if any(statement.get("Sid") == deny["Sid"] for statement in existing):
+        raise TenantBucketError(f"The organization bucket {bucket} has a conflicting HTTPS policy statement")
+    policy["Statement"] = [*existing, deny]
+    s3.put_bucket_policy(Bucket=bucket, ExpectedBucketOwner=account_id, Policy=json.dumps(policy))
+
+
 def _create_bucket(bucket: str, org: Org) -> None:
     region = config.AWS_DEPLOYMENT_REGION
     account_id = config.AWS_DEPLOYMENT_ACCOUNT_ID
@@ -85,6 +119,7 @@ def _create_bucket(bucket: str, org: Org) -> None:
             if error.response.get("Error", {}).get("Code") != "BucketAlreadyOwnedByYou":
                 raise
         _ensure_org_tag(s3, bucket, org, account_id)
+        _enforce_https(s3, bucket, account_id)
 
         s3.put_bucket_versioning(
             Bucket=bucket, VersioningConfiguration={"Status": "Enabled"}, ExpectedBucketOwner=account_id

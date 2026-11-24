@@ -17,6 +17,8 @@ from benchmark_service import (
     ImageSource,
     SandboxNotFoundError,
     SandboxRecoveryPolicy,
+    SnapshotSource,
+    TargetedSnapshotSource,
 )
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceStreamClosedError
 from benchmark_service.sandbox.local.docker import DockerSandbox
@@ -545,6 +547,50 @@ class TestTaskExecutionRetry:
             assert not provider.create_sandbox.called
             error = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
             assert "requires unrestricted egress for every stage" in error.error_message
+
+    @pytest.mark.description(
+        "A snapshot task on local Docker fails once with a clear error before any sandbox is created."
+    )
+    @pytest.mark.usefixtures("process_benchmark_env")
+    @pytest.mark.parametrize(
+        "source",
+        [SnapshotSource(snapshot="env-build"), TargetedSnapshotSource(snapshot="env-build", target="us")],
+        ids=["snapshot", "targeted"],
+    )
+    async def test_docker_refuses_a_snapshot_before_creation(
+        self,
+        contract: AgentContractRequest,
+        control_postgres_session: Session,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        runtime_services: RuntimeServices,
+        source: SnapshotSource | TargetedSnapshotSource,
+    ) -> None:
+        request, task_row, benchmark_id, control = create_task_environment(
+            contract, control_postgres_session, bound_controls
+        )
+        provider = AsyncMock()
+        provider.__aenter__.return_value = provider
+
+        def provider_factory(_config: DockerProviderConfig) -> Any:
+            return provider
+
+        monkeypatch.setattr(DockerProviderConfig, "create_provider", provider_factory)
+        monkeypatch.setattr(
+            runtime_services, "get_sandbox_provider_config", AsyncMock(return_value=DockerProviderConfig())
+        )
+        monkeypatch.setattr(
+            BenchmarkServiceClient,
+            "retrieve_task",
+            AsyncMock(return_value=make_retrieve_task_response().model_copy(update={"source": source})),
+        )
+
+        result = await run_process_task(request, task_row, benchmark_id, runtime_services, control)
+
+        assert result == {"task_0": None}
+        assert not provider.create_sandbox.called
+        error = control_postgres_session.exec(select(ErrorResult).where(ErrorResult.task == task_row.id)).one()
+        assert "Local Docker execution can't create a sandbox from a snapshot" in error.error_message
 
     @pytest.mark.description(
         "The same transient provider failure is a free fresh-sandbox retry before generation and terminal after it."

@@ -12,16 +12,26 @@ class LazyGroup(click.Group):
         *args: Any,
         lazy_commands: Mapping[str, tuple[str, str]],
         hidden_commands: Mapping[str, str] | None = None,
+        removed_commands: Mapping[str, str | None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.lazy_commands = dict(lazy_commands)
         self.hidden_commands = dict(hidden_commands or {})
+        self.removed_commands = dict(removed_commands or {})
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         return sorted(self.lazy_commands)
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name in self.removed_commands:
+            replacement = self.removed_commands[cmd_name]
+            message = (
+                f"{self.name} {cmd_name} is now {self.name} {replacement}"
+                if replacement
+                else f"{self.name} {cmd_name} has been removed"
+            )
+            raise click.UsageError(message, ctx)
         if cmd_name in self.lazy_commands:
             target = self.lazy_commands[cmd_name][0]
         elif cmd_name in self.hidden_commands:

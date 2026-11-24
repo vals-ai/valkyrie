@@ -20,6 +20,10 @@ PASSKEY_ORGS = frozenset(name.strip() for name in os.environ.get("TRACKER_PASSKE
 VALSMITH_ORGS = frozenset({"smith-research"})
 GATEWAY_KEY_ORGS = frozenset({"vals.ai", *PASSKEY_ORGS, *VALSMITH_ORGS})
 ORG_RUN_LIMITS_PARAMETER = os.environ.get("ORG_RUN_LIMITS_PARAMETER") or None
+PROVIDER_SPLIT_BENCHMARKS = frozenset(
+    name.strip() for name in os.environ.get("PROVIDER_SPLIT_BENCHMARKS", "").split(",") if name.strip()
+)
+PROVIDER_SPLIT_PROVIDERS = ("daytona", "daytona_v2", "modal")
 
 
 class BenchmarkServiceDestination(Enum):

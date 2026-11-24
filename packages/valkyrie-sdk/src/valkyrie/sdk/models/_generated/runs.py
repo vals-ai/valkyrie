@@ -92,6 +92,7 @@ class FailureCategory(str, Enum):
 
     INFRASTRUCTURE = "infrastructure"
     BENCHMARK_SERVICE = "benchmark_service"
+    DATASET = "dataset"
     AGENT = "agent"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"

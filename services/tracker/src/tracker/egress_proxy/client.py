@@ -47,13 +47,26 @@ class _Provider:
     route: str
     base_url: str
     keys: tuple[str, ...]
+    default_url: str
 
 
 PROVIDERS = (
-    _Provider("/passthrough/openai/v1", "OPENAI_BASE_URL", ("OPENAI_API_KEY",)),
-    _Provider("/passthrough/anthropic", "ANTHROPIC_BASE_URL", ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")),
-    _Provider("/passthrough/google", "GOOGLE_GEMINI_BASE_URL", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
-    _Provider("/passthrough/openrouter/api/v1", "OPENROUTER_BASE_URL", ("OPENROUTER_API_KEY",)),
+    _Provider("/passthrough/openai/v1", "OPENAI_BASE_URL", ("OPENAI_API_KEY",), "https://api.openai.com/v1"),
+    _Provider(
+        "/passthrough/anthropic",
+        "ANTHROPIC_BASE_URL",
+        ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+        "https://api.anthropic.com",
+    ),
+    _Provider(
+        "/passthrough/google",
+        "GOOGLE_GEMINI_BASE_URL",
+        ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "https://generativelanguage.googleapis.com",
+    ),
+    _Provider(
+        "/passthrough/openrouter/api/v1", "OPENROUTER_BASE_URL", ("OPENROUTER_API_KEY",), "https://openrouter.ai/api/v1"
+    ),
 )
 
 

@@ -23,7 +23,7 @@ class TestLocalSecrets:
 
     @pytest.mark.description("A secret store missing declared keys fails to build and names every missing key.")
     def test_missing_declared_keys_fail_before_store_is_available(self) -> None:
-        with pytest.raises(SecretsError, match="missing keys: FIRST_KEY, SECOND_KEY"):
+        with pytest.raises(SecretsError, match="no value for FIRST_KEY, SECOND_KEY"):
             InMemorySecretStore({"SECOND_KEY": "shared", "FIRST_KEY": "shared"}, {"UNDECLARED": "private"})
 
     @pytest.mark.description("A `${VAR}` in a secrets file stays literal, and undeclared keys are dropped.")

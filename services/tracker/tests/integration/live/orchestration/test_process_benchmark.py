@@ -4,13 +4,15 @@ from asyncio import gather
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import SetupTaskResponse
 import pytest
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
+from tests.integration.live_dataset import LIVE_DATASET_NAME, LIVE_DATASET_TASK_IDS
 from tests.utils import TEST_ORG_ID
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.services.datasets.ref import LocalDataset
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import copy_agent_to_benchmark, delete_from_s3, get_benchmark_contract_s3_key
@@ -27,9 +29,8 @@ from tracker.types import ManagedExecutionContext, RunExecutionRequest, StartBen
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
 from tracker.services.runs.start import process_benchmark
 
-_TASK_ID: str = "astropy__astropy-12907"
-_TASK_IDS: list[str] = ["astropy__astropy-12907", "astropy__astropy-13033"]
-_BENCHMARK: str = "swebench"
+_TASK_ID: str = LIVE_DATASET_TASK_IDS[0]
+_TASK_IDS: list[str] = LIVE_DATASET_TASK_IDS[:2]
 
 pytestmark = pytest.mark.usefixtures("live_deployment")
 
@@ -59,18 +60,18 @@ async def _create_benchmark(
     live_aws_runtime: AWSRuntime,
     frozen_contract_keys: set[str],
     session: Session,
-    service_headers: dict[str, str],
+    dataset: LocalDataset,
     provider_secret_name: str,
     task_ids: list[str] | None = None,
     concurrency: int = 5,
 ) -> tuple[Benchmark, RunExecutionRequest]:
     request = StartBenchmarkRequest(
-        benchmark_name=_BENCHMARK,
+        benchmark_name=LIVE_DATASET_NAME,
+        dataset_ref=dataset,
         contract=contract,
         concurrency=concurrency,
         task_ids=task_ids,
         properties=live_aws_runtime.resources,
-        service_headers=service_headers,
         sandbox_provider="daytona",
         sandbox_provider_secret_name=provider_secret_name,
     )
@@ -84,7 +85,7 @@ async def _create_benchmark(
         frozen_contract_keys.add(get_benchmark_contract_s3_key(str(benchmark.id), contract.name))
     session.add(benchmark)
     session.commit()
-    return benchmark, benchmark.managed_start_benchmark_request(service_headers)
+    return benchmark, benchmark.managed_start_benchmark_request()
 
 
 def _execution_context(request: RunExecutionRequest, benchmark: Benchmark, task_ids: list[str]) -> dict[str, Any]:
@@ -128,7 +129,7 @@ class TestProcessBenchmark:
         live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
-        service_headers: dict[str, str],
+        live_dataset: LocalDataset,
         daytona_secret_name: str,
         bound_controls: Any,
     ) -> None:
@@ -137,7 +138,7 @@ class TestProcessBenchmark:
             live_aws_runtime,
             frozen_contract_keys,
             live_control_database,
-            service_headers,
+            live_dataset,
             daytona_secret_name,
             task_ids=_TASK_IDS,
         )
@@ -181,7 +182,7 @@ class TestProcessBenchmark:
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         monkeypatch: pytest.MonkeyPatch,
-        service_headers: dict[str, str],
+        live_dataset: LocalDataset,
         daytona_secret_name: str,
         bound_controls: Any,
     ) -> None:
@@ -190,7 +191,7 @@ class TestProcessBenchmark:
             live_aws_runtime,
             frozen_contract_keys,
             live_control_database,
-            service_headers,
+            live_dataset,
             daytona_secret_name,
             task_ids=[_TASK_ID],
         )
@@ -233,11 +234,11 @@ class TestProcessBenchmark:
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
         monkeypatch: pytest.MonkeyPatch,
-        service_headers: dict[str, str],
+        live_dataset: LocalDataset,
         daytona_secret_name: str,
         bound_controls: Any,
     ) -> None:
-        failing_task = "astropy__astropy-13033"
+        failing_task = LIVE_DATASET_TASK_IDS[1]
         task_ids = [_TASK_ID, failing_task]
 
         benchmark, request = await _create_benchmark(
@@ -245,12 +246,12 @@ class TestProcessBenchmark:
             live_aws_runtime,
             frozen_contract_keys,
             live_control_database,
-            service_headers,
+            live_dataset,
             daytona_secret_name,
             task_ids=task_ids,
         )
 
-        original_setup_task = BenchmarkServiceClient.setup_task
+        original_setup_task = DatasetTaskService.setup_task
 
         async def setup_task_with_failure(
             self: Any,
@@ -272,7 +273,7 @@ class TestProcessBenchmark:
                 **kwargs,
             )
 
-        monkeypatch.setattr(BenchmarkServiceClient, "setup_task", setup_task_with_failure)
+        monkeypatch.setattr(DatasetTaskService, "setup_task", setup_task_with_failure)
         authority_kwargs = bound_controls(benchmark, session=live_control_database)
 
         await process_benchmark(
@@ -319,7 +320,7 @@ class TestProcessBenchmark:
         live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
-        service_headers: dict[str, str],
+        live_dataset: LocalDataset,
         daytona_secret_name: str,
         bound_controls: Any,
     ) -> None:
@@ -329,7 +330,7 @@ class TestProcessBenchmark:
             live_aws_runtime,
             frozen_contract_keys,
             live_control_database,
-            service_headers,
+            live_dataset,
             daytona_secret_name,
             task_ids=[_TASK_ID],
         )
@@ -370,7 +371,7 @@ class TestProcessBenchmark:
         live_control_database: Session,
         live_aws_runtime: AWSRuntime,
         frozen_contract_keys: set[str],
-        service_headers: dict[str, str],
+        live_dataset: LocalDataset,
         daytona_secret_name: str,
         bound_controls: Any,
     ) -> None:
@@ -380,7 +381,7 @@ class TestProcessBenchmark:
                 live_aws_runtime,
                 frozen_contract_keys,
                 live_control_database,
-                service_headers,
+                live_dataset,
                 daytona_secret_name,
                 task_ids=[_TASK_ID],
             )

@@ -66,6 +66,7 @@ class AgentCausedExitReason(str, Enum):
 class FailureCategory(str, Enum):
     INFRASTRUCTURE = "infrastructure"
     BENCHMARK_SERVICE = "benchmark_service"
+    DATASET = "dataset"
     AGENT = "agent"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
@@ -92,3 +93,7 @@ class SandboxResource(str, Enum):
 class RetryMode(str, Enum):
     AUTO = "auto"
     FROM_SCRATCH = "from_scratch"
+
+
+SANDBOX_REJECTED_CAUSE = "sandbox_rejected"
+ACCOUNT_REJECTION_SOURCE = "account"

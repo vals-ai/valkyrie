@@ -234,6 +234,9 @@ class SandboxRecord(SQLModel, table=True):
     sandbox_id: str = Field(primary_key=True)
     benchmark_id: UUID = Field(foreign_key="benchmark.id")
     last_seen_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
+    created_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True, server_default=func.now())
+    )
     attempt_id: str | None = None
 
 
@@ -570,7 +573,7 @@ class Benchmark(SQLModel, table=True):
         return FetchBenchmarkMetadataResponse(
             benchmark_id=self.id,
             benchmark_name=self.name,
-            benchmark_arguments=self.arguments.with_hosted_dataset(),
+            benchmark_arguments=self.arguments.with_dataset_metadata(),
             storage_bucket=None,
             started_by_email=self.started_by_email,
             executor_release_id=self.executor_release_id,
@@ -776,6 +779,7 @@ class Task(SQLModel, table=True):
     status: TaskStatus = Field(default=TaskStatus.PENDING)
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     finished_at: datetime | None = None
+    last_log_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))
     build_phase_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
     build_phase_token: UUID | None = None
     evaluation_phase_dispatch_id: UUID | None = Field(default=None, foreign_key="executordispatch.id")
@@ -891,8 +895,10 @@ class ErrorResult(ResultBase, table=True):
     category: FailureCategory | None = Field(default=None)
     phase: FailurePhase | None = Field(default=None)
     transient: bool | None = Field(default=None)
+    sandbox_provider: str | None = Field(default=None)
     retry_scheduled: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
     failed_attempt_number: int | None = Field(default=None)
+    sandbox_source: str | None = Field(default=None)

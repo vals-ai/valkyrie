@@ -809,7 +809,7 @@ def test_tracker_routes_match_the_sdk_http_contract() -> None:
         for parameter in schema["paths"]["/benchmarks/{benchmark_id}/tasks"]["get"]["parameters"]
     }
     assert task_parameters["status"]["schema"]["default"] == ""
-    assert task_parameters["sort"]["schema"]["enum"] == ["task_id", "started_at", "duration", "status"]
+    assert task_parameters["sort"]["schema"]["enum"] == ["task_id", "started_at", "duration", "status", "last_log_at"]
     assert task_parameters["sort"]["schema"]["default"] == "started_at"
     assert task_parameters["sort_dir"]["schema"]["enum"] == ["asc", "desc"]
     assert task_parameters["sort_dir"]["schema"]["default"] == "desc"

@@ -1,52 +1,238 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import math
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from tenacity import wait_fixed, wait_none
+from daytona.v2 import (
+    ConflictError,
+    DaytonaError,
+    ImageBuildFailedError,
+    LogFrame,
+    NotFoundError,
+    SandboxLifecycle,
+    SandboxTerminalStateError,
+    WaitResult,
+)
 
 from benchmark_service.sandbox import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSandbox,
     ComposeSource,
     DaytonaProviderConfig,
     DaytonaV2ProviderConfig,
     ImageSource,
     Resources,
+    SandboxAccountRejectedError,
+    SandboxBuildError,
+    SandboxCapabilities,
     SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    SandboxRejectedError,
     priced_provider_types,
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.sandbox import daytona_v2
 from benchmark_service.sandbox.created import sandbox_created_scope
 from benchmark_service.sandbox.daytona_v2 import DaytonaV2Sandbox, DaytonaV2SandboxProvider, v2_resources
+from benchmark_service.sandbox.types import SandboxQuery
 
-API = "https://api.daytona.test"
-TOOLBOX = "https://toolbox.daytona.test"
-Handler = Callable[[httpx.Request], httpx.Response]
+CREATED_AT = "2026-11-11T00:00:00Z"
 
 
-def _provider(handler: Handler, *, spot: bool = False) -> DaytonaV2SandboxProvider:
+def _wait(exit_code: int | None = 0, reason: str = "exited", signal: str | None = None) -> WaitResult:
+    return WaitResult(reason=reason, exit_code=exit_code, signal=signal, raw_reason=reason)  # pyright: ignore[reportArgumentType]
+
+
+def _frame(data: str, channel: str = "stdout") -> LogFrame:
+    return LogFrame(cursor="c", channel=channel, data=data, timestamp_ms=0)
+
+
+class FakeProcess:
+    def __init__(self, frames: list[LogFrame], wait: WaitResult | None = None, hang: bool = False) -> None:
+        self.frames, self.result, self.hang = frames, wait, hang
+        self.started: list[dict[str, Any]] = []
+        self.killed = False
+
+    async def start(self, command: str, **kwargs: Any) -> FakeProcess:
+        self.started.append({"command": command, **kwargs})
+        return self
+
+    async def logs(self, *, cursor: str | None = None) -> SimpleNamespace:
+        items = self.frames if cursor is None else []
+        return SimpleNamespace(items=items, next_cursor="end", eof=not self.hang)
+
+    async def wait(self, *, timeout: float | None = None) -> WaitResult:
+        if self.hang:
+            return _wait(None, "timed_out")
+        assert self.result is not None
+        return self.result
+
+    async def kill(self, **kwargs: Any) -> None:
+        self.killed = True
+
+
+class FakeFs:
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        self.files[path] = content
+
+    async def read_bytes(self, path: str) -> bytes:
+        if path not in self.files:
+            raise NotFoundError("missing", status_code=404, code="FILE_NOT_FOUND")
+        return self.files[path]
+
+
+class FakeSandbox:
+    def __init__(self, sandbox_id: str = "sbx-1", state: str = "started", **info: Any) -> None:
+        self.id, self.state, self.error = sandbox_id, state, info.get("error")
+        self.spot_evicted_at = info.get("spot_evicted_at")
+        self.lifecycle_policy = info.get("lifecycle_policy")
+        self.name = info.get("name", sandbox_id)
+        self.labels = info.get("labels", {"run": "r1"})
+        self.cpu, self.memory = info.get("cpu", 0.25), info.get("memory", 2.0)
+        self.region, self.spot = info.get("region", "us-east-ash-1"), info.get("spot", False)
+        self.process = FakeProcess([], _wait())
+        self.fs = FakeFs()
+        self.after_refresh = state
+        self.policies: list[dict[str, Any]] = []
+        self.policy_states: list[SimpleNamespace] = []
+        self.forks: list[dict[str, Any]] = []
+
+    @property
+    def raw_state(self) -> str:
+        return self.state
+
+    async def wait(self, *, until: str, timeout: float) -> FakeSandbox:
+        if self.state != until:
+            raise SandboxTerminalStateError("ended", state=self.state)  # pyright: ignore[reportArgumentType]
+        return self
+
+    async def refresh_data(self) -> None:
+        self.state = self.after_refresh
+
+    async def get_network_policy(self) -> SimpleNamespace:
+        return self.policy_states.pop(0) if self.policy_states else SimpleNamespace(etag="e1")
+
+    async def update_network_policy(self, *, network_policy: dict[str, Any], if_match: str) -> SimpleNamespace:
+        self.policies.append({**network_policy, "if_match": if_match})
+        return SimpleNamespace(desired_revision=2, applied_revision=1, status="pending", error=None)
+
+    async def capture_image(self) -> SimpleNamespace:
+        return SimpleNamespace(id="img-cp")
+
+    async def create_snapshot(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(id=f"snap-{name}")
+
+    async def fork(self, **kwargs: Any) -> FakeSandbox:
+        self.forks.append(kwargs)
+        return FakeSandbox("sbx-fork")
+
+
+class FakeArtifacts:
+    def __init__(self, status: str = "ready") -> None:
+        self.status = status
+        self.deleted: list[str] = []
+        self.delete_errors: list[DaytonaError] = []
+        self.pulled: list[tuple[str, dict[str, Any]]] = []
+
+    async def pull(self, image: str, **kwargs: Any) -> SimpleNamespace:
+        self.pulled.append((image, kwargs))
+        return SimpleNamespace(id="img-1", status="pending", error=None)
+
+    async def get(self, artifact_id: str, **kwargs: Any) -> SimpleNamespace:
+        if self.status == "raise":
+            raise ImageBuildFailedError("build failed", status_code=409, build_error="no space left")
+        return SimpleNamespace(id=artifact_id, status=self.status, error="broken" if self.status != "ready" else None)
+
+    async def delete(self, artifact_id: str) -> None:
+        if self.delete_errors:
+            raise self.delete_errors.pop(0)
+        self.deleted.append(artifact_id)
+
+
+class FakeClient:
+    def __init__(self, sandbox: FakeSandbox | None = None) -> None:
+        self.sandbox = sandbox or FakeSandbox()
+        self.images, self.snapshots = FakeArtifacts(), FakeArtifacts()
+        self.calls: list[tuple[str, Any, dict[str, Any]]] = []
+        self.deleted: list[str] = []
+        self.create_error: DaytonaError | None = None
+        self.pages: list[SimpleNamespace] = []
+        self.sandboxes: dict[str, FakeSandbox] = {}
+
+    async def create(self, image: str, **kwargs: Any) -> FakeSandbox:
+        self.calls.append(("create", image, kwargs))
+        if self.create_error is not None:
+            raise self.create_error
+        return self.sandbox
+
+    async def create_from_snapshot(self, snapshot: str, **kwargs: Any) -> FakeSandbox:
+        self.calls.append(("restore", snapshot, kwargs))
+        return self.sandbox
+
+    async def get(self, sandbox_id: str) -> FakeSandbox:
+        return self.sandboxes.get(sandbox_id, self.sandbox)
+
+    async def delete(self, sandbox_id: str) -> None:
+        self.deleted.append(sandbox_id)
+
+    async def search(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(("search", None, kwargs))
+        return self.pages.pop(0)
+
+    async def close(self) -> None:
+        pass
+
+
+def _provider(
+    monkeypatch: pytest.MonkeyPatch,
+    client: FakeClient,
+    *,
+    spot: bool = False,
+    created_at: str | None = CREATED_AT,
+    labels: dict[str, str] | None = None,
+) -> DaytonaV2SandboxProvider:
+    monkeypatch.setattr(daytona_v2, "DaytonaClient", lambda *, config: SimpleNamespace(v2=client))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
     return DaytonaV2SandboxProvider(
-        DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="key", DAYTONA_V2_API_URL=API, DAYTONA_V2_SPOT=spot),
-        transport=httpx.MockTransport(handler),
+        DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="key", DAYTONA_V2_REGION="us", DAYTONA_V2_SPOT=spot),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"labels": labels or {"run": "r1"}, "created_at": created_at})
+        ),
     )
 
 
-def _request(vcpu: float, **overrides: Any) -> SandboxCreateRequest:
+def _sandbox(sandbox: FakeSandbox, client: FakeClient | None = None) -> DaytonaV2Sandbox:
+    return DaytonaV2Sandbox(
+        sandbox,  # pyright: ignore[reportArgumentType]
+        client or FakeClient(sandbox),  # pyright: ignore[reportArgumentType]
+        httpx.AsyncClient(
+            base_url="https://api.daytona.com",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"created_at": CREATED_AT})),
+        ),
+        sandbox.labels,
+        datetime(2026, 11, 11, tzinfo=UTC),
+    )
+
+
+def _request(vcpu: float = 1, **overrides: Any) -> SandboxCreateRequest:
     fields: dict[str, Any] = {
         "source": ImageSource(image="python:3.13-slim"),
         "resources": Resources(vcpu=vcpu, memory=1, disk=3),
         "name": "tts-task-1",
         "labels": {"run": "r1"},
-        "env_vars": {"A": "1"},
+        "env_vars": {"A": "1", "DAYTONA_SECRET": "x", "DAYTONA_API_URL": "u"},
         "auto_stop_interval": 15,
         "create_timeout": 120,
     }
@@ -57,443 +243,552 @@ def _request(vcpu: float, **overrides: Any) -> SandboxCreateRequest:
 @pytest.fixture(autouse=True)
 def no_poll_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    monkeypatch.setattr(daytona_v2, "_RATE_LIMIT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_v2, "_backoff", wait_none())
 
 
 @pytest.mark.parametrize(
     ("vcpu", "cores", "cores_max"),
-    [
-        (0.25, 0.125, 0.5),
-        (0.5, 0.25, 0.5),
-        (1, 0.5, 0.5),
-        (1.0000000001, 0.50000000005, 1.0),
-        (1.5, 0.75, 1.0),
-        (3, 1.5, 1.5),
-        (4, 2, 2.0),
-    ],
+    [(0.25, 0.125, 0.5), (1, 0.5, 0.5), (1.0000000001, 0.50000000005, 1.0), (1.5, 0.75, 1.0), (4, 2, 2.0)],
 )
 def test_v2_resources_reserves_fractional_cores_and_caps_them(vcpu: float, cores: float, cores_max: float) -> None:
-    assert v2_resources(Resources(vcpu=vcpu, memory=2, disk=3)) == {
-        "cpu": cores,
-        "cores_max": cores_max,
-        "memory_mib": 2048,
-        "memory_max_mib": 2048,
-        "disk_mib": 3072,
-    }
+    resources = v2_resources(Resources(vcpu=vcpu, memory=2, disk=3))
+    assert (resources.cpu, resources.cpu_max) == (cores, cores_max)
+    assert (resources.memory, resources.memory_max, resources.disk) == (2, 2, 3)
 
 
-def test_config_parses_from_mapping_and_v0_stays_distinct() -> None:
-    config = sandbox_provider_config_from_mapping({"type": "daytona_v2", "DAYTONA_V2_API_KEY": "key"})
-    assert isinstance(config, DaytonaV2ProviderConfig)
-    assert config == DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="key")
-    assert config.DAYTONA_V2_API_URL == "https://api.daytona.com"
-    assert isinstance(config.create_provider(), DaytonaV2SandboxProvider)
-    v0 = sandbox_provider_config_from_mapping(
-        {"type": "daytona", "DAYTONA_API_KEY": "k", "DAYTONA_API_URL": "u", "DAYTONA_TARGET": "us"}
-    )
-    assert isinstance(v0, DaytonaProviderConfig)
+def test_config_parses_from_mapping_and_rejects_other_apis() -> None:
+    config = sandbox_provider_config_from_mapping({"type": "daytona_v2", "DAYTONA_V2_API_KEY": "k"})
+    assert isinstance(config, DaytonaV2ProviderConfig) and config.DAYTONA_V2_API_URL == "https://api.daytona.com"
+    v0 = {"type": "daytona", "DAYTONA_API_KEY": "k", "DAYTONA_API_URL": "https://app.daytona.io/api"}
+    assert isinstance(sandbox_provider_config_from_mapping({**v0, "DAYTONA_TARGET": "us"}), DaytonaProviderConfig)
+    with pytest.raises(ValueError, match="DAYTONA_V2_API_URL"):
+        DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="k", DAYTONA_V2_API_URL="https://api.daytona.test")
 
 
-def test_config_rejects_plain_http_api_url() -> None:
-    with pytest.raises(ValueError, match="https"):
-        DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="key", DAYTONA_V2_API_URL="http://api.daytona.com")
-
-
-@pytest.mark.parametrize("requires_nested_docker", [False, True])
-async def test_create_sandbox_sends_fractional_cores_and_waits_for_running(requires_nested_docker: bool) -> None:
-    calls: list[httpx.Request] = []
-    statuses = iter(["booting", "running"])
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        path = request.url.path
-        if request.method == "POST" and path == "/images":
-            return httpx.Response(201, json={"id": "img-1", "status": "pulling"})
-        if path == "/images/img-1":
-            return httpx.Response(200, json={"id": "img-1", "status": "ready"})
-        if request.method == "POST" and path == "/sandboxes":
-            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
-        if path == "/sandboxes/sb-1":
-            return httpx.Response(200, json={"id": "sb-1", "name": "tts-task-1", "status": next(statuses)})
-        raise AssertionError(f"unexpected {request.method} {path}")
-
-    provider = _provider(handler, spot=True)
-    provider.validate_sandbox_config(requires_nested_docker=requires_nested_docker, resources=_request(0.25).resources)
-    assert calls == []
-
-    sandbox = await provider.create_sandbox(
-        _request(
-            0.25,
-            requires_nested_docker=requires_nested_docker,
-            env_vars={"A": "1", "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": "run=r1", "DAYTONA_OTEL_ENDPOINT": "https://otel"},
+async def test_create_pulls_the_image_and_waits_for_the_started_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    provider = _provider(monkeypatch, client, spot=True)
+    announced: list[str] = []
+    with sandbox_created_scope(lambda provider, sandbox_id: announced.append(sandbox_id) or _none()):
+        sandbox = await provider.create_sandbox(
+            _request(network_block_all=True, labels={"run": "r1", "name": "agent-sandbox"})
         )
-    )
 
-    assert (sandbox.id, sandbox.state) == ("sb-1", "running")
-    assert all(call.headers["Authorization"] == "Bearer key" for call in calls)
-    assert json.loads(calls[0].content) == {"source": {"type": "registry", "ref": "python:3.13-slim"}}
-    create = next(call for call in calls if call.method == "POST" and call.url.path == "/sandboxes")
-    assert create.headers["Idempotency-Key"] == "tts-task-1"
-    assert json.loads(create.content) == {
-        "image": "img-1",
-        "name": "tts-task-1",
-        "labels": {"run": "r1"},
-        "env": {"A": "1", "DAYTONA_OTEL_ENDPOINT": "https://otel"},
-        "cpu": 0.125,
-        "cores_max": 0.5,
-        "memory_mib": 1024,
-        "memory_max_mib": 1024,
-        "disk_mib": 3072,
-        "spot": True,
-        "create_timeout_seconds": 120,
-        "wait_seconds": 0,
-        "lifecycle_policy": {"idle_expiry_seconds": 900, "on_idle_timeout": "delete"},
+    assert client.images.pulled == [("python:3.13-slim", {"region": "us", "wait": False})]
+    _, image, kwargs = client.calls[0]
+    assert image == "img-1"
+    assert kwargs["env"] == {"A": "1", "DAYTONA_API_URL": "u"}
+    assert kwargs["resources"] == v2_resources(Resources(vcpu=1, memory=1, disk=3))
+    assert (kwargs["spot"], kwargs["region"], kwargs["idempotency_key"]) == (True, "us", "tts-task-1")
+    assert kwargs["labels"] == {"run": "r1"}
+    assert kwargs["network_policy"] == {"block_all": True}
+    assert kwargs["lifecycle_policy"] == {
+        "timeout_seconds": 24 * 60 * 60,
+        "on_timeout": "delete",
+        "idle_expiry_seconds": 900,
+        "on_idle_timeout": "delete",
+    }
+    assert (kwargs["wait_seconds"], kwargs["create_timeout_seconds"]) == (0, 120)
+    assert announced == ["sbx-1"]
+    assert sandbox.created_at == datetime(2026, 11, 11, tzinfo=UTC)
+    assert dict(sandbox.provider_metadata) == {
+        "region_id": "us-east-ash-1",
+        "cpu": "0.25",
+        "memory_mib": "2048",
+        "spot": "False",
     }
 
 
-async def test_failed_sandbox_is_deleted_and_raises() -> None:
-    deleted: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/sandboxes":
-            return httpx.Response(201, json={"id": "sb-2", "status": "failed", "error": "no capacity"})
-        if request.method == "DELETE":
-            deleted.append(request.url.path)
-            return httpx.Response(204)
-        raise AssertionError(f"unexpected {request.method} {request.url.path}")
-
-    request = _request(0.5, source=daytona_v2.SnapshotSource(snapshot="tts-image"))
-    with pytest.raises(SandboxError, match="no capacity"):
-        await _provider(handler).create_sandbox(request)
-    assert deleted == ["/sandboxes/sb-2"]
+async def _none() -> None:
+    return None
 
 
-async def test_sandbox_is_deleted_when_startup_polling_fails() -> None:
-    deleted: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/sandboxes":
-            return httpx.Response(201, json={"id": "sb-3", "status": "pending"})
-        if request.method == "GET":
-            return httpx.Response(403, text="forbidden")
-        deleted.append(request.url.path)
-        return httpx.Response(204)
-
-    request = _request(0.5, source=daytona_v2.SnapshotSource(snapshot="tts-image"))
-    with pytest.raises(SandboxError, match="HTTP 403"):
-        await _provider(handler).create_sandbox(request)
-    assert deleted == ["/sandboxes/sb-3"]
+class EarlyWaitSandbox(FakeSandbox):
+    async def wait(self, *, until: str, timeout: float) -> FakeSandbox:
+        return self
 
 
-async def test_unsupported_features_fail_before_any_api_call() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("no request expected")
+@pytest.mark.description(
+    "A create whose SDK wait returns while v2 still reads the sandbox pending waits until it starts."
+)
+async def test_create_waits_until_v2_reads_the_sandbox_started(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(EarlyWaitSandbox(state="creating"))
+    client.sandbox.after_refresh = "started"
 
-    request = _request(1, resources=Resources(vcpu=1, memory=1, disk=1, gpu=1))
-    with pytest.raises(SandboxError, match="gpu"):
-        await _provider(handler).create_sandbox(request)
+    sandbox = await _provider(monkeypatch, client).create_sandbox(_request())
 
-
-def _sandbox(handler: Handler) -> DaytonaV2Sandbox:
-    client = httpx.AsyncClient(base_url=API, transport=httpx.MockTransport(handler))
-    return DaytonaV2Sandbox({"id": "sb-1", "status": "running", "toolbox_proxy_url": f"{TOOLBOX}/"}, client)
+    assert sandbox.state == "started"
 
 
-def _process_handler(
-    exit_code: int,
-    created: list[dict[str, Any]],
-    signals: list[dict[str, Any]] | None = None,
-    final: dict[str, Any] | None = None,
-) -> Handler:
-    pages = {
-        None: {"frames": [{"channel": "stdout", "data": "hi "}], "nextCursor": "c1", "eof": False},
-        "c1": {"frames": [{"channel": "stderr", "data": "err"}], "nextCursor": "c2", "eof": True},
-    }
+@pytest.mark.description("A create whose SDK wait returns early for a sandbox that then errors is deleted.")
+async def test_create_after_an_early_wait_deletes_a_sandbox_that_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(EarlyWaitSandbox(state="creating"))
+    client.sandbox.after_refresh = "error"
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if request.method == "POST" and path == "/sb-1/processes":
-            created.append(json.loads(request.content))
-            return httpx.Response(201, json={"id": "p1", "state": "running"})
-        if path == "/sb-1/processes/p1/logs":
-            assert request.url.params["encoding"] == "text"
-            return httpx.Response(200, json=pages[request.url.params.get("cursor")])
-        if path == "/sb-1/processes/p1":
-            return httpx.Response(200, json=final or {"id": "p1", "state": "exited", "exitCode": exit_code})
-        if signals is not None and path == "/sb-1/processes/p1/signals":
-            signals.append(json.loads(request.content))
-            return httpx.Response(202, json={})
-        raise AssertionError(f"unexpected {request.method} {path}")
-
-    return handler
+    with pytest.raises(SandboxError, match="did not start: error"):
+        await _provider(monkeypatch, client).create_sandbox(_request())
+    assert client.deleted == ["sbx-1"]
 
 
-async def test_exec_collects_logs_and_exit_code() -> None:
-    created: list[dict[str, Any]] = []
-    result = await _sandbox(_process_handler(3, created)).exec("echo hi", cwd="/work", timeout=5)
-    assert (result.exit_code, result.output) == (3, "hi err")
-    assert created == [{"kind": "exec", "shellCommand": "echo hi", "cwd": "/work", "timeoutMs": 5000}]
+async def test_sandbox_that_does_not_start_is_deleted(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(FakeSandbox(state="error"))
+    with pytest.raises(SandboxError, match="did not start"):
+        await _provider(monkeypatch, client).create_sandbox(_request())
+    assert client.deleted == ["sbx-1"]
 
 
 @pytest.mark.parametrize(
-    ("final", "exit_code"),
+    ("status", "build_error", "expected"),
+    [("failed", "", "img-1 failed: broken"), ("raise", "no space left", "image failed")],
+)
+async def test_failed_image_is_a_build_error(
+    monkeypatch: pytest.MonkeyPatch, status: str, build_error: str, expected: str
+) -> None:
+    client = FakeClient()
+    client.images.status = status
+    with pytest.raises(SandboxBuildError, match=expected):
+        await _provider(monkeypatch, client).create_sandbox(_request())
+    assert client.calls == []
+
+
+async def test_unsupported_features_fail_before_any_api_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    with pytest.raises(SandboxError, match="gpu, volumes"):
+        await _provider(monkeypatch, client).create_sandbox(
+            _request(resources=Resources(vcpu=1, memory=1, disk=3, gpu=1), volumes=[{"name": "v", "mount_path": "/v"}])
+        )
+    assert client.calls == [] and client.images.pulled == []
+
+
+@pytest.mark.description(
+    "A rate-limited Daytona v2 call waits the delay the server gives, and one that stays limited names the code."
+)
+async def test_rate_limited_calls_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    limited = DaytonaError("x", status_code=429, code="RATE_LIMITED", retry_after_seconds=0)
+    calls = 0
+
+    async def get(sandbox_id: str) -> FakeSandbox:
+        nonlocal calls
+        calls += 1
+        if calls <= 8:
+            raise limited if calls % 2 else DaytonaError("x", status_code=429, retry_after_ms=0)
+        return client.sandbox
+
+    monkeypatch.setattr(client, "get", get)
+    monkeypatch.setattr(daytona_v2, "_RATE_LIMIT_SECONDS", 60)
+    provider = _provider(monkeypatch, client)
+    assert (await provider.get_sandbox("sbx-1")).id == "sbx-1"
+    assert calls == 9
+    monkeypatch.setattr(daytona_v2, "_RATE_LIMIT_SECONDS", 0.05)
+
+    responses = iter([httpx.Response(429, json={"retry_after_seconds": 0}), httpx.Response(200, json={})])
+    provider._http = httpx.AsyncClient(  # pyright: ignore[reportPrivateUsage]
+        base_url="https://api.daytona.com", transport=httpx.MockTransport(lambda request: next(responses))
+    )
+    assert (await provider.get_sandbox("sbx-1")).id == "sbx-1"
+
+    client.create_error = limited
+    with pytest.raises(SandboxConnectionError, match="HTTP 429 RATE_LIMITED"):
+        await provider.create_sandbox(_request())
+    assert len(client.calls) > 1
+
+
+@pytest.mark.description(
+    "A create that stays rate limited gives up at the request's start deadline, not the longer retry budget."
+)
+async def test_rate_limited_create_stops_at_its_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_RATE_LIMIT_SECONDS", 60)
+    monkeypatch.setattr(daytona_v2, "_backoff", wait_fixed(0.05))
+    client = FakeClient()
+    client.create_error = DaytonaError("x", status_code=429, code="RATE_LIMITED")
+    started = time.monotonic()
+    with pytest.raises(SandboxConnectionError, match="HTTP 429 RATE_LIMITED"):
+        await _provider(monkeypatch, client).create_sandbox(_request(create_timeout=1))
+    assert time.monotonic() - started < 5 and len(client.calls) > 1
+
+
+@pytest.mark.description(
+    "A task name that starts with a Daytona v2 reserved prefix gets a `vals-` prefix, and the idempotency key keeps it."
+)
+async def test_reserved_names_are_prefixed(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    await _provider(monkeypatch, client).create_sandbox(_request(name="build-pmars_ae1f28"))
+    _, _, kwargs = client.calls[0]
+    assert (kwargs["name"], kwargs["idempotency_key"]) == ("vals-build-pmars_ae1f28", "build-pmars_ae1f28")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
     [
-        ({"state": "terminal", "signal": "SIGKILL", "reason": "timed_out"}, 124),
-        ({"state": "terminal", "signal": "SIGKILL"}, 137),
-        ({"state": "terminal", "signal": "TERM"}, 143),
+        (DaytonaError("x", status_code=403, code="ORG_SUSPENDED"), SandboxAccountRejectedError),
+        (DaytonaError("x", status_code=402, code="PROJECT_BUDGET_EXCEEDED"), SandboxAccountRejectedError),
+        (DaytonaError("x", status_code=402), SandboxAccountRejectedError),
+        (DaytonaError("x", status_code=404, code="IMAGE_NOT_FOUND"), SandboxRejectedError),
+        (DaytonaError("x", status_code=404, code="SANDBOX_NOT_FOUND"), SandboxNotFoundError),
+        (DaytonaError("x", status_code=429, code="RATE_LIMITED", retry_after_seconds=0), SandboxConnectionError),
+        (DaytonaError("x", status_code=503, code="OVERLOADED"), SandboxConnectionError),
+        (daytona_v2.DaytonaConnectionError("reset"), SandboxConnectionError),
+        (DaytonaError("x", status_code=400, code="BAD_RANGE"), SandboxError),
     ],
 )
-async def test_exec_maps_timed_out_and_signalled_processes_to_exit_codes(final: dict[str, Any], exit_code: int) -> None:
-    sandbox = _sandbox(_process_handler(0, [], final={"id": "p1", **final}))
-    result = await asyncio.wait_for(sandbox.exec("sleep 30", timeout=3), 5)
-    assert result.exit_code == exit_code
-
-
-async def test_command_streams_output_and_raises_on_failure() -> None:
-    created: list[dict[str, Any]] = []
-    chunks: list[str] = []
-    with pytest.raises(SandboxCommandError):
-        async for chunk in _sandbox(_process_handler(2, created)).command("run", env_vars={"K": "v"}):
-            chunks.append(chunk)
-    assert chunks == ["hi ", "err"]
-    assert created[0]["env"] == {"K": "v"}
-
-
-STOP_SIGNAL = {"signal": "SIGTERM", "escalateAfterMs": 5000, "escalateTo": "SIGKILL"}
-
-
-async def test_closing_command_stops_remote_process() -> None:
-    signals: list[dict[str, Any]] = []
-    stream = _sandbox(_process_handler(0, [], signals)).command("serve")
-    assert await anext(stream) == "hi "
-    await stream.aclose()
-    assert signals == [STOP_SIGNAL]
-
-
-async def test_cancelling_exec_stops_remote_process() -> None:
-    signals: list[dict[str, Any]] = []
-    polled = asyncio.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/sb-1/processes":
-            return httpx.Response(201, json={"id": "p1", "state": "running"})
-        if request.url.path == "/sb-1/processes/p1/logs":
-            polled.set()
-            return httpx.Response(200, json={"frames": [], "nextCursor": None, "eof": False})
-        assert request.url.path == "/sb-1/processes/p1/signals"
-        signals.append(json.loads(request.content))
-        return httpx.Response(202, json={})
-
-    task = asyncio.create_task(_sandbox(handler).exec("sleep 100"))
-    await polled.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert signals == [STOP_SIGNAL]
-
-
-async def test_file_transfer_uses_toolbox_paths() -> None:
-    seen: list[tuple[str, str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((request.method, request.url.path, request.url.params["path"]))
-        if request.method == "POST":
-            assert b'name="file"' in request.content and b"payload" in request.content
-            return httpx.Response(200, json={})
-        return httpx.Response(200, content=b"data")
-
-    sandbox = _sandbox(handler)
-    await sandbox.upload_file("/tmp/in.txt", b"payload")
-    assert await sandbox.download_file("/tmp/out.txt") == b"data"
-    assert seen == [("POST", "/sb-1/files/upload", "/tmp/in.txt"), ("GET", "/sb-1/files/download", "/tmp/out.txt")]
-
-
-async def test_missing_file_is_not_a_lost_sandbox() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/sandboxes/sb-1":
-            return httpx.Response(200, json={"id": "sb-1", "status": "running"})
-        return httpx.Response(404, text="no such file")
-
-    with pytest.raises(SandboxError, match="/tmp/missing not found") as raised:
-        await _sandbox(handler).download_file("/tmp/missing")
-    assert not isinstance(raised.value, SandboxNotFoundError)
-
-
-async def test_file_transfer_on_lost_sandbox_raises_not_found() -> None:
-    sandbox = _sandbox(lambda request: httpx.Response(404, text="not found"))
-    with pytest.raises(SandboxNotFoundError):
-        await sandbox.upload_file("/tmp/in.txt", b"payload")
-
-
-async def test_list_sandboxes_pages_by_labels_and_skips_deleted() -> None:
-    searches: list[httpx.QueryParams] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/sandboxes/search":
-            searches.append(request.url.params)
-            if "cursor" in request.url.params:
-                return httpx.Response(200, json={"sandboxes": [{"id": "b"}, {"id": "gone"}], "next_cursor": None})
-            return httpx.Response(200, json={"sandboxes": [{"id": "a"}, {"id": "going"}], "next_cursor": "n1"})
-        sandbox_id = request.url.path.rsplit("/", 1)[-1]
-        status = {"gone": "deleted", "going": "deleting"}.get(sandbox_id, "running")
-        return httpx.Response(200, json={"id": sandbox_id, "status": status})
-
-    found = [
-        sandbox.id async for sandbox in _provider(handler).list_sandboxes(daytona_v2.SandboxQuery(labels={"run": "r1"}))
-    ]
-    assert found == ["a", "b"]
-    assert json.loads(searches[0]["labels"]) == {"run": "r1"}
-    assert searches[1]["cursor"] == "n1"
-
-
-async def test_list_sandboxes_bounds_creation_time_inclusively() -> None:
-    searches: list[httpx.QueryParams] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/sandboxes/search":
-            searches.append(request.url.params)
-            return httpx.Response(200, json={"sandboxes": [{"id": "a"}], "next_cursor": None})
-        return httpx.Response(200, json={"id": "a", "status": "running", "created_at": "2026-11-01T00:00:00Z"})
-
-    cutoff = datetime(2026, 11, 2, tzinfo=UTC)
-    query = daytona_v2.SandboxQuery(labels={}, created_at_lte=cutoff)
-    found = [sandbox async for sandbox in _provider(handler).list_sandboxes(query)]
-
-    assert [sandbox.created_at for sandbox in found] == [datetime(2026, 11, 1, tzinfo=UTC)]
-    assert searches[0]["created_end_at"] == "2026-11-02T00:00:00.000001+00:00"
-
-
-async def test_create_sandbox_announces_it_before_it_is_running() -> None:
-    announced: list[tuple[str, str]] = []
-
-    async def hook(provider: str, sandbox_id: str) -> None:
-        announced.append((provider, sandbox_id))
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/images":
-            return httpx.Response(201, json={"id": "img-1", "status": "ready"})
-        if request.method == "POST" and request.url.path == "/sandboxes":
-            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
-        assert announced == [("daytona_v2", "sb-1")]
-        return httpx.Response(200, json={"id": "sb-1", "status": "running"})
-
-    with sandbox_created_scope(hook):
-        await _provider(handler).create_sandbox(_request(0.25))
-
-    assert announced == [("daytona_v2", "sb-1")]
-
-
-def _policy_handler(puts: list[httpx.Request], final: dict[str, Any]) -> Handler:
-    reads = iter([{"status": "pending", "applied_revision": 4, "desired_revision": 5}, final])
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/sandboxes/sb-1/network-policy"
-        if request.method == "PUT":
-            puts.append(request)
-            return httpx.Response(202, json={"status": "pending", "applied_revision": 4, "desired_revision": 5})
-        if not puts:
-            return httpx.Response(200, headers={"etag": '"np-4"'}, json={"status": "applied", "desired_revision": 4})
-        return httpx.Response(200, json=next(reads))
-
-    return handler
-
-
-EgressChange = Callable[[DaytonaV2Sandbox], Awaitable[None]]
-_EGRESS_CHANGES: list[tuple[EgressChange, dict[str, Any]]] = [
-    (
-        lambda sandbox: sandbox.modify_egress_rules(["example.com", "10.0.0.1"]),
-        {"block_all": True, "allow_cidrs": ["10.0.0.1/32"], "allow_domains": ["example.com"]},
-    ),
-    (
-        lambda sandbox: sandbox.modify_egress_rules(["10.0.0.0/8"]),
-        {"block_all": True, "allow_cidrs": ["10.0.0.0/8"], "allow_domains": None},
-    ),
-    (lambda sandbox: sandbox.block_all_egress(), {"block_all": True, "allow_cidrs": [], "allow_domains": None}),
-    (lambda sandbox: sandbox.clear_egress_rules(), {"block_all": False, "allow_cidrs": [], "allow_domains": None}),
-]
-
-
-@pytest.mark.parametrize(("change", "rules"), _EGRESS_CHANGES)
-async def test_egress_changes_replace_the_policy_and_wait_until_applied(
-    change: EgressChange, rules: dict[str, Any]
+async def test_create_classifies_refusals_by_code(
+    monkeypatch: pytest.MonkeyPatch, error: DaytonaError, expected: type[SandboxError]
 ) -> None:
-    puts: list[httpx.Request] = []
-    await change(_sandbox(_policy_handler(puts, {"status": "applied", "applied_revision": 5, "desired_revision": 5})))
-
-    assert [(put.headers["If-Match"], json.loads(put.content)) for put in puts] == [('"np-4"', rules)]
-
-
-async def test_egress_change_raises_when_daytona_cannot_apply_it() -> None:
-    final = {"status": "failed", "applied_revision": 4, "desired_revision": 5, "error": "bad domain"}
-    with pytest.raises(SandboxError, match="bad domain"):
-        await _sandbox(_policy_handler([], final)).block_all_egress()
+    client = FakeClient()
+    client.create_error = error
+    with pytest.raises(SandboxError) as exc_info:
+        await _provider(monkeypatch, client).create_sandbox(_request())
+    assert type(exc_info.value) is expected
 
 
-async def test_sandbox_is_deleted_when_announcement_is_cancelled() -> None:
-    deleted: list[str] = []
-
-    async def hook(provider: str, sandbox_id: str) -> None:
-        raise asyncio.CancelledError
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/images":
-            return httpx.Response(201, json={"id": "img-1", "status": "ready"})
-        if request.method == "POST" and request.url.path == "/sandboxes":
-            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
-        if request.method == "DELETE":
-            deleted.append(request.url.path)
-            return httpx.Response(204)
-        raise AssertionError(f"unexpected {request.method} {request.url.path}")
-
-    with sandbox_created_scope(hook), pytest.raises(asyncio.CancelledError):
-        await _provider(handler).create_sandbox(_request(0.25))
-
-    assert deleted == ["/sandboxes/sb-1"]
+@pytest.mark.parametrize(
+    ("frames", "wait", "exit_code"),
+    [
+        ([_frame("hi "), _frame("err", "stderr"), _frame("x", "system")], _wait(3), 3),
+        ([], _wait(None, "timed_out"), 124),
+        ([], _wait(None, "signaled", "KILL"), 137),
+    ],
+)
+async def test_exec_collects_output_and_maps_exit_codes(
+    frames: list[LogFrame], wait: WaitResult, exit_code: int
+) -> None:
+    inner = FakeSandbox()
+    inner.process = FakeProcess(frames, wait)
+    result = await _sandbox(inner).exec("echo hi", cwd="/w", timeout=5)
+    assert result.exit_code == exit_code
+    assert result.output == ("hi err" if frames else "")
+    assert inner.process.started == [{"command": "echo hi", "cwd": "/w", "env": None, "execution_timeout": 5}]
 
 
-def _priced(**data: Any) -> DaytonaV2Sandbox:
-    fields: dict[str, Any] = {
-        "id": "a",
-        "status": "deleted",
-        "created_at": "2026-11-11T00:00:00Z",
-        "cpu": 0.25,
-        "memory_mib": 2048,
-        "spot": False,
-        "region_id": "us-east-ash-1",
-    }
-    fields.update(data)
-    return DaytonaV2Sandbox(fields, httpx.AsyncClient())
+async def test_command_streams_output_raises_on_failure_and_stops_when_closed() -> None:
+    inner = FakeSandbox()
+    inner.process = FakeProcess([_frame("a")], _wait(2))
+    sandbox = _sandbox(inner)
+    with pytest.raises(SandboxCommandError):
+        assert [line async for line in sandbox.command("x", env_vars={"K": "v"})] == ["a"]
+    assert inner.process.killed is False
+
+    inner.process = FakeProcess([_frame("a")], hang=True)
+    stream = sandbox.command("x")
+    assert await anext(stream) == "a"
+    await stream.aclose()
+    assert inner.process.killed is True
+
+
+async def test_missing_file_is_not_a_lost_sandbox_until_the_sandbox_is_gone() -> None:
+    inner = FakeSandbox()
+    sandbox = _sandbox(inner)
+    await sandbox.upload_file("/w/a.txt", b"hi")
+    assert await sandbox.download_file("/w/a.txt") == b"hi"
+    with pytest.raises(SandboxError, match="/w/b.txt not found") as exc_info:
+        await sandbox.download_file("/w/b.txt")
+    assert not isinstance(exc_info.value, SandboxNotFoundError)
+
+    inner.after_refresh = "destroyed"
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.download_file("/w/b.txt")
+
+
+@pytest.mark.description("A sandbox deleted mid-task reports the state, error, eviction and last activity v2 recorded.")
+async def test_lost_sandbox_reports_why_v2_deleted_it() -> None:
+    evicted = datetime(2026, 11, 21, 23, 30, tzinfo=UTC)
+    inner = FakeSandbox(
+        error="host lost",
+        spot_evicted_at=evicted,
+        lifecycle_policy=SandboxLifecycle(last_activity_at=evicted, last_activity_source="exec"),
+    )
+    inner.after_refresh = "destroyed"
+    with pytest.raises(SandboxNotFoundError) as exc_info:
+        await _sandbox(inner).download_file("/w/missing.txt")
+    assert str(exc_info.value) == (
+        f"sandbox sbx-1 was deleted: state=destroyed, error=host lost, spot_evicted_at={evicted}, "
+        f"last_activity_at={evicted}, last_activity_source=exec"
+    )
+
+
+@pytest.mark.parametrize("state", ["destroying", "destroyed"])
+async def test_get_sandbox_treats_a_destroyed_sandbox_as_gone(monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+    with pytest.raises(SandboxNotFoundError):
+        await _provider(monkeypatch, FakeClient(FakeSandbox(state=state))).get_sandbox("sbx-1")
+
+
+async def test_list_sandboxes_pages_by_labels_bounds_creation_and_skips_destroyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    client.sandboxes = {"a": FakeSandbox("a"), "b": FakeSandbox("b", state="destroyed"), "c": FakeSandbox("c")}
+    client.pages = [
+        SimpleNamespace(items=[SimpleNamespace(id="a"), SimpleNamespace(id="b")], next_cursor="n1"),
+        SimpleNamespace(items=[SimpleNamespace(id="c")], next_cursor=None),
+    ]
+    cutoff = datetime(2026, 11, 1, tzinfo=UTC)
+    query = SandboxQuery(labels={"run": "r1"}, page_size=2, created_at_lte=cutoff)
+    found = [sandbox async for sandbox in _provider(monkeypatch, client).list_sandboxes(query)]
+
+    assert [sandbox.id for sandbox in found] == ["a", "c"]
+    assert [call[2] for call in client.calls] == [
+        {"labels": {"run": "r1"}, "created_end_at": cutoff + timedelta(microseconds=1), "limit": 2, "cursor": None},
+        {"labels": {"run": "r1"}, "created_end_at": cutoff + timedelta(microseconds=1), "limit": 2, "cursor": "n1"},
+    ]
+
+
+async def test_egress_changes_replace_the_policy_and_wait_until_applied() -> None:
+    inner = FakeSandbox()
+    inner.policy_states = [
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(status="applied", applied_revision=2, error=None),
+    ]
+    await _sandbox(inner).block_all_egress()
+    assert inner.policies == [{"block_all": True, "allow_cidrs": [], "allow_domains": None, "if_match": "e1"}]
+
+    inner.policy_states = [
+        SimpleNamespace(etag="e2"),
+        SimpleNamespace(status="failed", applied_revision=1, error="bad"),
+    ]
+    with pytest.raises(SandboxError, match="could not apply"):
+        await _sandbox(inner).clear_egress_rules()
+
+
+class PolicyInTransitionSandbox(FakeSandbox):
+    def __init__(self, conflict: str, busy: int) -> None:
+        super().__init__()
+        self.conflict, self.busy = conflict, busy
+
+    async def update_network_policy(self, *, network_policy: dict[str, Any], if_match: str) -> SimpleNamespace:
+        if self.busy:
+            self.busy -= 1
+            raise ConflictError("conflict", status_code=409, code=self.conflict)
+        return await super().update_network_policy(network_policy=network_policy, if_match=if_match)
+
+
+@pytest.mark.description("An egress change waits out a policy transition that is still in progress.")
+async def test_egress_changes_wait_out_a_policy_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    inner = PolicyInTransitionSandbox("network_policy_transition_in_progress", busy=2)
+    inner.policy_states = [
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(etag="e2"),
+        SimpleNamespace(status="applied", applied_revision=2, error=None),
+    ]
+    await _sandbox(inner).clear_egress_rules()
+    assert inner.policies == [{"block_all": False, "allow_cidrs": [], "allow_domains": None, "if_match": "e2"}]
+
+
+@pytest.mark.description("A policy transition that outlasts the policy timeout fails the egress change.")
+async def test_egress_changes_stop_waiting_for_a_policy_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    monkeypatch.setattr(daytona_v2, "_POLICY_TIMEOUT_SECONDS", 0)
+    inner = PolicyInTransitionSandbox("network_policy_transition_in_progress", busy=5)
+    with pytest.raises(SandboxError, match="409"):
+        await _sandbox(inner).clear_egress_rules()
+    assert inner.busy == 4
+
+
+@pytest.mark.description("An egress change fails at once on a policy conflict other than a transition.")
+async def test_egress_changes_fail_on_other_policy_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    inner = PolicyInTransitionSandbox("etag_mismatch", busy=5)
+    with pytest.raises(SandboxError, match="409"):
+        await _sandbox(inner).clear_egress_rules()
+    assert inner.busy == 4
 
 
 def test_cost_is_cores_and_memory_over_lifetime() -> None:
     ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
-    on_demand, spot = _priced().cost_usd(ended), _priced(spot=True).cost_usd(ended)
+    on_demand = _sandbox(FakeSandbox()).cost_usd(ended)
+    spot = _sandbox(FakeSandbox(spot=True)).cost_usd(ended)
+    earth = _sandbox(FakeSandbox(region="earth")).cost_usd(ended)
     assert on_demand is not None and math.isclose(on_demand, 2.0 * (0.25 * 0.235 + 2 * 0.0162) / 2)
     assert spot is not None and math.isclose(spot, 0.7 * on_demand)
-    earth = _priced(region_id="earth").cost_usd(ended)
     assert earth is not None and math.isclose(earth, on_demand / 2)
 
 
-def test_cost_needs_created_at_and_resources() -> None:
-    ended = datetime(2026, 11, 11, 1, tzinfo=UTC)
-    assert _priced(created_at=None).cost_usd(ended) is None
-    assert _priced(cpu=None).cost_usd(ended) is None
-    assert _priced(spot=None).cost_usd(ended) is None
-    assert _priced(region_id=None).cost_usd(ended) is None
-    assert _priced(region_id="eu-central-fra-1").cost_usd(ended) is None
+@pytest.mark.parametrize("info", [{"cpu": None}, {"spot": None}, {"region": None}, {"region": "eu-central-fra-1"}])
+def test_cost_needs_resources_and_a_known_region(info: dict[str, Any]) -> None:
+    assert _sandbox(FakeSandbox(**info)).cost_usd(datetime(2026, 11, 11, 1, tzinfo=UTC)) is None
+
+
+async def test_cost_needs_created_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    sandbox = await _provider(monkeypatch, FakeClient(), created_at=None).get_sandbox("sbx-1")
+    assert sandbox.cost_usd(datetime(2026, 11, 11, 1, tzinfo=UTC)) is None
 
 
 def test_compose_sandbox_is_priced_as_its_outer_sandbox() -> None:
-    outer = _priced()
+    outer = _sandbox(FakeSandbox(state="destroyed"))
     compose = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
     ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
     assert compose.has_ended is True
     assert compose.cost_usd(ended) == outer.cost_usd(ended)
 
 
-@pytest.mark.parametrize(("status", "ended"), [("running", False), ("deleting", True), ("stopped", True)])
-def test_has_ended_follows_status(status: str, ended: bool) -> None:
-    assert _priced(status=status).has_ended is ended
+@pytest.mark.parametrize(("state", "ended"), [("started", False), ("destroying", True), ("stopped", True)])
+def test_has_ended_follows_state(state: str, ended: bool) -> None:
+    assert _sandbox(FakeSandbox(state=state)).has_ended is ended
 
 
-def test_only_daytona_v2_is_priced_from_rates() -> None:
+def test_only_daytona_v2_is_priced_from_rates_and_it_checkpoints_and_forks(monkeypatch: pytest.MonkeyPatch) -> None:
     assert priced_provider_types() == ["daytona_v2"]
+    assert _provider(monkeypatch, FakeClient()).capabilities == SandboxCapabilities(
+        checkpoints=frozenset(CheckpointKind), fork=True
+    )
+
+
+@pytest.mark.parametrize(("kind", "ref"), [(CheckpointKind.FILES, "img-cp"), (CheckpointKind.MEMORY, "snap-cp-1")])
+async def test_checkpoint_waits_until_ready_and_deletes_a_failed_capture(kind: CheckpointKind, ref: str) -> None:
+    client = FakeClient()
+    sandbox = _sandbox(client.sandbox, client)
+    assert await sandbox.checkpoint(kind, "cp-1") == Checkpoint(provider="daytona_v2", kind=kind, ref=ref)
+
+    artifacts = client.images if kind == CheckpointKind.FILES else client.snapshots
+    artifacts.status = "failed"
+    with pytest.raises(SandboxError, match="did not become ready"):
+        await sandbox.checkpoint(kind, "cp-1")
+    assert artifacts.deleted == [ref]
+
+
+class PendingVmSandbox(FakeSandbox):
+    def __init__(self, conflict: str, pending: int) -> None:
+        super().__init__()
+        self.conflict, self.pending, self.captures = conflict, pending, 0
+
+    async def _capture(self) -> None:
+        self.captures += 1
+        if self.captures <= self.pending:
+            raise ConflictError(self.conflict, status_code=409)
+
+    async def capture_image(self) -> SimpleNamespace:
+        await self._capture()
+        return await super().capture_image()
+
+    async def create_snapshot(self, name: str) -> SimpleNamespace:
+        await self._capture()
+        return await super().create_snapshot(name)
+
+
+@pytest.mark.description("A checkpoint taken while v2 still reports the VM pending is retried until the VM runs.")
+@pytest.mark.parametrize(("kind", "ref"), [(CheckpointKind.FILES, "img-cp"), (CheckpointKind.MEMORY, "snap-cp-1")])
+async def test_checkpoint_retries_while_the_vm_is_pending(
+    monkeypatch: pytest.MonkeyPatch, kind: CheckpointKind, ref: str
+) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    client = FakeClient()
+    client.sandbox = PendingVmSandbox("conflict: vm status is pending, snapshots require a running vm", pending=2)
+    assert await _sandbox(client.sandbox, client).checkpoint(kind, "cp-1") == Checkpoint(
+        provider="daytona_v2", kind=kind, ref=ref
+    )
+    assert client.sandbox.captures == 3
+
+
+@pytest.mark.description("A pending-VM conflict that outlasts the retry window fails the checkpoint.")
+async def test_checkpoint_stops_retrying_a_pending_vm_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    monkeypatch.setattr(daytona_v2, "_VM_PENDING_SECONDS", 0)
+    client = FakeClient()
+    client.sandbox = PendingVmSandbox("conflict: vm status is pending, snapshots require a running vm", pending=5)
+    with pytest.raises(SandboxError, match="vm status is pending"):
+        await _sandbox(client.sandbox, client).checkpoint(CheckpointKind.MEMORY, "cp-1")
+    assert client.sandbox.captures == 1
+
+
+@pytest.mark.description("A checkpoint conflict other than a pending VM fails at once.")
+async def test_checkpoint_fails_on_other_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
+    client = FakeClient()
+    client.sandbox = PendingVmSandbox("conflict: sandbox is stopped", pending=5)
+    with pytest.raises(SandboxError, match="409"):
+        await _sandbox(client.sandbox, client).checkpoint(CheckpointKind.MEMORY, "cp-1")
+    assert client.sandbox.captures == 1
+
+
+async def test_fork_keeps_memory_and_waits_for_the_copy() -> None:
+    client = FakeClient()
+    fork = await _sandbox(client.sandbox, client).fork("fork-1")
+    assert client.sandbox.forks == [{"name": "fork-1", "memory": True, "wait_seconds": 0}]
+    assert fork.id == "sbx-fork"
+
+
+async def test_restoring_a_memory_checkpoint_creates_from_it_and_opens_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    client.sandbox.policy_states = [
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(status="applied", applied_revision=2, error=None),
+    ]
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+    await _provider(monkeypatch, client).create_sandbox(_request(source=saved, env_vars={}))
+
+    kind, snapshot, kwargs = client.calls[0]
+    assert (kind, snapshot, kwargs["idempotency_key"], kwargs["region"]) == ("restore", "snap-1", "tts-task-1", "us")
+    assert client.sandbox.policies[0]["block_all"] is False
+
+
+@pytest.mark.description(
+    "A memory restore keeps fresh env off the snapshot create and gives it to every command it runs."
+)
+async def test_restoring_a_memory_checkpoint_hands_its_env_to_each_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    client.sandbox.policy_states = [
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(status="applied", applied_revision=2, error=None),
+    ]
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+    sandbox = await _provider(monkeypatch, client).create_sandbox(_request(source=saved))
+
+    assert "env" not in client.calls[0][2]
+    assert client.calls[0][2]["labels"] == {"run": "r1", "cbs-command-env": "true"}
+    await sandbox.exec("echo hi")
+    assert [chunk async for chunk in sandbox.command("echo hi", env_vars={"A": "2", "B": "3"})] == []
+    assert [start["env"] for start in client.sandbox.process.started] == [
+        {"A": "1", "DAYTONA_API_URL": "u"},
+        {"A": "2", "DAYTONA_API_URL": "u", "B": "3"},
+    ]
+
+
+@pytest.mark.description(
+    "A memory-restored sandbox reopened by ID reads its saved env at its first command, not when it is opened."
+)
+async def test_reopening_a_memory_restored_sandbox_reads_its_saved_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    client.sandbox.policy_states = [
+        SimpleNamespace(etag="e1"),
+        SimpleNamespace(status="applied", applied_revision=2, error=None),
+    ]
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+    await _provider(monkeypatch, client).create_sandbox(_request(source=saved))
+
+    labels = {"run": "r1", "cbs-command-env": "true"}
+    saved_env = client.sandbox.fs.files.pop("/etc/cbs-command-env.json")
+    reopened = await _provider(monkeypatch, client, labels=labels).get_sandbox("sbx-1")
+    client.sandbox.fs.files["/etc/cbs-command-env.json"] = saved_env
+    await reopened.exec("echo hi")
+    assert client.sandbox.process.started[-1]["env"] == {"A": "1", "DAYTONA_API_URL": "u"}
+
+
+@pytest.mark.description("A memory restore that asks to block all egress is rejected before any sandbox is created.")
+async def test_restoring_a_memory_checkpoint_blocked_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+    with pytest.raises(SandboxError, match="network_block_all"):
+        await _provider(monkeypatch, client).create_sandbox(_request(source=saved, network_block_all=True))
+    assert client.calls == []
+
+
+async def test_restoring_a_files_checkpoint_boots_its_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-cp")
+    await _provider(monkeypatch, client).create_sandbox(_request(source=saved))
+    assert client.calls[0][:2] == ("create", "img-cp") and client.images.pulled == []
+
+
+async def test_delete_checkpoint_waits_out_conflicts_and_ignores_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient()
+    provider = _provider(monkeypatch, client)
+    client.snapshots.delete_errors = [ConflictError("in use", status_code=409)]
+    await provider.delete_checkpoint(Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1"))
+    assert client.snapshots.deleted == ["snap-1"]
+
+    client.images.delete_errors = [NotFoundError("gone", status_code=404)]
+    await provider.delete_checkpoint(Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-1"))
+    assert client.images.deleted == []

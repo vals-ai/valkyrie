@@ -227,21 +227,18 @@ class TestSteps:
 
         assert report.errors == ("the compose verifier of step 'first' can't request GPUs",)
 
-    @pytest.mark.description("A task with too many steps or step artifacts is refused.")
-    def test_a_task_with_too_many_steps_or_step_artifacts_is_refused(self, tmp_path: Path) -> None:
+    @pytest.mark.description("A task with more than 100 steps is refused.")
+    def test_a_task_with_too_many_steps_is_refused(self, tmp_path: Path) -> None:
         many_steps = MINIMAL + "".join(f"[[steps]]\nname = 's{index}'\n" for index in range(101))
-        crowded = (
-            "artifacts = ["
-            + ", ".join(f"'/task/{index}'" for index in range(15))
-            + "]\n"
-            + MINIMAL
-            + "[[steps]]\nname = 'first'\nartifacts = ["
-            + ", ".join(f"'/step/{index}'" for index in range(10))
-            + "]\n"
-        )
 
-        assert "at most 100 items" in problems(validate_task(write_task(tmp_path / "many", many_steps)))
-        assert "would collect more than 20 artifacts" in problems(validate_task(write_task(tmp_path / "full", crowded)))
+        assert "at most 100 items" in problems(validate_task(write_task(tmp_path, many_steps)))
+
+    @pytest.mark.description("A `docker_image` that is not an image reference fails validation.")
+    @pytest.mark.parametrize("image", ["ubuntu\\n:24.04", "registry:port/app", "Ubuntu:24.04"])
+    def test_a_malformed_docker_image_fails_validation(self, tmp_path: Path, image: str) -> None:
+        toml = MINIMAL.replace('workdir = "/app"', f'workdir = "/app"\ndocker_image = "{image}"')
+
+        assert "docker_image must be an image reference" in problems(validate_task(write_task(tmp_path, toml)))
 
     @pytest.mark.description("A reward strategy without steps is ignored with a warning.")
     def test_a_reward_strategy_without_steps_is_ignored_with_a_warning(self, tmp_path: Path) -> None:
@@ -329,7 +326,7 @@ class TestRequiredFiles:
 
 
 @pytest.mark.description(
-    ("A task builds its sandbox from one source: a compose file, else its image, else its Dockerfile.")
+    ("A task builds its sandbox from one source: a snapshot, a compose file, else its image, else its Dockerfile.")
 )
 class TestSandboxSource:
     @pytest.mark.description("No source is an error.")
@@ -362,6 +359,52 @@ class TestSandboxSource:
         task = write_task(tmp_path, toml, files=files)
 
         assert sandbox_kind(task, TaskConfig.parse(toml)) == kind
+
+    @pytest.mark.description("A task with only a snapshot needs no environment folder and runs from the snapshot.")
+    def test_a_task_with_only_a_snapshot_runs_from_the_snapshot(self, tmp_path: Path) -> None:
+        toml = f'{MINIMAL}snapshot = "env-build"\nsnapshot_target = "us"\n'
+        task = write_task(tmp_path, toml, skip=("environment/Dockerfile",))
+
+        report = validate_task(task)
+
+        assert report.ok
+        assert report.warnings == ()
+        assert sandbox_kind(task, TaskConfig.parse(toml)) == SandboxKind.SNAPSHOT
+
+    @pytest.mark.description("A snapshot beside an environment Dockerfile or compose file is an error.")
+    @pytest.mark.parametrize(
+        ("files", "named"),
+        [
+            ({}, "environment/Dockerfile"),
+            ({"environment/docker-compose.yaml": ""}, "environment/docker-compose.yaml"),
+        ],
+        ids=["dockerfile", "compose"],
+    )
+    def test_a_snapshot_beside_an_environment_dockerfile_or_compose_file_is_an_error(
+        self, tmp_path: Path, files: dict[str, str], named: str
+    ) -> None:
+        report = validate_task(write_task(tmp_path, f'{MINIMAL}snapshot = "env-build"\n', files=files))
+
+        assert f"[environment].snapshot can't be combined with {named}" in report.errors
+
+    @pytest.mark.description("A verifier environment can't run from a snapshot.")
+    @pytest.mark.parametrize(
+        ("toml", "label"),
+        [
+            ('[verifier.environment]\nsnapshot = "grader"', "[verifier.environment]"),
+            (
+                '[[steps]]\nname = "one"\n[steps.verifier.environment]\nsnapshot = "grader"',
+                "[steps.one.verifier.environment]",
+            ),
+        ],
+        ids=["task", "step"],
+    )
+    def test_a_verifier_environment_cant_run_from_a_snapshot(self, tmp_path: Path, toml: str, label: str) -> None:
+        files = {"steps/one/instruction.md": "Do it.\n"}
+
+        report = validate_task(write_task(tmp_path, toml, files=files))
+
+        assert f"{label}.snapshot is not supported yet; only [environment] runs from a snapshot" in report.errors
 
 
 @pytest.mark.description(

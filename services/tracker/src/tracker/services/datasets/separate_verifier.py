@@ -7,7 +7,7 @@ import re
 import shlex
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -31,9 +31,16 @@ from benchmark_service.schemas import SandboxCreatedData
 
 from tracker.services.datasets.artifacts import MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, SkippedArtifact, StagedArtifact
 from tracker.services.datasets.compose import ComposeRuntime, compose_runtime, compose_source, start_compose_runtime
-from tracker.services.datasets.config import MAIN_SERVICE, EnvironmentConfig, TaskConfig
+from tracker.services.datasets.config import EnvironmentConfig, TaskConfig
 from tracker.services.datasets.folder import COMPOSE_FILE, DOCKERFILE
-from tracker.services.datasets.grading import ARTIFACTS_DIR, OPEN_LOG_DIRS, VERIFIER_DIR, grade_task, keep
+from tracker.services.datasets.grading import (
+    ARTIFACTS_DIR,
+    OPEN_LOG_DIRS,
+    VERIFIER_DIR,
+    GradingSandbox,
+    grade_task,
+    keep,
+)
 from tracker.services.datasets.retrieve_task import sandbox_resources, stage_egress, with_gateway
 from tracker.services.datasets.steps import step_config, step_layers
 from tracker.sandbox import apply_egress_policy, runtime_sandbox
@@ -209,7 +216,7 @@ def _plain(member: tarfile.TarInfo) -> tarfile.TarInfo:
     return member
 
 
-def _clean_archive(archive_path: Path, name: str, source: str, scratch: Path) -> Path:
+def _clean_archive(archive_path: Path, name: str, source: str, scratch: Path) -> tuple[Path, bool]:
     unpacked = scratch / "unpacked"
     unpacked.mkdir()
     files = 0
@@ -241,17 +248,17 @@ def _clean_archive(archive_path: Path, name: str, source: str, scratch: Path) ->
             repacked.add(unpacked / name, arcname=name, filter=_plain)
     except (tarfile.TarError, OSError, EOFError, KeyError) as error:
         raise SeparateVerifierError(f"Artifact {source} can't be carried: {str(error)[:200]}") from error
-    return clean
+    return clean, (unpacked / name).is_dir()
 
 
-async def _download(source_sandbox: Sandbox, remote_path: str, destination: Path, source: str) -> None:
+async def _download(artifact: StagedArtifact, destination: Path) -> None:
     total = 0
     sink = await asyncio.to_thread(destination.open, "wb")
     try:
-        async for chunk in source_sandbox.stream_download(remote_path):
+        async for chunk in artifact.read():
             total += len(chunk)
             if total > MAX_ARTIFACT_BYTES:
-                raise SeparateVerifierError(f"Artifact {source} is over {MAX_ARTIFACT_BYTES} bytes")
+                raise SeparateVerifierError(f"Artifact {artifact.source} is over {MAX_ARTIFACT_BYTES} bytes")
             await asyncio.to_thread(sink.write, chunk)
     finally:
         await asyncio.to_thread(sink.close)
@@ -261,26 +268,29 @@ def ignore(_message: str) -> None:
     return None
 
 
-async def _carry(source_sandbox: Sandbox, verifier: Sandbox, artifact: StagedArtifact) -> None:
+async def _carry(verifier: Sandbox, artifact: StagedArtifact) -> None:
     name = posixpath.basename(artifact.source)
     parent = posixpath.dirname(artifact.source) or "/"
     with tempfile.TemporaryDirectory(prefix="artifact-") as scratch_name:
         scratch = Path(scratch_name)
         archive_path = scratch / "artifact.tar.gz"
-        await _download(source_sandbox, artifact.archive_path, archive_path, artifact.source)
-        clean = await asyncio.to_thread(_clean_archive, archive_path, name, artifact.source, scratch)
+        await _download(artifact, archive_path)
+        clean, folder = await asyncio.to_thread(_clean_archive, archive_path, name, artifact.source, scratch)
         remote = f"{TRANSFER_DIR}/{uuid4().hex}.tar.gz"
         await verifier.exec(f"mkdir -p {shlex.quote(TRANSFER_DIR)} {shlex.quote(parent)}")
         await verifier.upload_file(remote, await asyncio.to_thread(clean.read_bytes))
+    target = shlex.quote(posixpath.join(parent, name))
     unpacked = await verifier.exec(
-        f"tar -xzf {shlex.quote(remote)} -C {shlex.quote(parent)} && rm -f {shlex.quote(remote)}"
+        f"{f'rm -rf {target} && ' if folder else ''}"
+        f"tar -xzf {shlex.quote(remote)} -C {shlex.quote(parent)} && rm -f {shlex.quote(remote)} && "
+        f"if [ -d {target} ]; then chmod a+rwx {target}; "
+        f"elif [ {shlex.quote(parent)} != / ]; then chmod a+rwx {shlex.quote(parent)}; fi"
     )
     if unpacked.exit_code != 0:
         raise SeparateVerifierError(f"Could not unpack artifact {artifact.source}: {unpacked.output.strip()[-300:]}")
 
 
 async def _carry_artifacts(
-    services: Mapping[str, Sandbox],
     verifier: Sandbox,
     staged: Sequence[StagedArtifact],
     skipped: Sequence[SkippedArtifact],
@@ -294,7 +304,7 @@ async def _carry_artifacts(
         say(f"The folder {ARTIFACTS_DIR} could not be carried to the verifier: {artifact.reason}")
     for artifact in staged:
         try:
-            await _carry(services[artifact.service], verifier, artifact)
+            await _carry(verifier, artifact)
         except SeparateVerifierError as error:
             if artifact.source != ARTIFACTS_DIR:
                 raise
@@ -309,7 +319,7 @@ async def grade_separately(
     env: dict[str, str],
     sandbox_env: dict[str, str],
     tests_dir: Path,
-    services: Mapping[str, Sandbox],
+    labels: Mapping[str, str],
     agent_source: SandboxSource,
     agent_compose: ComposeRuntime | None,
     provider: SandboxProvider,
@@ -320,12 +330,14 @@ async def grade_separately(
     redact: Callable[[str], str] = keep,
     layers: Layers | None = None,
     gateway_url: str | None = None,
+    default_user: str | None = None,
+    image_workdir: Callable[[GradingSandbox, SandboxSource], Awaitable[str | None]] | None = None,
 ) -> dict[str, Any]:
     environment = verifier_environment(task_id, tests_dir, config, agent_source, agent_compose, layers)
     source = environment.source
     if on_message is not None:
         on_message(f"Starting a separate verifier for {task_id}")
-    labels = {**(services[MAIN_SERVICE].labels or {}), "valkyrie-role": "verifier"}
+    labels = {**labels, "valkyrie-role": "verifier"}
     policy = select_policy(
         stage_egress(config.verifier, config.verifier.environment or config.environment),
         "evaluation",
@@ -344,9 +356,23 @@ async def grade_separately(
         if policy != "*" and (policy or isinstance(source, ComposeSource)):
             await apply_egress_policy(verifier, policy)
         grader = runtime_sandbox(verifier, source)
-        await _carry_artifacts(services, grader, staged, skipped, on_message or ignore)
+        cwd = (
+            await image_workdir(grader, source)
+            if image_workdir is not None and not (config.verifier.environment or config.environment).workdir
+            else None
+        )
+        await _carry_artifacts(grader, staged, skipped, on_message or ignore)
         result = await grade_task(
-            task_id, config, env, tests_dir, grader, on_message, redact=redact, upload_tests=environment.upload_tests
+            task_id,
+            config,
+            env,
+            tests_dir,
+            grader,
+            on_message,
+            redact=redact,
+            upload_tests=environment.upload_tests,
+            cwd=cwd,
+            default_user=default_user if source is agent_source else None,
         )
         result["metadata"]["verifier_environment_mode"] = "separate"
         return result

@@ -2,7 +2,7 @@ import click
 from valkyrie.sdk import SchedulerOverviewResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, one_line
+from valkyrie.cli.display import emit, json_option, format_table, one_line
 
 
 @click.group(help="Inspect your organization's sandbox scheduler.")
@@ -23,7 +23,7 @@ def queue() -> None:
 @click.option(
     "--active-offset", type=click.IntRange(min=0), default=0, show_default=True, help="Active entries to skip."
 )
-@format_option("Output format. JSON includes task pages, capped flags, and next offsets.")
+@json_option()
 def status(waiting_limit: int, active_limit: int, waiting_offset: int, active_offset: int, output_format: str) -> None:
     response = call(
         lambda client: client.scheduler.overview(
@@ -35,7 +35,7 @@ def status(waiting_limit: int, active_limit: int, waiting_offset: int, active_of
     )
 
     if output_format == "json":
-        click.echo(response.model_dump_json(indent=2))
+        emit(response)
         return
 
     _format_overview(response)

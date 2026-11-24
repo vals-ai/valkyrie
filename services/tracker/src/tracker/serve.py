@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 from pathlib import Path
 
@@ -19,15 +20,32 @@ def main() -> None:
         config.configure(args.config)
         os.environ["EXECUTOR_LAUNCHER"] = "local"
         os.environ.pop("EXECUTOR_PAYLOAD_KMS_KEY_ID", None)
+        from tracker.database.session import engine
+        from tracker.executor.dispatch_recovery import recover_interrupted_local_dispatches
         from tracker.local.releases import register_checkout_release
+        from tracker.repositories.advisory_lock import local_tracker_lock
 
-        register_checkout_release()
-    is_local = config.resources is not None
+        if not asyncio.run(local_tracker_lock(engine).acquire()):
+            raise SystemExit("Another local Tracker is already using this database. Stop it first.")
+
+        server_config = uvicorn.Config(
+            "main:app",
+            host="127.0.0.1",
+            port=args.port,
+            timeout_keep_alive=args.timeout_keep_alive,
+            log_config=None,
+            access_log=False,
+        )
+        with server_config.bind_socket() as listener:
+            register_checkout_release()
+            recover_interrupted_local_dispatches()
+            uvicorn.Server(server_config).run(sockets=[listener])
+        return
     uvicorn.run(
         "main:app",
-        host="127.0.0.1" if is_local else "0.0.0.0",
+        host="0.0.0.0",
         port=args.port,
-        workers=1 if is_local else 2,
+        workers=2,
         timeout_keep_alive=args.timeout_keep_alive,
         log_config=None,
     )

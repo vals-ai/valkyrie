@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 import inspect
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from importlib import import_module
 from uuid import UUID
@@ -228,6 +230,20 @@ def test_public_exports_and_constants_are_stable() -> None:
     assert getattr(sdk, "LoginSession") is LoginSession
     assert getattr(sdk, "SessionAuth") is SessionAuth
     assert getattr(sdk, "device_login") is device_login
+
+
+@pytest.mark.description("Importing `valkyrie.sdk` loads no models or `httpx` until a public name is used.")
+def test_public_exports_load_lazily() -> None:
+    script = (
+        "import sys, valkyrie.sdk as sdk\n"
+        "import valkyrie.sdk.models as models\n"
+        "assert set(sdk.__all__) <= set(dir(sdk)) and set(models.__all__) <= set(dir(models))\n"
+        "print(sorted(name for name in ('httpx', 'valkyrie.sdk.models.runs', 'valkyrie.sdk.client') if name in sys.modules))\n"
+        "print(all(getattr(sdk, name) is not None for name in sdk.__all__))"
+    )
+    result = subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+    assert result.stdout.split("\n")[:2] == ["[]", "True"]
 
 
 @pytest.mark.description("Public SDK functions and methods keep their recorded signatures.")

@@ -3,6 +3,7 @@ from uuid import UUID
 import click
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import json_option, emit, confirm, done, warn
 from valkyrie.cli.run.progress import echo_next_steps
 from valkyrie.cli.run.task_ids import resolve_task_ids
 
@@ -16,14 +17,7 @@ from valkyrie.cli.run.task_ids import resolve_task_ids
     type=str,
     required=False,
     default=None,
-    help="Comma-separated list of task IDs to stop.",
-)
-@click.option(
-    "--task-ids-file",
-    type=str,
-    required=False,
-    default=None,
-    help="Path or http(s) URL to a text file with one task ID per line.",
+    help="Comma-separated task IDs, @FILE, or an http(s) URL with one task ID per line.",
 )
 @click.option(
     "--force",
@@ -33,27 +27,26 @@ from valkyrie.cli.run.task_ids import resolve_task_ids
     help="Force stop the benchmark run.",
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def stop(run_id: UUID, task_ids: str | None, task_ids_file: str | None, force: bool, yes: bool):
-    selected_task_ids = resolve_task_ids(task_ids, task_ids_file)
+@json_option()
+def stop(run_id: UUID, task_ids: str | None, force: bool, yes: bool, output_format: str):
+    selected_task_ids = resolve_task_ids(task_ids)
     scope = f"{len(selected_task_ids)} selected task(s) in run {run_id}" if selected_task_ids else f"run {run_id}"
-    if not yes and not click.confirm(f"{'Force stop' if force else 'Stop'} {scope}?"):
-        click.echo("Cancelled.")
+    if not confirm(f"{'Force stop' if force else 'Stop'} {scope}?", yes=yes):
+        click.echo("Cancelled.", err=True)
         return
 
     call(lambda client: client.runs.stop(run_id, force=force, task_ids=selected_task_ids))
+    if emit({"run_id": run_id, "stopped": True, "force": force, "task_ids": selected_task_ids}, output_format):
+        return
 
     subject = "Selected tasks" if selected_task_ids else "Run"
     if force:
-        click.echo(click.style(f"✓ {subject} force stopped.", fg="green", bold=True))
+        done(f"{subject} force stopped.")
     else:
         detail = (
             "agent tasks already running may finish"
             if selected_task_ids
             else "will finish after in-flight tasks complete"
         )
-        click.echo(
-            click.style(
-                f"{subject} {'are' if selected_task_ids else 'is'} stopping — {detail}.", fg="yellow", bold=True
-            )
-        )
+        warn(f"{subject} {'are' if selected_task_ids else 'is'} stopping — {detail}.")
     echo_next_steps(run_id)

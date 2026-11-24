@@ -1936,7 +1936,8 @@
                 "task_id",
                 "started_at",
                 "duration",
-                "status"
+                "status",
+                "last_log_at"
               ],
               "type": "string",
               "default": "started_at",
@@ -7260,7 +7261,7 @@
     "/regrade-benchmark/{benchmark_id}": {
       "post": {
         "summary": "Regrade Benchmark",
-        "description": "Regrade a finished run's saved task states into a new run on another dataset.\n\nThe source run, its tasks and its evaluation stay unchanged. Tasks without saved evaluation state are skipped and listed on the new run.",
+        "description": "Regrade a finished run's saved task states into a new run on another dataset.\n\nThe source run, its tasks and its evaluation stay unchanged. Tasks without saved evaluation state are skipped and listed on the new run.\n\nA dataset run's graded tasks are graded again from their saved artifacts in a fresh separate verifier.",
         "operationId": "regrade_benchmark",
         "parameters": [
           {
@@ -10066,6 +10067,7 @@
         "enum": [
           "infrastructure",
           "benchmark_service",
+          "dataset",
           "agent",
           "cancelled",
           "unknown"
@@ -10730,7 +10732,6 @@
         "properties": {
           "limit_dollars": {
             "type": "string",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Limit Dollars"
           },
           "reason": {
@@ -10814,8 +10815,7 @@
                 "exclusiveMinimum": 0.0
               },
               {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+                "type": "string"
               }
             ],
             "title": "Limit Dollars"
@@ -11587,8 +11587,7 @@
                 "exclusiveMinimum": 0.0
               },
               {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+                "type": "string"
               },
               {
                 "type": "null"
@@ -12014,8 +12013,7 @@
                 "exclusiveMinimum": 0.0
               },
               {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+                "type": "string"
               }
             ],
             "title": "Limit Dollars"
@@ -12042,7 +12040,6 @@
         "properties": {
           "limit_dollars": {
             "type": "string",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Limit Dollars"
           },
           "reason": {
@@ -12318,7 +12315,6 @@
         "properties": {
           "limit_dollars": {
             "type": "string",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
             "title": "Limit Dollars"
           },
           "reason": {
@@ -14025,6 +14021,17 @@
             ],
             "title": "Finished At"
           },
+          "last_log_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Log At"
+          },
           "error_message": {
             "anyOf": [
               {
@@ -14744,6 +14751,17 @@
               }
             ],
             "title": "Finished At"
+          },
+          "last_log_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Log At"
           },
           "error_message": {
             "anyOf": [

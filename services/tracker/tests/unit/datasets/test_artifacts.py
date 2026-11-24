@@ -11,6 +11,7 @@ from benchmark_service.sandbox.types import ExecResult, Sandbox
 from tests.unit.datasets.support import ShellSandbox
 from tracker.services.datasets import artifacts
 from tracker.services.datasets.artifacts import (
+    SkippedArtifact,
     discard_staged,
     run_collect_hooks,
     stage_artifacts,
@@ -114,7 +115,7 @@ class TestStageAndUpload:
             [ArtifactConfig(source=str(out), exclude=["*.tmp"]), ArtifactConfig(source="log.txt", destination="logs")],
             str(tmp_path / "work"),
         )
-        await upload_artifacts("task-1", {"main": sandbox}, staged, sink, lambda _message: None)
+        await upload_artifacts("task-1", staged, [], sink, lambda _message: None)
         await discard_staged({"main": sandbox}, staged)
 
         folder = f"task-1:artifacts/{str(out).strip('/')}.tar.gz"
@@ -124,6 +125,23 @@ class TestStageAndUpload:
         assert member_names(uploaded[folder]) == ["out/nested/kept.txt", "out/result.txt"]
         assert member_names(uploaded["task-1:artifacts/logs.tar.gz"]) == ["log.txt"]
         assert staging_folders(tmp_path) == []
+
+    @pytest.mark.description(
+        "An artifact the agent never wrote leaves an empty marker, and one that failed leaves none."
+    )
+    async def test_an_unwritten_artifact_leaves_a_marker_and_a_failed_one_does_not(self) -> None:
+        uploaded: dict[str, bytes] = {}
+
+        async def sink(task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+            uploaded[name] = b"".join([chunk async for chunk in chunks])
+
+        skipped = [
+            SkippedArtifact("/app/out", "it does not exist", True, "app/out"),
+            SkippedArtifact("/app/big", "it is over the limit", False, "app/big"),
+        ]
+        await upload_artifacts("task-1", [], skipped, sink, lambda _message: None)
+
+        assert uploaded == {"artifacts/app/out.absent": b""}
 
     @pytest.mark.description("Staging uses a private folder with an unpredictable name.")
     async def test_staging_uses_a_private_folder_with_an_unpredictable_name(
@@ -225,7 +243,7 @@ class TestStageAndUpload:
 
     @pytest.mark.description("Output with warnings before the count is still counted.")
     async def test_output_with_warnings_before_the_count_is_still_counted(self, tmp_path: Path) -> None:
-        class NoisySandbox:
+        class NoisySandbox(ShellSandbox):
             async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
                 if command.endswith("| wc -l"):
                     return ExecResult(exit_code=0, output="tar: Removing leading `/' from member names\n3\n")
@@ -270,7 +288,7 @@ class TestStageAndUpload:
                 raise OSError("store unavailable")
             saved.append(name)
 
-        await upload_artifacts("task-1", {"main": sandbox}, staged, sink, messages.append)
+        await upload_artifacts("task-1", staged, [], sink, messages.append)
 
         assert saved == ["artifacts/b.txt.tar.gz"]
         assert messages == [f"Artifact {tmp_path / 'a.txt'} could not be saved: store unavailable"]

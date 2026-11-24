@@ -15,12 +15,16 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+import httpx
 import pytest
-from daytona import CreateSecretParams
+from daytona import V0_API_URL
+from daytona.v0 import CreateSecretParams
 from modal import Sandbox as ModalSdkSandbox
 
 from benchmark_service import (
+    CheckpointKind,
     DockerfileSource,
+    ExecResult,
     ImageSource,
     Resources,
     Sandbox,
@@ -67,6 +71,29 @@ _STORAGE_FAULT_COMMAND = _python_command(
 )
 
 
+async def _exec_until_success(sandbox: Sandbox, command: str, attempts: int = 10) -> ExecResult:
+    for _ in range(attempts - 1):
+        result = await sandbox.exec(command)
+        if result.exit_code == 0:
+            return result
+        await asyncio.sleep(3)
+    return await sandbox.exec(command)
+
+
+async def _policy_error(provider: SandboxProvider, sandbox_id: str) -> object:
+    if not isinstance(provider, DaytonaSandboxProvider):
+        return None
+    api_key = provider._config.DAYTONA_API_KEY  # pyright: ignore[reportPrivateUsage]
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{V0_API_URL}/sandbox/{sandbox_id}", headers={"Authorization": f"Bearer {api_key}"}
+            )
+        return response.json().get("networkPolicyError")
+    except (httpx.HTTPError, ValueError) as exc:
+        return f"networkPolicyError lookup failed: {exc!r}"
+
+
 def _egress_probe_command(allowed_url: str, blocked_url: str | None = None) -> str:
     script = (
         "import sys\n"
@@ -105,7 +132,40 @@ async def _wait_until_listed(provider: SandboxProvider, query: SandboxQuery, san
             pytest.fail(f"Sandbox {sandbox_id} was listed more than once.")
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
-    pytest.fail(f"Sandbox {sandbox_id} was not listed within {_POLL_TIMEOUT_SECONDS} seconds.")
+    pytest.fail(
+        f"Sandbox {sandbox_id} was not listed within {_POLL_TIMEOUT_SECONDS} seconds. "
+        + await _listing_diagnosis(provider, query, sandbox_id)
+    )
+
+
+async def _listing_diagnosis(provider: SandboxProvider, query: SandboxQuery, sandbox_id: str) -> str:
+    async def labelled() -> str:
+        started = time.monotonic()
+        ids = [sandbox.id async for sandbox in provider.list_sandboxes(query)]
+        return f"returned {len(ids)} sandboxes in {time.monotonic() - started:.1f}s"
+
+    async def unfiltered() -> str:
+        ids = [sandbox.id async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}, page_size=100))]
+        return f"returned {len(ids)} with this one {'in' if sandbox_id in ids else 'not in'} it"
+
+    async def lookup() -> str:
+        try:
+            found = await provider.get_sandbox(sandbox_id)
+        except SandboxNotFoundError:
+            return "does not find it"
+        return f"finds it with labels {dict(found.labels or {})}"
+
+    async def attempt(check: Callable[[], Awaitable[str]]) -> str:
+        try:
+            return await check()
+        except SandboxError as exc:
+            return f"failed with {exc!r}"
+
+    return (
+        f"Query {query.labels} {await attempt(labelled)}, "
+        f"an unfiltered listing {await attempt(unfiltered)}, "
+        f"and get_sandbox {await attempt(lookup)}."
+    )
 
 
 async def _wait_until_not_found(provider: SandboxProvider, sandbox_id: str) -> None:
@@ -538,6 +598,82 @@ class TestSandboxProviderIntegration:
             create_timeout=create_timeout,
         )
 
+    async def test_files_checkpoint_restores_the_filesystem_into_a_new_sandbox(
+        self, sandbox_provider: SandboxProvider
+    ) -> None:
+        """Checkpoint a sandbox's files, delete it, and read the same file back from a sandbox restored from it."""
+        if CheckpointKind.FILES not in sandbox_provider.capabilities.checkpoints:
+            pytest.skip("Provider does not offer filesystem checkpoints")
+        name = f"cbs-checkpoint-test-{uuid4().hex[:10]}"
+        remote_path = "/opt/checkpointed.txt"
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=name,
+            labels={"ProviderIntegrationTest": name},
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=360,
+        )
+
+        sandbox = await sandbox_provider.create_sandbox(request)
+        try:
+            await sandbox.upload_file(remote_path, name.encode())
+            checkpoint = await sandbox.checkpoint(CheckpointKind.FILES, name)
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
+
+        try:
+            restored = await sandbox_provider.create_sandbox(
+                request.model_copy(update={"source": checkpoint, "name": f"{name}-restored"})
+            )
+            try:
+                assert await restored.download_file(remote_path) == name.encode()
+            finally:
+                await sandbox_provider.delete_sandbox(restored.id)
+        finally:
+            await sandbox_provider.delete_checkpoint(checkpoint)
+
+    async def test_memory_checkpoint_restores_with_fresh_command_env(self, sandbox_provider: SandboxProvider) -> None:
+        """A sandbox restored from a memory checkpoint keeps its files and gives fresh env to each command."""
+        if CheckpointKind.MEMORY not in sandbox_provider.capabilities.checkpoints:
+            pytest.skip("Provider does not offer memory checkpoints")
+        name = f"cbs-memory-test-{uuid4().hex[:10]}"
+        remote_path = "/opt/checkpointed.txt"
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=name,
+            labels={"ProviderIntegrationTest": name},
+            env_vars={"RESTORE_VALUE": "saved"},
+            auto_stop_interval=10,
+            create_timeout=360,
+        )
+
+        sandbox = await sandbox_provider.create_sandbox(request)
+        try:
+            await sandbox.upload_file(remote_path, name.encode())
+            checkpoint = await sandbox.checkpoint(CheckpointKind.MEMORY, name)
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
+
+        try:
+            restored = await sandbox_provider.create_sandbox(
+                request.model_copy(
+                    update={"source": checkpoint, "name": f"{name}-restored", "env_vars": {"RESTORE_VALUE": "fresh"}}
+                )
+            )
+            try:
+                assert await restored.download_file(remote_path) == name.encode()
+                result = await restored.exec('printf "$RESTORE_VALUE"')
+                assert (result.exit_code, result.stdout) == (0, "fresh")
+                reopened = await sandbox_provider.get_sandbox(restored.id)
+                assert (await reopened.exec('printf "$RESTORE_VALUE"')).stdout == "fresh"
+            finally:
+                await sandbox_provider.delete_sandbox(restored.id)
+        finally:
+            await sandbox_provider.delete_checkpoint(checkpoint)
+
     async def test_dockerfile_source_is_built_with_its_folder_as_the_context(
         self, sandbox_provider: SandboxProvider, tmp_path: Path
     ) -> None:
@@ -586,6 +722,54 @@ class TestSandboxProviderIntegration:
         assert time.monotonic() - started < 120
         await _wait_until_none_listed(sandbox_provider, SandboxQuery(labels={"ProviderIntegrationTest": name}))
 
+    async def test_a_sandbox_created_blocked_accepts_a_hostname_rule(self, sandbox_provider: SandboxProvider) -> None:
+        """A sandbox created with all egress blocked can't reach out until a hostname rule allows that host."""
+        sandbox_name = f"cbs-provider-blocked-{uuid4().hex[:10]}"
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=sandbox_name,
+            labels={"ProviderIntegrationTest": sandbox_name},
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=360,
+            network_block_all=True,
+        )
+
+        sandbox = await sandbox_provider.create_sandbox(request)
+        try:
+            blocked_result = await sandbox.exec(_egress_probe_command("https://www.python.org"))
+            assert "allowed=False" in blocked_result.stdout
+
+            await sandbox.modify_egress_rules(["www.python.org"])
+            allowed_result = await _exec_until_success(
+                sandbox, _egress_probe_command("https://www.python.org", "https://example.com")
+            )
+            assert "allowed=True blocked=False" in allowed_result.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
+
+    @pytest.mark.parametrize("provider_type", ["daytona_v2"], indirect=True)
+    async def test_a_sandbox_outlives_the_platform_default_timeout(self, sandbox_provider: SandboxProvider) -> None:
+        """A sandbox running one long command is still there after seven minutes."""
+        sandbox = await sandbox_provider.create_sandbox(
+            SandboxCreateRequest(
+                source=ImageSource(image=_TEST_IMAGE),
+                resources=_TEST_RESOURCES,
+                name=f"cbs-lifetime-test-{uuid4().hex[:10]}",
+                labels={"test": "lifetime"},
+                env_vars={},
+                auto_stop_interval=10,
+                create_timeout=360,
+            )
+        )
+        try:
+            result = await sandbox.exec("sleep 420 && echo survived", timeout=600)
+            assert result.exit_code == 0, result.output
+            assert "survived" in result.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
+
     async def test_provider_contract(self, sandbox_provider: SandboxProvider) -> None:
         """Verify each provider implements the shared sandbox lifecycle and operation contract.
 
@@ -593,7 +777,8 @@ class TestSandboxProviderIntegration:
         - Create-time and command-time environment variables reach sandbox commands.
         - Memory, storage, timeout, and OS-kill faults preserve their command exit codes.
         - Egress rules allow the configured host, block an off-list host, and restore unrestricted access.
-        - Deleting a sandbox during command streaming raises SandboxNotFoundError.
+        - A host on the same CDN as an allowed one stays blocked, and a `*.` wildcard allows its subdomains.
+        - Deleting a sandbox during command streaming raises SandboxNotFoundError with the provider's last-known state.
         - Create, get, list, exec, file, and streaming download operations work.
         - Deleted sandboxes disappear and stale handles consistently raise SandboxNotFoundError.
         """
@@ -651,17 +836,29 @@ class TestSandboxProviderIntegration:
 
                 assert error.value.exit_code == expected_exit_code, fault_name
 
-            await sandbox.modify_egress_rules(["https://example.com"])
+            egress_cases = [
+                (["https://example.com"], "https://example.com", "https://www.python.org"),
+                (["files.pythonhosted.org"], "https://files.pythonhosted.org", "https://www.python.org"),
+                (["*.python.org"], "https://www.python.org", "https://example.com"),
+            ]
             try:
-                restricted_result = await sandbox.exec(
-                    _egress_probe_command("https://example.com", "https://www.python.org")
-                )
-                assert restricted_result.exit_code == 0
-                assert "allowed=True blocked=False" in restricted_result.stdout
+                for allowlist, allowed_url, blocked_url in egress_cases:
+                    await sandbox.modify_egress_rules(allowlist)
+                    restricted_result = await _exec_until_success(
+                        sandbox, _egress_probe_command(allowed_url, blocked_url)
+                    )
+                    assert "allowed=True blocked=False" in restricted_result.stdout, (
+                        allowlist,
+                        await _policy_error(sandbox_provider, sandbox.id),
+                    )
+                    assert restricted_result.exit_code == 0, allowlist
+                await sandbox.block_all_egress()
+                blocked_result = await sandbox.exec(_egress_probe_command("https://example.com"))
+                assert "allowed=False" in blocked_result.stdout
             finally:
                 await sandbox.clear_egress_rules()
 
-            restored_result = await sandbox.exec(_egress_probe_command("https://www.python.org"))
+            restored_result = await _exec_until_success(sandbox, _egress_probe_command("https://www.python.org"))
             assert restored_result.exit_code == 0
             assert "allowed=True" in restored_result.stdout
 
@@ -670,8 +867,9 @@ class TestSandboxProviderIntegration:
             await asyncio.wait_for(stream_ready.wait(), timeout=30)
             await sandbox_provider.delete_sandbox(sandbox.id)
 
-            with pytest.raises(SandboxNotFoundError):
+            with pytest.raises(SandboxNotFoundError) as lost:
                 await asyncio.wait_for(stream_task, timeout=60)
+            assert "state=" in str(lost.value) or "poll_result=" in str(lost.value), str(lost.value)
 
         finally:
             if stream_task is not None and not stream_task.done():

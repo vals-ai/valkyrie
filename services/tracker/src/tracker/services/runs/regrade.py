@@ -2,12 +2,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from benchmark_service.schemas import DatasetVersion
 
 from tracker.auth import RequestIdentity
 from tracker.database.models import Benchmark, ErrorResult, Task
 from tracker.domain import TaskStatus
+from tracker.services.datasets.artifacts import SAVED_ARTIFACTS_RUN
+from tracker.services.datasets.ref import HostedDataset
 
 
 @dataclass(frozen=True)
@@ -20,12 +23,21 @@ class RegradeTasks:
         return list(self.eval_resume_states)
 
 
-def regrade_tasks(source_tasks: Sequence[Task]) -> RegradeTasks:
+def regrade_tasks(source_tasks: Sequence[Task], saved_artifacts_run: UUID | None = None) -> RegradeTasks:
+    def state(task: Task) -> dict[str, Any] | None:
+        if task.eval_resume_state is not None:
+            return task.eval_resume_state
+        if saved_artifacts_run is not None and (
+            task.status == TaskStatus.FINISHED
+            or (task.status == TaskStatus.ERROR and task.evaluation_phase_token is not None)
+        ):
+            return {SAVED_ARTIFACTS_RUN: str(saved_artifacts_run)}
+        return None
+
+    states = {task.task_id: found for task in source_tasks if (found := state(task)) is not None}
     return RegradeTasks(
-        eval_resume_states={
-            task.task_id: task.eval_resume_state for task in source_tasks if task.eval_resume_state is not None
-        },
-        skipped_task_ids=[task.task_id for task in source_tasks if task.eval_resume_state is None],
+        eval_resume_states=states,
+        skipped_task_ids=[task.task_id for task in source_tasks if task.task_id not in states],
     )
 
 
@@ -34,13 +46,14 @@ def regrade_run(
     tasks: RegradeTasks,
     run_starter: RequestIdentity,
     *,
-    dataset: str,
-    dataset_version: DatasetVersion | None,
+    dataset: str | None = None,
+    dataset_version: DatasetVersion | None = None,
     concurrency: int | None = None,
+    dataset_ref: HostedDataset | None = None,
 ) -> Benchmark:
     return Benchmark(
         org_id=source.org_id,
-        name=source.name,
+        name=source.name if dataset_ref is None else dataset_ref.benchmark,
         label=source.label,
         custom_benchmark_service=source.custom_benchmark_service,
         arguments=source.arguments.model_copy(
@@ -54,6 +67,7 @@ def regrade_run(
                 "regraded_from_run_id": source.id,
                 "agent_attempts": [],
                 "regrade_skipped_task_ids": tasks.skipped_task_ids,
+                "dataset_ref": dataset_ref,
             }
         ),
         started_by_id=run_starter.access_key_id or run_starter.user_id,

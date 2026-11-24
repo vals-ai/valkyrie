@@ -15,24 +15,24 @@ ID.
 ## Follow a run
 
 ```bash
-valkyrie run fetch RUN_ID --connect
+valkyrie run show RUN_ID --follow
 ```
 
 This prints the run's details, then its progress until the run finishes.
 
 - Press **Control+C** to stop watching. The run keeps going.
-- Without `--connect`, `run fetch` prints one snapshot. `--format json` prints the SDK's
+- Without `--follow`, `run show` prints one snapshot. `--json` prints the SDK's
   `RunSnapshot`: the run and its launch metadata.
 - CLI snapshots omit saved agent configuration and agent secret references. Use the SDK to read
   the full launch metadata when you need it.
 
-A run ends as `FINISHED`, `ERROR`, or `STOPPED`. The command exits with 0 whichever way the
-run ends, so check the status rather than the exit code.
+A run ends as `FINISHED`, `ERROR`, or `STOPPED`. Following an errored run exits with 1,
+while `FINISHED` and `STOPPED` exit with 0.
 
 ### Follow a run from a script
 
 ```bash
-valkyrie run fetch RUN_ID --connect --format jsonl
+valkyrie run show RUN_ID --follow --jsonl
 ```
 
 Each line is an SDK model as JSON.
@@ -40,12 +40,12 @@ Each line is an SDK model as JSON.
 - The first line is the `RunSnapshot`. Each line after it is a `RunStreamEvent` with an `event` field.
 - `update` lines carry the run. The last line is `complete`, `error`, or `disconnect`.
 - After `complete`, check `run.details.status` in the last `update` for how the run ended.
-- If the stream ends without a final event, the command exits with 1.
+- An errored run, an `error` event, or a stream without a final event exits with 1.
 
 ## Check several runs at once
 
 ```bash
-valkyrie run status --ids RUN_ID_1,RUN_ID_2 --format json
+valkyrie run show RUN_ID_1 RUN_ID_2 --json
 ```
 
 Replace *`RUN_ID_1`* and *`RUN_ID_2`* with the runs' IDs.
@@ -70,10 +70,10 @@ valkyrie run tasks RUN_ID --status ERROR
 valkyrie run task RUN_ID TASK_ID
 
 # Temporary links to one task's files and logs
-valkyrie run task-artifacts RUN_ID TASK_ID
+valkyrie run task RUN_ID TASK_ID --links
 ```
 
-For scripts, add `--format json` to any of these.
+For scripts, add `--json` to any of these.
 
 ## Check how long a task took
 
@@ -109,27 +109,26 @@ valkyrie run logs RUN_ID --task-id TASK_ID --query "rate limit" \
 ```
 
 To watch new log lines arrive, add `--follow` with `--task-id`. For scripts, add
-`--format jsonl`.
+`--jsonl`.
 
 ## Search your run history
 
 ```bash
-valkyrie run list --benchmark-name swebench --status IN_PROGRESS
+valkyrie run list --benchmark swebench --status IN_PROGRESS
 ```
 
-Filter by `--agent-name`, `--benchmark-name`, `--model`, `--dataset`, `-l` for the label,
-`--status`, and `--started-by`, and sort with `--order-by asc` or `desc`. Page through the
+Filter by `--agent`, `--benchmark`, `--model`, `--dataset`, `-l` for the label,
+`--status`, and `--started-by`, and sort with `--order asc` or `desc`. Page through the
 list with **h** and **l**, and quit with **q**. To print every match as one JSON document:
 
 ```bash
-valkyrie run list --format json --all --status IN_PROGRESS
+valkyrie run list --json --status IN_PROGRESS
 ```
 
 JSON output is the SDK model the command reads, here `FetchBenchmarksResponse`. Scores that
 aren't finite numbers are `null`.
 
-`valkyrie run filter-options` lists the agents, benchmarks, models, and other values your
-organization's earlier runs used, which are the values the filters accept.
+JSON output fetches every matching run automatically. Add `--limit N` to cap the number of runs.
 
 ## Inspect the priority queue
 

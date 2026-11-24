@@ -1,3 +1,4 @@
+import shutil
 from collections.abc import AsyncIterator
 
 import click
@@ -10,10 +11,21 @@ from valkyrie.sdk.models import (
 )
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, paginate_cli_pages, progress_percent, short_local_time
+from valkyrie.cli.display import (
+    console,
+    emit,
+    json_option,
+    format_table,
+    paginate_cli_pages,
+    progress_percent,
+    short_local_time,
+    empty,
+)
 from valkyrie.cli.run.progress import styled_status
 
 _MACHINE_PAGE_LIMIT = 500
+_WIDE_HEADERS = {"Label", "By", "Dataset", "Finished"}
+_NARROW_HEADERS = {"Started", "Progress"}
 
 
 @click.command(
@@ -22,17 +34,19 @@ _MACHINE_PAGE_LIMIT = 500
         "List runs that match the filters.\n"
         "\n"
         "Example:\n"
-        "    valkyrie run list --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC"
+        "    valkyrie run list --agent claude_code --benchmark swebench --status IN_PROGRESS --order DESC"
     ),
 )
 @click.option(
-    "--agent-name",
+    "--agent",
+    "agent_name",
     type=str,
     required=False,
     help="Agent name (e.g., claude_code).",
 )
 @click.option(
-    "--benchmark-name",
+    "--benchmark",
+    "benchmark_name",
     type=str,
     required=False,
     help="Benchmark name (e.g., swebench).",
@@ -64,7 +78,8 @@ _MACHINE_PAGE_LIMIT = 500
     help="Status of the benchmarks to fetch (e.g., in_progress, finished, error).",
 )
 @click.option(
-    "--order-by",
+    "--order",
+    "order_by",
     type=click.Choice([option.value for option in Order], case_sensitive=False),
     required=False,
     default=Order.DESC.value,
@@ -77,12 +92,20 @@ _MACHINE_PAGE_LIMIT = 500
     default=None,
     help="Comma-separated list of starter emails (e.g., alice@vals.ai,bob@vals.ai). Case-insensitive.",
 )
-@format_option("Output format. Machine-readable JSON requires --all.")
+@json_option()
+@click.option("--limit", type=click.IntRange(min=1), default=None, help="Maximum number of matching runs to print.")
+@click.option(
+    "--page-size",
+    type=click.IntRange(min=1, max=_MACHINE_PAGE_LIMIT),
+    default=None,
+    help="Runs to show per page. Defaults to as many as fit in the terminal.",
+)
+@click.option("--wide", is_flag=True, help="Also show the label, starter, dataset and finish time of each run.")
 @click.option(
     "--all",
     "all_runs",
     is_flag=True,
-    help="Fetch every matching run without interactive paging. Requires --format json.",
+    help="Fetch matching runs without interactive paging. JSON does this automatically. Requires --json.",
 )
 def list_runs(
     agent_name: str | None,
@@ -95,11 +118,12 @@ def list_runs(
     started_by: str | None,
     output_format: str,
     all_runs: bool,
+    limit: int | None,
+    page_size: int | None,
+    wide: bool,
 ) -> None:
-    if output_format == "json" and not all_runs:
-        raise click.UsageError("--format json requires --all.")
     if all_runs and output_format != "json":
-        raise click.UsageError("--all requires --format json.")
+        raise click.UsageError("--all requires --json.")
 
     request = FetchBenchmarksRequest(
         agent_name=[agent_name] if agent_name else None,
@@ -113,22 +137,28 @@ def list_runs(
     )
 
     if output_format == "json":
-        machine_request = request.model_copy(update={"limit": _MACHINE_PAGE_LIMIT})
-        runs = call(lambda client: _collect(client.runs.iter(machine_request)))
-        click.echo(FetchBenchmarksResponse(benchmarks=runs).model_dump_json())
+        machine_request = request.model_copy(update={"limit": min(limit or _MACHINE_PAGE_LIMIT, _MACHINE_PAGE_LIMIT)})
+        runs = call(lambda client: _collect(client.runs.iter(machine_request), limit))
+        emit(FetchBenchmarksResponse(benchmarks=runs))
     else:
-        paginate_benchmarks(request)
+        paginate_benchmarks(
+            request,
+            page_size or min(max(5, shutil.get_terminal_size().lines - 5), _MACHINE_PAGE_LIMIT),
+            wide,
+            max_runs=limit,
+        )
 
 
 def format_fetch_benchmarks_response(
     fetch_benchmarks_response: FetchBenchmarksResponse,
     current_page: int,
     total_pages: int,
+    wide: bool,
 ) -> None:
     benchmarks = fetch_benchmarks_response.benchmarks
 
     if not benchmarks:
-        click.echo(click.style("No runs found.", fg="yellow"))
+        empty("No runs found.")
         return
 
     def format_score(score: float | None) -> str:
@@ -144,31 +174,37 @@ def format_fetch_benchmarks_response(
                 "Benchmark": benchmark.name,
                 "Agent": benchmark.agent_name,
                 "Label": benchmark.label or "-",
-                "Started By": benchmark.started_by_email or "—",
+                "By": benchmark.started_by_email or "—",
                 "Model": benchmark.model or "-",
                 "Dataset": benchmark.dataset or "default",
                 "Status": styled_status(benchmark.status),
                 "Score": format_score(benchmark.final_score),
-                "Started / Finished": f"{short_local_time(benchmark.started_at)} / {short_local_time(benchmark.finished_at, include_date=False) if benchmark.finished_at else '-'}",
+                "Started": short_local_time(benchmark.started_at),
+                "Finished": short_local_time(benchmark.finished_at, include_date=False)
+                if benchmark.finished_at
+                else "-",
                 "Progress": f"{progress_percentage:.1f}%",
             }
         )
 
+    headers = [
+        "ID",
+        "Benchmark",
+        "Agent",
+        "Label",
+        "By",
+        "Model",
+        "Dataset",
+        "Status",
+        "Score",
+        "Started",
+        "Finished",
+        "Progress",
+    ]
+    hidden = (set() if wide else _WIDE_HEADERS) | (_NARROW_HEADERS if console().width < 100 else set())
     format_table(
         rows,
-        [
-            "ID",
-            "Benchmark",
-            "Agent",
-            "Label",
-            "Started By",
-            "Model",
-            "Dataset",
-            "Status",
-            "Score",
-            "Started / Finished",
-            "Progress",
-        ],
+        [header for header in headers if header not in hidden],
         current_page,
         total_pages,
         fetch_benchmarks_response.total_count,
@@ -187,7 +223,7 @@ def format_no_benchmarks_found(request: FetchBenchmarksRequest) -> None:
         "Started By": request.started_by,
     }
     click.echo()
-    click.echo(click.style("No runs found matching the specified filters.", fg="yellow"))
+    empty("No runs found matching the specified filters.")
     click.echo()
     if active := {name: value for name, value in filters.items() if value}:
         click.echo("Filters applied:")
@@ -195,21 +231,29 @@ def format_no_benchmarks_found(request: FetchBenchmarksRequest) -> None:
             click.echo(f"  • {name}: {value if isinstance(value, str) else ', '.join(value)}")
 
 
-async def _collect(rows: AsyncIterator[BenchmarkTableRow]) -> list[BenchmarkTableRow]:
-    return [row async for row in rows]
+async def _collect(rows: AsyncIterator[BenchmarkTableRow], limit: int | None) -> list[BenchmarkTableRow]:
+    collected: list[BenchmarkTableRow] = []
+    async for row in rows:
+        collected.append(row)
+        if limit is not None and len(collected) >= limit:
+            break
+    return collected
 
 
-def paginate_benchmarks(request: FetchBenchmarksRequest, limit: int = 5) -> None:
+def paginate_benchmarks(request: FetchBenchmarksRequest, limit: int, wide: bool, max_runs: int | None = None) -> None:
 
     def load_page(offset: int, page_limit: int) -> tuple[int, FetchBenchmarksResponse]:
+        if max_runs is not None:
+            page_limit = min(page_limit, max_runs - offset)
         page_request = request.model_copy(update={"offset": offset, "limit": page_limit})
         response = call(lambda client: client.runs.list(page_request))
-        return response.total_count or 0, response
+        total = response.total_count or 0
+        return min(total, max_runs) if max_runs is not None else total, response
 
     paginate_cli_pages(
         load_page,
         lambda response, current_page, total_pages, _total_count: format_fetch_benchmarks_response(
-            response, current_page, total_pages
+            response, current_page, total_pages, wide
         ),
         limit=limit,
         render_empty=lambda: format_no_benchmarks_found(request),

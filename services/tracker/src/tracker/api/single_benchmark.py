@@ -138,6 +138,7 @@ def get_benchmark_tasks(
                 status=task.status,
                 started_at=task.started_at,
                 finished_at=task.finished_at,
+                last_log_at=task.last_log_at,
                 error_message=error_message if task.status == TaskStatus.ERROR else None,
                 failure_category=category if task.status == TaskStatus.ERROR else None,
             )

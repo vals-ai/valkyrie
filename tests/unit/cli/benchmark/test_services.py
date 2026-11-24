@@ -122,7 +122,7 @@ def test_paginate_services_renders_latency_as_response_status(monkeypatch: pytes
         "\n"
         "Test cases:\n"
         "- The first page is health-checked before rendering.\n"
-        "- Moving forward checks only the next page, and moving back reuses cached results.\n"
+        "- Moving forward checks only the next page, moving back reuses cached results, and `r` checks again.\n"
         "- Each page render clears the previous table output."
     )
 )
@@ -137,7 +137,7 @@ def test_paginate_services_health_checks_visible_pages_only(
     ]
     checked_pages: list[list[str]] = []
     rendered_pages: list[list[str]] = []
-    keys = iter(["l", "h", "q"])
+    keys = iter(["l", "h", "r", "q"])
 
     def check_services(entries: list[BenchmarkServiceEntry]) -> list[BenchmarkServiceHealth]:
         checked_pages.append([entry.name for entry in entries])
@@ -167,6 +167,6 @@ def test_paginate_services_health_checks_visible_pages_only(
 
     paginate_services(service_entries, limit=2, check_services=check_services)
 
-    assert checked_pages == [["one", "two"], ["three"]]
-    assert rendered_pages == [["one", "two"], ["three"], ["one", "two"]]
-    assert capsys.readouterr().out.count("\033[2J\033[3J\033[1;1H") == 3
+    assert checked_pages == [["one", "two"], ["three"], ["one", "two"]]
+    assert rendered_pages == [["one", "two"], ["three"], ["one", "two"], ["one", "two"]]
+    assert capsys.readouterr().out.count("\033[2J\033[3J\033[1;1H") == 4

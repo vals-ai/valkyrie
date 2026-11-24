@@ -189,6 +189,34 @@ class TestTaskConfig:
         assert TaskConfig.parse('[environment]\nos = "Windows"').environment.os == TaskOS.WINDOWS
 
 
+@pytest.mark.description("A task environment can start from a provider snapshot instead of an image.")
+class TestSnapshot:
+    @pytest.mark.description("A snapshot and its target are kept alongside the resources.")
+    def test_a_snapshot_and_its_target_are_kept_alongside_the_resources(self) -> None:
+        environment = TaskConfig.parse(
+            '[environment]\nsnapshot = "env-build"\nsnapshot_target = "us"\ncpus = 4\nmemory_mb = 8192'
+        ).environment
+
+        assert (environment.snapshot, environment.snapshot_target) == ("env-build", "us")
+        assert (environment.cpus, environment.memory_mb) == (4, 8192)
+
+    @pytest.mark.description("A malformed snapshot, or one that conflicts with another setting, is rejected.")
+    @pytest.mark.parametrize(
+        ("setting", "complaint"),
+        [
+            ('snapshot_target = "us"', "snapshot_target is only valid with snapshot"),
+            ('snapshot = "env-build"\ndocker_image = "ubuntu:24.04"', "Set only one"),
+            ('snapshot = "env-build"\ngpus = 1', "can't request gpus"),
+            ('snapshot = ""', "snapshot must be a name or ID without spaces"),
+            ('snapshot = "env build"', "snapshot must be a name or ID without spaces"),
+            ('snapshot = "env-build"\nsnapshot_target = " "', "snapshot_target must be a name or ID"),
+        ],
+        ids=["target-alone", "with-image", "with-gpus", "empty", "spaces", "blank-target"],
+    )
+    def test_a_malformed_or_conflicting_snapshot_is_rejected(self, setting: str, complaint: str) -> None:
+        assert complaint in _rejection(f"[environment]\n{setting}")
+
+
 @pytest.mark.description("Field names older task folders use.")
 class TestOlderEnvironmentNames:
     @pytest.mark.description("Memory and storage sizes become megabytes.")
@@ -380,10 +408,9 @@ class TestArtifacts:
     def test_an_artifact_that_could_escape_or_cannot_be_stored_is_rejected(self, artifact: str, complaint: str) -> None:
         assert complaint in _rejection(f"artifacts = [{artifact}]")
 
-    @pytest.mark.description("Two artifacts may not share a name and there is a limit.")
-    def test_two_artifacts_may_not_share_a_name_and_there_is_a_limit(self) -> None:
+    @pytest.mark.description("Two artifacts may not share a name.")
+    def test_two_artifacts_may_not_share_a_name(self) -> None:
         assert "same name" in _rejection("artifacts = ['/a/out', { source = '/b', destination = 'a/out' }]")
-        assert "at most 20" in _rejection("artifacts = [" + ", ".join(f"'/f{index}'" for index in range(21)) + "]")
 
     @pytest.mark.description("Collect hooks default to the main service and a minute.")
     def test_collect_hooks_default_to_the_main_service_and_a_minute(self) -> None:

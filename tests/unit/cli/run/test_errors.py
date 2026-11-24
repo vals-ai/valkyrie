@@ -6,7 +6,9 @@ import pytest
 from click.testing import CliRunner, Result
 from valkyrie.sdk.models import BenchmarkStatus, FailureCategory, FinalViewResponse
 
+from valkyrie.cli.main import cli
 from valkyrie.cli.run.errors import errors
+from valkyrie.palette import status_label
 
 from tests.unit.cli.conftest import MockTracker
 from tests.unit.cli.factories import make_final_view, ok
@@ -70,7 +72,7 @@ def test_errors_text_handles_run_task_and_empty_states(
     assert result.exit_code == 0, result.output
     assert expected in result.stdout
     assert unexpected not in result.stdout
-    assert status.value.replace("_", " ").title() in result.stdout
+    assert status_label(status.value) in result.stdout
 
 
 @pytest.mark.description("Text errors keep empty messages.")
@@ -79,6 +81,23 @@ def test_errors_text_preserves_empty_messages(tracker: MockTracker) -> None:
 
     assert result.exit_code == 0, result.output
     assert result.stdout.count("(empty error message)") == 2
+
+
+@pytest.mark.description("Text errors show only the exception summary unless `-v` asks for full tracebacks.")
+def test_errors_text_only_shows_traceback_when_verbose(tracker: MockTracker) -> None:
+    response = make_final_view(
+        uuid4(),
+        task_errors={"alpha": "Traceback (most recent call last):\n  pool.py:13\nSandboxSetupError: image not found\n"},
+    )
+
+    brief = invoke_with_tracker(tracker, response)
+    tracker.reply("GET", "/retrieve-results", ok(response))
+    full = CliRunner().invoke(cli, ["-v", "run", "errors", str(response.benchmark_id)])
+
+    assert brief.exit_code == full.exit_code == 0
+    assert "SandboxSetupError: image not found" in brief.stdout
+    assert "pool.py:13" not in brief.stdout
+    assert "pool.py:13" in full.stdout
 
 
 @pytest.mark.description("Text errors strip terminal control characters.")
@@ -108,7 +127,7 @@ def test_errors_json_prints_the_sdk_final_view(tracker: MockTracker, task_errors
         task_failure_categories={"task-b": FailureCategory.AGENT} if task_errors else None,
     )
 
-    result = invoke_with_tracker(tracker, response, "--format", "json")
+    result = invoke_with_tracker(tracker, response, "--json")
 
     assert result.exit_code == 0, result.output
     assert len(result.stdout.splitlines()) == 1

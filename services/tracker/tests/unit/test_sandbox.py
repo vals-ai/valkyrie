@@ -23,6 +23,8 @@ from uuid import uuid4
 
 import pytest
 from benchmark_service import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSandbox,
     ComposeSource,
     DockerfileSource,
@@ -40,6 +42,7 @@ from benchmark_service import (
 )
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import SandboxRejectedError as ProviderSandboxRejectedError
 from benchmark_service.sandbox.created import notify_sandbox_created
 
 from tracker.runtime.task_logs import TaskLogBuffer
@@ -307,11 +310,11 @@ class TestOutputArtifacts:
         uploaded: list[tuple[bytes, str]] = []
 
         async def fake_exec(_sandbox: Any, command: str) -> ExecResult:
-            if command == "find /logs -type f -path '/logs/*/turns/init/config.json' | sort | head -n 1":
+            if "find /logs -type f -path '/logs/*/turns/init/config.json'" in command:
                 return ExecResult(exit_code=0, output="/logs/task/turns/init/config.json\n")
             if command == "stat -c%s /logs/task/turns/init/config.json":
                 return ExecResult(exit_code=0, output="11")
-            if command == "find /logs -type f -path '/logs/*/result.json' | sort | head -n 1":
+            if "find /logs -type f -path '/logs/*/result.json'" in command:
                 return ExecResult(exit_code=0, output="/logs/task/result.json\n")
             if command == "stat -c%s /logs/task/result.json":
                 return ExecResult(exit_code=0, output="13")
@@ -379,23 +382,37 @@ class TestOutputArtifacts:
 
         assert uploaded == [(b'{"turns":[]}\n', "benchmarks/benchmark-123/task_0/artifacts/result.json")]
 
-    @pytest.mark.description("Output upload fails when a declared file is missing.")
-    async def test_upload_output_artifacts_fails_when_declared_file_is_missing(
+    @pytest.mark.description("Output upload distinguishes absent files and glob roots from failed lookups.")
+    @pytest.mark.parametrize("use_glob", [False, True], ids=["file", "glob"])
+    @pytest.mark.parametrize(("state", "missing"), [("absent", True), ("invalid", False), ("dangling", True)])
+    async def test_upload_output_artifacts_distinguishes_absence_from_lookup_failure(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        aws_runtime: AWSRuntime,
+        tmp_path: Path,
+        use_glob: bool,
+        state: str,
+        missing: bool,
     ) -> None:
         store = _mock_object_store()
-        artifact = "artifacts/missing.json"
+        parent = tmp_path / "parent"
+        if state == "invalid":
+            parent.touch()
+        probe = parent / "output" if use_glob else parent / "output" / "answer.json"
+        if state == "dangling":
+            probe.parent.mkdir(parents=True)
+            probe.symlink_to(tmp_path / "missing-target")
+        source = probe / "*/answer.json" if use_glob else probe
+        artifact = OutputArtifact(path="artifacts/answer.json", source=str(source))
 
         async def fake_exec(_sandbox: Any, command: str) -> ExecResult:
-            assert command == "test -f /tmp/valkyrie/artifacts/missing.json"
-            return ExecResult(exit_code=1, output="")
+            result = subprocess.run(["sh", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return ExecResult(exit_code=result.returncode, output=result.stdout)
 
         monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
 
-        with pytest.raises(OutputArtifactError, match="Required output artifact missing"):
+        with pytest.raises(OutputArtifactError) as error:
             await upload_output_artifacts(Mock(), [artifact], "benchmark-123", "task_0", store)
+        assert error.value.missing is missing
 
     @pytest.mark.description("Output upload skips a missing optional model patch with one INFO line and no traceback.")
     async def test_upload_output_artifacts_skips_missing_optional_model_patch(
@@ -412,7 +429,14 @@ class TestOutputArtifacts:
         )
 
         sandbox = Mock()
-        exec_mock = AsyncMock(return_value=ExecResult(exit_code=1, output=""))
+        exec_mock = AsyncMock(
+            side_effect=[
+                ExecResult(exit_code=1),
+                ExecResult(
+                    exit_code=1, output="stat: cannot statx '/logs/artifacts/model.patch': No such file or directory"
+                ),
+            ]
+        )
         monkeypatch.setattr(sandbox_module, "_exec", exec_mock)
 
         sandbox_module.logger.addHandler(caplog.handler)
@@ -434,7 +458,7 @@ class TestOutputArtifacts:
 
         assert exec_mock.await_args_list == [
             call(sandbox, "test -f /logs/artifacts/model.patch && ! test -L /logs/artifacts/model.patch"),
-            call(sandbox, "test -e /logs/artifacts/model.patch || test -L /logs/artifacts/model.patch"),
+            call(sandbox, "LC_ALL=C stat -c%F /logs/artifacts/model.patch 2>&1"),
         ]
         store.put_stream.assert_not_awaited()
 
@@ -461,8 +485,8 @@ class TestOutputArtifacts:
                 return ExecResult(exit_code=0, output="")
             if command == "test -f '/logs/symlink result.json' && ! test -L '/logs/symlink result.json'":
                 return ExecResult(exit_code=1, output="")
-            if command == "test -e '/logs/symlink result.json' || test -L '/logs/symlink result.json'":
-                return ExecResult(exit_code=0, output="")
+            if command == "LC_ALL=C stat -c%F '/logs/symlink result.json' 2>&1":
+                return ExecResult(exit_code=0, output="symbolic link")
             if command == "stat -c%s '/logs/symlink result.json'":
                 return ExecResult(exit_code=0, output="6")
             raise AssertionError(f"unexpected command: {command}")
@@ -1154,7 +1178,9 @@ class TestRunAgent:
         assert sandbox.controlled_calls[0][1:] == ("/workspace", None)
         assert sandbox.exec_calls == []
 
-    @pytest.mark.description("A user runs the whole agent command under that account.")
+    @pytest.mark.description(
+        "A user runs the whole agent command under that account and owns the log folders its install created."
+    )
     async def test_a_user_runs_the_whole_agent_command_under_that_account(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1186,6 +1212,38 @@ class TestRunAgent:
         prepared = run_exec.await_args_list[0].args[1]
         assert "chown agent /workspace" in prepared
         assert "chmod 1777 /tmp/.valkyrie" in prepared
+        assert (
+            "find /logs -mindepth 1 \\( -path /logs/agent -o -path /logs/verifier -o -path /logs/artifacts \\) -prune"
+            " -o -user 0 ! -type l -exec chown agent {} +"
+        ) in prepared
+
+    @pytest.mark.description("An agent run without the safe Python path starts the command with no `PYTHONSAFEPATH`.")
+    async def test_an_agent_run_without_the_safe_python_path_leaves_it_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workload = _FakeCommandWorkload(wait_release=asyncio.Event())
+        workload.wait_release.set()
+        sandbox = _FakeControlledSandbox(workload)
+        contract = _controlled_contract().model_copy(update={"run_cmd": "echo hello"})
+        monkeypatch.setattr(sandbox_module, "_exec", AsyncMock(return_value=ExecResult(exit_code=0)))
+
+        await run_agent(
+            cast(Any, sandbox),
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            _ignore_output,
+            "/workspace",
+            object_store=_mock_object_store(),
+            plan=GenerationPlan(allowance_seconds=None, staged=False, episode=None),
+            deadline_controller=ExternalServiceDeadlineController(base_allowance_seconds=None),
+            log_line=_ignore_output,
+            safe_python_path=False,
+        )
+
+        (command, _cwd, _env) = sandbox.controlled_calls[0]
+        assert "PYTHONSAFEPATH" not in command
+        assert command.endswith(";; esac; echo hello")
 
     @pytest.mark.description("The mcp config and skills placeholders point at what the task provides.")
     @pytest.mark.parametrize(
@@ -4542,8 +4600,17 @@ class TestSandboxLifecycle:
         )
         assert metric_source_name(SnapshotSource(snapshot="base-python")) == "snapshot"
         assert metric_source_name(DockerfileSource(dockerfile="/srv/task/Dockerfile")) == "dockerfile"
+        assert metric_source_name(Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-1")) == (
+            "checkpoint"
+        )
         with pytest.raises(AssertionError, match="Expected code to be unreachable"):
             metric_source_name(cast(SandboxSource, object()))
+
+    @pytest.mark.description("A checkpoint source is remembered by its provider ref when the provider refuses it.")
+    def test_rejection_source_keys_a_checkpoint_by_its_ref(self) -> None:
+        checkpoint = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+
+        assert sandbox_module.rejection_source(checkpoint) == "checkpoint:snap-1"
 
     @pytest.mark.description(
         (
@@ -4969,6 +5036,12 @@ class TestSandboxLifecycle:
         [
             pytest.param(RuntimeError("create failed"), RuntimeError, "RuntimeError", id="unexpected"),
             pytest.param(ProviderSandboxError("quota"), SandboxSetupError, "SandboxError", id="provider"),
+            pytest.param(
+                ProviderSandboxRejectedError("snapshot not found"),
+                ProviderSandboxRejectedError,
+                "SandboxRejectedError",
+                id="rejected",
+            ),
             pytest.param(
                 SandboxBuildError("build failed", "step 3 broke"),
                 SandboxSetupError,

@@ -11,9 +11,8 @@ import pytest
 from click.testing import CliRunner
 
 import valkyrie.cli.login as login_module
+import valkyrie.sdk as sdk
 from valkyrie.cli.main import cli
-from valkyrie.sdk import ValkyrieConfig
-from valkyrie.sdk.config import DEFAULT_TRACKER_URL
 from valkyrie.sdk.errors import ValkyrieConfigError, ValkyrieTransportError
 from valkyrie.sdk import LoginSession
 
@@ -112,7 +111,7 @@ def requests(
         return handler(request)
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
-    monkeypatch.setattr(login_module, "device_login", device_login)
+    monkeypatch.setattr(sdk, "device_login", device_login)
     monkeypatch.setattr(login_module.click, "launch", lambda _url: 0)
     monkeypatch.setenv("VALKYRIE_URL", TRACKER)
     return seen
@@ -135,41 +134,40 @@ def test_login_saves_a_session_and_lists_the_organizations(requests: list[httpx.
 
     assert result.exit_code == 0, result.output
     assert "ABCD-EFGH" in result.stderr
-    assert result.stdout.startswith(f"Logged in to {TRACKER} as alice@example.com.\n{listing}")
+    assert f"Logged in to {TRACKER} as alice@example.com." in result.stderr
+    assert result.stdout.startswith(listing)
     assert listed.output.startswith(listing)
     assert LoginSession.load(TRACKER) is not None
     assert requests[-1].headers["authorization"] == "Bearer access-1"
 
 
 @pytest.mark.description(
-    "After `login` the CLI uses that Tracker until `logout`, and an access key in the environment is used as `x-api-key`."
+    "A login is saved for the Tracker it was made on, and an access key in the environment is used as `x-api-key`."
 )
-def test_login_picks_the_tracker_until_logout(requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_login_is_saved_per_tracker(requests: list[httpx.Request], monkeypatch: pytest.MonkeyPatch) -> None:
     runner = CliRunner()
-    runner.invoke(cli, ["login"])
     monkeypatch.delenv("VALKYRIE_URL")
+    runner.invoke(cli, ["tracker", "add", "test", TRACKER])
+    runner.invoke(cli, ["--tracker", "test", "login"])
 
-    whoami = runner.invoke(cli, ["whoami"])
+    whoami = runner.invoke(cli, ["--tracker", "test", "whoami"])
     assert whoami.exit_code == 0, whoami.output
-    assert whoami.output == f"alice@example.com in acme on {TRACKER} (using a login)\n"
+    assert whoami.output == f"alice@example.com in acme on test at {TRACKER} (using a login)\n"
 
-    runner.invoke(cli, ["logout"], env={"VALKYRIE_URL": "https://other.test"})
-    assert ValkyrieConfig().url == TRACKER
+    runner.invoke(cli, ["--tracker", "https://other.test", "logout"])
+    assert LoginSession.load(TRACKER) is not None
 
-    logout = runner.invoke(cli, ["logout"])
-    assert logout.output == f"Logged out of {TRACKER}.\n"
+    logout = runner.invoke(cli, ["--tracker", "test", "logout"])
+    assert logout.output == f"Logged out of test at {TRACKER}.\n"
     assert LoginSession.load(TRACKER) is None
-    assert ValkyrieConfig().url == DEFAULT_TRACKER_URL
 
-    monkeypatch.setenv("VALKYRIE_URL", TRACKER)
-
-    signed_out = runner.invoke(cli, ["whoami"])
+    signed_out = runner.invoke(cli, ["--tracker", "test", "whoami"])
     assert signed_out.exit_code == 1
-    assert "valkyrie login" in signed_out.output
+    assert "try: valkyrie --tracker test login" in signed_out.output
 
     monkeypatch.setenv("VALKYRIE_API_KEY", "ci-secret")
-    with_key = runner.invoke(cli, ["whoami"])
-    assert with_key.output == f"alice@example.com in acme on {TRACKER} (using an access key)\n"
+    with_key = runner.invoke(cli, ["--tracker", TRACKER, "whoami", "--json"])
+    assert json.loads(with_key.output)["tracker"] == TRACKER
     assert requests[-1].headers["x-api-key"] == "ci-secret"
 
 
@@ -289,7 +287,7 @@ def test_organization_commands_never_use_an_access_key(
     result = CliRunner().invoke(cli, ["org", "list"])
 
     assert result.exit_code == 1
-    assert "Organizations are managed with your login. Run `valkyrie login`." in result.output
+    assert "error: Organizations are managed with your login.\n  try: valkyrie login\n" in result.output
     assert requests == []
 
 
@@ -319,7 +317,7 @@ def test_an_unreachable_login_service_is_reported_without_a_traceback(monkeypatc
         raise ValkyrieTransportError(f"The login to {tracker_url} could not finish: offline")
 
     monkeypatch.setenv("VALKYRIE_URL", TRACKER)
-    monkeypatch.setattr(login_module, "device_login", offline)
+    monkeypatch.setattr(sdk, "device_login", offline)
 
     result = CliRunner().invoke(cli, ["login"])
 

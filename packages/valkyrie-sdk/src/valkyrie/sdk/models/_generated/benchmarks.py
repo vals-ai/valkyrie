@@ -83,6 +83,7 @@ class SingleTaskResponse(ResponseModel):
     status: runs.TaskStatus
     started_at: UTCDateTime
     finished_at: UTCDateTime | None
+    last_log_at: UTCDateTime | None = None
     error_message: str | None
     failure_category: runs.FailureCategory | None = None
     evaluation_result: dict[str, Any] | None
@@ -98,6 +99,7 @@ class TaskSummary(ResponseModel):
     status: runs.TaskStatus
     started_at: UTCDateTime
     finished_at: UTCDateTime | None
+    last_log_at: UTCDateTime | None = None
     error_message: str | None = None
     failure_category: runs.FailureCategory | None = None
 

@@ -92,6 +92,7 @@ What the check does:
 Read the matching skill before starting. `.claude/skills/` links to the same files.
 
 - `.agents/writing-tests/SKILL.md`: adding or changing tests, and choosing which suites prove a change.
+- `.agents/writing-cli/SKILL.md`: adding, renaming, or changing `valk` commands, flags, and output.
 - `.agents/tracker-repositories/SKILL.md`: Tracker code that reads or writes the database.
 - `.agents/updating-docs/SKILL.md`: public docs, generated CLI and SDK references, and code that makes docs stale.
   Pages under `docs/` also follow `docs/AGENTS.md`.

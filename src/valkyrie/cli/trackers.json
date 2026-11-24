@@ -1,0 +1,7 @@
+{
+  "default": "vals",
+  "trackers": {
+    "vals": "https://benchmark-tracker-prod.vals.ai",
+    "local": "http://127.0.0.1:8000"
+  }
+}

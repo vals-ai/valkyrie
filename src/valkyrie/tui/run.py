@@ -39,6 +39,8 @@ from valkyrie.sdk.models import (
     TaskStatus,
     TaskSummary,
 )
+from valkyrie.display import ago
+from valkyrie.palette import status_label
 from valkyrie.tui.theme import palette
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.errors import ErrorsScreen, failed_tasks
@@ -49,13 +51,10 @@ from valkyrie.tui.widgets import (
     KeyBar,
     Table,
     TopBar,
-    ago,
     progress_bar,
-    run_glyph,
     short_id,
     shown,
-    status_label,
-    task_glyph,
+    status_glyph,
 )
 
 if TYPE_CHECKING:
@@ -88,8 +87,8 @@ class RunSummary(Widget):
         run = self.run
         if run is None:
             return Text()
-        glyph, color = run_glyph(run.status)
-        status = Text(f"{glyph} {status_label(run.status)}", style=f"bold {color}")
+        glyph, color = status_glyph(run.status)
+        status = Text(f"{glyph} {status_label(run.status.value)}", style=f"bold {color}")
         tail = Text()
         if run.total_tasks:
             percent = round(100 * run.finished_tasks / run.total_tasks)
@@ -118,9 +117,9 @@ class RunSummary(Widget):
                 continue
             if line:
                 line.append("  ")
-            glyph, color = task_glyph(status)
+            glyph, color = status_glyph(status)
             line.append(f"{glyph} {count} ", style=color)
-            line.append(status_label(status), style=palette().muted)
+            line.append(status_label(status.value), style=palette().muted)
             if status == TaskStatus.ERROR and self.categories:
                 breakdown = " · ".join(f"{label} {count}" for label, count in self.categories)
                 line.append(f" ({breakdown})", style=palette().error)
@@ -338,8 +337,10 @@ class RunScreen(BrowseScreen[None]):
         self.fresh()
 
     def _refresh_if_stale(self) -> None:
-        if self.tasks_stale and not self.busy("tasks"):
+        selected = self.tasks.get(self.shown_task) if self.shown_task else None
+        if (self.tasks_stale or (selected and selected.status in ACTIVE_TASKS)) and not self.busy("tasks"):
             self.load_tasks()
+        self._show_detail()
 
     @work(exclusive=True, group="tasks")
     async def load_tasks(self) -> None:
@@ -394,7 +395,7 @@ class RunScreen(BrowseScreen[None]):
 
     def _matches(self, task: TaskSummary) -> bool:
         category = task.failure_category.value if task.failure_category else None
-        return matches(self.filter, task.task_id, status_label(task.status), category, task.error_message)
+        return matches(self.filter, task.task_id, status_label(task.status.value), category, task.error_message)
 
     def on_data_table_row_highlighted(self, _event: Table.RowHighlighted) -> None:
         task_id = self.query_one(Table).highlighted_key()
@@ -412,11 +413,14 @@ class RunScreen(BrowseScreen[None]):
     def _reload_shown_task(self) -> None:
         task = self.tasks.get(self.shown_task) if self.shown_task else None
         previous = self.shown_summary
-        if task is None or previous is None or (task.status, task.started_at) == (previous.status, previous.started_at):
+        if task is None or previous is None:
             return
-        if task.started_at != previous.started_at or previous.status not in ACTIVE_TASKS:
-            self.load_logs(task.task_id, 0)
-        self.load_detail(task.task_id, 0)
+        if (task.status, task.started_at) != (previous.status, previous.started_at):
+            if task.started_at != previous.started_at or previous.status not in ACTIVE_TASKS:
+                self.load_logs(task.task_id, 0)
+            self.load_detail(task.task_id, 0)
+        elif task.last_log_at != previous.last_log_at:
+            self._show_detail()
         self.shown_summary = task
 
     @work(exclusive=True, group="logs")
@@ -463,6 +467,7 @@ class RunScreen(BrowseScreen[None]):
             try:
                 task = await self.source.task(self.run.id, task_id)
             except ValkyrieSDKError as error:
+                self.detail_task = None
                 body.update(Text(shown(str(error)), style=palette().error))
                 return
             if self._settled(self.tasks[task_id]):
@@ -471,10 +476,16 @@ class RunScreen(BrowseScreen[None]):
         self._show_detail()
 
     def _show_detail(self) -> None:
-        if self.detail_task:
-            self.query_one("#detail-body", Static).update(
-                _detail(self.detail_task, cast("ValkyrieApp", self.app).now())
-            )
+        if task := self.detail_task:
+            summary = self.tasks.get(task.task_id)
+            if (
+                summary is not None
+                and summary.started_at == task.started_at
+                and summary.last_log_at is not None
+                and (task.last_log_at is None or summary.last_log_at > task.last_log_at)
+            ):
+                task = task.model_copy(update={"last_log_at": summary.last_log_at})
+            self.query_one("#detail-body", Static).update(_detail(task, cast("ValkyrieApp", self.app).now()))
 
     def restyle(self) -> None:
         super().restyle()
@@ -594,7 +605,7 @@ class RunScreen(BrowseScreen[None]):
         task_id = self.query_one(Table).highlighted_key()
         task = self.tasks.get(task_id) if task_id else None
         if task is None:
-            command = f"valk run fetch {self.run.id} --connect"
+            command = f"valk run show {self.run.id} --follow"
         elif self.tab == "detail":
             command = f"valk run task {self.run.id} {shlex.quote(task.task_id)}"
         else:
@@ -622,7 +633,7 @@ def _triage_key(task: TaskSummary) -> tuple[int, str, str, str]:
 
 
 def _task_cells(task: TaskSummary, now: datetime) -> list[Text]:
-    glyph, color = task_glyph(task.status)
+    glyph, color = status_glyph(task.status)
     if task.failure_category:
         info = Text(CATEGORY_LABEL[task.failure_category], style=palette().error)
     elif task.status == TaskStatus.PENDING:
@@ -642,13 +653,15 @@ def log_line(event: LogEvent) -> str:
 
 
 def _detail(task: SingleTaskResponse, now: datetime) -> Text:
-    glyph, color = task_glyph(task.status)
-    status = Text(f"{glyph} {status_label(task.status)}", style=f"bold {color}")
+    glyph, color = status_glyph(task.status)
+    status = Text(f"{glyph} {status_label(task.status.value)}", style=f"bold {color}")
     if task.failure_category:
         status.append(f" · {task.failure_category.value}", style=palette().error)
     timing = f"started {task.started_at.astimezone():%H:%M:%S}"
     if task.status != TaskStatus.PENDING:
         timing += f" · ran {ago(task.started_at, task.finished_at or now)}"
+    if task.last_log_at is not None:
+        timing += f" · last log {ago(task.last_log_at, now, compact=True)} ago"
     lines = [
         Text(shown(task.task_id), style=f"bold {palette().text}"),
         status,

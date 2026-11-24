@@ -374,6 +374,7 @@ async def _run_queued_tasks(
             runner.cancel()
         await gather(*(runner for _attempt, runner in local_runners.values()), return_exceptions=True)
         await _stop_monitor(monitor_task)
+        await task_control.flush_last_logs()
         if cancellation_attempts is not None:
             record_cancellation(cancellation_attempts)
 
@@ -566,6 +567,7 @@ async def _process_benchmark(
             finally:
                 await gather(*runners, return_exceptions=True)
                 await _stop_monitor(monitor_task)
+                await task_control.flush_last_logs()
         post_tasks = True
         decision = await run_control.prepare_finalization()
         if decision.kind == "deferred":

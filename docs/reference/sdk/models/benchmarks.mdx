@@ -88,7 +88,7 @@ Benchmarks model · 6 fields
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"sort"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Literal['task_id', 'started_at', 'duration', 'status'] · default: <code>{"'started_at'"}</code></span></div>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"sort"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · Literal['task_id', 'started_at', 'duration', 'status', 'last_log_at'] · default: <code>{"'started_at'"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -199,7 +199,7 @@ Benchmarks model · 20 fields
 
 Detailed state and evaluation output for one task.
 
-Benchmarks model · 10 fields
+Benchmarks model · 11 fields
 
 **Fields**
 
@@ -221,6 +221,10 @@ Benchmarks model · 10 fields
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"finished_at"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · datetime | None</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"last_log_at"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · datetime | None · default: <code>{"None"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
@@ -289,7 +293,7 @@ Benchmarks model · 2 fields
 
 Summary information for one task in a paginated run.
 
-Benchmarks model · 7 fields
+Benchmarks model · 8 fields
 
 **Fields**
 
@@ -311,6 +315,10 @@ Benchmarks model · 7 fields
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"finished_at"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · datetime | None</span></div>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"last_log_at"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · datetime | None · default: <code>{"None"}</code></span></div>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

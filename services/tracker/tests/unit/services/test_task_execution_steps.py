@@ -25,6 +25,7 @@ from tracker.types import AgentContractRequest
 from tracker.services.failures import FailurePhase
 from tracker.services.datasets.config import MultiStepRewardStrategy
 from tracker.services.datasets.healthcheck import HealthcheckError
+from tracker.services.datasets.egress import NO_INFERENCE_HOST_WARNING
 from tracker.services.datasets.oracle import ORACLE_CONTRACT
 from tracker.services.datasets.retrieve_task import StepPlan, TaskFolderResponse
 from tracker.clients.dataset_tasks import DatasetTaskService
@@ -134,6 +135,7 @@ class StepRun:
                     "user": kwargs["user"],
                     "base": kwargs["deadline_controller"].base_allowance_seconds,
                     "folder": kwargs["artifact_folder"],
+                    "safe_python_path": kwargs["safe_python_path"],
                 }
             )
             self.controllers.append(kwargs["deadline_controller"])
@@ -336,7 +338,28 @@ class TestSteps:
         assert [env["MODE"] for env in run.agent_envs] == ["oracle", "oracle"]
         assert run.bundle_uploads == 0
 
-    @pytest.mark.description("Each agent run gets its steps timeout user and output folder.")
+    @pytest.mark.description("An oracle run on a restricted network logs no missing model endpoint warning.")
+    async def test_an_oracle_run_logs_no_missing_model_endpoint_warning(
+        self,
+        stepped: StepStarter,
+        database_session: Session,
+        bound_controls: Any,
+        runtime_services: RuntimeServices,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logged: list[str] = []
+
+        def record(_buffer: object, data: str) -> None:
+            logged.append(data)
+
+        monkeypatch.setattr("tracker.services.tasks.execute.TaskLogBuffer.write", record)
+        run = stepped(_response("one", egress_run=[]), [_grade(1.0)])
+
+        await _run(run, ORACLE_CONTRACT, database_session, runtime_services, bound_controls)
+
+        assert not any(NO_INFERENCE_HOST_WARNING in line for line in logged)
+
+    @pytest.mark.description("Each agent run gets its steps timeout user and output folder, and no `PYTHONSAFEPATH`.")
     async def test_each_agent_run_gets_its_steps_timeout_user_and_output_folder(
         self,
         stepped: StepStarter,
@@ -350,8 +373,8 @@ class TestSteps:
         await _run(run, contract, database_session, runtime_services, bound_controls)
 
         assert run.agent_runs == [
-            {"allowance": 10.0, "user": "user-one", "base": 10.0, "folder": "steps/one"},
-            {"allowance": 20.0, "user": "user-two", "base": 20.0, "folder": "steps/two"},
+            {"allowance": 10.0, "user": "user-one", "base": 10.0, "folder": "steps/one", "safe_python_path": False},
+            {"allowance": 20.0, "user": "user-two", "base": 20.0, "folder": "steps/two", "safe_python_path": False},
         ]
 
     @pytest.mark.description("The final strategy keeps only the last steps rewards.")
@@ -425,7 +448,9 @@ class TestSteps:
         assert task_row.status == TaskStatus.ERROR
         assert run.events == ["setup", "prepare one", "agent", "grade one"]
 
-    @pytest.mark.description("A steps agent run gets the contracts egress allowlist added to its own.")
+    @pytest.mark.description(
+        "A steps agent run gets the contracts egress allowlist and the host of its model endpoint added to its own."
+    )
     async def test_a_steps_agent_run_gets_the_contracts_egress_allowlist_added_to_its_own(
         self,
         stepped: StepStarter,
@@ -443,11 +468,14 @@ class TestSteps:
         monkeypatch.setattr("tracker.services.tasks.execute.apply_egress_policy", record)
         monkeypatch.setattr("tracker.runtime.run_egress.apply_egress_policy", record)
         contract = contract.model_copy(update={"egress_allowlist": ["api.model.example"]})
-        run = stepped(_response("one", egress_run=["step.example"]), [_grade(1.0)])
+        run = stepped(
+            _response("one", egress_run=["step.example"], env={"OPENAI_BASE_URL": "https://llm.example/v1"}),
+            [_grade(1.0)],
+        )
 
         await _run(run, contract, database_session, runtime_services, bound_controls)
 
-        assert ["step.example", "api.model.example"] in applied
+        assert ["step.example", "api.model.example", "llm.example"] in applied
 
     @pytest.mark.description("Local docker refuses a step that restricts egress before creating a sandbox.")
     @pytest.mark.parametrize(

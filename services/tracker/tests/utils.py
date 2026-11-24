@@ -1,14 +1,45 @@
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Generator, Iterable
+from contextlib import contextmanager
 from typing import Any, TypeVar
 from uuid import UUID, uuid4
 
 import pytest
 from descope.exceptions import AuthException
+from sqlalchemy import text
+from sqlalchemy.engine import Engine, make_url
+from sqlmodel import SQLModel, create_engine
 
 _Item = TypeVar("_Item")
 
 
 TEST_ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
+_SCHEMA_TEMPLATE = "tracker_schema"
+
+
+def create_schema_template(url: str) -> None:
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
+        connection.execute(text(f"CREATE DATABASE {_SCHEMA_TEMPLATE}"))
+    admin.dispose()
+    template = create_engine(make_url(url).set(database=_SCHEMA_TEMPLATE))
+    SQLModel.metadata.create_all(template)
+    template.dispose()
+
+
+@contextmanager
+def database_from_schema_template(url: str) -> Generator[Engine, None, None]:
+    name = f"test_{uuid4().hex}"
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
+        connection.execute(text(f"CREATE DATABASE {name} TEMPLATE {_SCHEMA_TEMPLATE} STRATEGY FILE_COPY"))
+    engine = create_engine(make_url(url).set(database=name))
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f"DROP DATABASE {name} WITH (FORCE)"))
+        admin.dispose()
 
 
 def inline_database_calls_in(monkeypatch: pytest.MonkeyPatch) -> None:

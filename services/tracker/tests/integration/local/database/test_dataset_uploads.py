@@ -31,6 +31,7 @@ from tracker.local.storage import FilesystemObjectStore
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
 from tracker.runtime.artifacts import dataset_blob_key, dataset_file_key, dataset_upload_key
+import tracker.dataset_worker as dataset_worker
 from tracker.dataset_worker import clean_uploads, run_claimed_upload, run_worker
 from tests.unit.datasets.support import TASK, archive_digest_of, zip_bytes
 
@@ -98,6 +99,7 @@ async def upload_worker(
     configuration = tmp_path / "worker.json"
     configuration.write_text(json.dumps({"data_root": str(tmp_path)}))
     monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
+    monkeypatch.setattr(dataset_worker, "_POLL_SECONDS", 0.05)
     worker = asyncio.create_task(run_worker(postgres_engine, configuration))
     try:
         yield

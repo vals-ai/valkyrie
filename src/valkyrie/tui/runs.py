@@ -18,24 +18,23 @@ from textual.widget import Widget
 
 from valkyrie.sdk.errors import ValkyrieSDKError
 from valkyrie.sdk.models import BenchmarkStatusEntry, BenchmarkTableRow, TaskStatus
+from valkyrie.palette import status_label
 from valkyrie.tui.theme import palette
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.datasets import DatasetsScreen
 from valkyrie.tui.run import RunScreen
 from valkyrie.tui.source import FINAL_STATUSES, RunSource
+from valkyrie.display import ago
 from valkyrie.tui.widgets import (
     CommandLine,
     KeyBar,
     Table,
     TopBar,
-    ago,
     progress_bar,
-    run_glyph,
     run_status,
     short_id,
     shown,
-    status_label,
-    task_glyph,
+    status_glyph,
 )
 
 if TYPE_CHECKING:
@@ -68,8 +67,8 @@ class RunPreview(Widget):
         if run.label:
             title.append(f"  {shown(run.label)}", style=palette().accent)
         started = shown(" · ".join(part for part in (f"{ago(run.started_at, now)} ago", run.started_by_email) if part))
-        glyph, color = run_glyph(run.status)
-        status = _line((f"{glyph} {status_label(run.status)}", f"bold {color}"))
+        glyph, color = status_glyph(run.status)
+        status = _line((f"{glyph} {status_label(run.status.value)}", f"bold {color}"))
         if run.final_score is not None:
             status.append(f"   score {run.final_score:.3f}", style=palette().text)
 
@@ -102,9 +101,11 @@ def _counts(run: BenchmarkTableRow) -> list[Text]:
     for status in COUNT_ORDER:
         count = run.task_state_counts.get(status.value, 0)
         if count:
-            glyph, color = task_glyph(status)
+            glyph, color = status_glyph(status)
             lines.append(
-                Text.assemble((f"{glyph} ", color), (f"{status_label(status):<12}", palette().muted), f"{count:>5}")
+                Text.assemble(
+                    (f"{glyph} ", color), (f"{status_label(status.value):<12}", palette().muted), f"{count:>5}"
+                )
             )
     return lines
 
@@ -264,7 +265,7 @@ class RunsScreen(BrowseScreen[None]):
         self._show_highlighted()
 
     def _matches(self, run: BenchmarkTableRow) -> bool:
-        fields = (run.name, run.agent_name, run.model, run.label, status_label(run.status), short_id(run.id))
+        fields = (run.name, run.agent_name, run.model, run.label, status_label(run.status.value), short_id(run.id))
         return matches(self.filter, *fields, run.started_by_email)
 
     @work(exclusive=True, group="statuses")
@@ -310,7 +311,7 @@ class RunsScreen(BrowseScreen[None]):
             progress = progress_bar(run.task_state_counts, run.total_tasks, 10)
             progress.append(f" {run.finished_tasks}/{run.total_tasks}", style=palette().muted)
         else:
-            progress = Text(status_label(run.status), style=run_glyph(run.status)[1])
+            progress = Text(status_label(run.status.value), style=status_glyph(run.status)[1])
         errors = run.task_state_counts.get(TaskStatus.ERROR.value, 0)
         return [
             run_status(run.status),
@@ -360,4 +361,4 @@ class RunsScreen(BrowseScreen[None]):
         preview = self.query_one(RunPreview)
         preview.run = run
         preview.border_title = f"{short_id(run.id)} · {escape(shown(run.name))}" if run else ""
-        self.query_one(CommandLine).show(f"valk run fetch {run.id} --connect" if run else "valk run list")
+        self.query_one(CommandLine).show(f"valk run show {run.id} --follow" if run else "valk run list")

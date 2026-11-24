@@ -23,9 +23,19 @@ TYPE_INDEX = TYPE_ROOT / "index.mdx"
 SDK_ERRORS = SDK_ROOT / "errors.mdx"
 
 STATIC_REDIRECTS = [
+    {"source": "/reference/cli/run/fetch", "destination": "/reference/cli/run#show"},
+    {"source": "/reference/cli/run/status", "destination": "/reference/cli/run#show"},
+    {"source": "/reference/cli/run/retag", "destination": "/reference/cli/run#update"},
+    {"source": "/reference/cli/run/shed", "destination": "/reference/cli/run#update"},
+    {"source": "/reference/cli/run/output", "destination": "/reference/cli/run#download"},
+    {"source": "/reference/cli/run/outputs", "destination": "/reference/cli/run#download"},
+    {"source": "/reference/cli/run/artifacts", "destination": "/reference/cli/run#files"},
+    {"source": "/reference/cli/run/task-artifacts", "destination": "/reference/cli/run#task"},
+    {"source": "/reference/cli/run/filter-options", "destination": "/reference/sdk/runs#filter-options"},
     {"source": "/introduction", "destination": "/introduction/what-is-valkyrie"},
     {"source": "/get-started/overview", "destination": "/introduction/what-is-valkyrie"},
     {"source": "/get-started/hosting", "destination": "/introduction/what-is-valkyrie"},
+    {"source": "/get-started/hosted", "destination": "/get-started/quickstart"},
     {"source": "/self-hosting/infrastructure", "destination": "/introduction/what-is-valkyrie"},
     {"source": "/sdk/errors", "destination": "/sdk/quickstart"},
     {"source": "/contributing/local-development", "destination": "/self-hosting/local-tracker"},
@@ -57,10 +67,12 @@ GUIDE_LINKS = {
     "project": "/runs/start#put-the-run-in-a-project",
     "secret": "/get-started/sandbox-providers",
     "provider": "/get-started/sandbox-providers",
+    "tracker": "/get-started/configuration#choose-a-tracker",
     "login": "/get-started/configuration#sign-in",
     "token": "/get-started/configuration#create-an-access-key-for-ci",
     "org": "/get-started/configuration#join-an-organization",
     "tui": "/runs/monitor#browse-runs-in-the-terminal",
+    "completion": "/get-started/configuration#shell-completion",
 }
 
 CLI_CARDS = {
@@ -75,10 +87,12 @@ CLI_CARDS = {
     "project": ("folder-kanban", "managing the projects runs are started in"),
     "secret": ("key-round", "storing, listing, and removing the secrets your runs reference"),
     "provider": ("server", "choosing the secret behind each sandbox provider and your default provider"),
+    "tracker": ("server", "saving Trackers by name and choosing the one commands use by default"),
     "login": ("log-in", "signing in, signing out, and checking which account your requests use"),
     "token": ("key-round", "creating and revoking access keys for CI and other headless use"),
     "org": ("building-2", "creating, joining and switching organizations, and managing their members"),
     "tui": ("monitor", "browsing runs, tasks, and logs in a terminal UI"),
+    "completion": ("terminal", "enabling shell completion"),
 }
 CLI_PAGE_GROUPS = {"logout": "login", "whoami": "login"}
 CLI_TITLES = {"tui": "TUI"}

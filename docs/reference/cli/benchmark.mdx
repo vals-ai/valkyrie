@@ -17,7 +17,8 @@ valkyrie benchmark tasks \
   [--dataset <TEXT>] \
   [--header|-H <TEXT> <TEXT>...] \
   [--ignore-custom-services|--ics] \
-  [--output|-o <PATH>]
+  [--output|-o <PATH>] \
+  [--json]
 ```
 
 ```bash Example
@@ -54,6 +55,11 @@ valkyrie benchmark tasks \
   <p className="mb-0 mt-1">{"Path to save task IDs, one per line. Defaults to <benchmark>-<dataset>-tasks.txt."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Benchmark guides](/benchmarks/custom-services).
 
 ---
@@ -69,7 +75,8 @@ valkyrie benchmark service set \
   <BENCHMARK> \
   <URL> \
   [--auth-secret <SECRET>] \
-  [--auth-header <HEADER>]
+  [--auth-header <HEADER>] \
+  [--json]
 ```
 
 ```bash Example
@@ -101,6 +108,11 @@ valkyrie benchmark service set \
   <p className="mb-0 mt-1">{"Header that carries the secret. Defaults to Authorization."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Benchmark guides](/benchmarks/custom-services).
 
 ---
@@ -111,7 +123,8 @@ Go back to the hosted service for your runs of a benchmark.
 
 ```bash Syntax
 valkyrie benchmark service remove \
-  <BENCHMARK>
+  <BENCHMARK> \
+  [--json]
 ```
 
 ```bash Example
@@ -122,6 +135,13 @@ valkyrie benchmark service remove swebench
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"BENCHMARK"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Benchmark guides](/benchmarks/custom-services).
@@ -135,7 +155,15 @@ List hosted benchmark services and your saved URLs, with their latency.
 A URL you saved replaces the hosted service with the same name.
 
 ```bash Syntax
-valkyrie benchmark service list
+valkyrie benchmark service list \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Benchmark guides](/benchmarks/custom-services).

@@ -1,5 +1,5 @@
 .PHONY: help install style format format-check lint lint-fix typecheck \
-	tracker-service local-tracker venv_check tool-install build test unit-test sdk-models sdk-models-check docs-reference docs-reference-check
+	tracker-service local-tracker local-stop local-reset venv_check tool-install build test unit-test sdk-models sdk-models-check docs-reference docs-reference-check
 
 PYTHON_VERSION := 3.12
 
@@ -33,10 +33,7 @@ venv_check:
 	fi
 
 install:
-	uv venv --python $(PYTHON_VERSION)
-	@echo "Installing cli dependencies..."
-	uv cache clean model-library valsai
-	uv sync --dev
+	uv sync --dev --python $(PYTHON_VERSION)
 	@echo "🎉 Done! Run 'source .venv/bin/activate' to activate the environment locally."
 
 tool-install:
@@ -52,6 +49,7 @@ build: venv_check
 		--specpath build \
 		--clean \
 		--collect-submodules valkyrie.cli \
+		--collect-data valkyrie.cli \
 		--collect-data valkyrie.tui \
 		scripts/binary/valkyrie_cli.py
 	@echo "✓ Binary built at dist/valkyrie"
@@ -70,10 +68,9 @@ lint: venv_check
 	@uv run python scripts/check_tracker_no_utils.py
 
 test: venv_check
-	@uv run pytest tests/unit/cli tests/unit/tui tests/unit/sdk tests/unit/docs tests/contract \
+	@uv run pytest -n auto tests/unit/cli tests/unit/tui tests/unit/sdk tests/unit/docs tests/contract \
 		$(wildcard tests/unit/egress_proxy) tests/integration/local \
 		--cov=src/valkyrie --cov-report=xml --cov-report=term-missing --cov-fail-under=80
-	@cd services/run-monitor && uv run --frozen pytest -q
 	@cd services/projects && uv run --frozen pytest -q
 
 unit-test: test
@@ -105,3 +102,6 @@ tracker-service:
 
 local-tracker:
 	cd services/tracker && make local-tracker $(if $(CONFIG),CONFIG=$(abspath $(CONFIG)))
+
+local-stop local-reset:
+	@$(MAKE) --no-print-directory -C services/tracker $@

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import UUID
@@ -46,7 +47,9 @@ def _group_alive(pid: int) -> bool:
         return False
 
 
-def _report_exit(dispatch_id: UUID, benchmark_id: UUID, invocation_key: str) -> None:
+def _report_exit(
+    dispatch_id: UUID, benchmark_id: UUID, invocation_key: str, *, shutting_down: Callable[[], bool]
+) -> None:
     request = Request(
         f"{os.environ['EXECUTOR_CONTROL_URL'].rstrip('/')}/executor-control/v1/queue-exit",
         data=json.dumps({"benchmark_id": str(benchmark_id), "dispatch_id": str(dispatch_id)}).encode(),
@@ -58,7 +61,7 @@ def _report_exit(dispatch_id: UUID, benchmark_id: UUID, invocation_key: str) -> 
         method="POST",
     )
     delay = 0.1
-    while True:
+    while not shutting_down():
         try:
             with urlopen(request, timeout=8) as response:
                 response.read()
@@ -73,6 +76,8 @@ def _report_exit(dispatch_id: UUID, benchmark_id: UUID, invocation_key: str) -> 
 
 
 def supervise(dispatch_id: UUID) -> int:
+    local = os.environ.get("EXECUTOR_LAUNCHER") == "local"
+    owner = os.getppid()
     parent, child = socket.socketpair()
     environment = os.environ.copy()
     environment["TRACKER_WATCHDOG_FD"] = str(child.fileno())
@@ -99,11 +104,16 @@ def supervise(dispatch_id: UUID) -> int:
         if termination_at is None:
             termination_at = time.monotonic()
 
+    def shutting_down() -> bool:
+        return local and (termination_at is not None or os.getppid() != owner)
+
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
     try:
         while True:
             now = time.monotonic()
+            if shutting_down() and termination_at is None:
+                forward(signal.SIGTERM, None)
             if termination_at is not None and now >= termination_at + _GRACE_SECONDS:
                 _signal_group(process.pid, signal.SIGKILL)
                 forced = True
@@ -117,7 +127,7 @@ def supervise(dispatch_id: UUID) -> int:
                         break
                 if not _group_alive(process.pid):
                     if identity is not None:
-                        _report_exit(dispatch_id, *identity)
+                        _report_exit(dispatch_id, *identity, shutting_down=shutting_down)
                     return 143 if forced else process.returncode
             timeout = 0.1
             if termination_at is not None and now < termination_at + _GRACE_SECONDS:

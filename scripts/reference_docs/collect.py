@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import operator
 import re
 import types
@@ -127,6 +128,59 @@ def _collect_click_parameter(parameter: click.Parameter) -> CLIParameterReferenc
         constraints=tuple(constraints),
         help=_sanitize_public_text(parameter.help or "") if is_option else "",
     )
+
+
+def collect_cli_global_options() -> tuple[CLIParameterReference, ...]:
+    from valkyrie.cli.main import cli
+
+    return tuple(_collect_click_parameter(parameter) for parameter in cli.params if not parameter.hidden)
+
+
+def collect_completion() -> str:
+    from valkyrie.cli.main import cli
+
+    records: list[dict[str, Any]] = []
+
+    def visit(command: click.Command, path: tuple[str, ...]) -> None:
+        ctx = click.Context(command)
+        params: list[dict[str, Any]] = []
+        for parameter in command.get_params(ctx):
+            if isinstance(parameter, click.Option) and parameter.hidden:
+                continue
+            saved: dict[str, Any] = {
+                "kind": "option" if isinstance(parameter, click.Option) else "argument",
+                "names": parameter.opts + parameter.secondary_opts,
+                "nargs": parameter.nargs,
+            }
+            if isinstance(parameter, click.Option):
+                saved.update(
+                    help=" ".join((parameter.help or "").split()),
+                    is_flag=parameter.is_flag,
+                    multiple=parameter.multiple,
+                    count=parameter.count,
+                )
+            if isinstance(parameter.type, click.Choice):
+                saved["choices"] = [str(choice) for choice in parameter.type.choices]
+                saved["case_sensitive"] = parameter.type.case_sensitive
+            if isinstance(parameter.type, click.Path):
+                saved["path"] = {"file_okay": parameter.type.file_okay, "dir_okay": parameter.type.dir_okay}
+            params.append(saved)
+        records.append(
+            {
+                "path": path,
+                "group": isinstance(command, click.Group),
+                "help": command.get_short_help_str(limit=200),
+                "params": params,
+            }
+        )
+        if isinstance(command, click.Group):
+            for name in command.list_commands(ctx):
+                child = command.get_command(ctx, name)
+                if child is not None and not child.hidden:
+                    visit(child, (*path, name))
+
+    visit(cli, ())
+    return "[\n" + ",\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n]\n"
 
 
 def collect_cli_commands() -> tuple[CLICommandReference, ...]:

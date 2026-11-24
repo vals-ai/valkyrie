@@ -28,7 +28,8 @@ valkyrie project create \
   [--customer <TEXT>] \
   [--tag <TEXT>...] \
   [--budget <AMOUNT>] \
-  [--budget-reason <TEXT>]
+  [--budget-reason <TEXT>] \
+  [--json]
 ```
 
 ```bash Example
@@ -84,6 +85,11 @@ valkyrie project create \
   <p className="mb-0 mt-1">{"Why the project needs that budget (e.g., \"3 runs, about 100 each\"). Required where projects get a Gateway key."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Project guides](/runs/start#put-the-run-in-a-project).
 
 ---
@@ -94,14 +100,14 @@ List your organization's projects.
 
 ```bash Syntax
 valkyrie project list \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 **Options**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Project guides](/runs/start#put-the-run-in-a-project).
@@ -121,7 +127,8 @@ valkyrie project update \
   [--customer <TEXT>] \
   [--clear-customer] \
   [--tag <TEXT>...] \
-  [--clear-tags]
+  [--clear-tags] \
+  [--json]
 ```
 
 **Arguments**
@@ -167,6 +174,11 @@ valkyrie project update \
   <p className="mb-0 mt-1">{"Remove all extra tags."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Project guides](/runs/start#put-the-run-in-a-project).
 
 ---
@@ -178,7 +190,8 @@ Delete an unused project. Projects with run history cannot be deleted.
 ```bash Syntax
 valkyrie project delete \
   <HANDLE> \
-  [--yes|-y]
+  [--yes|-y] \
+  [--json]
 ```
 
 **Arguments**
@@ -192,6 +205,11 @@ valkyrie project delete \
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
   <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Project guides](/runs/start#put-the-run-in-a-project).

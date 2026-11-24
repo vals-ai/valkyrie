@@ -1,12 +1,12 @@
-from pathlib import Path
-
 import httpx
 import pytest
 
+from tracker.services.datasets import image_config as image_config_module
 from tracker.services.datasets.image_config import (
     DOCKER_HUB,
+    _get_json,
     _public_https_only,
-    dockerfile_base_image,
+    image_config,
     image_reference,
 )
 
@@ -29,26 +29,6 @@ def test_an_image_name_splits_into_registry_repository_and_reference(
     assert image_reference(image) == reference
 
 
-@pytest.mark.description("A dockerfile starts from the image of its last stage.")
-@pytest.mark.parametrize(
-    ("dockerfile", "base"),
-    [
-        ("FROM golang:1.23\nRUN go version\n", "golang:1.23"),
-        ("FROM --platform=linux/amd64 python:3.12 AS build\nFROM golang:1.23\n", "golang:1.23"),
-        ("FROM golang:1.23 AS build\nRUN true\nFROM build\n", None),
-        ("ARG BASE=golang\nFROM ${BASE}:1.23\n", None),
-    ],
-    ids=["one stage", "last stage", "earlier stage", "build argument"],
-)
-def test_a_dockerfile_starts_from_the_image_of_its_last_stage(
-    tmp_path: Path, dockerfile: str, base: str | None
-) -> None:
-    path = tmp_path / "Dockerfile"
-    path.write_text(dockerfile)
-
-    assert dockerfile_base_image(path) == base
-
-
 @pytest.mark.description("Image config lookups contact only public hosts over https.")
 @pytest.mark.parametrize(
     ("url", "allowed"),
@@ -68,3 +48,18 @@ async def test_image_config_lookups_contact_only_public_hosts_over_https(url: st
     else:
         with pytest.raises(httpx.RequestError):
             await _public_https_only(request)
+
+
+@pytest.mark.description("A registry response over the size cap is refused while it is read.")
+async def test_a_registry_response_over_the_size_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(image_config_module, "MAX_RESPONSE_BYTES", 8)
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=b'{"config": "too long"}'))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(ValueError, match="more than 8 bytes"):
+            await _get_json(client, "https://registry.example/v2/app/manifests/1")
+
+
+@pytest.mark.description("An image whose registry address is not a valid URL has an unknown config.")
+async def test_an_image_with_an_invalid_registry_address_has_an_unknown_config() -> None:
+    assert await image_config("registry:99999/app") is None

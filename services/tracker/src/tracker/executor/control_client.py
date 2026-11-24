@@ -15,10 +15,11 @@ def _retry_pause(
     operation: str, error: httpx.TransportError | httpx.HTTPStatusError, deadline: float, backoff: float
 ) -> float:
     remaining = deadline - time.monotonic()
+    retryable_statuses = (500, 502, 503, 504) if operation == "monitor_tasks" else (502, 503, 504)
     if (
         operation not in RETRYABLE_OPERATIONS
         or remaining <= 0
-        or (isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in (502, 503, 504))
+        or (isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in retryable_statuses)
     ):
         raise error
     return min(random.uniform(0, backoff), remaining)
@@ -54,6 +55,7 @@ RETRYABLE_OPERATIONS = frozenset(
         "queue-states",
         "read_dataset_version",
         "read_run_state",
+        "read_source_rejection",
         "read_task",
         "record_sandbox_cost",
         "record_sandbox_link",

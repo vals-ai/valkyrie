@@ -12,6 +12,7 @@ from tracker.executor.control_queue import queue_pool_lock_id
 _TASK_EVALUATION_LOCK_SCOPE = "task-evaluation"
 _TASK_BUILD_LOCK_SCOPE = "task-build"
 _SANDBOX_COST_SWEEP_LOCK_RESOURCE_ID = "sandbox-cost-sweep"
+_LOCAL_TRACKER_LOCK_RESOURCE_ID = "local-tracker"
 
 
 def advisory_lock_key(resource_id: str) -> int:
@@ -156,6 +157,10 @@ def task_evaluation_lock(engine: Engine, task_row_id: UUID) -> PostgresAdvisoryL
 
 def sandbox_cost_sweep_lock(engine: Engine) -> PostgresAdvisoryLock:
     return PostgresAdvisoryLock(engine, resource_id=_SANDBOX_COST_SWEEP_LOCK_RESOURCE_ID)
+
+
+def local_tracker_lock(engine: Engine) -> PostgresAdvisoryLock:
+    return PostgresAdvisoryLock(engine, resource_id=_LOCAL_TRACKER_LOCK_RESOURCE_ID)
 
 
 def task_build_lock(engine: Engine, task_row_id: UUID) -> PostgresAdvisoryLock:

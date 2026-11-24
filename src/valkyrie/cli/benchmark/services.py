@@ -5,7 +5,7 @@ import click
 from valkyrie.sdk import BenchmarkServiceEntry, BenchmarkServiceHealth
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_table, paginate_cli_pages
+from valkyrie.cli.display import emit, format_table, paginate_cli_pages, json_option, empty
 
 
 @click.group(help="Save benchmark service URLs that your runs use instead of the hosted services.")
@@ -32,17 +32,20 @@ def service() -> None:
     help="Organization secret whose value the Tracker sends to the service. Create it with `valkyrie secret set`.",
 )
 @click.option("--auth-header", metavar="HEADER", help="Header that carries the secret. Defaults to Authorization.")
-def service_set(benchmark: str, url: str, auth_secret: str | None, auth_header: str | None) -> None:
+@json_option()
+def service_set(benchmark: str, url: str, auth_secret: str | None, auth_header: str | None, output_format: str) -> None:
     settings = call(
         lambda client: client.settings.set_benchmark_service(
             benchmark, url, auth_secret=auth_secret, auth_header=auth_header
         )
     )
+    if emit(settings, output_format):
+        return
     saved = settings.benchmark_services[benchmark]
     message = f"Runs of {benchmark} now use {saved.url}"
     if saved.auth_secret_name:
         message += f", sending the secret {saved.auth_secret_name} as {saved.auth_header_name}"
-    click.echo(f"{message}.")
+    click.echo(f"{message}.", err=True)
 
 
 @service.command(
@@ -55,9 +58,12 @@ def service_set(benchmark: str, url: str, auth_secret: str | None, auth_header: 
     ),
 )
 @click.argument("benchmark")
-def service_remove(benchmark: str) -> None:
+@json_option()
+def service_remove(benchmark: str, output_format: str) -> None:
     call(lambda client: client.settings.remove_benchmark_service(benchmark))
-    click.echo(f"Runs of {benchmark} now use the hosted service.")
+    if emit({"removed": benchmark}, output_format):
+        return
+    click.echo(f"Runs of {benchmark} now use the hosted service.", err=True)
 
 
 @service.command(
@@ -68,14 +74,19 @@ def service_remove(benchmark: str) -> None:
         "A URL you saved replaces the hosted service with the same name."
     ),
 )
-def service_list() -> None:
+@json_option()
+def service_list(output_format: str) -> None:
     saved = call(lambda client: client.settings.get()).benchmark_services
 
     catalog = call(lambda client: client.services.catalog())
     services_by_name = {service.name: service for service in catalog.services}
     services_by_name.update({name: BenchmarkServiceEntry(name=name, url=entry.url) for name, entry in saved.items()})
+    if output_format == "json":
+        response = call(lambda client: client.services.check(list(services_by_name.values())))
+        emit(response)
+        return
     if not services_by_name:
-        click.echo(click.style("No benchmark services configured.", fg="yellow"))
+        empty("No benchmark services configured.")
         return
 
     paginate_services(
@@ -89,31 +100,19 @@ def _service_source_domain(service: BenchmarkServiceHealth) -> str:
     return host.removeprefix(f"{service.name}.")
 
 
-def _health_checked_page(
-    services: Sequence[BenchmarkServiceEntry],
-    cache: dict[str, BenchmarkServiceHealth],
-    check_services: Callable[[list[BenchmarkServiceEntry]], list[BenchmarkServiceHealth]],
-) -> list[BenchmarkServiceHealth]:
-    missing = [service for service in services if service.name not in cache]
-    if missing:
-        cache.update({service.name: service for service in check_services(missing)})
-    for service in missing:
-        cache.setdefault(
-            service.name, BenchmarkServiceHealth(name=service.name, url=service.url, healthy=False, latency_ms=None)
-        )
-    return [cache[service.name] for service in services]
-
-
 def paginate_services(
     services: Sequence[BenchmarkServiceEntry],
     check_services: Callable[[list[BenchmarkServiceEntry]], list[BenchmarkServiceHealth]],
     limit: int = 10,
 ) -> None:
-    health_cache: dict[str, BenchmarkServiceHealth] = {}
-
     def load_page(offset: int, page_limit: int) -> tuple[int, list[BenchmarkServiceHealth]]:
-        page_services = _health_checked_page(services[offset : offset + page_limit], health_cache, check_services)
-        return len(services), page_services
+        page_services = services[offset : offset + page_limit]
+        checked = {service.name: service for service in check_services(list(page_services))}
+        return len(services), [
+            checked.get(service.name)
+            or BenchmarkServiceHealth(name=service.name, url=service.url, healthy=False, latency_ms=None)
+            for service in page_services
+        ]
 
     def render_page(
         page_services: list[BenchmarkServiceHealth],
@@ -143,5 +142,5 @@ def paginate_services(
         load_page,
         render_page,
         limit=limit,
-        render_empty=lambda: click.echo(click.style("No benchmark services found.", fg="yellow")),
+        render_empty=lambda: empty("No benchmark services found."),
     )

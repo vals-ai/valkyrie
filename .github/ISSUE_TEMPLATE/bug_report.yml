@@ -1,0 +1,40 @@
+name: Bug report
+description: Something in the CLI, SDK, or Tracker is broken or behaves unexpectedly.
+labels: [bug]
+body:
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or SDK call
+      description: The exact command or SDK call you ran.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened
+      description: What you expected, what happened, and the full error output.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Your CLI version from `uv tool list` and, if you use the SDK, its version from `uv pip show valkyrie-sdk`.
+    validations:
+      required: true
+  - type: dropdown
+    id: tracker
+    attributes:
+      label: Tracker
+      options:
+        - Hosted Valkyrie
+        - Local Tracker
+    validations:
+      required: true
+  - type: input
+    id: run
+    attributes:
+      label: Run ID
+      description: The run ID, if the problem involves a run.

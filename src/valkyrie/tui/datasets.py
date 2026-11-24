@@ -18,7 +18,8 @@ from valkyrie.sdk.models import DatasetResponse, DatasetTaskResponse
 from valkyrie.tui.browse import BrowseScreen, matches
 from valkyrie.tui.source import RunSource
 from valkyrie.tui.theme import palette
-from valkyrie.tui.widgets import CommandLine, KeyBar, Table, TopBar, ago, shown
+from valkyrie.display import ago
+from valkyrie.tui.widgets import CommandLine, KeyBar, Table, TopBar, shown
 
 if TYPE_CHECKING:
     from valkyrie.tui.app import ValkyrieApp

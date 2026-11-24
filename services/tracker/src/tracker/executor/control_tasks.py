@@ -6,10 +6,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from pydantic import BaseModel
+import httpx
+from pydantic import AwareDatetime, BaseModel, Field
 
 from tracker.domain import BenchmarkStatus, FailureCategory, FailurePhase, TaskStatus
 from tracker.egress_proxy.resolve import AttemptStoppedError
+from tracker.exceptions import ExecutionAuthorityRevoked
 from tracker.executor.control_client import ControlClient
 from tracker.executor.control_protocol import (
     AttemptPhaseSnapshot,
@@ -75,9 +77,15 @@ class TaskReadResponse(BaseModel):
     benchmark: BenchmarkState
 
 
+class TaskLastLog(BaseModel):
+    attempt: AttemptRef
+    last_log_at: AwareDatetime
+
+
 class TaskMonitorRequest(BaseModel):
     ref: DispatchRef
     task_ids: list[str]
+    last_logs: list[TaskLastLog] = Field(default_factory=list)
 
 
 class TaskMonitorResponse(BaseModel):
@@ -154,6 +162,8 @@ class TaskFailure(BaseModel):
     cause_code: str | None
     phase: FailurePhase | None
     transient: bool | None
+    sandbox_provider: str | None = None
+    sandbox_source: str | None = None
 
 
 class TaskFailureRequest(BaseModel):
@@ -163,6 +173,15 @@ class TaskFailureRequest(BaseModel):
     expected_status: TaskStatus | None
     retry_scheduled: bool
     failed_attempt_number: int | None
+
+
+class SourceRejectionRequest(BaseModel):
+    ref: DispatchRef
+    source: str | None
+
+
+class SourceRejectionResponse(BaseModel):
+    message: str | None
 
 
 class TaskAccountingRequest(BaseModel):
@@ -236,6 +255,7 @@ class TaskControl:
         self.client = client
         self.ref = ref
         self._active: dict[UUID, AttemptPhaseSnapshot] = {}
+        self._last_logs: dict[UUID, TaskLastLog] = {}
         self._accounting: dict[UUID, TaskAccountingRequest] = {}
         self._search_costs: dict[tuple[UUID, str | None], TaskSearchCostsRequest] = {}
         self._checkpoints: dict[UUID, TaskResumeRequest] = {}
@@ -287,9 +307,24 @@ class TaskControl:
         return await self.client.call("read_task", TaskReadRequest(ref=self.ref, task=task), TaskReadResponse)
 
     async def monitor(self, task_ids: list[str]) -> TaskMonitorResponse:
-        return await self.client.call(
-            "monitor_tasks", TaskMonitorRequest(ref=self.ref, task_ids=task_ids), TaskMonitorResponse
+        last_logs = list(self._last_logs.values())
+        response = await self.client.call(
+            "monitor_tasks",
+            TaskMonitorRequest(ref=self.ref, task_ids=task_ids, last_logs=last_logs),
+            TaskMonitorResponse,
         )
+        for entry in last_logs:
+            row_id = entry.attempt.task_row_id
+            if self._last_logs.get(row_id) is entry:
+                del self._last_logs[row_id]
+        return response
+
+    async def flush_last_logs(self) -> None:
+        if self._last_logs:
+            try:
+                await self.monitor([])
+            except (httpx.TransportError, httpx.HTTPStatusError, ExecutionAuthorityRevoked):
+                logger.warning("Final task log timestamps could not be recorded", exc_info=True)
 
     async def admit(self, attempt: AttemptRef) -> DirectAdmissionResponse:
         return await self.client.call(
@@ -303,6 +338,11 @@ class TaskControl:
             RemoteGraderGrantResponse,
         )
         return response.grant_token
+
+    def record_last_log(self, attempt: AttemptRef, last_log_at: datetime) -> None:
+        previous = self._last_logs.get(attempt.task_row_id)
+        if previous is None or (attempt.started_at, last_log_at) > (previous.attempt.started_at, previous.last_log_at):
+            self._last_logs[attempt.task_row_id] = TaskLastLog(attempt=attempt, last_log_at=last_log_at)
 
     async def transition(self, request: TaskMutationRequest) -> bool:
         return (await self.client.call("transition_task", request, TaskDecision)).accepted
@@ -320,6 +360,10 @@ class TaskControl:
 
     async def finish(self, request: TaskResultRequest) -> bool:
         return (await self.client.call("finish_task_evaluation", request, TaskDecision)).accepted
+
+    async def source_rejection(self, source: str | None) -> str | None:
+        request = SourceRejectionRequest(ref=self.ref, source=source)
+        return (await self.client.call("read_source_rejection", request, SourceRejectionResponse)).message
 
     async def fail(self, request: TaskFailureRequest) -> bool:
         if not request.retry_scheduled:

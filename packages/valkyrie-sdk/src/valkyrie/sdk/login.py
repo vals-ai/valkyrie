@@ -19,7 +19,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationErr
 from valkyrie.sdk._transfer import finish_before_cancelling
 from valkyrie.sdk.errors import ValkyrieConfigError, ValkyrieTransportError
 
-DEFAULT_SESSION_DIR = Path("~/.config/valkyrie/sessions")
+DEFAULT_SESSION_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config") / "valkyrie" / "sessions"
 REFRESH_MARGIN_SECONDS = 60.0
 _LOGIN_EXPIRED = "Your Valkyrie login has expired. Run `valkyrie login` again."
 
@@ -102,7 +102,7 @@ def _read[Model: _Response](model: type[Model], response: httpx.Response, action
 
 
 class LoginSession(BaseModel):
-    """A browser login for one Tracker, saved under `~/.config/valkyrie/sessions` by `valkyrie login`."""
+    """A browser login for one Tracker, saved by `valkyrie login` under `valkyrie/sessions` in `XDG_CONFIG_HOME`, which defaults to `~/.config`."""
 
     model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
 

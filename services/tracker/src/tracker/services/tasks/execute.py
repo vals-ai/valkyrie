@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import partial
 from pathlib import PurePosixPath
 from types import TracebackType
 from typing import Any, TypeVar, cast
@@ -27,8 +28,11 @@ from benchmark_service import (
     SandboxCreatedData,
     SandboxNotFoundError,
     SandboxProvider,
+    SandboxAccountRejectedError,
     SandboxProviderConfig,
     SandboxRecoveryAttempt,
+    SnapshotSource,
+    TargetedSnapshotSource,
     UnsupportedSandboxConfigError,
 )
 from benchmark_service.client import BenchmarkServiceError
@@ -68,7 +72,14 @@ from tracker.config import (
     UPSTREAM_MODEL_GATEWAY_URL,
     VALKYRIE_STAGE,
 )
-from tracker.domain import AgentCausedExitReason, BenchmarkStatus, FailureCategory, FailurePhase, TaskStatus
+from tracker.domain import (
+    ACCOUNT_REJECTION_SOURCE,
+    AgentCausedExitReason,
+    BenchmarkStatus,
+    FailureCategory,
+    FailurePhase,
+    TaskStatus,
+)
 from tracker.executor.control_protocol import AttemptRef, PhaseRef, TaskRef
 from tracker.executor.control_tasks import (
     NativeOutputRequest,
@@ -86,6 +97,7 @@ from tracker.executor.control_tasks import (
 )
 from tracker.executor.control_queue import queued_sandbox_name
 from tracker.services.datasets.config import MultiStepRewardStrategy
+from tracker.services.datasets.egress import allow_inference_hosts
 from tracker.services.datasets.oracle import ORACLE_AGENT
 from tracker.services.datasets.retrieve_task import StepPlan, TaskFolderResponse
 from tracker.clients.dataset_tasks import DatasetTaskService
@@ -116,6 +128,7 @@ from tracker.external_service_gateway import (
 from tracker.generation_plan import GenerationPlan
 from tracker.logging import get_logger
 from tracker.logging.events import LogEvent
+from tracker.logging.context import sandbox_provider_var
 from tracker.observability import TaskOutcome, error_span, incr, record_task_outcome
 from tracker.observability.sentry import capture_exception, clear_sandbox_context, task_scope
 from tracker.observability.tracing import observability_span
@@ -125,10 +138,13 @@ from tracker.sandbox import (
     MODAL_ATTEMPT_TAG,
     DependencySetupMode,
     SandboxCreationState,
+    SandboxSourceRejectedError,
     apply_egress_policy,
     create_agent_error_redactor,
     create_sandbox,
+    gateway_env_name,
     install_agent_dependencies,
+    rejection_source,
     run_agent,
     runtime_sandbox,
     sandbox_resolves,
@@ -224,6 +240,10 @@ async def _child_egress_grants(
         yield grants
 
 
+def _rejected_source(exc: BaseException, source: str | None) -> str | None:
+    return ACCOUNT_REJECTION_SOURCE if isinstance(exc, SandboxAccountRejectedError) else source
+
+
 def _exception_message(exc: BaseException) -> str:
     if isinstance(exc, UnsupportedSandboxConfigError):
         return str(exc)
@@ -274,6 +294,7 @@ async def _record_failure_before_retry(
                 cause_code=exc.cause_code,
                 phase=exc.phase,
                 transient=exc.transient,
+                sandbox_provider=sandbox_provider_var.get() or None,
             ),
             expected_status=None,
             retry_scheduled=True,
@@ -424,6 +445,7 @@ class TrackedTask:
                             cause_code=failure.cause_code,
                             phase=failure.phase,
                             transient=failure.transient,
+                            sandbox_provider=sandbox_provider_var.get() or None,
                         ),
                         expected_status=None,
                         retry_scheduled=False,
@@ -465,8 +487,15 @@ class TaskMonitor:
                     tick = await self._control.monitor(list(tasks_to_check))
                 except ExecutionAuthorityRevoked:
                     revoked = True
-                except httpx.ReadTimeout:
-                    logger.warning("Task monitor read timed out; retrying next tick", exc_info=True)
+                except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                    if isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in (
+                        500,
+                        502,
+                        503,
+                        504,
+                    ):
+                        raise
+                    logger.warning("Task monitor request failed; retrying next tick", exc_info=True)
                     await asyncio.sleep(self._TRACK_INTERVAL)
                     continue
             for task_id, tracked in tracking_snapshot:
@@ -651,7 +680,7 @@ async def process_task(
     ) -> dict[str, dict[str, Any] | None]:
         clear_sandbox_context()
         stream_key = f"{benchmark_id}:{task_log_stream_name(task_id, task_row.started_at)}"
-        async with TaskLogBuffer(runtime.logs, stream_key) as task_logs:
+        async with TaskLogBuffer(runtime.logs, stream_key, partial(control.record_last_log, task_row.ref)) as task_logs:
             return await _process_task_attempt(
                 task_row=task_row,
                 start_benchmark_request=start_benchmark_request,
@@ -746,6 +775,7 @@ async def _process_task_attempt(
     sentry_sdk.set_tag("agent_name", start_benchmark_request.contract.name)
 
     phase = FailurePhase.ADMISSION
+    sandbox_source: str | None = None
 
     requested_attempt_started_at = task_row.started_at
     read_result = await control.read(TaskRef(org_id=task_row.org_id, task_row_id=task_row.id, task_id=task_row.task_id))
@@ -891,6 +921,13 @@ async def _process_task_attempt(
     if benchmark_started_by_email:
         identity["email"] = benchmark_started_by_email
     attempt_id = task_attempt_id(task_row.id, attempt_started_at)
+    labels = {
+        "Benchmark": start_benchmark_request.benchmark_name,
+        "Id": str(benchmark_id),
+        "run-id": str(benchmark_id),
+        MODAL_ATTEMPT_TAG: attempt_id,
+        "Task": task_row.task_id,
+    }
     attested_model = (
         start_benchmark_request.contract.model if start_benchmark_request.contract.inference_settings_attested else None
     )
@@ -983,7 +1020,18 @@ async def _process_task_attempt(
         async with enforce_wall_deadline(task_row.credited_wall_deadline_at), resumed_child_egress() as grants:
             async with grading_credentials(None) as grading_gateway:
                 result = await until_stream_ends(
-                    run_benchmark_service_websocket(
+                    benchmark_service.regrade(
+                        task_row.task_id,
+                        state,
+                        objects=runtime.objects,
+                        labels=labels,
+                        sandbox_provider=sandbox_provider_config,
+                        on_message=task_logs.write_line,
+                        on_sandbox_created=on_sandbox_created,
+                        grading_gateway=grading_gateway,
+                    )
+                    if isinstance(benchmark_service, DatasetTaskService)
+                    else run_benchmark_service_websocket(
                         benchmark_service.resume_evaluation(
                             task_row.task_id,
                             eval_resume_state=state,
@@ -1064,7 +1112,9 @@ async def _process_task_attempt(
                     "transient": failure.transient,
                 },
             )
-            if not is_agent_outcome(exc) and not isinstance(exc, (VerifierResultError, UnsupportedSandboxConfigError)):
+            if not is_agent_outcome(exc) and not isinstance(
+                exc, (VerifierResultError, UnsupportedSandboxConfigError, SandboxSourceRejectedError)
+            ):
                 with sentry_sdk.new_scope() as scope:
                     scope.set_tag("failure_category", failure.category.value)
                     scope.set_tag("failure_phase", phase.value)
@@ -1081,6 +1131,8 @@ async def _process_task_attempt(
                 cause_code=failure.cause_code,
                 phase=phase,
                 transient=failure.transient,
+                sandbox_provider=sandbox_provider_var.get() or None,
+                sandbox_source=_rejected_source(exc, sandbox_source) if phase is FailurePhase.SANDBOX else None,
             ),
             expected_status=expected_failure_status,
             retry_scheduled=False,
@@ -1294,7 +1346,15 @@ async def _process_task_attempt(
         async with enforce_wall_deadline(task_row.credited_wall_deadline_at):
             task_data = await recovery_attempt.retrieve_task()
         grading_spec = None if task_data.eval_sandbox is None else resolve_grading_spec(task_data)
+        sandbox_source = rejection_source(task_data.source)
         unrestricted_docker = sandbox_provider_config.type == "docker"
+        if unrestricted_docker and isinstance(
+            task_data.source.outer if isinstance(task_data.source, ComposeSource) else task_data.source,
+            (SnapshotSource, TargetedSnapshotSource),
+        ):
+            raise InvalidSandboxConfigurationError(
+                "Local Docker execution can't create a sandbox from a snapshot; use an image or a Dockerfile"
+            )
         run_egress_policy = combine_run_egress_policies(
             task_data.egress.run,
             start_benchmark_request.contract.egress_allowlist,
@@ -1351,14 +1411,6 @@ async def _process_task_attempt(
         ) -> EgressPolicy:
             return select_policy(policy, stage, step, phase, context=egress_context)
 
-        labels = {
-            "Benchmark": start_benchmark_request.benchmark_name,
-            "Id": str(benchmark_id),
-            "run-id": str(benchmark_id),
-            MODAL_ATTEMPT_TAG: attempt_id,
-            "Task": task_row.task_id,
-        }
-
         if queue_context is None and not execution_is_current(TaskStatus.BUILDING):
             return {task_id: None}
 
@@ -1367,6 +1419,7 @@ async def _process_task_attempt(
 
         deadline_controller: ExternalServiceDeadlineController
         sandbox_gateway_url: str | None = None
+        agent_env: dict[str, str] = {}
 
         task_env = folder.env if folder is not None else {}
         task_secret_values = [task_env[name] for name in folder.secret_env] if folder is not None else []
@@ -1401,7 +1454,7 @@ async def _process_task_attempt(
         @asynccontextmanager
         async def sandbox_context() -> AsyncGenerator[Sandbox]:
             nonlocal deadline_controller, start_sandbox_build_time, redact_error, phase, sandbox_gateway_url
-            nonlocal secret_env_names
+            nonlocal secret_env_names, agent_env
             start_sandbox_build_time = time.perf_counter()
             sandbox_name = (
                 task_row.task_id if queue_context is None else queued_sandbox_name(task_row.id, attempt_started_at)
@@ -1437,6 +1490,7 @@ async def _process_task_attempt(
                     if sandbox_gateway_url
                     else None,
                 )
+                agent_env = {**sandbox_environment.env_vars, **sandbox_environment.secrets}
                 redact_error = create_agent_error_redactor(
                     [
                         *(scoped_env_vars[name] for name in contract.secrets if name in scoped_env_vars),
@@ -1481,6 +1535,10 @@ async def _process_task_attempt(
                     finally:
                         if wall_timeout is not None and not wall_timeout.expired():
                             wall_timeout.reschedule(None)
+
+        if rejection := await control.source_rejection(sandbox_source):
+            phase = FailurePhase.SANDBOX
+            raise SandboxSourceRejectedError(f"Not creating a sandbox; the provider already refused it: {rejection}")
 
         async with AsyncExitStack() as sandbox_stack:
             token = policy_context.set(egress_context)
@@ -1669,6 +1727,11 @@ async def _process_task_attempt(
                     generation_gateway_url = (
                         EXTERNAL_SERVICE_GATEWAY_URL if run_controller.snapshot is not None else None
                     )
+                    if folder is not None and not oracle:
+                        run_env = dict(agent_env)
+                        if generation_gateway_url is not None:
+                            run_env[gateway_env_name(run_plan.episode, run_plan.staged)] = generation_gateway_url
+                        run_egress = allow_inference_hosts(run_egress, run_env, task_logs.write_line)
                     run_access = RunStageAccess()
                     if not unrestricted_docker:
                         if not task_data.egress.run_through_proxy:
@@ -1727,6 +1790,7 @@ async def _process_task_attempt(
                             skills_dir=task_data.skills_dir,
                             task_dir=task_data.task_dir,
                             on_search_costs=lambda charges: save_search_costs(charges, step_name),
+                            safe_python_path=folder is None,
                         )
                     except AgentRunFailedError as agent_error:
                         gateway_url = generation_gateway_url or resolved_secrets.get(MODEL_GATEWAY_URL)

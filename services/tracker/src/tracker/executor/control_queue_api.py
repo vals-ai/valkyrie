@@ -636,6 +636,7 @@ def reconcile(
         RemoteGraderRepository(session).close_attempt(task.id, attempt_id_for(task))
         task.status = TaskStatus.PENDING
         task.started_at = max(task.started_at + timedelta(microseconds=1), now)
+        task.last_log_at = None
     if not stale_attempt:
         BenchmarkRepository(session).save(task)
     session.commit()

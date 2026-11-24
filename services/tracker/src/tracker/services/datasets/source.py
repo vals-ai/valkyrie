@@ -59,16 +59,16 @@ class LocalFolderSource:
         self._root = root
 
     async def task_ids(self) -> list[str]:
-        return list(await asyncio.to_thread(self._folders))
+        return list(await asyncio.to_thread(self.task_folders))
 
     @asynccontextmanager
     async def open_task(self, task_id: str, parts: Collection[str] = ()) -> AsyncGenerator[Path]:
-        folders = await asyncio.to_thread(self._folders)
+        folders = await asyncio.to_thread(self.task_folders)
         if task_id not in folders:
             raise FileNotFoundError(f"Task {task_id!r} is not under {self._root}")
         yield folders[task_id]
 
-    def _folders(self) -> dict[str, Path]:
+    def task_folders(self) -> dict[str, Path]:
         if not self._root.is_dir():
             raise FileNotFoundError(f"{self._root} is not a folder")
         return discover_task_folders(self._root)

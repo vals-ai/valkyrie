@@ -21,7 +21,7 @@ _RUN_ID = UUID("123e4567-e89b-12d3-a456-426614174000")
         "Test cases:\n"
         "- Comma-separated task IDs are trimmed and deduplicated.\n"
         "- A task ID file uses the shared one-per-line parser.\n"
-        "- Inline and file selectors cannot be combined.\n"
+        "- A missing task ID file reports an error.\n"
         "- A delimiter-only selector cannot widen into a full-run stop."
     )
 )
@@ -32,10 +32,8 @@ def test_stop_task_selection(tracker: MockTracker, tmp_path: Path) -> None:
     runner = CliRunner()
 
     inline_result = runner.invoke(stop, [str(_RUN_ID), "--task-ids", "task-a, task-b,task-a"], input="y\n")
-    file_result = runner.invoke(stop, [str(_RUN_ID), "--task-ids-file", str(task_ids_file)], input="y\n")
-    conflicting_result = runner.invoke(
-        stop, [str(_RUN_ID), "--task-ids", "task-a", "--task-ids-file", str(task_ids_file)]
-    )
+    file_result = runner.invoke(stop, [str(_RUN_ID), "--task-ids", f"@{task_ids_file}"], input="y\n")
+    conflicting_result = runner.invoke(stop, [str(_RUN_ID), "--task-ids", f"@{tmp_path / 'missing.txt'}"])
     empty_result = runner.invoke(stop, [str(_RUN_ID), "--task-ids", ","])
 
     assert inline_result.exit_code == 0, inline_result.output
@@ -44,8 +42,8 @@ def test_stop_task_selection(tracker: MockTracker, tmp_path: Path) -> None:
         ["task-a", "task-b"],
         ["task-c", "task-d"],
     ]
-    assert conflicting_result.exit_code == 2
-    assert "mutually exclusive" in conflicting_result.output
+    assert conflicting_result.exit_code == 1
+    assert "Failed to read task ids" in conflicting_result.output
     assert empty_result.exit_code == 2
     assert "No task ids provided" in empty_result.output
 

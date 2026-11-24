@@ -9,11 +9,13 @@ This page documents all 3 commands in the `login` group in registration order. U
 
 ## `valkyrie login` {#login}
 
-Sign in with your browser, save the login, and use this Tracker by default.
+Sign in to the active Tracker with your browser and save the login for it.
 
 ```bash Syntax
 valkyrie login \
-  [--no-browser]
+  [--no-browser] \
+  [--yes|-y] \
+  [--json]
 ```
 
 **Options**
@@ -23,17 +25,35 @@ valkyrie login \
   <p className="mb-0 mt-1">{"Print the sign-in link without opening a browser."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--yes, -y"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Allow the browser sign-in flow with --json."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Login guides](/get-started/configuration#sign-in).
 
 ---
 
 ## `valkyrie logout` {#logout}
 
-Forget the saved login for this Tracker, and stop using it by default.
+Forget the saved login for the active Tracker.
 
 ```bash Syntax
-valkyrie logout
+valkyrie logout \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Login guides](/get-started/configuration#sign-in).
 
@@ -44,7 +64,15 @@ Task guidance: [Login guides](/get-started/configuration#sign-in).
 Show which Tracker, organization and account your requests use.
 
 ```bash Syntax
-valkyrie whoami
+valkyrie whoami \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Login guides](/get-started/configuration#sign-in).

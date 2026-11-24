@@ -56,12 +56,12 @@ they hold. You can't undo it.
 
 ## Shed load when a model hits rate limits
 
-Lowering concurrency waits for running tasks to finish. `run shed` lowers it and stops the
+Lowering concurrency waits for running tasks to finish. `run update --shed` lowers it and stops the
 most recently started tasks at once, which have done the least work, until the run is at
 the new limit:
 
 ```bash
-valkyrie run shed RUN_ID --concurrency 10
+valkyrie run update --shed RUN_ID --concurrency 10
 ```
 
 - The CLI lists the tasks to stop and asks you to confirm. `--dry-run` only lists them.
@@ -82,7 +82,7 @@ valkyrie run retry RUN_ID
 
 - On a finished or stopped run, `resume` reruns tasks in `STOPPED`, and `retry` reruns tasks
   in `STOPPED` or `ERROR`.
-- With `--task-ids` or `--task-ids-file` on a finished or stopped run, `retry` reruns
+- With `--task-ids` accepting `@FILE` on a finished or stopped run, `retry` reruns
   exactly those tasks, whatever their status, and `resume` reruns them along with the
   stopped tasks. A dataset task the run never had is added to it.
 - On a run in progress, `retry` reruns failed and stopped tasks, and `resume` only applies a
@@ -99,7 +99,7 @@ These options change what the rerun uses:
 | `-s ENV_VAR SECRET` | Adds or replaces a secret mapping, for example after you rotate a key. |
 | `-H NAME VALUE` | Sends a header to the benchmark service. |
 | `--concurrency` | Sets a new concurrency. |
-| `--connect` | Streams progress after the rerun starts. |
+| `--follow` | Streams progress after the rerun starts. |
 
 A rerun that restarts the agent gives the task a fresh [wall
 limit](/runs/time-limits#wall-limit).

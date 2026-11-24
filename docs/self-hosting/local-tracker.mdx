@@ -1,172 +1,134 @@
 ---
 title: "Run Tracker locally"
-description: "Run the Tracker on your machine without AWS, with sandboxes on Daytona, Modal, or Docker."
+description: "Run the Tracker on your machine without AWS, with sandboxes on Docker, Daytona, or Modal."
 ---
 
-A local Tracker keeps run state in a PostgreSQL container and writes artifacts and logs to
-a folder on your machine. Sandboxes run on Daytona, Modal, or your own Docker daemon, and
-no AWS account or login is needed.
+A local Tracker runs on your machine with no AWS account and no sign-in. It keeps run state in a PostgreSQL container, writes artifacts and logs to a local folder, and starts sandboxes on Docker, Daytona, or Modal.
 
-You need Docker, the [Valkyrie CLI](/get-started/quickstart#install-the-cli), and a Daytona
-API key or Modal token unless you only use Docker sandboxes.
+You need Docker with Compose, Make, and `uv`.
 
-## Get the code
+## Start the Tracker
 
-```bash
-git clone https://github.com/vals-ai/Valkyrie.git
+1. Install the CLI, then get the code and install its dependencies:
 
-cd Valkyrie
+   ```bash
+   uv tool install valkyrie-cli
 
-make -C services/tracker install
-```
+   git clone https://github.com/vals-ai/Valkyrie.git
 
-## Add your secrets
+   cd Valkyrie
 
-Create `.env` at the repository root with your provider settings and the secrets your
-agents declare:
+   make install
+   ```
+
+2. Start the Tracker in the foreground:
+
+   ```bash
+   valk tracker start
+   ```
+
+3. In a second terminal, make it the default Tracker and check the connection:
+
+   ```bash
+   valk tracker use local
+
+   valk whoami
+   ```
+
+Every `valk` command now talks to your local Tracker and works the same way it does against a hosted one.
+
+- A `VALKYRIE_URL` in your shell or `.env` overrides `tracker use`, so remove it first.
+- To go back to hosted Valkyrie, run `valk tracker use vals`.
+
+## Add secrets
+
+A Docker run whose agent declares no secrets needs no setup. For a model key or a Daytona or Modal account, put the values in `.env` at the repository root:
 
 ```env .env
+OPENAI_API_KEY=OPENAI_KEY
+
 DAYTONA_API_KEY=API_KEY
 DAYTONA_API_URL=https://app.daytona.io/api
 DAYTONA_TARGET=us
 
 MODAL_TOKEN_ID=TOKEN_ID
 MODAL_TOKEN_SECRET=TOKEN_SECRET
-
-OPENAI_API_KEY=OPENAI_KEY
 ```
 
-Replace the following:
+Replace *`OPENAI_KEY`* with a secret your agent declares, *`API_KEY`* with your Daytona API key, and *`TOKEN_ID`* and *`TOKEN_SECRET`* with your Modal token. Keep only the lines you use.
 
-- *`API_KEY`*: your Daytona API key
-- *`TOKEN_ID`* and *`TOKEN_SECRET`*: your Modal token's ID and secret
-- *`OPENAI_KEY`*: an example agent secret, here an OpenAI API key
+Restart the Tracker. It reads `.env` at the repository root and prints its path at startup.
 
-- Each task reads only the selected provider's settings and the variables its agent
-  contract declares.
+- A task sees only the selected provider's settings and the variables its agent declares.
 - Valkyrie saves the file's path with the run, never its values.
 - Agent contracts can't declare `DAYTONA_*` or `MODAL_TOKEN_*` variables.
-
-## Start the Tracker
-
-From the repository root, set the bootstrap secret used by local execution:
-
-```bash
-export EXECUTOR_BOOTSTRAP_KEY=YOUR_BOOTSTRAP_SECRET
-make local-tracker
-```
-
-This starts PostgreSQL and the project service in Docker, explicitly applies migrations,
-and serves Tracker at `http://127.0.0.1:8000`. The project service listens at
-`http://127.0.0.1:8010` and has its own PostgreSQL.
-
-- Runs, including retries and resumes, use code from your checkout after changes.
-- If you restart Tracker while tasks are waiting to start, retry the run afterwards.
-
-To keep access to queued tasks across a restart, set and retain a base64-encoded 32-byte
-`EXECUTOR_PAYLOAD_LOCAL_KEY` before starting the Tracker. Without it,
-`make local-tracker` generates a new key on each start.
-
-The default settings are in `local-server.yaml` at the repository root:
-
-```yaml local-server.yaml
-data_root: .local/data
-secrets_file: .env
-```
-
-To use other locations, pass your own file with `make local-tracker CONFIG=CONFIG_FILE`,
-where *`CONFIG_FILE`* is its path. Relative paths in it resolve from its folder.
-
-## Choose a benchmark service
-
-Use one of these:
-
-- **A service Vals AI hosts.** Start the Tracker with the hosted services' domain, and set
-  `VALKYRIE_API_KEY` in the CLI's environment to a Valkyrie [access
-  key](/get-started/configuration#create-an-access-key-for-ci) that can use the benchmark:
-
-  ```bash
-  BENCHMARK_SERVICE_BASE_URL=benchmarks.vals.ai make local-tracker
-  ```
-
-- **Your own service**, on your machine or at any URL. Run it
-  [without authentication](/benchmarks/authentication#require-a-credential) and save its
-  URL:
-
-  ```bash
-  valkyrie benchmark service set my-benchmark http://127.0.0.1:8001
-  ```
 
 ## Start a run
 
 ```bash
-export VALKYRIE_URL=http://127.0.0.1:8000
+valk agent push ./my-agent
 
-valkyrie agent push ./my-agent
-
-valkyrie run start --agent my-agent --benchmark my-benchmark \
-  --provider daytona --concurrency 1
+valk run start --agent my-agent --benchmark my-benchmark --provider docker
 ```
 
-- Without `--provider` or a [default
-  provider](/get-started/sandbox-providers#choose-the-provider-for-a-run), runs use
-  `daytona`.
-- Every other `valkyrie run` command works against the local Tracker, which serves artifacts
-  over HTTP, so the CLI doesn't need access to `data_root`.
-- Retries, resumes, and forced stops use the provider and secrets file saved on the run.
+- Runs use `daytona` unless you pass `--provider` or set a [default provider](/get-started/sandbox-providers#choose-the-provider-for-a-run).
+- The Tracker serves artifacts over HTTP, so the CLI doesn't need access to `data_root`.
+- Retries, resumes, and forced stops reuse the provider and secrets file saved on the run.
+
+## Choose a benchmark service
+
+- **A service Vals AI hosts:** start the Tracker with `BENCHMARK_SERVICE_BASE_URL=benchmarks.vals.ai`, and set `VALKYRIE_API_KEY` in the CLI's environment to an [access key](/get-started/configuration#create-an-access-key-for-ci) that can use the benchmark.
+- **Your own service**, on your machine or at any URL: run it [without authentication](/benchmarks/authentication#require-a-credential), then save its URL.
+
+  ```bash
+  valk benchmark service set my-benchmark http://127.0.0.1:8001
+  ```
 
 ## Docker sandboxes
 
-Docker runs each task in a container on the daemon that the Tracker and your benchmark
-service share. Select the daemon with `DOCKER_HOST`, and pass `--provider docker` or set
-it as your default with `valkyrie provider default docker`.
+Docker runs each task in a container on the daemon that the Tracker and your benchmark service share. Select the daemon with `DOCKER_HOST`, and pass `--provider docker` or make it your default with `valk provider default docker`.
 
-- Services Vals AI hosts can't use Docker sandboxes. Start your own service with
-  `CBS_DOCKER_ENABLED=true`, built with the create-benchmark-service version that
-  `services/tracker/pyproject.toml` pins.
-- Docker can't change network access between stages, so the benchmark and the agent must
-  allow unrestricted (`"*"`) access in every stage. Allowlists are refused before a
-  container starts.
+- Services Vals AI hosts can't use Docker sandboxes. Start your own service with `CBS_DOCKER_ENABLED=true`, built with the create-benchmark-service version that `services/tracker/pyproject.toml` pins.
+- Docker can't change network access between stages, so the benchmark and the agent must allow unrestricted (`"*"`) access in every stage. Allowlists are refused before a container starts.
 - Containers can't run Docker themselves.
-- If the Tracker stops mid-run, the run's containers keep running. To remove them, run the
-  following, replacing *`RUN_ID`* with the run's ID:
 
-  ```bash
-  docker rm -f $(docker ps -aq --filter label=io.vals.cbs.managed=true \
-    --filter label=run-id=RUN_ID)
-  ```
+## Stop and restart
+
+- To stop the Tracker, press Ctrl+C or send it `SIGTERM`. Running tasks stop and their Docker containers are removed.
+- The database containers keep running, so a restart is quick. To stop them too, without deleting data, run `make local-stop`.
+- When the Tracker restarts, tasks it was running are marked as errors. To run them again, run `valk run retry RUN_ID`, where *`RUN_ID`* is the run's ID.
+- The Tracker keeps its keys in `.local/executor.keys`. Don't delete that file while you still need existing runs.
 
 ## Reset local state
 
-Run records live in the PostgreSQL Docker volume and run files under `data_root`. Delete
-both together, or the remaining records point at missing files:
+<Warning>
+
+This deletes every local run, its files, and the Tracker's keys.
+
+</Warning>
+
+Stop the Tracker, then run:
 
 ```bash
-docker compose -f services/tracker/docker-compose.yml down -v
-
-rm -rf .local
+make local-reset
 ```
 
 ## Settings
 
 | Setting | Where | Effect |
 | --- | --- | --- |
-| `data_root` | `local-server.yaml` | Folder for artifacts and logs |
-| `secrets_file` | `local-server.yaml` | File the provider settings and agent secrets come from |
-| `secrets_manager_region` | `local-server.yaml` | Reads named secrets from AWS Secrets Manager in this Region instead of `secrets_file`, with the AWS credentials in the Tracker's environment |
+| `data_root` | `--config` file | Folder for artifacts and logs |
+| `secrets_file` | `--config` file | File the provider settings and agent secrets come from. Defaults to `.env` beside the config file when it exists |
+| `secrets_manager_region` | `--config` file | Reads named secrets from AWS Secrets Manager in this Region instead of `secrets_file`, with the AWS credentials in the Tracker's environment |
 | `BENCHMARK_SERVICE_BASE_URL` | Tracker environment | Domain of the hosted benchmark services |
-| `PROJECT_SERVICE_TOKEN` | Tracker and project service environment | Token Tracker sends to the project service. Defaults to `local-project-token` |
+| `PROJECT_SERVICE_TOKEN` | Tracker and project service environment | Token the Tracker sends to the project service. Defaults to `local-project-token` |
 
-With `secrets_manager_region`, map each provider to its secret with `valkyrie provider set`.
-Only this source can send a benchmark service's
-[saved credential](/benchmarks/authentication#save-the-credential-with-the-service).
+With `secrets_manager_region`, map each provider to its secret with `valk provider set`. Only this source can send a benchmark service's [saved credential](/benchmarks/authentication#save-the-credential-with-the-service).
 
 ## Limits
 
-- Post-run Lambdas, `valkyrie run results --s3`, result previews, and Docent analysis need
-  S3 storage, so a local Tracker can't run them.
-- Some hosted benchmarks start sandboxes from snapshots or images that only Vals AI's
-  Daytona organization can read, so they fail with your own Daytona account.
+- Post-run Lambdas, `valk run results --s3`, result previews, and Docent analysis need S3 storage, so a local Tracker can't run them.
+- Some hosted benchmarks start sandboxes from snapshots or images that only Vals AI's Daytona organization can read, so they fail with your own Daytona account.
 
 ## Fix common errors
 
@@ -174,6 +136,7 @@ Only this source can send a benchmark service's
 | --- | --- |
 | `Invalid daytona settings: daytona.DAYTONA_TARGET: Field required` | Add the named keys to `secrets_file`. |
 | `Local daytona execution requires a secrets_file` | Set `secrets_file`, or pass `--provider docker`. |
+| `The secrets file has no value for KEY` | Add `KEY` to `.env`, then run `valk run retry RUN_ID`. |
 | `Agent secrets cannot read sandbox provider settings` | Remove `DAYTONA_*` and `MODAL_TOKEN_*` names from the agent contract. |
 | `Snapshot quota exceeded` | Delete unused snapshots in your Daytona organization. |
-| `Virtualenv not found!` | Run `make -C services/tracker install`. |
+| `Tracker dependencies not found` | Run `make install` from the checkout root. |

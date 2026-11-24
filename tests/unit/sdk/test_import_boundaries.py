@@ -48,6 +48,11 @@ BOUNDARIES = (
         paths=("src/valkyrie/display.py",),
         forbidden=("tracker", "valkyrie.cli", "valkyrie.tui"),
     ),
+    Boundary(
+        name="palette",
+        paths=("src/valkyrie/palette.py",),
+        forbidden=("tracker", "valkyrie", "textual", "rich", "click", "httpx"),
+    ),
 )
 
 

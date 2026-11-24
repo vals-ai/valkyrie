@@ -34,8 +34,10 @@ def test_error_result_provenance_schema_matches_metadata(postgres_engine: Engine
         "category",
         "phase",
         "transient",
+        "sandbox_provider",
         "retry_scheduled",
         "failed_attempt_number",
+        "sandbox_source",
     }
     metadata_columns = {column.name for column in metadata_table.columns}
     actual_columns = {column["name"]: column for column in inspector.get_columns("errorresult")}

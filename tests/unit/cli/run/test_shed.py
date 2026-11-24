@@ -5,7 +5,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from valkyrie.cli.run.shed import shed
+from valkyrie.cli.run.update import update as shed
 
 from tests.unit.cli.conftest import MockTracker
 
@@ -31,7 +31,7 @@ def shed_calls(tracker: MockTracker) -> list[tuple[int, bool]]:
 def test_shed_previews_then_sheds_after_confirmation(cli_runner: CliRunner, tracker: MockTracker) -> None:
     serve_shed(tracker, ["late", "b"])
 
-    result = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "1"], input="y\n")
+    result = cli_runner.invoke(shed, [str(RUN_ID), "--shed", "--concurrency", "1"], input="y\n")
 
     assert result.exit_code == 0, result.output
     assert shed_calls(tracker) == [(1, True), (1, False)]
@@ -41,11 +41,13 @@ def test_shed_previews_then_sheds_after_confirmation(cli_runner: CliRunner, trac
     assert result.output.count("late") == 2
 
 
-@pytest.mark.description("`run shed` says no tasks are above the limit for both the dry run and the real call.")
+@pytest.mark.description(
+    "`run update --shed` says no tasks are above the limit for both the dry run and the real call."
+)
 def test_shed_reports_when_nothing_is_above_the_limit(cli_runner: CliRunner, tracker: MockTracker) -> None:
     serve_shed(tracker, [])
 
-    result = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "4"], input="y\n")
+    result = cli_runner.invoke(shed, [str(RUN_ID), "--shed", "--concurrency", "4"], input="y\n")
 
     assert result.exit_code == 0, result.output
     assert shed_calls(tracker) == [(4, True), (4, False)]
@@ -67,7 +69,7 @@ def test_shed_surfaces_tracker_rejections_from_the_preview(
 ) -> None:
     serve_shed(tracker, [], error=detail)
 
-    result = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "4"], input="y\n")
+    result = cli_runner.invoke(shed, [str(RUN_ID), "--shed", "--concurrency", "4"], input="y\n")
 
     assert result.exit_code == 1
     assert shed_calls(tracker) == [(4, True)]
@@ -78,8 +80,8 @@ def test_shed_surfaces_tracker_rejections_from_the_preview(
 def test_shed_dry_run_and_cancel_only_preview(cli_runner: CliRunner, tracker: MockTracker) -> None:
     serve_shed(tracker, ["b"])
 
-    dry_run = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "1", "--dry-run"])
-    declined = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "1"], input="n\n")
+    dry_run = cli_runner.invoke(shed, [str(RUN_ID), "--shed", "--concurrency", "1", "--dry-run"])
+    declined = cli_runner.invoke(shed, [str(RUN_ID), "--shed", "--concurrency", "1"], input="n\n")
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Would force stop 1 task(s):" in dry_run.output
@@ -88,12 +90,21 @@ def test_shed_dry_run_and_cancel_only_preview(cli_runner: CliRunner, tracker: Mo
     assert shed_calls(tracker) == [(1, True), (1, True)]
 
 
-@pytest.mark.description("`run shed --yes` sheds without a prompt, so scripts can run it.")
-def test_shed_yes_skips_the_prompt(cli_runner: CliRunner, tracker: MockTracker) -> None:
-    serve_shed(tracker, ["b"])
+@pytest.mark.description("`run update --shed --yes` sheds without a prompt, so scripts can run it.")
+@pytest.mark.parametrize("task_ids", [[], ["b"]])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_shed_yes_skips_the_prompt(
+    cli_runner: CliRunner, tracker: MockTracker, task_ids: list[str], json_output: bool
+) -> None:
+    serve_shed(tracker, task_ids)
 
-    result = cli_runner.invoke(shed, [str(RUN_ID), "--concurrency", "1", "--yes"])
+    result = cli_runner.invoke(
+        shed, [str(RUN_ID), "--shed", "--concurrency", "1", "--yes", *(["--json"] if json_output else [])]
+    )
 
     assert result.exit_code == 0, result.output
     assert "?" not in result.output
     assert shed_calls(tracker) == [(1, True), (1, False)]
+    if json_output:
+        assert json.loads(result.stdout)["shed"]["task_ids"] == task_ids
+        assert "Would force stop" in result.stderr or "No building" in result.stderr

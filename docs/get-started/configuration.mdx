@@ -7,6 +7,18 @@ description: "Sign in, create or join an organization, create access keys for CI
 Sign in to use the CLI and Python SDK on your machine. For continuous integration (CI),
 create an access key instead.
 
+## Use the CLI in scripts
+
+- Add `--json` to print a result as JSON on stdout. Progress and warnings go to stderr.
+- Use `--jsonl` for streaming output, including `run show --follow` and logs.
+- Add `--yes` when confirming an action in JSON mode. Without it, the command fails
+  instead of waiting for input.
+- A followed run that ends in `ERROR` exits with status 1.
+
+```bash
+valkyrie whoami --json | jq
+```
+
 ## Sign in
 
 ```bash
@@ -113,25 +125,36 @@ those settings, pass `--provider` and `--ignore-custom-services` when starting a
 
 ## Choose a Tracker
 
-Valkyrie connects to Vals AI's hosted service by default. You only need to change this if
-you [run your own Tracker](/self-hosting/local-tracker) or have been given another server
-address:
+Valkyrie connects to Vals AI's hosted service, saved as `vals`, by default. To use
+[your own Tracker](/self-hosting/local-tracker) or another server, save it by name and make
+it the default:
 
 ```bash
-VALKYRIE_URL=https://tracker.example.com valkyrie login
+valkyrie tracker add team https://tracker.example.com
+
+valkyrie tracker use team
+
+valkyrie login
 ```
 
-- Signing in saves that address for later commands.
-- Use `VALKYRIE_URL` to choose a different Tracker for one command.
-- Signing out returns the CLI to the hosted service.
+- `local` is built in as `http://127.0.0.1:8000`.
+- Saved Trackers live in `~/.config/valkyrie/trackers.json` and logins in `~/.config/valkyrie/sessions`. Both move under `XDG_CONFIG_HOME` when it is set.
+- The file holds `{"default": NAME, "trackers": {NAME: URL}}`. A name you set there overrides a built-in, such as `local` on another port.
+- Each Tracker keeps its own login, so switching doesn't sign you out of the others.
+- Use `--tracker NAME` or `--tracker URL` to pick a Tracker for one command.
+- `VALKYRIE_URL` wins over the saved default, and `--tracker` wins over both.
+- `valkyrie whoami` and `valkyrie run start` print the Tracker they used.
 
-An access key works only on the Tracker that issued it. Set `VALKYRIE_URL` beside `VALKYRIE_API_KEY`
-when the key comes from another Tracker.
+To see saved Trackers and which ones you are signed in to, run `valkyrie tracker list`.
+
+An access key works only on the Tracker that issued it. Pass `--tracker` or set
+`VALKYRIE_URL` beside `VALKYRIE_API_KEY` when the key comes from another Tracker.
 
 ## Configure the Python SDK
 
-`ValkyrieClient()` uses the same Tracker and login as the CLI. To choose them in code, pass
-a `ValkyrieConfig`:
+`ValkyrieClient()` uses `VALKYRIE_URL`, then the Tracker of your last `valkyrie login`, then
+Vals AI's hosted service. It doesn't read saved Tracker names, so pass a `ValkyrieConfig` to
+choose a Tracker in code:
 
 ```python
 from valkyrie.sdk import ValkyrieClient, ValkyrieConfig
@@ -146,10 +169,38 @@ Replace *`ACCESS_KEY`* with an access key, or leave out `api_key` to use your lo
 See the [`ValkyrieConfig` reference](/reference/sdk/models/config#valkyrie-config) for all
 connection options.
 
+## CLI diagnostics
+
+To print the CLI and SDK versions, run `valkyrie --version`. Add `--verbose` before a
+command to show SDK logs and full error tracebacks.
+
+Use `--no-color` or set `NO_COLOR` to disable colors.
+
+## Shell completion
+
+To enable completion in Bash for your current shell:
+
+```bash
+eval "$(valkyrie completion bash)"
+```
+
+- Bash, Zsh, Fish, and Nushell are supported.
+- Each script enables both `valkyrie` and `valk`.
+- Zsh, Fish, and Nushell show descriptions beside commands and flags.
+
+For installation commands for each shell, run:
+
+```bash
+valkyrie completion --help
+```
+
+See the [completion reference](/reference/cli/completion#completion).
+
 ## Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `VALKYRIE_API_KEY` | Authenticates every request with this access key instead of a saved login. |
-| `VALKYRIE_URL` | Sends requests to this Tracker instead of your last login's Tracker or the hosted one. |
+| `VALKYRIE_URL` | Sends CLI requests to this Tracker URL instead of the `valkyrie tracker use` default. |
 | `VALKYRIE_CLI_LOGS` | Show extra CLI logs when set to `true`. |
+| `NO_COLOR` | Disables CLI colors when set. |

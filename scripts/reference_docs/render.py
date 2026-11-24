@@ -7,7 +7,7 @@ import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
-from .collect import collect_cli_commands, collect_sdk_reference
+from .collect import collect_cli_commands, collect_cli_global_options, collect_sdk_reference
 from .model import (
     CLI_CARDS,
     CLI_PAGE_GROUPS,
@@ -294,6 +294,9 @@ def _cli_pages(commands: Sequence[CLICommandReference]) -> dict[Path, str]:
         "CLI reference",
         "Complete generated reference for every Valkyrie CLI command.",
         "This reference is generated from the CLI itself. Use the task guides for complete workflows.",
+        "## Global options",
+        "Put these options before the command name.",
+        _cli_parameters(collect_cli_global_options(), "option"),
         "## Command groups",
         _card_group(cards),
     )

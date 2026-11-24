@@ -34,7 +34,7 @@ from tracker.search_cost import SearchCharge
 from decimal import Decimal
 from tracker.repositories.dataset_version import DatasetVersionRepository
 from tracker.services.datasets.ref import HostedDataset
-from tracker.domain import BenchmarkStatus, FailureCategory, TaskStatus
+from tracker.domain import ACCOUNT_REJECTION_SOURCE, BenchmarkStatus, FailureCategory, TaskStatus
 from tracker.executor.control_tasks import (
     TaskControl,
     TaskDecision,
@@ -113,7 +113,7 @@ class TestRunState:
         secrets = {
             "provider-secret": {
                 "DAYTONA_API_KEY": "key",
-                "DAYTONA_API_URL": "url",
+                "DAYTONA_API_URL": "https://app.daytona.io/api",
                 "DAYTONA_TARGET": "target",
             },
         }
@@ -126,7 +126,7 @@ class TestRunState:
         assert provider_config.model_dump(mode="json") == {
             "type": "daytona",
             "DAYTONA_API_KEY": "key",
-            "DAYTONA_API_URL": "url",
+            "DAYTONA_API_URL": "https://app.daytona.io/api",
             "DAYTONA_TARGET": "target",
         }
 
@@ -626,7 +626,7 @@ class TestRunState:
             TaskFailureRequest(
                 ref=control.ref,
                 attempt=attempt,
-                failure=_task_failure("agent failed"),
+                failure=_task_failure("agent failed").model_copy(update={"sandbox_provider": "modal"}),
                 expected_status=TaskStatus.IN_PROGRESS,
                 retry_scheduled=False,
                 failed_attempt_number=None,
@@ -642,8 +642,85 @@ class TestRunState:
         assert error_result.operation == "process_task"
         assert error_result.error_type == "RuntimeError"
         assert error_result.cause_code is None
+        assert error_result.sandbox_provider == "modal"
         assert error_result.retry_scheduled is False
         assert error_result.failed_attempt_number is None
+
+    @pytest.mark.description(
+        "A provider refusal of one source stands for the rest of the run until the refused task is retried."
+    )
+    async def test_source_rejection_holds_until_the_task_is_retried(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
+    ) -> None:
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
+            org_id=TEST_ORG_ID,
+            task_id="task_0",
+            benchmark=benchmark.id,
+            status=TaskStatus.IN_PROGRESS,
+            started_at=_ACTIVE_ATTEMPT,
+        )
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        attempt = AttemptRef(org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
+        failure = _task_failure("snapshot not found").model_copy(
+            update={"cause_code": "sandbox_rejected", "sandbox_source": "snap-a"}
+        )
+
+        assert await control.fail(
+            TaskFailureRequest(
+                ref=control.ref,
+                attempt=attempt,
+                failure=failure,
+                expected_status=TaskStatus.IN_PROGRESS,
+                retry_scheduled=False,
+                failed_attempt_number=None,
+            )
+        )
+        assert await control.source_rejection("snap-a") == "snapshot not found"
+        assert await control.source_rejection("snap-b") is None
+
+        task.status = TaskStatus.PENDING
+        task.started_at = datetime.now(ZoneInfo("UTC"))
+        control_postgres_session.add(task)
+        control_postgres_session.commit()
+        assert await control.source_rejection("snap-a") is None
+
+    @pytest.mark.description(
+        "An account-wide provider refusal stands for every source in the run, Dockerfile builds included."
+    )
+    async def test_account_rejection_covers_every_source(
+        self, contract: AgentContractRequest, control_postgres_session: Session, bound_controls: Any
+    ) -> None:
+        benchmark = make_benchmark(contract=contract)
+        task = Task(
+            org_id=TEST_ORG_ID,
+            task_id="task_0",
+            benchmark=benchmark.id,
+            status=TaskStatus.IN_PROGRESS,
+            started_at=_ACTIVE_ATTEMPT,
+        )
+        control_postgres_session.add_all([benchmark, task])
+        control_postgres_session.commit()
+        control = cast(TaskControl, bound_controls(benchmark, session=control_postgres_session)["task_control"])
+        attempt = AttemptRef(org_id=TEST_ORG_ID, task_row_id=task.id, task_id=task.task_id, started_at=task.started_at)
+        failure = _task_failure("organization is suspended").model_copy(
+            update={"cause_code": "sandbox_rejected", "sandbox_source": ACCOUNT_REJECTION_SOURCE}
+        )
+
+        assert await control.fail(
+            TaskFailureRequest(
+                ref=control.ref,
+                attempt=attempt,
+                failure=failure,
+                expected_status=TaskStatus.IN_PROGRESS,
+                retry_scheduled=False,
+                failed_attempt_number=None,
+            )
+        )
+        assert await control.source_rejection("snap-b") == "organization is suspended"
+        assert await control.source_rejection(None) == "organization is suspended"
 
     @pytest.mark.description(
         "Search charges reported for two steps of one attempt are saved as two rows, and a repeated report adds none."

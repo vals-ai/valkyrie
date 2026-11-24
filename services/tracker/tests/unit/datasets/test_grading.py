@@ -112,15 +112,42 @@ class TestVerifierCommand:
 
 @pytest.mark.description("The result of a grading run.")
 class TestGradeTask:
-    @pytest.mark.description("A verifier user gets the tests and log directory it needs.")
+    @pytest.mark.description("A verifier user can read the tests and write to the open log directory.")
     async def test_a_verifier_user_gets_the_tests_and_log_directory_it_needs(self, tmp_path: Path) -> None:
         sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
         config = TaskConfig.parse("[verifier]\nuser = 'grader'")
 
         await grade_task("task-1", config, {}, write_tests_folder(tmp_path), sandbox)
 
-        assert "chmod -R a+rX /tests; chown -R grader /logs/verifier" in sandbox.commands
+        assert "chmod -R a+rX /tests" in sandbox.commands
+        assert "find /logs/verifier -mindepth 1 -delete; chmod 777 /logs/verifier" in sandbox.commands
         assert any("getent passwd grader" in command for command in sandbox.commands)
+
+    @pytest.mark.description(
+        "Without `[verifier].user`, the image's user runs the verifier from the agent's working directory."
+    )
+    async def test_the_image_user_runs_the_verifier_from_the_agent_working_directory(self, tmp_path: Path) -> None:
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+
+        await grade_task(
+            "task-1", TaskConfig.parse(""), {}, write_tests_folder(tmp_path), sandbox, cwd="/root", default_user="agent"
+        )
+
+        assert sandbox.cwds == ["/root"]
+        assert "chmod -R a+rX /tests" in sandbox.commands
+        assert any("getent passwd agent" in command for command in sandbox.commands)
+
+    @pytest.mark.description(
+        "`[environment].workdir` and `[verifier].user` win over the agent's directory and image user."
+    )
+    async def test_task_settings_win_over_the_agent_directory_and_image_user(self, tmp_path: Path) -> None:
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+        config = TaskConfig.parse("[verifier]\nuser = 'grader'\n[environment]\nworkdir = '/app'")
+
+        await grade_task("task-1", config, {}, write_tests_folder(tmp_path), sandbox, cwd="/root", default_user="agent")
+
+        assert sandbox.cwds == ["/app"]
+        assert not any("passwd agent" in command for command in sandbox.commands)
 
     @pytest.mark.description("A reward file becomes the result.")
     async def test_a_reward_file_becomes_the_result(self, tmp_path: Path) -> None:
@@ -170,13 +197,13 @@ class TestGradeTask:
         assert len(saved) == 20_000
         assert saved.endswith("the end")
 
-    @pytest.mark.description("The verifier folder is emptied and made private before the grader runs.")
-    async def test_the_verifier_folder_is_emptied_and_made_private_before_the_grader_runs(self, tmp_path: Path) -> None:
+    @pytest.mark.description("The verifier folder is emptied and opened to every user before the grader runs.")
+    async def test_the_verifier_folder_is_emptied_and_opened_before_the_grader_runs(self, tmp_path: Path) -> None:
         sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
 
         await grade_task("task-1", CONFIG, CONFIG.verifier.env, write_tests_folder(tmp_path), sandbox)
 
-        reset = sandbox.commands.index("find /logs/verifier -mindepth 1 -delete; chmod 755 /logs/verifier")
+        reset = sandbox.commands.index("find /logs/verifier -mindepth 1 -delete; chmod 777 /logs/verifier")
         assert reset < next(index for index, command in enumerate(sandbox.commands) if "bash -c" in command)
 
     @pytest.mark.description("A reward left before the grader ran is not scored.")

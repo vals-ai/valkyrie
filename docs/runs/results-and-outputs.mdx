@@ -21,7 +21,10 @@ valkyrie run results RUN_ID
 ```
 
 This writes the run's score and each task's grade to `./results-RUN_ID.json`. Choose
-another file with `--path`.
+another file with `--output`.
+
+- Add `--overwrite` to replace an existing local results file.
+- Use `--yes` to answer confirmation prompts, not to replace local files.
 
 To score part of the run, name the tasks. Valkyrie recomputes `final_score` over only those
 tasks, and the stored result stays as it was:
@@ -42,16 +45,16 @@ valkyrie run results RUN_ID --task-ids task_1,task_2
 ## Download agent outputs
 
 ```bash
-valkyrie run outputs RUN_ID
+valkyrie run download RUN_ID
 ```
 
 This downloads and extracts each task's [`final_output` and output
 artifacts](/agents/agent-contract#output-files) into a new directory named after the
 benchmark, the agent, and the run, such as `./swebench_my-agent_RUN_ID`. Choose the
-directory with `--output-dir`, or only some tasks with `--task-ids`:
+directory with `--output`, or only some tasks with `--task-ids`:
 
 ```bash
-valkyrie run outputs RUN_ID --output-dir ./outputs \
+valkyrie run download RUN_ID --output ./outputs \
   --task-ids astropy__astropy-7606,django__django-10880
 ```
 
@@ -61,13 +64,13 @@ List the paths stored for a run, one page at a time. Pass the returned `next_cur
 `--cursor` for the next page:
 
 ```bash
-valkyrie run artifacts RUN_ID --format json
+valkyrie run files RUN_ID --json
 ```
 
 Then download one task's folder, or one file by its full path:
 
 ```bash
-valkyrie run output RUN_ID TASK_ID --output-dir ./task-files
+valkyrie run download RUN_ID TASK_ID --output ./task-files
 ```
 
 The destination must be a new directory, and defaults to `./RUN_ID`. Paths keep their
@@ -80,13 +83,13 @@ when you retry, and the files are copied when the retried task starts. To list t
 attempts, add `--attempts`:
 
 ```bash
-valkyrie run artifacts RUN_ID --prefix TASK_ID --attempts
+valkyrie run files RUN_ID TASK_ID --attempts
 ```
 
 Each attempt has a folder named `TASK_ID/ATTEMPT_ID`, which holds the attempt's files and an
 `attempt.json` with its status, start and finish times, and error. To download one, add
-`--attempts` to `valkyrie run output`:
+`--attempts` to `valkyrie run download`:
 
 ```bash
-valkyrie run output RUN_ID TASK_ID/ATTEMPT_ID --attempts --output-dir ./attempt
+valkyrie run download RUN_ID TASK_ID/ATTEMPT_ID --attempts --output ./attempt
 ```

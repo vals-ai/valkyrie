@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from collections.abc import Iterable
 from pathlib import Path
 from uuid import UUID
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 from valkyrie.sdk import (
@@ -12,28 +14,24 @@ from valkyrie.sdk import (
     RunMonitoring,
     StartBenchmarkResponse,
     ValkyrieAPIError,
-    ValkyrieClient,
+    ValkyrieConfig,
     ValkyrieSDKError,
 )
 from valkyrie.sdk.models import HostedDataset, LocalDataset, folder_run_name
 
-from valkyrie.cli.client import call
-from valkyrie.cli.display import local_time, one_line
+from valkyrie.cli.client import call, retry_unavailable
+from valkyrie.cli.display import command, details, emit, fail, local_time, one_line, json_option, warn
 from valkyrie.cli.project import describe_project, project_option
 from valkyrie.cli.resource import validate_versioned_dataset_reference
 from valkyrie.cli.run.progress import follow_run_status
 from valkyrie.cli.run.task_ids import resolve_task_ids
+from valkyrie.cli.tracker_profiles import TrackerProfiles
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 
-BOX_WIDTH = 80
-COLUMN_WIDTH = 14
-RUN_COLUMN_WIDTH = 17
-_UNKNOWN_START_OUTCOME = "The latest start request's outcome may be unknown. Verify with `valkyrie run list`."
 _CLEAR_LINE = "\r\033[K"
-
-
-def row(label: str, value: str, width: int = COLUMN_WIDTH) -> str:
-    return f"│ {label:<{width}} {value}"
 
 
 def format_run_start_details(
@@ -44,19 +42,19 @@ def format_run_start_details(
     task_ids: str | None,
     priority: int | None,
 ) -> None:
-    click.echo("┌─ Benchmark ".ljust(BOX_WIDTH, "─"))
-    click.echo(row("Name:", benchmark))
-    click.echo(row("Dataset:", dataset or "default"))
-    click.echo(row("Concurrency:", str(concurrency)))
-    if priority is not None:
-        click.echo(row("Priority override:", str(priority)))
-    if slice_str:
-        click.echo(row("Slice:", slice_str))
-    click.echo(
-        row("Task IDs:", (task_ids[:60] + "..." if len(task_ids) > 60 else task_ids) if task_ids else "all tasks")
+    details(
+        "Benchmark",
+        [
+            ("Name", benchmark),
+            ("Dataset", dataset or "default"),
+            ("Concurrency", str(concurrency)),
+            ("Priority override", str(priority) if priority is not None else None),
+            ("Slice", slice_str),
+            ("Task IDs", (task_ids[:60] + "..." if len(task_ids) > 60 else task_ids) if task_ids else "all tasks"),
+        ],
+        err=True,
     )
-    click.echo("└".ljust(BOX_WIDTH, "─"))
-    click.echo()
+    click.echo(err=True)
 
 
 def format_agent_start_details(
@@ -66,68 +64,62 @@ def format_agent_start_details(
     kwargs: tuple[tuple[str, str], ...],
     header_names: Iterable[str],
 ) -> None:
-    click.echo("┌─ Agent ".ljust(BOX_WIDTH, "─"))
-    click.echo(row("Agent:", agent))
-    if model:
-        click.echo(row("Model:", model))
-    for index, (env_var, secret_name) in enumerate(secrets):
-        click.echo(row("Secrets:" if index == 0 else "", f"{env_var} → {secret_name}"))
-    if kwargs:
-        click.echo(row("Kwargs:", ", ".join(f"{key}={value}" for key, value in kwargs)))
-    if header_names := list(header_names):
-        click.echo(row("Headers:", ", ".join(header_names)))
-    click.echo("└".ljust(BOX_WIDTH, "─"))
-    click.echo()
+    details(
+        "Agent",
+        [
+            ("Agent", agent),
+            ("Model", model),
+            *(
+                ("Secrets" if index == 0 else "", f"{env_var} → {secret_name}")
+                for index, (env_var, secret_name) in enumerate(secrets)
+            ),
+            ("Kwargs", ", ".join(f"{key}={value}" for key, value in kwargs)),
+            ("Headers", ", ".join(header_names)),
+        ],
+        err=True,
+    )
+    click.echo(err=True)
 
 
-def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResponse, connect: bool = False) -> None:
-    run_id = start_benchmark_response.benchmark_id
+def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResponse, follow: bool = False) -> None:
+    run_id = str(start_benchmark_response.benchmark_id)
     version = start_benchmark_response.dataset_version
-    details = [
-        ("Benchmark:", start_benchmark_response.benchmark_name),
-        ("Agent:", start_benchmark_response.agent_name),
-        ("Run ID:", run_id),
-        ("Started at:", local_time(start_benchmark_response.started_at)),
-        ("Max concurrency:", start_benchmark_response.concurrency),
-        ("Total tasks:", start_benchmark_response.task_count),
-        ("Dataset version:", version.label or version.id if version else "not pinned"),
-    ]
     project = start_benchmark_response.project
-    details.append(("Spend:", describe_project(project) if project is not None else "untagged"))
-    commands = [
-        ("Get results:", f"valkyrie run results {run_id} --path ./results-{run_id}.json"),
-        ("Stop:", f"valkyrie run stop {run_id}"),
-        ("Resume:", f"valkyrie run resume {run_id}"),
-        ("Retry:", f"valkyrie run retry {run_id}"),
-        ("Run outputs:", f"valkyrie run outputs {run_id} --output-dir ."),
-    ]
-    if not connect:
-        commands.insert(0, ("Track progress:", f"valkyrie run fetch {run_id} --connect"))
-
-    click.echo()
-    click.echo("┌─ Run Details ".ljust(BOX_WIDTH, "─"))
-    for label, value in details:
-        click.echo(row(label, str(value), RUN_COLUMN_WIDTH))
+    details(
+        "Run details",
+        [
+            ("Run ID", run_id),
+            ("Tracker", TrackerProfiles.load().describe(ValkyrieConfig().url)),
+            ("Started at", local_time(start_benchmark_response.started_at)),
+            ("Max concurrency", str(start_benchmark_response.concurrency)),
+            ("Total tasks", str(start_benchmark_response.task_count)),
+            ("Dataset version", version.label or version.id if version else "not pinned"),
+            ("Spend", describe_project(project) if project is not None else "untagged"),
+            ("Logs", start_benchmark_response.cloudwatch_url),
+            ("Artifacts", start_benchmark_response.s3_bucket_url),
+        ],
+        [
+            ("Track progress", None if follow else command("run", "show", run_id, "--follow")),
+            ("Get results", command("run", "results", run_id, "--output", f"./results-{run_id}.json")),
+            ("Stop", command("run", "stop", run_id)),
+            ("Resume", command("run", "resume", run_id)),
+            ("Retry", command("run", "retry", run_id)),
+            ("Run outputs", command("run", "download", run_id, "--output", ".")),
+        ],
+        err=True,
+    )
     if start_benchmark_response.dataset_version_warning:
-        click.secho(start_benchmark_response.dataset_version_warning, fg="yellow")
-    if start_benchmark_response.cloudwatch_url:
-        click.echo(row("Logs:", start_benchmark_response.cloudwatch_url, RUN_COLUMN_WIDTH))
-    if start_benchmark_response.s3_bucket_url:
-        click.echo(row("Artifacts:", start_benchmark_response.s3_bucket_url, RUN_COLUMN_WIDTH))
-    click.echo("├".ljust(BOX_WIDTH, "─"))
-    for label, command in commands:
-        click.echo(row(label, click.style(command, fg="cyan"), RUN_COLUMN_WIDTH))
-    click.echo("└".ljust(BOX_WIDTH, "─"))
+        warn(start_benchmark_response.dataset_version_warning)
 
 
 def format_confirmed_start_summary(run_ids: list[UUID], count: int, outcome_unknown: bool = False) -> None:
     if count > 1:
-        click.echo()
-        click.echo(f"{len(run_ids)} / {count} requested runs successfully started.")
+        click.echo(err=True)
+        click.echo(f"{len(run_ids)} / {count} requested runs successfully started.", err=True)
         if run_ids:
-            click.echo(f"Track progress: valkyrie run status --ids {','.join(str(run_id) for run_id in run_ids)}")
+            click.echo(f"Track progress: {command('run', 'show', *map(str, run_ids))}", err=True)
     if outcome_unknown:
-        click.echo(click.style(_UNKNOWN_START_OUTCOME, fg="yellow"))
+        warn(f"The latest start request's outcome may be unknown. Verify with `{command('run', 'list')}`.")
 
 
 def _is_folder(path: str) -> bool:
@@ -213,14 +205,7 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
     type=str,
     required=False,
     default=None,
-    help="Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908).",
-)
-@click.option(
-    "--task-ids-file",
-    type=str,
-    required=False,
-    default=None,
-    help="Path or http(s) URL to a text file with one task ID per line.",
+    help="Comma-separated task IDs, @FILE, or an http(s) URL with one task ID per line.",
 )
 @click.option(
     "--slice",
@@ -277,7 +262,7 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY YourAnthropicKeySecret).",
+    help="Secret as ENV_VAR SECRET_NAME. Adds to or replaces the agent contract's mapping for ENV_VAR.",
 )
 @click.option(
     "--header",
@@ -295,7 +280,7 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
     help="Use the hosted benchmark service instead of the URL saved with `valkyrie benchmark service set`.",
 )
 @click.option(
-    "--connect",
+    "--follow",
     is_flag=True,
     required=False,
     help="Connect to the tracker service to stream run updates after starting.",
@@ -305,12 +290,12 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
 )
 @click.option(
     "--count",
-    "-n",
     type=click.IntRange(1, 10),
     default=1,
     show_default=True,
     help="Number of independent runs to start.",
 )
+@json_option(stream=True)
 def start(
     agent: str,
     agent_release: str | None,
@@ -320,7 +305,6 @@ def start(
     concurrency: int,
     lambda_function: str | None,
     task_ids: str | None,
-    task_ids_file: str | None,
     slice_str: str | None,
     dataset: str | None,
     dataset_version: str | None,
@@ -332,12 +316,15 @@ def start(
     secrets: tuple[tuple[str, str]],
     headers: tuple[tuple[str, str]],
     ignore_custom_services: bool,
-    connect: bool,
+    follow: bool,
     monitor: bool,
     count: int,
+    output_format: str,
 ) -> None:
-    if count > 1 and connect:
-        raise click.UsageError("--connect cannot be used when --count is greater than 1")
+    if count > 1 and follow:
+        raise click.UsageError("--follow cannot be used when --count is greater than 1")
+    if output_format == "jsonl" and not follow:
+        raise click.UsageError("--jsonl requires --follow.")
 
     monitoring = RunMonitoring() if monitor else None
     reference = _dataset_reference(dataset, benchmark)
@@ -348,7 +335,7 @@ def start(
         )
     if reference is not None and monitoring is not None:
         raise click.UsageError("--monitor cannot be used with a pushed dataset or a folder")
-    formatted_task_ids = resolve_task_ids(task_ids, task_ids_file)
+    formatted_task_ids = resolve_task_ids(task_ids)
     agent_dir = _local_agent_dir(agent)
     if agent_sha256 and not agent_release:
         raise click.UsageError("--agent-sha256 requires --agent-release")
@@ -404,42 +391,37 @@ def start(
         agent_name = await _publish_local_agent(client, agent_dir, model, kwargs) if agent_dir else agent
         confirmed_run_ids: list[UUID] = []
         for _ in range(count):
-            click.echo(f"{_CLEAR_LINE}Starting run for: {agent_name}...", nl=False)
+            click.echo(f"{_CLEAR_LINE}Starting run for: {agent_name}...", nl=False, err=True)
             try:
-                response = await begin(client, agent_name)
+                response = await retry_unavailable(lambda: begin(client, agent_name))
             except ValkyrieAPIError as error:
-                click.echo(_CLEAR_LINE, nl=False)
-                click.echo(click.style("Run failed to start!", fg="red", bold=True))
+                click.echo(_CLEAR_LINE, nl=False, err=True)
+                fail("Run failed to start!")
                 format_confirmed_start_summary(confirmed_run_ids, count, outcome_unknown=error.status_code >= 500)
                 raise click.ClickException(one_line(str(error.detail))) from error
             except (ValkyrieSDKError, ValueError):
-                click.echo(_CLEAR_LINE, nl=False)
+                click.echo(_CLEAR_LINE, nl=False, err=True)
                 format_confirmed_start_summary(confirmed_run_ids, count, outcome_unknown=True)
                 raise
 
-            click.echo(_CLEAR_LINE, nl=False)
+            click.echo(_CLEAR_LINE, nl=False, err=True)
             confirmed_run_ids.append(response.benchmark_id)
-            format_start_benchmark_response(response, connect)
+            format_start_benchmark_response(response, follow)
 
         format_confirmed_start_summary(confirmed_run_ids, count)
         return confirmed_run_ids
 
     run_ids = call(start_runs)
-    if connect:
-        follow_run_status(run_ids[0])
+    emit({"run_ids": run_ids}, output_format)
+    if follow:
+        follow_run_status(run_ids[0], output_format="jsonl" if output_format == "jsonl" else "text")
 
 
 def _local_agent_dir(agent: str) -> Path | None:
     path = Path(agent)
     if agent == path.name and agent != "..":
         if path.is_dir():
-            click.echo(
-                click.style(
-                    f"Running the published agent '{agent}'. Use --agent ./{agent} to run the local directory.",
-                    fg="yellow",
-                ),
-                err=True,
-            )
+            warn(f"Running the published agent '{agent}'. Use --agent ./{agent} to run the local directory.")
         return None
     if not path.is_dir():
         raise click.BadParameter(f"Agent directory not found: {agent}", param_hint="'--agent'")

@@ -21,16 +21,17 @@ from aiohttp import (
     ClientSession,
     InvalidURL,
 )
-from daytona import (
-    AsyncDaytona,
+from daytona import V0_API_URL, DaytonaConfig
+from daytona import AsyncDaytona as DaytonaClient
+from daytona.v0 import (
     AsyncSandbox,
     CreateSandboxFromImageParams,
     CreateSandboxFromSnapshotParams,
-    DaytonaConfig,
     DaytonaNotFoundError,
     ListSandboxesQuery,
     SandboxState,
 )
+from daytona.v0._async.daytona import AsyncDaytona
 from daytona_api_client_async import (
     ApiClient as DaytonaApiClient,
     Configuration as DaytonaApiConfiguration,
@@ -42,16 +43,10 @@ from daytona_api_client_async import (
 )
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
-from daytona import (
-    Image as DaytonaImage,
-)
-from daytona import (
-    VolumeMount as DaytonaVolumeMount,
-)
-from daytona import (
-    Resources as DaytonaResources,
-)
-from daytona.common.errors import (
+from daytona.v0 import Image as DaytonaImage
+from daytona.v0 import VolumeMount as DaytonaVolumeMount
+from daytona.v0 import Resources as DaytonaResources
+from daytona.v0.common.errors import (
     SOURCE_API,
     SOURCE_DAEMON,
     SOURCE_PROXY,
@@ -59,11 +54,12 @@ from daytona.common.errors import (
     DaytonaConnectionError,
     DaytonaError,
     DaytonaRateLimitError,
+    DaytonaSpotEvictedError,
     DaytonaTimeoutError,
     create_daytona_error,
 )
-from daytona.common.pty import PtyResult, PtySize
-from daytona.handle.async_pty_handle import AsyncPtyHandle
+from daytona.v0.common.pty import PtyResult, PtySize
+from daytona.v0.handle.async_pty_handle import AsyncPtyHandle
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
 from pydantic import BaseModel, Field, field_validator
 from tenacity import (
@@ -80,6 +76,7 @@ from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.gpu import daytona_gpu_type
 from benchmark_service.sandbox.types import (
+    Checkpoint,
     ComposeSource,
     DockerfileSource,
     ExecResult,
@@ -94,9 +91,12 @@ from benchmark_service.sandbox.types import (
     SandboxCapacityDomain,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxAccountRejectedError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    provider_details,
     SandboxProvider,
     SandboxQuery,
     SandboxReservationDemand,
@@ -164,6 +164,19 @@ _TRANSPORT_ERROR_MESSAGES = (
 # Daytona's gateway throttler reports the throttle only in the message, under whatever status the
 # throttled call carries (a 401 when it is Bearer token validation), so the status cannot identify it.
 _THROTTLED_ERROR_MESSAGES = ("throttlerexception",)
+_REJECTED_REQUEST_MESSAGES = ("did you add it through the daytona dashboard",)
+_ACCOUNT_REJECTED_MESSAGES = ("organization is suspended",)
+_REJECTED_PULL_MESSAGES = ("401 unauthorized", "403 forbidden", "404 not found", "manifest unknown")
+# The org-wide quota frees up as other sandboxes end, so creating again later can succeed.
+_QUOTA_EXHAUSTED_MESSAGES = ("total cpu limit exceeded",)
+_TRANSIENT_ERROR_MESSAGES = (*_TRANSPORT_ERROR_MESSAGES, *_THROTTLED_ERROR_MESSAGES, *_QUOTA_EXHAUSTED_MESSAGES)
+_PROVIDER_ERROR_PREFIXES: Mapping[type[SandboxError], str] = {
+    SandboxAccountRejectedError: "Daytona rejected the sandbox request",
+    SandboxRejectedError: "Daytona rejected the sandbox request",
+    SandboxNotFoundError: "Sandbox not found",
+    SandboxConnectionError: "Daytona sandbox provider connection error",
+    SandboxError: "Daytona sandbox provider error",
+}
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ClientPayloadError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
 _FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
@@ -247,7 +260,9 @@ class DaytonaProviderConfig(BaseModel):
     @field_validator("DAYTONA_API_URL")
     @classmethod
     def _normalize_api_url(cls, value: str) -> str:
-        return value.rstrip("/")
+        if value.rstrip("/") != V0_API_URL:
+            raise ValueError(f"DAYTONA_API_URL must be {V0_API_URL}, the only API the Daytona SDK's v0 client calls")
+        return V0_API_URL
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
@@ -294,14 +309,9 @@ class DaytonaProviderConfig(BaseModel):
 
 
 def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
-    return AsyncDaytona(
-        config=DaytonaConfig(
-            api_key=config.DAYTONA_API_KEY,
-            api_url=config.DAYTONA_API_URL,
-            target=target,
-            connection_pool_maxsize=None,
-        )
-    )
+    return DaytonaClient(
+        config=DaytonaConfig(api_key=config.DAYTONA_API_KEY, target=target, connection_pool_maxsize=0)
+    ).v0
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -410,23 +420,49 @@ def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None
     return exc.status_code
 
 
-def _is_throttled_error(exc: DaytonaError | ClientResponseError) -> bool:
-    return _message_contains(exc, _THROTTLED_ERROR_MESSAGES)
-
-
-def _is_concurrent_operation_conflict(exc: DaytonaError | ClientResponseError) -> bool:
-    is_conflict = isinstance(exc, DaytonaConflictError) or _provider_status_code(exc) == 409
-    return is_conflict and _message_contains(exc, _CONCURRENT_OPERATION_MESSAGES)
-
-
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
-    if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
-        return True
-    if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
-        return True
-    if _is_throttled_error(exc) or _is_concurrent_operation_conflict(exc):
-        return True
-    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
+    status = _provider_status_code(exc)
+    concurrent_conflict = (isinstance(exc, DaytonaConflictError) or status == 409) and _message_contains(
+        exc, _CONCURRENT_OPERATION_MESSAGES
+    )
+    return (
+        isinstance(exc, _TRANSIENT_DAYTONA_ERRORS)
+        or status in _RETRYABLE_PROVIDER_STATUSES
+        or concurrent_conflict
+        or _has_retryable_cause(exc)
+        or _message_contains(exc, _TRANSIENT_ERROR_MESSAGES)
+    )
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    match exc:
+        case DaytonaError():
+            return _is_transient_daytona_error(exc)
+        case OpenApiException() | ClientResponseError():
+            status = getattr(exc, "status", None)
+            return status in _RETRYABLE_PROVIDER_STATUSES or (status is not None and 500 <= status <= 599)
+        case InvalidURL():
+            return False
+        case TimeoutError() | ClientError():
+            return True
+        case _:
+            return False
+
+
+def _is_rejected_pull(exc: DaytonaError | ClientResponseError) -> bool:
+    return _message_contains(exc, ("sandboxstate.build_failed",)) and _message_contains(exc, _REJECTED_PULL_MESSAGES)
+
+
+def _error_kind(exc: DaytonaError | ClientResponseError) -> type[SandboxError]:
+    if _message_contains(exc, _ACCOUNT_REJECTED_MESSAGES):
+        return SandboxAccountRejectedError
+    if _message_contains(exc, _REJECTED_REQUEST_MESSAGES) or _is_rejected_pull(exc):
+        return SandboxRejectedError
+    if _is_not_found_error(exc) or isinstance(exc, DaytonaSpotEvictedError):
+        return SandboxNotFoundError
+    if _is_transient_daytona_error(exc) or _is_failed_execute_command_error(exc):
+        return SandboxConnectionError
+    return SandboxError
 
 
 def _is_name_conflict_error(exc: DaytonaError) -> bool:
@@ -436,7 +472,11 @@ def _is_name_conflict_error(exc: DaytonaError) -> bool:
 
 
 def _is_ambiguous_pty_create_error(exc: DaytonaError | ClientResponseError) -> bool:
-    if isinstance(exc, DaytonaRateLimitError) or _provider_status_code(exc) == 429 or _is_throttled_error(exc):
+    if (
+        isinstance(exc, DaytonaRateLimitError)
+        or _provider_status_code(exc) == 429
+        or _message_contains(exc, _THROTTLED_ERROR_MESSAGES)
+    ):
         return False
     return _is_transient_daytona_error(exc)
 
@@ -585,15 +625,29 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_ref(self) -> str:
         return f"name={self.name}, id={self.id}"
 
+    @property
+    def _last_seen(self) -> str:
+        return (
+            " Last seen: "
+            + provider_details(
+                {
+                    "state": self._sandbox.state and self._sandbox.state.value,
+                    "error_reason": self._sandbox.error_reason,
+                    "spot_evicted_at": self._sandbox.spot_evicted_at,
+                    "last_activity_at": self._sandbox.last_activity_at,
+                }
+            )
+            + "."
+        )
+
     def _removed_error(self) -> SandboxNotFoundError:
-        return SandboxNotFoundError(f"Sandbox not found: {self._sandbox_ref}.")
+        return SandboxNotFoundError(f"Sandbox not found: {self._sandbox_ref}.{self._last_seen}")
 
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
-        if _is_not_found_error(exc):
+        kind = _error_kind(exc)
+        if kind is SandboxNotFoundError:
             return self._removed_error()
-        if _is_transient_daytona_error(exc) or _is_failed_execute_command_error(exc):
-            return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
-        return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
+        return kind(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
     @_PROVIDER_RETRY
     async def exec(
@@ -977,7 +1031,7 @@ class DaytonaSandbox(Sandbox):
         if self._sandbox.state in _DEAD_SANDBOX_STATES:
             if self._sandbox.state in _REMOVED_SANDBOX_STATES:
                 raise self._removed_error()
-            raise SandboxError(f"Sandbox is not running: {self._sandbox_ref}, state={self.state}.")
+            raise SandboxError(f"Sandbox is not running: {self._sandbox_ref}.{self._last_seen}")
 
 
 class DaytonaSandboxProvider(SandboxProvider):
@@ -1163,19 +1217,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                 usage.max_memory_per_sandbox,
                 usage.max_disk_per_sandbox,
             )
-        except DaytonaError as exc:
-            if _is_transient_daytona_error(exc):
-                return True
-            raise SandboxError("Daytona rejected the targeted snapshot admission request") from exc
-        except (OpenApiException, ClientResponseError) as exc:
-            status = cast(int | None, getattr(exc, "status", None))
-            if status in (408, 429) or (status is not None and 500 <= status <= 599):
+        except (DaytonaError, OpenApiException, ClientError, TimeoutError) as exc:
+            if _is_transient_error(exc):
                 return True
             raise SandboxError("Daytona rejected the admission capacity request") from exc
-        except InvalidURL as exc:
-            raise SandboxError("Daytona admission URL is invalid") from exc
-        except (TimeoutError, ClientError):
-            return True
 
         total = (usage.total_cpu_quota, usage.total_memory_quota, usage.total_disk_quota)
         used = (usage.current_cpu_usage, usage.current_memory_usage, usage.current_disk_usage)
@@ -1228,14 +1273,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                         )
                 if snapshot is not None and snapshot.region_ids is not None and target_id not in snapshot.region_ids:
                     raise SandboxError("Daytona targeted snapshot is not available in the requested target")
-        except DaytonaError as exc:
-            if _is_transient_daytona_error(exc):
-                raise SandboxError("Daytona snapshot metadata is unavailable") from None
-            raise SandboxError("Daytona rejected the snapshot metadata request") from exc
-        except (OpenApiException, ClientResponseError) as exc:
-            raise SandboxError("Daytona rejected the target metadata request") from exc
-        except (TimeoutError, ClientError):
-            raise SandboxError("Daytona snapshot metadata is unavailable") from None
+        except (DaytonaError, OpenApiException, ClientError, TimeoutError) as exc:
+            if _is_transient_error(exc):
+                raise SandboxConnectionError("Daytona admission metadata is unavailable") from exc
+            raise SandboxError("Daytona rejected the admission metadata request") from exc
 
         # GPU-attached CPU, memory and disk do not consume ordinary compute quota.
         return SandboxReservationDemand(
@@ -1248,11 +1289,8 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
-        if _is_not_found_error(exc):
-            return SandboxNotFoundError(f"Sandbox not found: {exc}")
-        if _is_transient_daytona_error(exc):
-            return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
-        return SandboxError(f"Daytona sandbox provider error: {exc}")
+        kind = _error_kind(exc)
+        return kind(f"{_PROVIDER_ERROR_PREFIXES[kind]}: {exc}")
 
     async def _resolve_volumes(
         self,
@@ -1376,6 +1414,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
+            case Checkpoint():
+                raise SandboxError("Daytona v0 sandboxes cannot be restored from a checkpoint")
 
         builds_dockerfile = isinstance(request.source, DockerfileSource)
         try:

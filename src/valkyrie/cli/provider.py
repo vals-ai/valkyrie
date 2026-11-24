@@ -1,6 +1,7 @@
 import click
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import json_option, emit
 
 
 @click.group(help="Choose the secret that configures each sandbox provider, and your default provider.")
@@ -21,9 +22,12 @@ def provider() -> None:
 )
 @click.argument("name")
 @click.argument("secret")
-def provider_set(name: str, secret: str) -> None:
+@json_option()
+def provider_set(name: str, secret: str, output_format: str) -> None:
     saved = call(lambda client: client.providers.set(name, secret))
-    click.echo(f"Provider {name} now uses the secret {saved.providers[name]}.")
+    if emit(saved, output_format):
+        return
+    click.echo(f"Provider {name} now uses the secret {saved.providers[name]}.", err=True)
 
 
 @provider.command(
@@ -38,15 +42,21 @@ def provider_set(name: str, secret: str) -> None:
     ),
 )
 @click.argument("name")
-def provider_remove(name: str) -> None:
+@json_option()
+def provider_remove(name: str, output_format: str) -> None:
     call(lambda client: client.providers.remove(name))
-    click.echo(f"Provider {name} no longer has a secret.")
+    if emit({"removed": name}, output_format):
+        return
+    click.echo(f"Provider {name} no longer has a secret.", err=True)
 
 
 @provider.command("list", help="List the secret behind each sandbox provider. Your default provider is marked *.")
-def provider_list() -> None:
+@json_option()
+def provider_list(output_format: str) -> None:
     providers = call(lambda client: client.providers.list()).providers
     default = call(lambda client: client.settings.get()).default_provider
+    if emit({"providers": providers, "default_provider": default}, output_format):
+        return
     if not providers and default is None:
         click.echo("No provider has a secret yet. Map one with `valkyrie provider set NAME SECRET`.")
     for name in sorted({*providers, default} if default else providers):
@@ -63,6 +73,9 @@ def provider_list() -> None:
     ),
 )
 @click.argument("name")
-def provider_default(name: str) -> None:
+@json_option()
+def provider_default(name: str, output_format: str) -> None:
     settings = call(lambda client: client.settings.set_default_provider(name))
-    click.echo(f"Your default provider is now {settings.default_provider}.")
+    if emit(settings, output_format):
+        return
+    click.echo(f"Your default provider is now {settings.default_provider}.", err=True)

@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -25,8 +25,13 @@ from tests.factories import make_error_result
 from tests.utils import TEST_ORG_ID
 from tracker.api import dependencies as run_dependencies
 from tracker.clients.projects import ProjectServiceClient
+from tracker.repositories.benchmark_definition import BenchmarkDefinitionRepository
+from tracker.repositories.dataset import DatasetRepository
+from tracker.repositories.dataset_version import DatasetVersionRepository
 from tracker.repositories.executor_release import ExecutorReleaseRepository
 from tracker.repositories.provider_secret import ProviderSecretRepository
+from tracker.services.datasets.artifacts import SAVED_ARTIFACTS_RUN
+from tracker.services.datasets.ref import HostedDataset
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSResources
 from tracker.aws import clients as aws_clients
@@ -66,7 +71,7 @@ from tracker.secret_access import tenant_secret_prefix
 
 ORG = Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME)
 PROVIDER_SETTINGS = {
-    "daytona": "DAYTONA_API_KEY=daytona-key\nDAYTONA_API_URL=https://daytona.test/api\nDAYTONA_TARGET=us\n",
+    "daytona": "DAYTONA_API_KEY=daytona-key\nDAYTONA_API_URL=https://app.daytona.io/api\nDAYTONA_TARGET=us\n",
     "modal": "MODAL_TOKEN_ID=modal-id\nMODAL_TOKEN_SECRET=modal-secret\n",
 }
 
@@ -385,7 +390,11 @@ def _use_secrets_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
         return {"daytona": "provider-secret"}
 
     async def get(_store: SecretsManagerStore, _name: str) -> dict[str, str]:
-        return {"DAYTONA_API_KEY": "daytona-key", "DAYTONA_API_URL": "https://daytona.test/api", "DAYTONA_TARGET": "us"}
+        return {
+            "DAYTONA_API_KEY": "daytona-key",
+            "DAYTONA_API_URL": "https://app.daytona.io/api",
+            "DAYTONA_TARGET": "us",
+        }
 
     monkeypatch.setattr(ProviderSecretRepository, "list_all", provider_secrets)
     monkeypatch.setattr(SecretsManagerStore, "get", get)
@@ -449,7 +458,7 @@ def test_start_rejects_incompatible_composition(
         if "DAYTONA_TARGET" in detail:
 
             async def get(_store: SecretsManagerStore, _name: str) -> dict[str, str]:
-                return {"DAYTONA_API_KEY": "daytona-key", "DAYTONA_API_URL": "https://daytona.test/api"}
+                return {"DAYTONA_API_KEY": "daytona-key", "DAYTONA_API_URL": "https://app.daytona.io/api"}
 
             monkeypatch.setattr(SecretsManagerStore, "get", get)
         else:
@@ -655,6 +664,89 @@ def test_regrade_copies_saved_states_into_a_new_run(
     metadata = local_tracker.get(f"/fetch-benchmark-metadata/{run.id}").json()
     for payload in (fetched, metadata):
         assert (payload["regraded_from_run_id"], payload["regrade_skipped_task_ids"]) == (str(source.id), ["task-3"])
+
+
+@pytest.mark.description(
+    "A dataset run's regrade copies its graded tasks onto the pinned version and points them at the saved artifacts, "
+    "keeps the source's Gateway key, and an ambiguous version is refused."
+)
+def test_a_dataset_run_regrade_points_graded_tasks_at_saved_artifacts(
+    local_tracker: TestClient,
+    control_postgres_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    source = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
+    (graded,) = control_postgres_session.exec(select(Task).where(Task.benchmark == source.id)).all()
+    task_ids = [graded.task_id, "failed-grading", "failed-agent"]
+    benchmark = BenchmarkDefinitionRepository(control_postgres_session).create(source.org_id, "ioi", "", None)
+    dataset = DatasetRepository(control_postgres_session).create(benchmark.id, "2024", "", None)
+    versions = DatasetVersionRepository(control_postgres_session)
+    for revision in (1, 2):
+        versions.publish(dataset.id, {task_id: (f"sha256:{revision:064x}", 10) for task_id in task_ids}, [], None)
+    source.status = BenchmarkStatus.FINISHED
+    gateway_ref = f"{tenant_secret_prefix(source.org_id)}project-gateway"
+    source.arguments = source.arguments.model_copy(
+        update={
+            "dataset_ref": HostedDataset(benchmark="ioi", dataset="2024", dataset_id=dataset.id, revision=1),
+            "selected_project_gateway_secret_ref": gateway_ref,
+        }
+    )
+    graded.status = TaskStatus.FINISHED
+    control_postgres_session.add_all(
+        [
+            source,
+            graded,
+            Task(
+                org_id=source.org_id,
+                benchmark=source.id,
+                task_id="failed-grading",
+                status=TaskStatus.ERROR,
+                evaluation_phase_token=uuid4(),
+            ),
+            Task(org_id=source.org_id, benchmark=source.id, task_id="failed-agent", status=TaskStatus.ERROR),
+        ]
+    )
+    control_postgres_session.commit()
+
+    for ambiguous in ({"dataset": "ioi/2024@1", "dataset_version": "2"}, {"dataset": "ioi/2024@"}):
+        rejected = local_tracker.post(f"/regrade-benchmark/{source.id}", json=ambiguous)
+        assert rejected.status_code == 400, rejected.text
+    response = local_tracker.post(
+        f"/regrade-benchmark/{source.id}", json={"dataset": "ioi/2024", "dataset_version": "2"}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (sorted(body["task_ids"]), body["skipped_task_ids"]) == (
+        sorted([graded.task_id, "failed-grading"]),
+        ["failed-agent"],
+    )
+
+    run = control_postgres_session.get(Benchmark, UUID(body["benchmark_id"]))
+    assert run is not None
+    assert (run.name, run.arguments.selected_project_gateway_secret_ref) == ("ioi", gateway_ref)
+    assert run.arguments.dataset_ref == HostedDataset(
+        benchmark="ioi", dataset="2024", ref="2", dataset_id=dataset.id, revision=2
+    )
+    tasks = {
+        task.task_id: (task.status, task.eval_resume_state)
+        for task in control_postgres_session.exec(select(Task).where(Task.benchmark == run.id)).all()
+    }
+    assert tasks == {
+        graded.task_id: (TaskStatus.EVALUATING, {SAVED_ARTIFACTS_RUN: str(source.id)}),
+        "failed-grading": (TaskStatus.EVALUATING, {SAVED_ARTIFACTS_RUN: str(source.id)}),
+        "failed-agent": (TaskStatus.ERROR, None),
+    }
+
+    dispatch = control_postgres_session.exec(
+        select(ExecutorDispatch).where(ExecutorDispatch.benchmark_id == run.id)
+    ).one()
+    sealed = control_postgres_session.get(ExecutorDispatchPayload, dispatch.id)
+    assert sealed is not None
+    payload = open_payload(dispatch.id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
+    assert payload["execution_context_json"]["start_benchmark_request"]["dataset_ref"]["revision"] == 2
 
 
 @pytest.mark.description(

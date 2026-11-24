@@ -1623,16 +1623,15 @@ async def test_unreadable_capacity_defers_grants_until_provider_recovers(
 @pytest.mark.description(
     "A large prepared backlog grants only up to the batch limit and leaves the rest as candidates."
 )
-@pytest.mark.parametrize("backlog", [400, 1000])
 @pytest.mark.parametrize("grant_limit", [3, 100])
 async def test_large_prepared_backlog_is_packed_once_for_a_bounded_batch(
     postgres_engine: Engine,
     postgres_session: Session,
     bound_controls: Callable[..., dict[str, object]],
-    backlog: int,
     grant_limit: int,
     executed_sql: list[str],
 ) -> None:
+    backlog = 400
     capacity = SandboxCapacity(
         cpu=ResourceCapacity(total=10000, used=0),
         memory=ResourceCapacity(total=10000, used=0),

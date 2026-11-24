@@ -58,7 +58,7 @@ def launch(command, **kwargs):
     return original([sys.executable, script, root], **kwargs)
 watchdog.subprocess.Popen = launch
 watchdog._GRACE_SECONDS = .3
-def report_exit(dispatch_id: UUID, benchmark_id: UUID, invocation_key: str) -> None:
+def report_exit(dispatch_id: UUID, benchmark_id: UUID, invocation_key: str, *, shutting_down) -> None:
     assert not watchdog._group_alive(int((Path(root) / "executor").read_text()))
     (Path(root) / "reported").write_text(f"{dispatch_id} {benchmark_id} {invocation_key}")
 watchdog._report_exit = report_exit
@@ -93,7 +93,19 @@ root, script = sys.argv[1:]
 def launch(command, **kwargs):
     return original([sys.executable, script, root], **kwargs)
 watchdog.subprocess.Popen = launch
+watchdog._GRACE_SECONDS = .3
 raise SystemExit(watchdog.supervise(UUID(int=1)))
+"""
+
+_TRACKER = """
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+root, driver, script = sys.argv[1:]
+(Path(root) / 'watchdog').write_text(str(subprocess.Popen([sys.executable, '-c', driver, root, script]).pid))
+time.sleep(60)
 """
 
 
@@ -105,8 +117,10 @@ def _wait_for(path: Path, *, seconds: float = 5) -> None:
 
 
 def _alive(pid: int) -> bool:
-    status = Path(f"/proc/{pid}/status")
-    return status.exists() and "State:\tZ" not in status.read_text()
+    try:
+        return "State:\tZ" not in Path(f"/proc/{pid}/status").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
 
 
 @pytest.mark.description(
@@ -212,6 +226,82 @@ def test_watchdog_exit_report_rejection(tmp_path: Path, status: int, retries: bo
                 os.killpg(int((tmp_path / "executor").read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def _kill_executor(root: Path) -> None:
+    if (root / "executor").exists():
+        try:
+            os.killpg(int((root / "executor").read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.description(
+    "A local watchdog whose Tracker dies stops its executor and exits without waiting to report it."
+)
+def test_local_watchdog_stops_executor_when_tracker_dies(tmp_path: Path) -> None:
+    script = tmp_path / "child.py"
+    script.write_text(_REPORT_CHILD)
+    tracker = subprocess.Popen(
+        [sys.executable, "-c", _TRACKER, str(tmp_path), _REPORT_DRIVER, str(script)],
+        env={**os.environ, "EXECUTOR_LAUNCHER": "local", "EXECUTOR_CONTROL_URL": "http://127.0.0.1:9"},
+        start_new_session=True,
+    )
+    try:
+        _wait_for(tmp_path / "ready")
+        watchdog_pid = int((tmp_path / "watchdog").read_text())
+        executor_pid = int((tmp_path / "executor").read_text())
+        tracker.kill()
+        tracker.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while _alive(executor_pid) or _alive(watchdog_pid):
+            assert time.monotonic() < deadline, "The watchdog or its executor outlived the Tracker"
+            time.sleep(0.01)
+    finally:
+        if tracker.poll() is None:
+            tracker.kill()
+            tracker.wait(timeout=5)
+        _kill_executor(tmp_path)
+
+
+@pytest.mark.description("A local watchdog stops retrying a rejected exit report when the Tracker shuts it down.")
+def test_local_watchdog_stops_exit_report_retries_on_shutdown(tmp_path: Path) -> None:
+    rejected = Event()
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            rejected.set()
+            self.send_response(503)
+            self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", 0), ControlHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    script = tmp_path / "child.py"
+    script.write_text(_REPORT_CHILD)
+    driver = subprocess.Popen(
+        [sys.executable, "-c", _REPORT_DRIVER, str(tmp_path), str(script)],
+        env={
+            **os.environ,
+            "EXECUTOR_LAUNCHER": "local",
+            "EXECUTOR_CONTROL_URL": f"http://127.0.0.1:{server.server_port}",
+        },
+    )
+    try:
+        _wait_for(tmp_path / "ready")
+        (tmp_path / "exit").touch()
+        assert rejected.wait(5)
+        driver.send_signal(signal.SIGTERM)
+        assert driver.wait(timeout=5) == 0
+    finally:
+        if driver.poll() is None:
+            driver.kill()
+            driver.wait(timeout=5)
+        _kill_executor(tmp_path)
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()

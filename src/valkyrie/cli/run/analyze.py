@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import click
 import yaml
-from valkyrie.sdk import ValkyrieAPIError, ValkyrieClient, ValkyrieSDKError
+from valkyrie.sdk import ValkyrieAPIError, ValkyrieSDKError
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import json_option, emit, warn, echo
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 _UNFINISHED_RUN_MESSAGES = {
     "IN_PROGRESS": "Run {run_id} is still in progress. Try again after it finishes.",
@@ -28,7 +34,8 @@ _UNFINISHED_RUN_MESSAGES = {
     default=False,
     help="Bypass the cached reading-plan URL and re-fire ingestion.",
 )
-def analyze(run_id: UUID, no_cache: bool) -> None:
+@json_option(stream=True)
+def analyze(run_id: UUID, no_cache: bool, output_format: str) -> None:
 
     async def run_analysis(client: ValkyrieClient) -> dict[str, Any] | None:
         metadata = await client.runs.metadata(run_id)
@@ -36,10 +43,12 @@ def analyze(run_id: UUID, no_cache: bool) -> None:
         result: dict[str, Any] | None = None
         try:
             async for event in client.runs.analyze(run_id, no_cache=no_cache, lambda_function=lambda_function):
+                if output_format == "jsonl":
+                    emit(event)
                 if event.event == "started":
-                    click.echo(f"  Invoking {event.data.get('lambda_function')}...")
+                    click.echo(f"  Invoking {event.data.get('lambda_function')}...", err=True)
                 elif event.event == "heartbeat":
-                    click.echo(".", nl=False)
+                    click.echo(".", nl=False, err=True)
                 elif event.event == "done":
                     result = event.data
         except ValkyrieAPIError as error:
@@ -47,18 +56,20 @@ def analyze(run_id: UUID, no_cache: bool) -> None:
             status = next((status for status in _UNFINISHED_RUN_MESSAGES if f"status is {status}" in detail), None)
             if "must be FINISHED" not in detail or status is None:
                 raise
-            click.echo(click.style(_UNFINISHED_RUN_MESSAGES[status].format(run_id=run_id), fg="yellow"))
+            warn(_UNFINISHED_RUN_MESSAGES[status].format(run_id=run_id))
             raise click.exceptions.Exit(1) from error
-        click.echo()
+        click.echo(err=True)
         return result
 
     result = call(run_analysis)
+    if output_format == "jsonl" or emit(result, output_format):
+        return
     if result is None:
         return
     if url := result.get("reading_plan_url"):
-        click.echo(f"  Reading plan: {click.style(url, fg='blue', underline=True)}")
+        echo("  Reading plan: ", (url, "accent underline"), err=False)
     else:
-        click.echo(click.style("Analysis completed but no reading plan URL was produced.", fg="yellow"))
+        warn("Analysis completed but no reading plan URL was produced.")
 
 
 async def _ingest_lambda(client: ValkyrieClient, agent_name: str) -> str:

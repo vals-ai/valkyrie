@@ -15,6 +15,18 @@ Each push makes an immutable version.
 - A `dataset.toml` in the parent folder pins the exact tasks and their digests, and its version
   becomes a tag.
 
+## Start a task from a sandbox snapshot
+
+Set `snapshot` in `[environment]` instead of an image or a Dockerfile. `snapshot_target` optionally picks the Daytona target that holds it.
+
+```toml
+[environment]
+snapshot = "my-snapshot"
+snapshot_target = "us"
+```
+
+- A Daytona snapshot sets the sandbox's CPU, memory, and disk. Local Docker can't run snapshots.
+
 ## Read secrets in task environments
 
 - In `task.toml`, use a whole-value `${NAME}` to read a secret available to the run.

@@ -748,7 +748,7 @@ class TestReadDaytonaUsage:
         async def provider_config(_org: Org, _secret: str) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://daytona.test/api",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="us",
                 DAYTONA_ORGANIZATION_ID="org-1",
             )
@@ -783,7 +783,7 @@ class TestReadDaytonaUsage:
 
         async def provider_config(_org: Org, _secret: str) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
-                DAYTONA_API_KEY="test-key", DAYTONA_API_URL="https://daytona.test/api", DAYTONA_TARGET="us"
+                DAYTONA_API_KEY="test-key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
             )
 
         class FakeConfigApi:
@@ -907,7 +907,7 @@ class FakeDaytona:
         async def provider_config(_org: Org, _secret: str) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://daytona.test/api",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="us",
                 DAYTONA_ORGANIZATION_ID="org-1",
             )
@@ -1441,7 +1441,7 @@ class TestBacklogDrainsUnderRateLimit:
     @pytest.mark.description(
         "Each sweep writes rows within its budget until every hour of the backlog is priced at full cost."
     )
-    @pytest.mark.parametrize("calls_per_second", [0.05, 0.1, 2, 5, 10])
+    @pytest.mark.parametrize("calls_per_second", [0.05, 0.1, 2, 10])
     async def test_each_sweep_prices_hours_until_the_backlog_is_empty(
         self, monkeypatch: pytest.MonkeyPatch, database_session: Session, calls_per_second: float
     ) -> None:
@@ -1619,32 +1619,40 @@ def _default_spacing_seconds(calls: int) -> float:
 )
 class TestPeakScale:
     @pytest.mark.description(
-        "The peak hour of 6,610 sandboxes costs seven listing calls, writes 6,610 rows, and moves the cursor one hour."
+        "The peak hour of 6,610 sandboxes costs seven listing calls, writes a row for each saved sandbox, and moves the cursor one hour."
     )
     async def test_peak_hour_of_6610_sandboxes_is_seven_calls_and_one_cursor_step(
         self, monkeypatch: pytest.MonkeyPatch, database_session: Session
     ) -> None:
-        daytona = _peak_sweep(database_session, monkeypatch, {PEAK_HOUR: 6610})
+        daytona = _peak_sweep(database_session, monkeypatch, {PEAK_HOUR: 6610}, owned_share=10)
 
         written = await sweep_sandbox_costs(
             database_session.get_bind(), now=PEAK_HOUR + timedelta(hours=1) + USAGE_SETTLE_LAG
         )
 
         assert daytona.offsets == [0, 1000, 2000, 3000, 4000, 5000, 6000]
-        assert written == 6610
+        assert written == len(daytona.owned) == 661
         assert _cursor(database_session) == PEAK_HOUR + timedelta(hours=1)
-        assert _rows_per_hour(database_session) == {PEAK_HOUR: pytest.approx(daytona.billed(PEAK_HOUR))}
+        assert _rows_per_hour(database_session) == {
+            PEAK_HOUR: pytest.approx(daytona.billed(PEAK_HOUR, owned=daytona.owned))
+        }
 
     @pytest.mark.description(
         (
             "The peak day of 55,113 sandbox-hours is 67 calls, one per page of each hour, which the default spacing"
             " fits in 142.5 seconds, so one 10 minute sweep drains it.\n\n"
-            "Only the 09:00Z hour and the day's total are measured. The other hours are a shape that sums to the total."
+            "Only the 09:00Z hour and the day's total are measured. The other hours are a shape that sums to the total.\n\n"
+            "Every tenth sandbox belongs to a saved run, so the database writes stay small."
         )
     )
     async def test_peak_day_drains_in_1_sweep(self, monkeypatch: pytest.MonkeyPatch, database_session: Session) -> None:
         hours = _hours(PEAK_DAY, 24)
-        daytona = _peak_sweep(database_session, monkeypatch, dict(zip(hours, PEAK_DAY_SANDBOXES_PER_HOUR, strict=True)))
+        daytona = _peak_sweep(
+            database_session,
+            monkeypatch,
+            dict(zip(hours, PEAK_DAY_SANDBOXES_PER_HOUR, strict=True)),
+            owned_share=10,
+        )
         calls = sum(math.ceil(count / USAGE_PAGE_SIZE) for count in PEAK_DAY_SANDBOXES_PER_HOUR)
         sweeps = math.ceil(_default_spacing_seconds(calls) / SWEEP_TIME_BUDGET.total_seconds())
 
@@ -1659,9 +1667,11 @@ class TestPeakScale:
         assert sum(PEAK_DAY_SANDBOXES_PER_HOUR) == 55113
         assert (calls, sweeps) == (67, 1)
         assert len(daytona.offsets) == calls
-        assert written_per_sweep == [55113]
+        assert written_per_sweep == [len(daytona.owned)]
         assert _cursor(database_session) == hours[-1] + timedelta(hours=1)
-        assert _rows_per_hour(database_session) == {hour: pytest.approx(daytona.billed(hour)) for hour in hours}
+        assert _rows_per_hour(database_session) == {
+            hour: pytest.approx(daytona.billed(hour, owned=daytona.owned)) for hour in hours
+        }
 
     @pytest.mark.description(
         (

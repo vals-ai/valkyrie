@@ -7,34 +7,30 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session
 from testcontainers.postgres import PostgresContainer
 
 import tracker.remote_grader_crypt as grader_crypt
 from tracker.api.remote_grader import router as remote_grader_router
 from tracker.database.models import ExecutorAdmission
 from tracker.database.session import get_session
+from tests.utils import create_schema_template, database_from_schema_template
 
 
 @pytest.fixture(scope="session")
 def postgres_container() -> Generator[PostgresContainer, None, None]:
     with PostgresContainer("postgres:16-alpine") as postgres:
+        create_schema_template(postgres.get_connection_url())
         yield postgres
 
 
 @pytest.fixture
 def postgres_engine(postgres_container: PostgresContainer) -> Generator[Engine, None, None]:
-    engine = create_engine(postgres_container.get_connection_url())
-    SQLModel.metadata.create_all(engine)
-    with Session(engine) as session:
-        session.add(ExecutorAdmission())
-        session.commit()
-
-    try:
+    with database_from_schema_template(postgres_container.get_connection_url()) as engine:
+        with Session(engine) as session:
+            session.add(ExecutorAdmission())
+            session.commit()
         yield engine
-    finally:
-        SQLModel.metadata.drop_all(engine)
-        engine.dispose()
 
 
 @pytest.fixture

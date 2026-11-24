@@ -1,17 +1,15 @@
 ---
 title: "Quickstart"
-description: "Run your first agent evaluation on one Terminal-Bench task with Modal."
+description: "Run Claude Code on one Terminal-Bench task on hosted Valkyrie, with a Modal sandbox."
 ---
 
-Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie.
+This quickstart runs Claude Code on one Terminal-Bench task on hosted Valkyrie, in a Modal sandbox. To run the Tracker on your own machine instead, follow [Run Tracker locally](/self-hosting/local-tracker).
 
 You need:
 
-- Python 3.12, [uv](https://docs.astral.sh/uv/), and Git.
+- [uv](https://docs.astral.sh/uv/) and a Vals AI account. To request one, email [contact@vals.ai](mailto:contact@vals.ai).
 - A [Modal](https://modal.com) account for task sandboxes.
 - An [Anthropic API key](https://platform.claude.com/settings/keys) for Claude Code.
-
-<a id="install-the-cli" style={{ display: "block", scrollMarginTop: "12rem" }} />
 
 ## 1. Install the CLI
 
@@ -19,99 +17,72 @@ You need:
 uv tool install valkyrie-cli
 ```
 
-<a id="sign-in" style={{ display: "block", scrollMarginTop: "12rem" }} />
+It installs as `valk`, with the long name `valkyrie`.
 
-## 2. Sign in and create an organization
+## 2. Sign in and choose an organization
 
 ```bash
-valkyrie login
+valk login
 ```
 
 If a teammate already set up your organization, join it instead of creating one:
 
-- If they invited you, run `valkyrie org accept ORG_ID`. See
-  [Join an organization](/get-started/configuration#join-an-organization).
-- If you already belong to it, run `valkyrie org use ORG_ID`.
+- If they invited you, run `valk org accept ORG_ID`. See [Join an organization](/get-started/configuration#join-an-organization).
+- If you already belong to it, run `valk org use ORG_ID`.
 
-Otherwise, create one:
+Otherwise, create one, replacing `my-team` with an unused [organization ID](/get-started/configuration#create-an-organization):
 
 ```bash
-valkyrie org create my-team
+valk org create my-team
 ```
-
-- Replace `my-team` with an unused organization ID. See the
-  [ID requirements](/get-started/configuration#create-an-organization).
-- Later commands use this organization.
-- Everyone in the organization sees its runs, datasets, and agents.
 
 ## 3. Connect Modal
 
-Follow [Set up Modal](/get-started/sandbox-providers#set-up-modal) to save your token and
-connect your workspace to Valkyrie.
+Follow [Set up Modal](/get-started/sandbox-providers#set-up-modal) to save your token and connect your workspace. It's set once per organization.
 
-## 4. Install Claude Code
-
-Install the [Claude Code example](https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0)
-from the public agent registry:
+## 4. Save your API key
 
 ```bash
-valkyrie agent install \
-  https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
-```
-
-- The CLI confirms that `claude_code-v1.0.0` is installed in your organization's library.
-
-Save your Anthropic API key:
-
-```bash
-valkyrie secret set anthropic-api-key
+valk secret set ANTHROPIC_API_KEY
 ```
 
 Enter the key when prompted. It is hidden as you type.
 
-## 5. Install a Harbor dataset
+## 5. Install Claude Code and a dataset
+
+Install the [Claude Code example](https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0) from the public agent registry, and Terminal-Bench 2 from Harbor as the dataset `tb/tb2`:
 
 ```bash
-valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
+valk agent install \
+  https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
+
+valk dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
 ```
-
-- The tasks are saved as `tb/tb2` in your organization.
-
-<a id="run-one-task" style={{ display: "block", scrollMarginTop: "12rem" }} />
 
 ## 6. Run one task
 
 ```bash
-valkyrie run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
+valk run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
   --model anthropic/claude-sonnet-4-6 --provider modal \
-  -s ANTHROPIC_API_KEY anthropic-api-key --slice 0:1 --concurrency 1 --connect
+  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --concurrency 1 --follow
 ```
 
-- Valkyrie creates a Modal sandbox, runs Claude Code on one task, and grades the result.
-- The CLI prints a **Run ID** and streams progress until the run finishes.
-
-<a id="read-the-result" style={{ display: "block", scrollMarginTop: "12rem" }} />
+- `-s` sets the agent's `ANTHROPIC_API_KEY` from the secret you saved under that name.
+- The CLI prints a **Run ID** and streams progress until the run finishes, which can take 10 minutes or more.
+- To run more tasks at once, raise `--slice` and `--concurrency`, for example `--slice 0:10 --concurrency 10`.
 
 ## 7. Read the result
 
 ```bash
-valkyrie run results RUN_ID
+valk run show RUN_ID
 ```
 
-Replace *`RUN_ID`* with the ID from the **Run ID** line.
+Replace *`RUN_ID`* with the ID from the **Run ID** line. **Final score** is the share of tasks that passed.
 
-- The CLI prints the saved results file's path.
-- Open that JSON file to inspect the task's result and score.
-
-To browse the run's tasks and logs, and your organization's other runs and datasets:
-
-```bash
-valkyrie tui
-```
+To browse your organization's runs, tasks, and logs, run `valk tui`.
 
 ## Next steps
 
 - [Package an agent](/agents/package-an-agent) to run your own agent
 - [Publish a dataset](/benchmarks/datasets) to evaluate tasks you build
-- [Start a run](/runs/start) on more tasks, with your model and concurrency
-- [Monitor runs](/runs/monitor) to follow progress and find failed tasks
+- [Run Tracker locally](/self-hosting/local-tracker) to run tasks on your machine with no account

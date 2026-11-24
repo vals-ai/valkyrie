@@ -1,4 +1,7 @@
 import pytest
+from benchmark_service.sandbox import SandboxConnectionError as ProviderSandboxConnectionError
+from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import SandboxRejectedError as ProviderSandboxRejectedError
 from benchmark_service.client import (
     BenchmarkServiceError,
     BenchmarkServiceStreamError,
@@ -6,6 +9,7 @@ from benchmark_service.client import (
 )
 from websockets.exceptions import ConnectionClosedError
 
+from tracker.clients.dataset_tasks import InvalidTaskError
 from tracker.domain import FailureCategory, FailurePhase
 from tracker.exceptions import (
     AgentRunFailedError,
@@ -44,6 +48,17 @@ from tracker.services.failures import Disposition, decide, describe_failure, is_
         (BenchmarkServiceStreamError("closed"), FailurePhase.EVALUATION, Disposition.RESUME_EVALUATION),
         (ConnectionClosedError(None, None), FailurePhase.EVALUATION, Disposition.RESUME_EVALUATION),
         (SandboxError("exit code 1"), FailurePhase.SETUP, Disposition.TERMINAL),
+        (
+            ProviderSandboxConnectionError("Daytona snapshot metadata is unavailable"),
+            FailurePhase.ADMISSION,
+            Disposition.RECREATE_SANDBOX,
+        ),
+        (
+            ProviderSandboxError("Daytona rejected the snapshot metadata request"),
+            FailurePhase.ADMISSION,
+            Disposition.TERMINAL,
+        ),
+        (ProviderSandboxRejectedError("snapshot not found"), FailurePhase.SANDBOX, Disposition.TERMINAL),
         (AgentRunFailedError("agent exited 1"), FailurePhase.AGENT, Disposition.TERMINAL),
         (SandboxDNSResolutionError("gateway"), FailurePhase.AGENT, Disposition.RECREATE_SANDBOX),
         (OutputArtifactError("missing"), FailurePhase.AGENT, Disposition.TERMINAL),
@@ -93,6 +108,7 @@ def _setup_error_with_cause(cause_code: str) -> SandboxSetupError:
         ),
         (AgentRunFailedError("x"), FailureCategory.AGENT, "tracker", None),
         (OutputArtifactError("x"), FailureCategory.INFRASTRUCTURE, "output_artifact", None),
+        (InvalidTaskError("x"), FailureCategory.DATASET, "dataset_task", "invalid_task"),
         (
             BenchmarkServiceStreamError("x"),
             FailureCategory.BENCHMARK_SERVICE,

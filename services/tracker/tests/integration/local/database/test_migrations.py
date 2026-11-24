@@ -1717,6 +1717,42 @@ def test_org_requires_project_migration_leaves_every_org_off_and_downgrades(migr
     engine.dispose()
 
 
+@pytest.mark.description("The migration requires projects only for `vals.ai` and restores its opt-out on downgrade.")
+def test_vals_org_requires_project_round_trip(migration_database_url: str) -> None:
+    upgrade = _run_alembic(migration_database_url, "upgrade", "c4e1a9d2b7f6")
+    assert upgrade.returncode == 0, upgrade.stderr
+    engine = create_engine(migration_database_url)
+    with engine.begin() as connection:
+        for name, requires_project in (("vals.ai", False), ("other-org", False), ("already-required", True)):
+            connection.execute(
+                text("INSERT INTO org (id, name, requires_project) VALUES (:id, :name, :requires_project)"),
+                {"id": uuid4(), "name": name, "requires_project": requires_project},
+            )
+
+    upgrade = _run_alembic(migration_database_url, "upgrade", "e5b9d2f8a4c3")
+    assert upgrade.returncode == 0, upgrade.stderr
+
+    with engine.connect() as connection:
+        assert dict(connection.execute(text("SELECT name, requires_project FROM org")).tuples().all()) == {
+            "default": False,
+            "vals.ai": True,
+            "other-org": False,
+            "already-required": True,
+        }
+
+    downgrade = _run_alembic(migration_database_url, "downgrade", "c4e1a9d2b7f6")
+    assert downgrade.returncode == 0, downgrade.stderr
+
+    with engine.connect() as connection:
+        assert dict(connection.execute(text("SELECT name, requires_project FROM org")).tuples().all()) == {
+            "default": False,
+            "vals.ai": False,
+            "other-org": False,
+            "already-required": True,
+        }
+    engine.dispose()
+
+
 def _insert_projects(engine: Engine, org_name: str, projects: list[tuple[str, str, bool]]) -> None:
     org_id = uuid4()
     with engine.begin() as connection:

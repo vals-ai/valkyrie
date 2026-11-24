@@ -50,15 +50,15 @@ def _client(responses: list[Exception | httpx.Response], attempts: list[str]) ->
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["read_run_state", "queue-states"])
-@pytest.mark.description("A retry-safe operation survives read timeouts and gateway errors within its retry budget.")
+@pytest.mark.parametrize("operation, status", [("read_run_state", 503), ("queue-states", 503), ("monitor_tasks", 500)])
+@pytest.mark.description("A retry-safe operation survives read timeouts and temporary errors within its retry budget.")
 async def test_retry_safe_operation_survives_transient_control_failures(
-    monkeypatch: pytest.MonkeyPatch, operation: str
+    monkeypatch: pytest.MonkeyPatch, operation: str, status: int
 ) -> None:
     monkeypatch.setattr(control_client.random, "uniform", lambda _low, _high: 0)
     attempts: list[str] = []
     client = _client(
-        [httpx.ReadTimeout("stalled"), httpx.Response(503), httpx.Response(200, json={"ok": True})], attempts
+        [httpx.ReadTimeout("stalled"), httpx.Response(status), httpx.Response(200, json={"ok": True})], attempts
     )
 
     result = await client.call(operation, _Body(ok=True), _Body)

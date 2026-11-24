@@ -50,7 +50,8 @@ These are for a caller, such as the Tracker, deciding where a sandbox fits. They
 
 - `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound traffic, and `Sandbox.clear_egress_rules()` restores unrestricted access.
 - Deny-all is its own provider-native operation, so don't express it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three methods to its outer sandbox.
-- On Modal, an exact hostname is enforced as the IPv4 addresses it resolves to, so other sites on those addresses are reachable too. Modal refuses a `*.` wildcard, because it can't enforce one.
+- Hostnames, including `*.` wildcards, are enforced as domain rules on every provider, so other sites on the same CDN address stay blocked.
+- Modal filters domains only on sandboxes created with a domain list, so every Modal sandbox starts with one.
 
 ### Inventory and pricing
 

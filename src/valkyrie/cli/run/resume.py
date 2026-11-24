@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import click
-from valkyrie.sdk import AgentReleaseSelection, ValkyrieClient
+from valkyrie.sdk import AgentReleaseSelection
 
-from valkyrie.cli.client import call
+from valkyrie.cli.client import call, retry_unavailable
+from valkyrie.cli.display import json_option, emit, done
 from valkyrie.cli.run.progress import echo_next_steps, follow_run_status
 from valkyrie.cli.run.task_ids import resolve_task_ids
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 _RESTART_OPTIONS: tuple[Callable[[Callable[..., Any]], Callable[..., Any]], ...] = (
     click.option("--agent-release", default=None, help="Saved replacement agent version."),
@@ -24,14 +30,7 @@ _RESTART_OPTIONS: tuple[Callable[[Callable[..., Any]], Callable[..., Any]], ...]
         type=str,
         required=False,
         default=None,
-        help="Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908).",
-    ),
-    click.option(
-        "--task-ids-file",
-        type=str,
-        required=False,
-        default=None,
-        help="Path or http(s) URL to a text file with one task ID per line.",
+        help="Comma-separated task IDs, @FILE, or an http(s) URL with one task ID per line.",
     ),
     click.option(
         "--secret",
@@ -40,7 +39,7 @@ _RESTART_OPTIONS: tuple[Callable[[Callable[..., Any]], Callable[..., Any]], ...]
         multiple=True,
         nargs=2,
         type=(str, str),
-        help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY YourAnthropicKeySecret).",
+        help="Secret as ENV_VAR SECRET_NAME. Adds to or replaces the agent contract's mapping for ENV_VAR.",
     ),
     click.option(
         "--header",
@@ -71,7 +70,7 @@ _RESTART_OPTIONS: tuple[Callable[[Callable[..., Any]], Callable[..., Any]], ...]
         help="Replace the benchmark service URL for this run.",
     ),
     click.option(
-        "--connect",
+        "--follow",
         is_flag=True,
         required=False,
         help="Connect to the tracker service to stream run updates after resuming.",
@@ -98,7 +97,6 @@ def _restart(
     retry: bool,
     concurrency: int | None,
     task_ids: str | None,
-    task_ids_file: str | None,
     secrets: tuple[tuple[str, str], ...],
     headers: tuple[tuple[str, str], ...],
     update_agent: bool,
@@ -107,9 +105,12 @@ def _restart(
     from_scratch: bool,
     benchmark_url: str | None,
     lambda_function: str | None,
-    connect: bool,
+    follow: bool,
+    output_format: str,
 ) -> None:
-    retry_task_ids = resolve_task_ids(task_ids, task_ids_file)
+    if output_format == "jsonl" and not follow:
+        raise click.UsageError("--jsonl requires --follow.")
+    retry_task_ids = resolve_task_ids(task_ids)
     if agent_sha256 and not agent_release:
         raise click.UsageError("--agent-sha256 requires --agent-release")
     if agent_release and not (update_agent and from_scratch):
@@ -117,24 +118,27 @@ def _restart(
     selection = AgentReleaseSelection(reference=agent_release, archive_sha256=agent_sha256) if agent_release else None
 
     async def restart(client: ValkyrieClient) -> None:
-        await (client.runs.retry if retry else client.runs.resume)(
-            run_id,
-            concurrency=concurrency,
-            task_ids=retry_task_ids,
-            secrets=dict(secrets),
-            service_headers=dict(headers),
-            from_scratch=from_scratch,
-            update_agent=update_agent,
-            agent_release=selection,
-            benchmark_url=benchmark_url,
-            lambda_function=lambda_function,
+        await retry_unavailable(
+            lambda: (client.runs.retry if retry else client.runs.resume)(
+                run_id,
+                concurrency=concurrency,
+                task_ids=retry_task_ids,
+                secrets=dict(secrets),
+                service_headers=dict(headers),
+                from_scratch=from_scratch,
+                update_agent=update_agent,
+                agent_release=selection,
+                benchmark_url=benchmark_url,
+                lambda_function=lambda_function,
+            )
         )
-        click.echo(click.style(f"✓ Run {'retried' if retry else 'resumed'} successfully!", fg="green", bold=True))
-        echo_next_steps(run_id, track=not connect)
+        done(f"Run {'retried' if retry else 'resumed'} successfully!")
+        echo_next_steps(run_id, track=not follow)
 
     call(restart)
-    if connect:
-        follow_run_status(run_id)
+    emit({"run_id": run_id, "retried": retry, "resumed": not retry}, output_format)
+    if follow:
+        follow_run_status(run_id, output_format="jsonl" if output_format == "jsonl" else "text")
 
 
 @click.command(
@@ -142,20 +146,14 @@ def _restart(
         "Resume a run's stopped tasks by its ID.\n"
         "\n"
         "Example:\n"
-        "    valkyrie run resume 123e4567-e89b-12d3-a456-426614174000 --retry --concurrency 20"
+        "    valkyrie run resume 123e4567-e89b-12d3-a456-426614174000 --concurrency 20"
     )
 )
 @click.argument("run_id", type=UUID)
-@click.option(
-    "--retry",
-    is_flag=True,
-    required=False,
-    default=False,
-    help="Retry tasks with the status error.",
-)
 @_restart_options
+@json_option(stream=True)
 def resume(**options: Any) -> None:
-    _restart(**options)
+    _restart(retry=False, **options)
 
 
 @click.command(
@@ -169,10 +167,8 @@ def resume(**options: Any) -> None:
     short_help="Retry a run's errored tasks by its ID.",
 )
 @click.argument("run_id", type=UUID)
-@click.option(
-    "--retry", is_flag=True, hidden=True, help="Accepted for compatibility. `retry` always retries errored tasks."
-)
 @_restart_options
+@json_option(stream=True)
 def retry_command(**options: Any) -> None:
     options["retry"] = True
     _restart(**options)

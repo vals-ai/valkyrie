@@ -587,6 +587,28 @@ class TestBenchmarkTaskListing:
 
         assert [task["task_id"] for task in response_body["tasks"]] == ["t-a", "t-b", "t-c"]
 
+    @pytest.mark.description(
+        "Sorting by last log orders known timestamps before pagination and puts unknown values last."
+    )
+    @pytest.mark.parametrize(("sort_dir", "first_day"), [("asc", 1), ("desc", 2)])
+    def test_get_benchmark_tasks_sort_by_last_log(
+        self, client: httpx.Client, database_session: Session, sort_dir: str, first_day: int
+    ) -> None:
+        benchmark = make_benchmark(name="bench-1", status=BenchmarkStatus.IN_PROGRESS, session=database_session)
+        for index in (2, None, 1):
+            task = make_task(benchmark, f"task-{index}", status=TaskStatus.IN_PROGRESS)
+            task.last_log_at = datetime(2026, 9, index, tzinfo=UTC) if index else None
+            database_session.add(task)
+        database_session.commit()
+
+        response = client.get(
+            f"/benchmarks/{benchmark.id}/tasks?sort=last_log_at&sort_dir={sort_dir}&limit=1",
+            headers={"X-Api-Key": "fake"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["tasks"][0]["last_log_at"] == datetime(2026, 9, first_day, tzinfo=UTC).isoformat()
+
 
 class TestBenchmarkConsoleUrls:
     @pytest.mark.description("A fetched run carries console URLs for its runtime.")

@@ -14,7 +14,8 @@ Create an access key for your organization. Set it as VALKYRIE_API_KEY where you
 ```bash Syntax
 valkyrie token create \
   <NAME> \
-  [--expires-in-days <INTEGER>]
+  [--expires-in-days <INTEGER>] \
+  [--json]
 ```
 
 **Arguments**
@@ -30,6 +31,11 @@ valkyrie token create \
   <p className="mb-0 mt-1">{"Days until the key stops working."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Token guides](/get-started/configuration#create-an-access-key-for-ci).
 
 ---
@@ -40,13 +46,21 @@ Delete an access key you created. The Tracker may accept it for up to one more m
 
 ```bash Syntax
 valkyrie token revoke \
-  <KEY_ID>
+  <KEY_ID> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"KEY_ID"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Token guides](/get-started/configuration#create-an-access-key-for-ci).

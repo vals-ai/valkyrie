@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import UTC, datetime, timedelta
+import sqlite3
 from sqlite3 import Connection, Cursor
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
@@ -16,7 +17,13 @@ from sqlmodel import Session, SQLModel, StaticPool, create_engine
 
 from tests.factories import make_benchmark
 from tests.project_service import MockProjectRoutes
-from tests.utils import TEST_ORG_ID, FakeAccessKeys, add_sqlite_btrim
+from tests.utils import (
+    TEST_ORG_ID,
+    FakeAccessKeys,
+    add_sqlite_btrim,
+    create_schema_template,
+    database_from_schema_template,
+)
 from tracker.api.projects import PreliminaryProjectCache
 from tracker.database.models import (
     Benchmark,
@@ -36,6 +43,7 @@ from tracker.database.session import get_session
 from tracker.executor.control_app import app as control_app
 from tracker.executor.control_client import ControlClient
 from tracker.executor.control_protocol import DispatchRef
+from tracker.executor import control_queue
 from tracker.executor.control_queue import QueueControl
 from tracker.executor.control_runs import RunControl
 from tracker.executor.control_store import invocation_digest
@@ -62,9 +70,25 @@ def aws_runtime() -> AWSRuntime:
     )
 
 
+@pytest.fixture(scope="session")
+def sqlite_schema() -> Generator[sqlite3.Connection, None, None]:
+    schema = sqlite3.connect(":memory:", check_same_thread=False)
+    engine = create_engine("sqlite://", creator=lambda: schema, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    try:
+        yield schema
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture(scope="function")
-def database_session() -> Generator[Session, None, None]:
-    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+def database_session(sqlite_schema: sqlite3.Connection) -> Generator[Session, None, None]:
+    def connect() -> sqlite3.Connection:
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        sqlite_schema.backup(connection)
+        return connection
+
+    test_engine = create_engine("sqlite://", creator=connect, poolclass=StaticPool)
 
     @event.listens_for(test_engine, "connect")
     def set_sqlite_pragma(dbapi_connection: Connection, _connection_record: ConnectionPoolEntry) -> None:  # type: ignore
@@ -82,7 +106,6 @@ def database_session() -> Generator[Session, None, None]:
             session.commit()
             yield session
     finally:
-        SQLModel.metadata.drop_all(test_engine)
         test_engine.dispose()
 
 
@@ -91,22 +114,18 @@ def control_postgres_container() -> Generator["PostgresContainer", None, None]:
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer("postgres:16-alpine") as postgres:
+        create_schema_template(postgres.get_connection_url())
         yield postgres
 
 
 @pytest.fixture
 def control_postgres_engine(control_postgres_container: "PostgresContainer") -> Generator[Engine, None, None]:
-    engine = create_engine(control_postgres_container.get_connection_url())
-    SQLModel.metadata.create_all(engine)
-    with Session(engine) as session:
-        session.add(ExecutorAdmission())
-        session.add(Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME, storage_key="test-bucket"))
-        session.commit()
-    try:
+    with database_from_schema_template(control_postgres_container.get_connection_url()) as engine:
+        with Session(engine) as session:
+            session.add(ExecutorAdmission())
+            session.add(Org(id=TEST_ORG_ID, name=DEFAULT_ORG_NAME, storage_key="test-bucket"))
+            session.commit()
         yield engine
-    finally:
-        SQLModel.metadata.drop_all(engine)
-        engine.dispose()
 
 
 @pytest.fixture
@@ -120,6 +139,7 @@ async def bound_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncGenerator[Callable[..., dict[str, object]], None]:
     clients: list[ControlClient] = []
+    monkeypatch.setattr(control_queue, "_STATE_BATCH_WINDOW_SECONDS", 0.01)
 
     def create(benchmark: Benchmark, *, session: Session, dispatch_id: UUID | None = None) -> dict[str, object]:
         engine = session.bind

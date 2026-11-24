@@ -72,15 +72,15 @@ def test_push_uploads_every_new_task_and_publishes_the_version(tracker: MockTrac
     result = _invoke(str(folder), "--tag", "stable")
 
     assert result.exit_code == 0, result.output
-    assert "✓ Uploaded task-a (99 bytes)" in result.output and "✓ Uploaded task-b (99 bytes)" in result.output
     assert "Published swe-bench/verified@3: 2 task(s), 2 uploaded. Tags: latest, stable." in result.output
     (published,) = tracker.requested("POST", f"{_URL}/versions")
     assert json.loads(published.content)["tags"] == ["stable"]
 
 
 @pytest.mark.description("Push warns about entries left out and what the tracker warns about.")
+@pytest.mark.parametrize("json_output", [False, True])
 def test_push_warns_about_entries_left_out_and_what_the_tracker_warns_about(
-    tracker: MockTracker, tmp_path: Path
+    tracker: MockTracker, tmp_path: Path, json_output: bool
 ) -> None:
     folder = _write_tasks(tmp_path, "task-a")
     (folder / "task-a" / "data").mkdir()
@@ -93,11 +93,14 @@ def test_push_warns_about_entries_left_out_and_what_the_tracker_warns_about(
         httpx.Response(201, json={"digest": digest, "size": 99, "warnings": ["[agent].mystery is ignored"]}),
     )
 
-    result = _invoke(str(folder))
+    result = _invoke(str(folder), *(["--json"] if json_output else []))
 
     assert result.exit_code == 0, result.output
     assert "! task-a: not stored because they are not part of a task: data, notes.txt" in result.output
     assert "! task-a: [agent].mystery is ignored" in result.output
+    assert "! task-a: [agent].mystery is ignored" in result.stderr
+    if json_output:
+        assert json.loads(result.stdout)["revision"] == 3
 
 
 @pytest.mark.description("Push uploads only what the dataset does not store.")
@@ -108,7 +111,6 @@ def test_push_uploads_only_what_the_dataset_does_not_store(tracker: MockTracker,
     result = _invoke(str(folder))
 
     assert result.exit_code == 0, result.output
-    assert "Uploaded task-b" in result.output and "Uploaded task-a" not in result.output
     assert "2 task(s), 1 uploaded" in result.output
     assert len(tracker.requested("PUT", f"{_URL}/blobs/{task_digest(folder / 'task-a')}")) == 0
 
@@ -162,7 +164,6 @@ def test_push_reports_failed_uploads_and_publishes_nothing(tracker: MockTracker,
     result = _invoke(str(folder))
 
     assert result.exit_code == 1
-    assert "✓ Uploaded task-a" in result.output
     assert "✗ task-b" in result.output and "Not allowed" in result.output
     assert "1 of 2 uploads failed and nothing was published" in result.output
     assert tracker.requested("POST", f"{_URL}/versions") == []

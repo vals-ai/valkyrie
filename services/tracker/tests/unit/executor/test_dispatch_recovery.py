@@ -16,6 +16,7 @@ from tracker.database.models import (
     ExecutorDispatch,
     ExecutorDispatchPayload,
     ExecutorRelease,
+    SandboxBuildReservation,
     Task,
 )
 from executor_protocol import ExecutorDispatchStatus
@@ -34,6 +35,66 @@ _PULL_FAILURE = (
     "CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref "
     "123456789012.dkr.ecr.us-east-1.amazonaws.com/runner:missing: not found"
 )
+
+
+@pytest.mark.description(
+    "Local startup marks interrupted tasks as errors and hands off their build reservations for orphan cleanup."
+)
+def test_local_tracker_restart_recovers_interrupted_tasks(
+    database_session: Session, example_benchmark_object: Benchmark, monkeypatch: MonkeyPatch
+) -> None:
+    session = database_session
+    benchmark = example_benchmark_object
+    release = ExecutorRelease(
+        id="local-restart", artifact_uri="source:///runner", artifact_digest="a" * 64, protocol_version="3"
+    )
+    register_release(session, release)
+    pin_benchmark_to_release(benchmark, release)
+    dispatch = create_executor_dispatch(
+        benchmark.id, release, ExecutorDispatchKind.START, dispatch_id=uuid4(), task_ids=["active", "done"]
+    )
+    dispatch.status = ExecutorDispatchStatus.RUNNING
+    active, done = [
+        Task(
+            org_id=benchmark.org_id,
+            benchmark=benchmark.id,
+            task_id=task_id,
+            status=status,
+            started_at=dispatch.created_at,
+        )
+        for task_id, status in (("active", TaskStatus.EVALUATING), ("done", TaskStatus.FINISHED))
+    ]
+    session.add_all([benchmark, dispatch, active, done])
+    session.flush()
+    reservation = SandboxBuildReservation(
+        task_row_id=active.id,
+        attempt_started_at=dispatch.created_at,
+        phase_dispatch_id=dispatch.id,
+        phase_token=uuid4(),
+        executor_dispatch_id=dispatch.id,
+        accepted_at=dispatch.created_at,
+        pool_id="local",
+        target_id="local",
+        sandbox_class="docker",
+        requested_vcpu=1,
+        requested_memory=1,
+        requested_disk=1,
+        requested_gpu=0,
+    )
+    session.add(reservation)
+    session.commit()
+    monkeypatch.setattr(dispatch_recovery, "engine", session.get_bind())
+
+    assert dispatch_recovery.recover_interrupted_local_dispatches() == 1
+    assert dispatch_recovery.recover_interrupted_local_dispatches() == 0
+
+    session.expire_all()
+    assert dispatch.status == ExecutorDispatchStatus.FAILED
+    assert benchmark.status == BenchmarkStatus.ERROR
+    assert (active.status, done.status) == (TaskStatus.ERROR, TaskStatus.FINISHED)
+    error = session.exec(select(ErrorResult).where(ErrorResult.task == active.id)).one()
+    assert error.cause_code == "LOCAL_TRACKER_INTERRUPTED"
+    assert (reservation.phase_dispatch_id, reservation.phase_token) == (None, None)
 
 
 @pytest.mark.description("Dispatch recovery sweeps only payloads outside the queue.")

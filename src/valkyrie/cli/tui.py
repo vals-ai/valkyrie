@@ -16,5 +16,7 @@ def tui(fake: bool) -> None:
         try:
             source = TrackerSource.from_cli_config()
         except ValkyrieConfigError as error:
-            raise click.ClickException(f"{error}\nOr try `valk tui --fake` for sample data.") from error
+            from valkyrie.cli.display import Failure, command
+
+            raise Failure(str(error), hint=command("tui", "--fake")) from error
     ValkyrieApp(source, switcher=None if fake else TrackerSwitcher()).run()

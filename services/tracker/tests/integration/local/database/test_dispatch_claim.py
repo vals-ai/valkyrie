@@ -418,7 +418,9 @@ def test_local_process_recovers_after_stop_or_crash(
     postgres_session.commit()
     work_started = tmp_path / "work-started"
     (tmp_path / "sitecustomize.py").write_text(
-        "import asyncio\nfrom pathlib import Path\nimport tracker.services.runs.start as orchestration\n"
+        "import asyncio\nfrom pathlib import Path\nimport executor_protocol\n"
+        "import tracker.services.runs.start as orchestration\n"
+        "executor_protocol.DEFAULT_EXECUTOR_DISPATCH_LEASE_TICK_SECONDS = 0.2\n"
         "async def wait_for_stop(**kwargs):\n"
         f"    Path({str(work_started)!r}).write_text('entered')\n"
         "    await asyncio.Future()\n"

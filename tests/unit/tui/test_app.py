@@ -35,9 +35,9 @@ from valkyrie.sdk.models import (
     TasksResponse,
     TaskStatus,
 )
-from valkyrie.tui.run import RunScreen, TaskLog, log_line
+from valkyrie.tui.run import RunScreen, TaskLog, _detail, log_line
 from valkyrie.tui.runs import MenuScreen, RunsScreen
-from valkyrie.tui.source import FINAL_STATUSES, LIVE_STATUSES, Environment, RunSource, TrackerSource
+from valkyrie.tui.source import ACTIVE_TASKS, FINAL_STATUSES, LIVE_STATUSES, Environment, RunSource, TrackerSource
 from valkyrie.tui.widgets import TopBar
 
 from tests.unit.tui.conftest import MockClock
@@ -79,7 +79,7 @@ class TestRunsScreen:
 
             assert_snapshot(pilot.app.export_screenshot(), "runs")
             await pilot.press("y")
-            assert pilot.app.clipboard == f"valk run fetch {_LIVE_RUN} --connect"
+            assert pilot.app.clipboard == f"valk run show {_LIVE_RUN} --follow"
 
     @pytest.mark.description("The runs screen poll updates each live run's finished and total task counts.")
     async def test_status_poll_updates_live_runs(self, clock: MockClock) -> None:
@@ -380,6 +380,65 @@ class TestDatasetsScreen:
 
 @pytest.mark.description("A run's summary, its tasks errors first, and the highlighted task's logs and detail.")
 class TestRunScreen:
+    @pytest.mark.description("A task detail shows its last log as an age next to the runtime.")
+    def test_last_log_age(self, clock: MockClock) -> None:
+        now = clock()
+        task = SingleTaskResponse(
+            id=UUID(int=1),
+            task_id="task",
+            status=TaskStatus.IN_PROGRESS,
+            started_at=now - timedelta(minutes=4),
+            last_log_at=now - timedelta(minutes=3),
+            finished_at=None,
+            error_message=None,
+            evaluation_result=None,
+            agent_caused_exit_reason=None,
+        )
+
+        assert "ran 4m · last log 3m ago" in _detail(task, now).plain
+
+    @pytest.mark.description("A selected running task's last-log age advances and updates when new logs arrive.")
+    async def test_selected_task_last_log_refreshes(self, clock: MockClock, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _open_app(clock) as pilot:
+            await pilot.press("j", "j", "j", "enter")
+            await _settle(pilot)
+            screen = cast(RunScreen, pilot.app.screen)
+            active = next(task for task in screen.tasks.values() if task.status in ACTIVE_TASKS)
+            screen.show_task(active.task_id)
+            await _settle(pilot)
+            detail = screen.query_one("#detail-body", Static)
+            assert "last log" not in str(detail.content)
+
+            source = screen.source
+            page = await source.tasks(screen.run.id)
+            last_log_at = clock() - timedelta(minutes=3)
+
+            async def tasks_with_latest_log(_run_id: UUID) -> TasksResponse:
+                return TasksResponse(
+                    tasks=[
+                        task.model_copy(update={"last_log_at": last_log_at}) if task.task_id == active.task_id else task
+                        for task in page.tasks
+                    ],
+                    total_count=page.total_count,
+                )
+
+            monkeypatch.setattr(source, "tasks", tasks_with_latest_log)
+
+            screen._refresh_if_stale()
+            await _settle(pilot)
+            assert "last log 3m ago" in str(detail.content)
+
+            clock.advance(60)
+            screen._refresh_if_stale()
+            await _settle(pilot)
+            assert "last log 4m ago" in str(detail.content)
+
+            last_log_at = clock()
+            screen._refresh_if_stale()
+            await _settle(pilot)
+            assert "last log 0s ago" in str(detail.content)
+            assert screen.tasks[active.task_id].status == active.status
+
     @pytest.mark.description("When the selected task starts, its log and detail panes reload with the new status.")
     async def test_the_shown_task_reloads_its_log_and_detail_when_it_starts(self, clock: MockClock) -> None:
         async with _open_app(clock) as pilot:
@@ -566,7 +625,7 @@ class TestRunScreen:
             await pilot.press("slash", *"-nothing", "enter", "y")
             log = screen.query_one(Log)
             assert (table.row_count, log.line_count) == (0, 0)
-            assert pilot.app.clipboard == f"valk run fetch {_LIVE_RUN} --connect"
+            assert pilot.app.clipboard == f"valk run show {_LIVE_RUN} --follow"
 
             await pilot.press("escape")
             await _settle(pilot)

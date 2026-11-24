@@ -9,7 +9,9 @@
   "reference/cli/secret",
   "reference/cli/provider",
   "reference/cli/login",
+  "reference/cli/tracker",
   "reference/cli/token",
   "reference/cli/org",
-  "reference/cli/tui"
+  "reference/cli/tui",
+  "reference/cli/completion"
 ]

@@ -38,12 +38,12 @@ def read_task_ids_source(source: str) -> list[str]:
     return task_ids
 
 
-def resolve_task_ids(task_ids: str | None = None, task_ids_file: str | None = None) -> list[str] | None:
-    if task_ids is not None and task_ids_file is not None:
-        raise click.UsageError("--task-ids and --task-ids-file are mutually exclusive")
-    if task_ids_file is not None:
-        return read_task_ids_source(task_ids_file)
+def resolve_task_ids(task_ids: str | None = None) -> list[str] | None:
     if task_ids is not None:
+        if task_ids.startswith("@"):
+            return read_task_ids_source(task_ids[1:])
+        if urlparse(task_ids).scheme in {"http", "https"}:
+            return read_task_ids_source(task_ids)
         resolved_task_ids = _clean_task_ids(task_ids.split(","))
         if not resolved_task_ids:
             raise click.UsageError("No task ids provided")

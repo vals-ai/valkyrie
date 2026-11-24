@@ -25,7 +25,9 @@ class InMemorySecretStore:
     def __init__(self, references: Mapping[str, str], values: Mapping[str, str]) -> None:
         missing = references.keys() - values.keys()
         if missing:
-            raise SecretsError(f"Local execution secrets missing keys: {', '.join(sorted(missing))}")
+            raise SecretsError(
+                f"The secrets file has no value for {', '.join(sorted(missing))}. Add it, then retry the run."
+            )
         self._values: dict[str, dict[str, SecretValue]] = {}
         for name, reference in references.items():
             self._values.setdefault(reference, {})[name] = values[name]

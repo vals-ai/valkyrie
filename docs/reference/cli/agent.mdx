@@ -14,7 +14,8 @@ Install a GitHub agent through Tracker, replacing an existing alias.
 ```bash Syntax
 valkyrie agent install \
   <GITHUB_URL> \
-  [--name|-n <TEXT>]
+  [--name|-n <TEXT>] \
+  [--json]
 ```
 
 **Arguments**
@@ -30,6 +31,11 @@ valkyrie agent install \
   <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Agent guides](/agents/manage-agents).
 
 ---
@@ -41,7 +47,8 @@ Upload a local agent through Tracker, replacing an existing alias.
 ```bash Syntax
 valkyrie agent push \
   <AGENT_PATH> \
-  [--name|-n <TEXT>]
+  [--name|-n <TEXT>] \
+  [--json]
 ```
 
 **Arguments**
@@ -57,6 +64,11 @@ valkyrie agent push \
   <p className="mb-0 mt-1">{"Agent name (defaults to the contract name)."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Agent guides](/agents/manage-agents).
 
 ---
@@ -68,7 +80,8 @@ Remove an installed agent.
 ```bash Syntax
 valkyrie agent remove \
   <AGENT_NAME> \
-  [--yes|-y]
+  [--yes|-y] \
+  [--json]
 ```
 
 **Arguments**
@@ -84,6 +97,11 @@ valkyrie agent remove \
   <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Agent guides](/agents/manage-agents).
 
 ---
@@ -95,8 +113,9 @@ Download an installed agent.
 ```bash Syntax
 valkyrie agent download \
   <AGENT_NAME> \
-  [--output-dir|-o <PATH>] \
-  [--overwrite]
+  [--output|-o <PATH>] \
+  [--overwrite] \
+  [--json]
 ```
 
 **Arguments**
@@ -108,13 +127,18 @@ valkyrie agent download \
 **Options**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--output-dir, -o"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"directory; readable"}</span></div>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--output, -o"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"path"}</code> · default: <code>{"None"}</code> · constraints: {"directory; readable"}</span></div>
   <p className="mb-0 mt-1">{"Output directory for downloaded agent (default: current directory)."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--overwrite"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
   <p className="mb-0 mt-1">{"Replace an existing agent directory after validating the download."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Agent guides](/agents/manage-agents).
@@ -128,7 +152,7 @@ List installed agents.
 ```bash Syntax
 valkyrie agent list \
   [--all] \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 **Options**
@@ -139,8 +163,8 @@ valkyrie agent list \
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format. JSON includes every agent without interactive paging."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Agent guides](/agents/manage-agents).

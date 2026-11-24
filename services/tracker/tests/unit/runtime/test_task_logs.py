@@ -1,6 +1,8 @@
 import asyncio
 import time
+from datetime import UTC, datetime
 from unittest.mock import Mock
+from uuid import UUID
 
 import pytest
 from opentelemetry import trace
@@ -8,27 +10,62 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from tracker.logging.context import sandbox_id_var, task_id_var
 from tracker.aws.cloudwatch_logs import _EVENT_OVERHEAD_BYTES, _MAX_BATCH_BYTES, _log_event_batches
+from tracker.executor.control_protocol import AttemptRef, DispatchRef
+from tracker.executor.control_tasks import TaskControl
 from tracker.runtime.logs import TaskLogLine
 from tracker.runtime.task_logs import _MAX_LINE_CHARS, TaskLogBuffer
 
 
+@pytest.mark.description("Task logs reach the sink while a timestamp report is still pending.")
+async def test_pending_timestamp_report_does_not_delay_log_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tracker.runtime.task_logs._MAX_BUFFERED_SECONDS", 1)
+    loop = asyncio.get_running_loop()
+    reporting = asyncio.Event()
+    release = asyncio.Event()
+    flushed = asyncio.Event()
+
+    async def monitor(*_: object) -> None:
+        reporting.set()
+        await release.wait()
+
+    def write(_: str, lines: list[TaskLogLine]) -> None:
+        if any(line.message == "second" for line in lines):
+            loop.call_soon_threadsafe(flushed.set)
+
+    control = TaskControl(Mock(call=monitor), DispatchRef(benchmark_id=UUID(int=1), dispatch_id=UUID(int=2)))
+    attempt = AttemptRef(org_id=UUID(int=3), task_row_id=UUID(int=4), task_id="task", started_at=datetime.now(UTC))
+    async with TaskLogBuffer(Mock(write=write), "run:stream", lambda at: control.record_last_log(attempt, at)) as logs:
+        logs.write_line("first")
+        await logs.flush()
+        tick = asyncio.create_task(control.monitor(["task"]))
+        try:
+            await asyncio.wait_for(reporting.wait(), 5)
+            logs.write_line("second")
+            await asyncio.wait_for(flushed.wait(), 5)
+        finally:
+            release.set()
+            await tick
+
+
 @pytest.mark.description(
-    "Output split across writes becomes one line per newline, stamped when its first chunk arrived, with trace fields and blank lines kept."
+    "Split output keeps blank lines, trace fields, and first-chunk timestamps, and closing reports the latest line timestamp."
 )
 async def test_lines_carry_receive_time_and_trace_context(monkeypatch: pytest.MonkeyPatch) -> None:
-    receive_times = iter([100.0, 105.0, 103.0])
+    receive_times = iter([100.0, 105.0, 103.0, 109.0])
     monkeypatch.setattr("tracker.runtime.task_logs.time.time", lambda: next(receive_times))
     sink = Mock()
+    report = Mock()
     tracer = TracerProvider().get_tracer(__name__)
     task_token = task_id_var.set("task-1")
     sandbox_token = sandbox_id_var.set("sandbox-1")
 
     try:
         with tracer.start_as_current_span("task") as span:
-            async with TaskLogBuffer(sink, "run:stream") as logs:
+            async with TaskLogBuffer(sink, "run:stream", report) as logs:
                 logs.write("first ")
                 logs.write("line\nsecond line\n\nthird")
                 logs.write(" line")
+                logs.write("")
     finally:
         task_id_var.reset(task_token)
         sandbox_id_var.reset(sandbox_token)
@@ -40,6 +77,7 @@ async def test_lines_carry_receive_time_and_trace_context(monkeypatch: pytest.Mo
         ("", 105.0),
         ("third line", 105.0),
     ]
+    report.assert_called_once_with(datetime.fromtimestamp(105, UTC))
 
     trace_id = trace.format_trace_id(span.get_span_context().trace_id)
     assert {line.fields["trace_id"] for line in lines} == {trace_id}

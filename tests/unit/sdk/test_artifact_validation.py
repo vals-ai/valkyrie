@@ -81,7 +81,7 @@ def test_sdk_package_configuration_matches_release_boundaries() -> None:
     with (PACKAGE_ROOT / "pyproject.toml").open("rb") as sdk_file:
         sdk_project = tomllib.load(sdk_file)
 
-    assert root_project["project"]["requires-python"] == ">=3.12,<3.13"
+    assert root_project["project"]["requires-python"] == ">=3.12,<3.15"
     assert sdk_project["project"]["requires-python"] == ">=3.12"
     assert root_project["tool"]["basedpyright"]["pythonVersion"] == "3.12"
     assert sdk_project["tool"]["basedpyright"]["pythonVersion"] == "3.12"
@@ -89,13 +89,14 @@ def test_sdk_package_configuration_matches_release_boundaries() -> None:
     assert (PACKAGE_ROOT / ".gitignore").read_text(encoding="utf-8") == ".ruff_cache/\n__pycache__/\ndist/\n"
 
 
-@pytest.mark.description("The CLI requires an SDK version that checks task MCP server declarations.")
+@pytest.mark.description("The CLI requires an SDK version that supports sorting tasks by their last log time.")
 def test_cli_requires_sdk_benchmark_and_dataset_methods() -> None:
     with (ROOT / "pyproject.toml").open("rb") as root_file:
         dependencies = tomllib.load(root_file)["project"]["dependencies"]
     requirement = next(Requirement(value) for value in dependencies if value.startswith("valkyrie-sdk"))
-    assert not requirement.specifier.contains("0.41.0")
-    assert requirement.specifier.contains("0.42.0")
+    assert not requirement.specifier.contains("0.43.0")
+    assert not requirement.specifier.contains("0.45.0")
+    assert requirement.specifier.contains("0.45.1")
 
 
 @pytest.mark.description("A correctly built wheel and sdist pass validation.")

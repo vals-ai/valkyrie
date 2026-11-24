@@ -81,7 +81,7 @@ def test_set_rejects_empty_values_and_bad_names_without_a_request(
 @pytest.mark.description("`secret list` prints each secret's name and store reference.")
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_list_shows_names_and_references(invoke: Callable[..., Result], output_format: str) -> None:
-    result = invoke("list", "--format", output_format)
+    result = invoke("list", *([] if output_format == "text" else [f"--{output_format}"]))
 
     assert result.exit_code == 0, result.output
     if output_format == "json":

@@ -1,7 +1,9 @@
 import asyncio
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from datetime import UTC, datetime
 from types import TracebackType
 
 from tracker.logging import get_logger
@@ -18,9 +20,15 @@ _MAX_BUFFERED_SECONDS = 10
 
 
 class TaskLogBuffer:
-    def __init__(self, sink: BenchmarkLogSink, stream_key: str) -> None:
+    def __init__(
+        self,
+        sink: BenchmarkLogSink,
+        stream_key: str,
+        record_last_log: Callable[[datetime], None] | None = None,
+    ) -> None:
         self._sink = sink
         self._stream_key = stream_key
+        self._record_last_log = record_last_log
         self._lines: list[TaskLogLine] = []
         self._partial: TaskLogLine | None = None
         self._last_received_at = 0.0
@@ -95,6 +103,8 @@ class TaskLogBuffer:
         if not lines:
             return
 
+        if self._record_last_log is not None:
+            self._record_last_log(datetime.fromtimestamp(max(line.received_at for line in lines), UTC))
         future = asyncio.get_running_loop().run_in_executor(logging_executor, self._sink.write, self._stream_key, lines)
         self._pending_writes.add(future)
         future.add_done_callback(self._write_finished)
@@ -127,5 +137,4 @@ class TaskLogBuffer:
         self._flush_task.cancel()
         with suppress(asyncio.CancelledError):
             await self._flush_task
-
         await self.flush()

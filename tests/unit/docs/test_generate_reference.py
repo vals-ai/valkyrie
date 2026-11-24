@@ -19,27 +19,21 @@ from scripts.reference_docs import collect
 _EXPECTED_CLI_PATHS = (
     "run analyze",
     "run errors",
-    "run fetch",
-    "run filter-options",
+    "run show",
     "run list",
     "run logs",
-    "run artifacts",
-    "run output",
-    "run outputs",
+    "run files",
+    "run download",
     "run results",
     "run rescore",
     "run regrade",
-    "run retag",
     "run resume",
     "run retry",
-    "run shed",
     "run start",
-    "run status",
     "run stop",
     "run update",
     "run tasks",
     "run task",
-    "run task-artifacts",
     "agent install",
     "agent push",
     "agent remove",
@@ -77,6 +71,11 @@ _EXPECTED_CLI_PATHS = (
     "provider default",
     "login",
     "logout",
+    "tracker start",
+    "tracker list",
+    "tracker add",
+    "tracker use",
+    "tracker remove",
     "whoami",
     "token create",
     "token revoke",
@@ -89,6 +88,7 @@ _EXPECTED_CLI_PATHS = (
     "org members",
     "org remove",
     "tui",
+    "completion",
 )
 _EXPECTED_RESOURCES = {
     "ArtifactsResource": ("list", "download_url", "download"),
@@ -311,6 +311,10 @@ class TestCLIReference:
         rendered: dict[Path, str],
     ) -> None:
         assert tuple(" ".join(command.path) for command in commands) == _EXPECTED_CLI_PATHS
+        index = rendered[Path("reference/cli/index.mdx")]
+        for option in collect.collect_cli_global_options():
+            for declaration in option.declarations:
+                assert declaration in index
 
         start = _command(commands, "run start")
         concurrency = _option(start, "concurrency")
@@ -325,10 +329,7 @@ class TestCLIReference:
         assert secrets.nargs == 2
         assert secrets.type_name == "tuple[text, text]"
         assert count.constraints == (">= 1", "<= 10")
-        assert _option(_command(commands, "run errors"), "output_format").constraints == (
-            "one of text, json",
-            "case-insensitive",
-        )
+        assert _option(_command(commands, "run errors"), "json_output").declarations == ("--json",)
 
         for command in commands:
             heading = f"## `valkyrie {' '.join(command.path)}` {{#{'-'.join(command.path[1:]) or command.path[0]}}}"

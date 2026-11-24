@@ -4,7 +4,7 @@ from uuid import UUID
 import click
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import terminal_safe
+from valkyrie.cli.display import emit, terminal_safe, json_option, done, fail
 
 
 @click.command(
@@ -15,14 +15,14 @@ from valkyrie.cli.display import terminal_safe
     )
 )
 @click.argument("run_id", type=UUID)
-def rescore(run_id: UUID) -> None:
+@json_option()
+def rescore(run_id: UUID, output_format: str) -> None:
     response = call(lambda client: client.runs.rescore(run_id))
     scorer = cast(dict[str, object], response.properties.get("scorer") or {})
     if error := scorer.get("error"):
-        click.echo(
-            click.style(f"✗ The metric script failed: {terminal_safe(str(error), preserve_newlines=True)}", fg="red"),
-            err=True,
-        )
+        fail(f"The metric script failed: {terminal_safe(str(error), preserve_newlines=True)}")
         raise click.ClickException(f"Run {run_id} has no score")
+    if emit(response, output_format):
+        return
     score = "no single headline score" if response.final_score is None else f"score {response.final_score:.2f}"
-    click.echo(click.style(f"✓ Run {run_id} rescored: {score}.", fg="green", bold=True))
+    done(f"Run {run_id} rescored: {score}.")

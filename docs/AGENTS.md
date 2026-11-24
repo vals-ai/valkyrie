@@ -79,7 +79,7 @@ it? If not, cut it.
   longer than about four words.
 - Use headings and numbered lists rather than Steps, Tabs, or Accordion. Keep callouts rare:
   a Warning for what can't be undone, a Note for a requirement that is easy to miss.
-- Hard-wrap prose at about 90 columns.
+- Write each paragraph and list item on one line. Don't hard-wrap prose.
 - Keep code lines within 88 characters: break long commands with `\` and format Python as a
   formatter would.
 - Code blocks scroll rather than wrap. Add Mintlify's `wrap` option only to prose-like output.

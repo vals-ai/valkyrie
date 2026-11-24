@@ -89,7 +89,7 @@ def _skip_log_write(*_args: Any, **_kwargs: Any) -> None:
 async def _provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
     return DaytonaProviderConfig(
         DAYTONA_API_KEY="test-key",
-        DAYTONA_API_URL="https://example.com",
+        DAYTONA_API_URL="https://app.daytona.io/api",
         DAYTONA_TARGET="test-target",
     )
 
@@ -338,7 +338,7 @@ class TestRunFinalization:
         async def provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://example.com",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="test-target",
             )
 
@@ -482,7 +482,7 @@ class TestRunFinalization:
         async def provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://example.com",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="test-target",
             )
 
@@ -606,7 +606,7 @@ class TestRunFinalization:
         async def provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
             return DaytonaProviderConfig(
                 DAYTONA_API_KEY="test-key",
-                DAYTONA_API_URL="https://example.com",
+                DAYTONA_API_URL="https://app.daytona.io/api",
                 DAYTONA_TARGET="test-target",
             )
 

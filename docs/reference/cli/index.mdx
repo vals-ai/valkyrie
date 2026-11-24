@@ -7,11 +7,37 @@ description: "Complete generated reference for every Valkyrie CLI command."
 
 This reference is generated from the CLI itself. Use the task guides for complete workflows.
 
+## Global options
+
+Put these options before the command name.
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--version"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Show CLI and SDK versions."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--tracker"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code></span></div>
+  <p className="mb-0 mt-1">{"Use this saved Tracker name or URL for this call. Defaults to `VALKYRIE_URL`, then `tracker use`."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"-v, --verbose"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Show SDK logs and full tracebacks."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--no-color"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Disable colors. Also honors NO_COLOR."}</p>
+</div>
+
 ## Command groups
 
 <CardGroup cols={2}>
   <Card title="Run commands" icon="play" href="/reference/cli/run">
-    23 commands for starting, monitoring, managing, and retrieving runs.
+    17 commands for starting, monitoring, managing, and retrieving runs.
   </Card>
   <Card title="Agent commands" icon="package" href="/reference/cli/agent">
     5 commands for installing, uploading, listing, downloading, and removing agent bundles.
@@ -37,6 +63,9 @@ This reference is generated from the CLI itself. Use the task guides for complet
   <Card title="Login commands" icon="log-in" href="/reference/cli/login">
     3 commands for signing in, signing out, and checking which account your requests use.
   </Card>
+  <Card title="Tracker commands" icon="server" href="/reference/cli/tracker">
+    5 commands for saving Trackers by name and choosing the one commands use by default.
+  </Card>
   <Card title="Token commands" icon="key-round" href="/reference/cli/token">
     2 commands for creating and revoking access keys for CI and other headless use.
   </Card>
@@ -45,5 +74,8 @@ This reference is generated from the CLI itself. Use the task guides for complet
   </Card>
   <Card title="TUI commands" icon="monitor" href="/reference/cli/tui">
     1 command for browsing runs, tasks, and logs in a terminal UI.
+  </Card>
+  <Card title="Completion commands" icon="terminal" href="/reference/cli/completion">
+    1 command for enabling shell completion.
   </Card>
 </CardGroup>

@@ -11,7 +11,7 @@ from tests.unit.cli.conftest import MockTracker
 
 @pytest.mark.description("Agent list prints every agent without paging.")
 @pytest.mark.parametrize("count", [0, 12])
-@pytest.mark.parametrize("arguments", [["--all"], ["--format", "json"], ["--all", "--format", "JSON"]])
+@pytest.mark.parametrize("arguments", [["--all"], ["--json"], ["--all", "--json"]])
 def test_list_without_paging(tracker: MockTracker, cli_runner: CliRunner, count: int, arguments: list[str]) -> None:
     agents = [
         {"name": f"agent-{index}", "last_modified": "2026-07-17T12:00:00+00:00" if index else None}
@@ -23,7 +23,7 @@ def test_list_without_paging(tracker: MockTracker, cli_runner: CliRunner, count:
 
     assert result.exit_code == 0, result.output
     assert "\x1b" not in result.output
-    if "--format" in arguments:
+    if "--json" in arguments:
         assert json.loads(result.output) == {"agents": agents}
     elif count:
         assert all(entry["name"] in result.output for entry in agents)

@@ -19,7 +19,7 @@ from valkyrie.sdk.models import (
 
 from valkyrie.sdk.models.runs import AgentExecutionAttempt
 
-from valkyrie.cli.run.fetch import fetch
+from valkyrie.cli.run.fetch import show as fetch
 from valkyrie.cli.run.progress import stream_benchmark_status
 
 from tests.unit.cli.conftest import MockTracker
@@ -78,9 +78,9 @@ def test_fetch_json_prints_the_sdk_run_snapshot(
     ]
     serve_run(tracker, run, metadata=metadata, stream=run_stream(run))
 
-    args = [str(_RUN_ID), "--format", output_format]
+    args = [str(_RUN_ID), *([] if output_format == "text" else [f"--{output_format}"])]
     if output_format == "jsonl":
-        args.append("--connect")
+        args.append("--follow")
     result = cli_runner.invoke(fetch, args)
 
     assert result.exit_code == 0, result.output
@@ -108,7 +108,7 @@ def test_fetch_json_outputs_one_clean_object(
     if not metadata_available:
         tracker.reply("GET", f"/fetch-benchmark-metadata/{_RUN_ID}", httpx.Response(404, json={"detail": "missing"}))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--json"])
 
     assert result.exit_code == 0, result.output
     assert not any(token in result.output for token in ("\x1b", "NaN", "Infinity"))
@@ -128,13 +128,13 @@ def test_fetch_text_shows_the_runs_launch_details(tracker: MockTracker, cli_runn
 
     assert result.exit_code == 0, result.output
     for line in (
-        "│ Agent:       mini_sweagent",
-        "│ Model:       openai/gpt-5",
-        "│ Dataset:     verified",
-        "│ Started by:  runner@vals.ai",
-        "│ Concurrency: 20",
+        "Agent mini_sweagent",
+        "Model openai/gpt-5",
+        "Dataset verified",
+        "Started by runner@vals.ai",
+        "Concurrency 20",
     ):
-        assert line in result.output
+        assert line in " ".join(result.output.split())
     assert not any(secret in result.output for secret in _SECRETS)
 
 
@@ -142,9 +142,9 @@ def test_fetch_text_shows_the_runs_launch_details(tracker: MockTracker, cli_runn
 @pytest.mark.parametrize(
     ("metadata", "spend_line"),
     [
-        (_tagged_metadata(), "│ Spend:       customer · google-report-xyz · report · google · engagement=q4"),
-        (make_fetch_metadata(_RUN_ID), "│ Spend:       untagged"),
-        (None, "│ Spend:       unavailable"),
+        (_tagged_metadata(), "Spend customer · google-report-xyz · report · google · engagement=q4"),
+        (make_fetch_metadata(_RUN_ID), "Spend untagged"),
+        (None, "Spend unavailable"),
     ],
     ids=["tagged", "untagged", "metadata-unavailable"],
 )
@@ -159,7 +159,7 @@ def test_fetch_text_shows_the_runs_project(
     result = cli_runner.invoke(fetch, [str(_RUN_ID)])
 
     assert result.exit_code == 0, result.output
-    assert spend_line in result.output
+    assert spend_line in " ".join(result.output.split())
 
 
 @pytest.mark.description("Text fetch shows escape characters in project fields as visible `\\x1b` text.")
@@ -209,10 +209,31 @@ def test_fetch_json_carries_the_runs_project(
 ) -> None:
     serve_run(tracker, make_fetch_response(_RUN_ID), metadata=metadata)
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--format", "json"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--json"])
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["metadata"]["project"] == project
+
+
+@pytest.mark.description("JSONL fetch writes the `RunSnapshot`, then each SDK stream event through the final one.")
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    [(BenchmarkStatus.FINISHED, 0), (BenchmarkStatus.STOPPED, 0), (BenchmarkStatus.ERROR, 1)],
+)
+def test_fetch_jsonl_terminal_snapshot_includes_the_complete_event(
+    tracker: MockTracker, cli_runner: CliRunner, status: BenchmarkStatus, exit_code: int
+) -> None:
+    serve_run(tracker, make_fetch_response(_RUN_ID, status=status), stream=AssertionError("unexpected stream"))
+
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow", "--jsonl"])
+
+    assert result.exit_code == exit_code, result.output
+    records = _records(result.stdout)
+    run = records[0]["run"]
+    assert isinstance(run, dict)
+    assert run["details"]["status"] == status.value
+    assert records[1:] == [{"event": "complete", "run": None, "detail": None}]
+    assert len(tracker.requests) == 2
 
 
 @pytest.mark.description("JSONL fetch writes the `RunSnapshot`, then each SDK stream event through the final one.")
@@ -220,7 +241,7 @@ def test_fetch_jsonl_writes_the_snapshot_then_sdk_stream_events(tracker: MockTra
     finished = make_fetch_response(_RUN_ID, status=BenchmarkStatus.FINISHED, finished_tasks=4, final_score=75.0)
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=run_stream(finished), metadata=make_fetch_metadata(_RUN_ID))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect", "--format", "jsonl"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow", "--jsonl"])
 
     assert result.exit_code == 0, result.output
     assert "\x1b" not in result.output
@@ -237,8 +258,8 @@ def test_fetch_jsonl_writes_the_snapshot_then_sdk_stream_events(tracker: MockTra
 @pytest.mark.parametrize(
     ("stream", "events", "exit_code"),
     [
-        (run_stream(make_fetch_response(_RUN_ID, status=BenchmarkStatus.ERROR)), ["update", "complete"], 0),
-        (run_stream(end="error"), ["error"], 0),
+        (run_stream(make_fetch_response(_RUN_ID, status=BenchmarkStatus.ERROR)), ["update", "complete"], 1),
+        (run_stream(end="error"), ["error"], 1),
         (run_stream(end="disconnect"), ["disconnect"], 0),
         (KeyboardInterrupt(), [], 0),
         (run_stream(end=None), ["update"], 1),
@@ -256,13 +277,13 @@ def test_fetch_jsonl_ends_on_the_streams_final_event(
         stream = run_stream(make_fetch_response(_RUN_ID), end=None)
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=stream, metadata=make_fetch_metadata(_RUN_ID))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect", "--format", "jsonl"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow", "--jsonl"])
 
     assert result.exit_code == exit_code
     records = _records(result.stdout)
     assert set(records[0]) == {"run", "metadata"}
     assert [record["event"] for record in records[1:]] == events
-    assert ("ended without a terminal event" in result.stderr) is bool(exit_code)
+    assert ("ended without a terminal event" in result.stderr) is (events == ["update"])
 
 
 @pytest.mark.description("Ctrl+C before the stream starts aborts with a nonzero exit and no records.")
@@ -270,7 +291,7 @@ def test_fetch_jsonl_interrupted_before_streaming_aborts(tracker: MockTracker, c
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=run_stream(), metadata=make_fetch_metadata(_RUN_ID))
     tracker.reply("GET", f"/fetch-benchmark-metadata/{_RUN_ID}", KeyboardInterrupt())
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect", "--format", "jsonl"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow", "--jsonl"])
 
     assert result.exit_code == 1
     assert _records(result.stdout) == []
@@ -307,10 +328,11 @@ def test_connected_text_shows_identity_then_the_errored_outcome(tracker: MockTra
     )
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=run_stream(errored), metadata=make_fetch_metadata(_RUN_ID))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow"])
 
-    assert result.exit_code == 0, result.output
-    assert "Run Details" in result.output
+    assert result.exit_code == 1, result.output
+    assert result.stdout == ""
+    assert "Run details" in result.output
     assert all(value in result.output for value in ("mini_sweagent", "openai/gpt-5", "verified", "runner@vals.ai"))
     assert not any(secret in result.output for secret in _SECRETS)
     assert "✗ Run errored." in result.output
@@ -319,7 +341,7 @@ def test_connected_text_shows_identity_then_the_errored_outcome(tracker: MockTra
 
 
 @pytest.mark.description(
-    "Fetching a finished run with `--connect` prints its status and main error once, without opening a stream."
+    "Fetching a finished run with `--follow` prints its status and main error once, without opening a stream."
 )
 def test_connected_fetch_of_a_finished_run_prints_its_status_without_streaming(
     tracker: MockTracker, cli_runner: CliRunner
@@ -327,16 +349,17 @@ def test_connected_fetch_of_a_finished_run_prints_its_status_without_streaming(
     errored = make_fetch_response(_RUN_ID, status=BenchmarkStatus.ERROR, error_message="Dominant task error")
     serve_run(tracker, errored, metadata=make_fetch_metadata(_RUN_ID))
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow"])
 
-    assert result.exit_code == 0, result.output
-    assert "Run Status" in result.output
+    assert result.exit_code == 1, result.output
+    assert result.stdout == ""
+    assert "Run status" in result.output
     assert "Error: Dominant task error" in result.output
     assert "Streaming run updates" not in result.output
     assert all(request.url.params.get("connect") is None for request in tracker.requests)
 
 
-@pytest.mark.description("Fetching an active run with `--connect` shows its spend line in the run details.")
+@pytest.mark.description("Fetching an active run with `--follow` shows its spend line in the run details.")
 @pytest.mark.parametrize(
     ("metadata", "spend_line"),
     [
@@ -351,15 +374,15 @@ def test_connected_fetch_of_an_active_run_shows_the_runs_project(
     finished = make_fetch_response(_RUN_ID, status=BenchmarkStatus.FINISHED)
     serve_run(tracker, make_fetch_response(_RUN_ID), stream=run_stream(finished), metadata=metadata)
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow"])
 
     assert result.exit_code == 0, result.output
-    assert "Run Details" in result.output
-    assert "Spend:" in result.output
-    assert spend_line in result.output
+    assert "Run details" in result.output
+    assert "Spend" in result.output
+    assert spend_line in " ".join(result.output.split())
 
 
-@pytest.mark.description("Fetching a finished run with `--connect` shows its spend line in the run status.")
+@pytest.mark.description("Fetching a finished run with `--follow` shows its spend line in the run status.")
 @pytest.mark.parametrize(
     ("metadata", "spend_line"),
     [
@@ -375,18 +398,18 @@ def test_connected_fetch_of_a_finished_run_shows_the_runs_project(
     finished = make_fetch_response(_RUN_ID, status=BenchmarkStatus.FINISHED)
     serve_run(tracker, finished, metadata=metadata)
 
-    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--connect"])
+    result = cli_runner.invoke(fetch, [str(_RUN_ID), "--follow"])
 
     assert result.exit_code == 0, result.output
-    assert "Run Status" in result.output
-    assert "Spend:" in result.output
-    assert spend_line in result.output
+    assert "Run status" in result.output
+    assert "Spend" in result.output
+    assert spend_line in " ".join(result.output.split())
 
 
 @pytest.mark.description("Conflicting output format flags exit 2 before any request.")
 @pytest.mark.parametrize(
     ("arguments", "expected_error"),
-    [(["--connect", "--format", "json"], "use --format jsonl"), (["--format", "jsonl"], "requires --connect")],
+    [(["--follow", "--json"], "use --jsonl"), (["--jsonl"], "requires --follow")],
 )
 def test_fetch_rejects_mismatched_machine_format(
     tracker: MockTracker, cli_runner: CliRunner, arguments: list[str], expected_error: str

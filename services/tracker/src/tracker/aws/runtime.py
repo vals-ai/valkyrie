@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import ConfigDict, Field, with_config
 
 from tracker.aws.clients import AWSClientProvider
 
 
+@with_config(ConfigDict(extra="ignore"))
 @dataclass(frozen=True)
 class AWSResources:
     region: Annotated[str, Field(min_length=1)]

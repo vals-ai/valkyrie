@@ -31,9 +31,9 @@ def _stream(*events: dict[str, object], end: bool = True) -> httpx.Response:
     ("arguments", "path", "task_id"),
     [
         ([], _LOGS_PATH, None),
-        (["--task-id", "provider/model:fast", "--format", "jsonl"], _LOGS_PATH, "provider/model:fast"),
+        (["--task-id", "provider/model:fast", "--jsonl"], _LOGS_PATH, "provider/model:fast"),
         (
-            ["--task-id", "provider/model:fast", "--follow", "--format", "jsonl"],
+            ["--task-id", "provider/model:fast", "--follow", "--jsonl"],
             f"{_LOGS_PATH}/stream",
             "provider/model:fast",
         ),
@@ -55,7 +55,7 @@ def test_logs_select_the_stream_and_forward_filters(
     assert request.url.params.get("task_id") == task_id
     assert request.url.params["query"] == "hello"
     assert request.url.params["start_time"] == "2026-01-01T00:00:00+00:00"
-    if "jsonl" in arguments:
+    if "--jsonl" in arguments:
         assert json.loads(result.output)["message"] == "hello"
     else:
         assert result.output == "2026-01-01T00:00:00Z [task-1] hello\n"

@@ -8,17 +8,20 @@ from benchmark_service.client import (
     BenchmarkServiceStreamError,
     BenchmarkServiceUnauthenticatedError,
 )
+from benchmark_service.sandbox import SandboxConnectionError as ProviderSandboxConnectionError
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import SandboxRejectedError as ProviderSandboxRejectedError
 from benchmark_service.sandbox import UnsupportedSandboxConfigError
 from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from tracker.clients.dataset_tasks import InvalidTaskError
+from tracker.services.datasets.artifacts import MissingSavedArtifactError
 from tracker.services.datasets.grading import VerifierResultError
 from tracker.services.datasets.healthcheck import HealthcheckError
 from tracker.services.datasets.separate_verifier import SeparateVerifierError
 from tracker.services.datasets.steps import StepSetupError
-from tracker.domain import FailureCategory, FailurePhase
+from tracker.domain import SANDBOX_REJECTED_CAUSE, FailureCategory, FailurePhase
 from tracker.exceptions import (
     AgentRunFailedError,
     CloudWatchError,
@@ -48,7 +51,6 @@ _DOCKER_NOT_READY_SIGNATURES = (
 _INFRASTRUCTURE_ERRORS = (
     SandboxError,
     ProviderSandboxError,
-    OutputArtifactError,
     S3Error,
     CloudWatchError,
     LambdaError,
@@ -93,6 +95,8 @@ def classify_failure(exc: BaseException) -> FailureCategory:
         return FailureCategory.CANCELLED
     if isinstance(exc, AgentRunFailedError):
         return FailureCategory.AGENT
+    if isinstance(exc, OutputArtifactError):
+        return FailureCategory.AGENT if exc.missing else FailureCategory.INFRASTRUCTURE
     if isinstance(exc, _INFRASTRUCTURE_ERRORS):
         return FailureCategory.INFRASTRUCTURE
     if isinstance(exc, BenchmarkServiceError):
@@ -130,12 +134,17 @@ _LABELS: dict[type[BaseException], _Labels] = {
     SeparateVerifierError: _Labels(
         "dataset_task", "separate_verifier", False, "separate_verifier", category=FailureCategory.BENCHMARK_SERVICE
     ),
-    InvalidTaskError: _Labels(
-        "dataset_task", "load_task", False, "invalid_task", category=FailureCategory.BENCHMARK_SERVICE
+    InvalidTaskError: _Labels("dataset_task", "load_task", False, "invalid_task", category=FailureCategory.DATASET),
+    MissingSavedArtifactError: _Labels(
+        "dataset_task", "regrade", False, "missing_saved_artifact", category=FailureCategory.BENCHMARK_SERVICE
     ),
     OutputArtifactError: _Labels("output_artifact", "upload_output_artifacts", transient=False),
     AgentRunFailedError: _Labels("tracker", "process_task", transient=False),
     SandboxError: _Labels("sandbox_provider", "sandbox"),
+    ProviderSandboxConnectionError: _Labels("sandbox_provider", "sandbox", transient=True),
+    ProviderSandboxRejectedError: _Labels(
+        "sandbox_provider", "sandbox", transient=False, cause_code=SANDBOX_REJECTED_CAUSE
+    ),
     BenchmarkServiceWebSocketDNSResolutionError: _Labels(
         "benchmark_service",
         "websocket_connect",

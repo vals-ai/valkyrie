@@ -2,7 +2,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, cast
 
 import pytest
-from daytona.common.errors import DaytonaError
+from daytona.v0.common.errors import DaytonaError
 from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
@@ -144,7 +144,7 @@ def _patch_daytona_provider(monkeypatch: pytest.MonkeyPatch, client: DaytonaClie
 _PROVIDER_BODY: dict[str, Any] = {
     "type": "daytona",
     "DAYTONA_API_KEY": "key",
-    "DAYTONA_API_URL": "url",
+    "DAYTONA_API_URL": "https://app.daytona.io/api",
     "DAYTONA_TARGET": "target",
 }
 

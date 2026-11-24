@@ -27,8 +27,10 @@ from tracker.services.datasets.config import (
 from tracker.services.datasets.env import TEMPLATE
 from tracker.services.datasets.extract import extract
 from tracker.services.datasets.folder import (
+    COMPOSE_FILE,
     CONFIG_FILE,
     DOCKERFILE,
+    ENVIRONMENT_DIR,
     INSTRUCTION_FILE,
     TEST_SCRIPT,
     SandboxKind,
@@ -126,6 +128,20 @@ def _unsupported(config: TaskConfig, raw: dict[str, Any], kind: SandboxKind | No
         for service in sorted(name for name in services if name not in (None, MAIN_SERVICE)):
             found.append(f"the service {service!r} is named, but only a compose task has services")
     return found
+
+
+def _snapshot_problems(config: TaskConfig, task_dir: Path) -> list[str]:
+    problems = [
+        f"[environment].snapshot can't be combined with {ENVIRONMENT_DIR}/{name}"
+        for name in (DOCKERFILE, COMPOSE_FILE)
+        if config.environment.snapshot and (task_dir / ENVIRONMENT_DIR / name).is_file()
+    ]
+    problems.extend(
+        f"{label}.snapshot is not supported yet; only [environment] runs from a snapshot"
+        for label, environment in _verifier_environments(config).items()
+        if environment.snapshot
+    )
+    return problems
 
 
 def _compose_verifier_problems(config: TaskConfig, task_dir: Path, kind: SandboxKind | None) -> list[str]:
@@ -307,9 +323,10 @@ def validate_task(task_dir: Path) -> TaskReport:
             kind = sandbox_kind(task_dir, config)
             if kind is None:
                 errors.append(
-                    "A task needs a sandbox source: [environment].docker_image, environment/Dockerfile "
-                    "or environment/docker-compose.yaml"
+                    "A task needs a sandbox source: [environment].snapshot, [environment].docker_image, "
+                    "environment/Dockerfile or environment/docker-compose.yaml"
                 )
+            errors.extend(_snapshot_problems(config, task_dir))
             errors.extend(_unsupported(config, raw, kind))
             errors.extend(_compose_verifier_problems(config, task_dir, kind))
             errors.extend(_env_problems(config))

@@ -30,6 +30,15 @@ _RUN_TASK_CONCURRENCY = 8
 _run_task_semaphore = asyncio.Semaphore(_RUN_TASK_CONCURRENCY)
 _run_task_slots = BoundedSemaphore(_RUN_TASK_CONCURRENCY)
 _run_task_calls: set[asyncio.Task[dict[str, Any]]] = set()
+_local_watchdogs: set[subprocess.Popen[bytes]] = set()
+
+
+async def stop_local_watchdogs() -> None:
+    running = [process for process in _local_watchdogs if process.poll() is None]
+    for process in running:
+        process.terminate()
+    await asyncio.gather(*(asyncio.to_thread(process.wait) for process in running))
+    _local_watchdogs.clear()
 
 
 class DefinitiveLaunchFailure(Exception):
@@ -145,7 +154,10 @@ async def launch_dispatch(dispatch: ExecutorDispatch) -> None:
         runner_environment = os.environ.copy()
         for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USERNAME", "DB_PASSWORD", "DATABASE_URL"):
             runner_environment.pop(key, None)
-        await asyncio.to_thread(subprocess.Popen, command, start_new_session=True, env=runner_environment)
+        _local_watchdogs.difference_update(process for process in tuple(_local_watchdogs) if process.poll() is not None)
+        _local_watchdogs.add(
+            await asyncio.to_thread(subprocess.Popen, command, start_new_session=True, env=runner_environment)
+        )
         return
     if launcher != "ecs":
         raise ValueError("EXECUTOR_LAUNCHER must be ecs or local")

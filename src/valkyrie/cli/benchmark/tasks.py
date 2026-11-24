@@ -3,6 +3,7 @@ from pathlib import Path
 import click
 
 from valkyrie.cli.client import call
+from valkyrie.cli.display import json_option, emit
 
 
 @click.command(
@@ -45,12 +46,14 @@ from valkyrie.cli.client import call
     default=None,
     help="Path to save task IDs, one per line. Defaults to <benchmark>-<dataset>-tasks.txt.",
 )
+@json_option()
 def tasks(
     benchmark_name: str,
     dataset: str | None,
     headers: tuple[tuple[str, str]],
     ignore_custom_services: bool,
     output: Path | None,
+    output_format: str,
 ):
     task_ids = call(
         lambda client: client.services.task_ids(
@@ -62,4 +65,6 @@ def tasks(
     )
     output_path = output or Path(f"{benchmark_name}-{dataset or 'default'}-tasks.txt")
     output_path.write_text("\n".join(task_ids) + "\n", encoding="utf-8")
-    click.echo(f"Wrote {len(task_ids)} task IDs to {output_path}")
+    if emit({"path": output_path, "task_ids": task_ids}, output_format):
+        return
+    click.echo(f"Wrote {len(task_ids)} task IDs to {output_path}", err=True)

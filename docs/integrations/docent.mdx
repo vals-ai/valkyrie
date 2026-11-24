@@ -74,7 +74,7 @@ valkyrie run analyze RUN_ID
 Replace *`RUN_ID`* with the run's ID, which must be `FINISHED`.
 
 - The command streams progress and prints the reading link when the analyzer returns.
-- `valkyrie run fetch RUN_ID` also shows the link when it exists.
+- `valkyrie run show RUN_ID` also shows the link when it exists.
 
 A run that already has a link returns it without calling the analyzer again. After you fix
 the analyzer, run it again with `--no-cache`:
@@ -88,7 +88,7 @@ analysis can run for up to 15 minutes, the Lambda limit.
 
 ## Analysis statuses
 
-`valkyrie run fetch RUN_ID` shows the run's analysis status:
+`valkyrie run show RUN_ID` shows the run's analysis status:
 
 | Analysis status | Meaning |
 | --- | --- |

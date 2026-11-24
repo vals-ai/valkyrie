@@ -143,12 +143,12 @@ from tracker.executor.dispatch_control import (
     validate_managed_execution_release,
 )
 from tracker.executor.dispatch_payload import PayloadKey, generate_payload_key, seal_payload
-from tracker.executor.launcher import launch_dispatch
+from tracker.executor.launcher import launch_dispatch, stop_local_watchdogs
 from tracker.database.session import check_database_connection, configure_server_threads, database_call, get_session
 from tracker.services.datasets.oracle import ORACLE_AGENT, ORACLE_CONTRACT
 from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDataset
 from tracker.services.datasets.scoring import scorer_for
-from tracker.clients.dataset_tasks import TaskSelectionError, dataset_service
+from tracker.clients.dataset_tasks import InvalidTaskError, TaskSelectionError, dataset_service
 from tracker.clients.projects import project_service
 from tracker.services.datasets.version_ref import parse_version_ref
 from tracker.services.datasets.versions import UnresolvedDatasetError, dataset_tasks
@@ -303,6 +303,8 @@ async def tracker_lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
+        if local_config.resources is not None:
+            await stop_local_watchdogs()
         await service_capacity.stop()
         await scheduler.stop()
         sandbox_cost.stop()
@@ -967,9 +969,7 @@ def _find_dataset(
         return dataset, DatasetVersionRepository(session).get(dataset.id, parse_version_ref(ref.ref))
 
 
-async def _resolve_dataset(ref: DatasetRef, bind: Engine | Connection, org_id: UUID) -> DatasetRef:
-    if isinstance(ref, LocalDataset):
-        return ref
+async def _resolve_hosted_dataset(ref: HostedDataset, bind: Engine | Connection, org_id: UUID) -> HostedDataset:
     try:
         found = await asyncio.to_thread(_find_dataset, bind, org_id, ref)
     except AmbiguousDigestError as error:
@@ -999,8 +999,10 @@ async def _verify_dataset_task_ids(
         raise HTTPException(status_code=409, detail=str(error)) from error
     service = dataset_service(ref, objects, tasks=tasks)
     try:
-        return await service.verify_task_ids(task_ids, slice_str)
-    except (TaskSelectionError, FileNotFoundError) as error:
+        verified = await service.verify_task_ids(task_ids, slice_str)
+        await service.validate_local_tasks(verified.task_ids)
+        return verified
+    except (InvalidTaskError, TaskSelectionError, FileNotFoundError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     finally:
         await service.close()
@@ -1257,7 +1259,11 @@ async def start_benchmark(
     if request.dataset_ref is None:
         verify_response = await _verify_through_benchmark_service(request, execution_request)
     else:
-        execution_request.dataset_ref = await _resolve_dataset(request.dataset_ref, bind, run_starter.org.id)
+        execution_request.dataset_ref = (
+            request.dataset_ref
+            if isinstance(request.dataset_ref, LocalDataset)
+            else await _resolve_hosted_dataset(request.dataset_ref, bind, run_starter.org.id)
+        )
         verify_response = await _verify_dataset_task_ids(
             execution_request.dataset_ref, bind, object_store, request.task_ids, request.slice_str
         )
@@ -1362,7 +1368,7 @@ async def start_benchmark(
             raise cancellation from bind_failure
         raise cancellation
 
-    pinned_version = benchmark_row.arguments.with_hosted_dataset().dataset_version
+    pinned_version = benchmark_row.arguments.with_dataset_metadata().dataset_version
     return StartBenchmarkResponse(
         benchmark_name=benchmark_row.name,
         agent_name=request.contract.name,
@@ -2121,7 +2127,7 @@ def retag_benchmark(
     session: Session = Depends(get_session),
     identity: RequestIdentity = Depends(get_current_starter),
 ) -> ProjectResponse:
-    benchmark_row = assert_org(BenchmarkRepository(session).get(identity.org.id, benchmark_id), identity.org)
+    benchmark_row = assert_org(BenchmarkRepository(session).lock(identity.org.id, benchmark_id), identity.org)
     projects = ProjectRepository(session)
     project = projects.get_for_link(identity.org.id, find_project(projects, identity.org.id, request.project).id)
     BenchmarkRepository(session).save(
@@ -2159,6 +2165,18 @@ class RecoveryPreparation:
     artifact_store: ObjectStore | None = None
     prepared_status: BenchmarkStatus | None = None
     retained_outputs: str | None = None
+    gateway_project: Project | None = None
+    project_gateway_secrets: dict[str, str] | None = None
+
+
+def _rebinding_project(session: Session, benchmark: Benchmark, org: Org, state: RetryState | None) -> Project | None:
+    if state is None or (benchmark.status == BenchmarkStatus.IN_PROGRESS and not state.task_ids):
+        return None
+    if benchmark.arguments.selected_project_gateway_secret_ref is None:
+        return None
+    if not selects_project_gateway_key(org) or reads_secrets_file(benchmark.arguments.properties):
+        return None
+    return ProjectRepository(session).get_for_run(benchmark.id, strict=True)
 
 
 def _prepare_recovery(
@@ -2214,6 +2232,7 @@ def _prepare_recovery(
             benchmark.arguments.properties,
             contract=benchmark.arguments.contract,
             prepared_status=benchmark.status,
+            gateway_project=_rebinding_project(session, benchmark, org, state),
         )
 
 
@@ -2374,6 +2393,13 @@ async def retry_or_resume_benchmark(
         benchmark_url,
         secrets,
     )
+    if preparation.gateway_project is not None:
+        preparation = replace(
+            preparation,
+            project_gateway_secrets=await asyncio.to_thread(
+                prepare_project_gateway_key, bind, preparation.gateway_project, org, secret_store(org)
+            ),
+        )
     if preparation.dataset_ref is not None and (service_headers or benchmark_url is not None):
         raise HTTPException(
             status_code=400, detail="A dataset run has no benchmark service to send headers or a URL to"
@@ -2544,6 +2570,8 @@ async def retry_or_resume_benchmark(
 class RegradeSource:
     run: Benchmark
     tasks: RegradeTasks
+    dataset_ref: DatasetRef | None
+    gateway_secret_ref: str | None
 
 
 def _regrade_source(session: Session, org: Org, source_run_id: UUID, *, for_update: bool = False) -> RegradeSource:
@@ -2556,10 +2584,16 @@ def _regrade_source(session: Session, org: Org, source_run_id: UUID, *, for_upda
             status_code=409,
             detail=f"Run {source_run_id} is {source.status.value}; only a finished run can be regraded.",
         )
-    tasks = regrade_tasks(repository.list_tasks(org.id, source.id))
+    dataset_ref = source.arguments.dataset_ref
+    tasks = regrade_tasks(repository.list_tasks(org.id, source.id), source.id if dataset_ref is not None else None)
     if not tasks.eval_resume_states:
         raise HTTPException(status_code=400, detail=f"Run {source_run_id} has no tasks with saved evaluation state.")
-    return RegradeSource(Benchmark.model_validate(source.model_dump()), tasks)
+    return RegradeSource(
+        Benchmark.model_validate(source.model_dump()),
+        tasks,
+        dataset_ref,
+        source.arguments.selected_project_gateway_secret_ref,
+    )
 
 
 def _prepare_regrade(bind: Engine | Connection, org: Org, source_run_id: UUID) -> RegradeSource:
@@ -2577,18 +2611,27 @@ def _commit_regrade(
     dispatch_id: UUID,
     telemetry_context: ExecutorTelemetryContext,
     issued_keys: Sequence[IssuedRunKey],
+    dataset_ref: DatasetRef | None,
 ) -> AdmissionResult:
     payload_key = generate_payload_key(dispatch_id)
     with Session(bind, expire_on_commit=False) as session:
         run = Benchmark.model_validate(json.loads(run_json))
         run.arguments = run.arguments.model_copy(
-            update={"regraded_from_run_id": source_id, "regrade_skipped_task_ids": tasks.skipped_task_ids}
+            update={
+                "regraded_from_run_id": source_id,
+                "regrade_skipped_task_ids": tasks.skipped_task_ids,
+                "dataset_ref": dataset_ref,
+            }
         )
         try:
             projects = ProjectRepository(session)
             project = _linked_project(projects, source_id)
-            if _regrade_source(session, org, source_id, for_update=True).tasks != tasks:
+            locked = _regrade_source(session, org, source_id, for_update=True)
+            if locked.tasks != tasks:
                 raise HTTPException(status_code=409, detail="Source run changed during regrade; retry the request.")
+            run.arguments = run.arguments.model_copy(
+                update={"selected_project_gateway_secret_ref": locked.gateway_secret_ref}
+            )
             dispatch = admit_start_dispatch(session, benchmark=run, dispatch_id=dispatch_id, task_ids=tasks.task_ids)
             _ensure_run_capacity(session, run.org_id, run.id)
             repository = BenchmarkRepository(session)
@@ -2621,38 +2664,16 @@ def _commit_regrade(
         return _admission_result(dispatch, tasks.task_ids)
 
 
-@app.post(
-    "/regrade-benchmark/{benchmark_id}",
-    description=(
-        "Regrade a finished run's saved task states into a new run on another dataset.\n"
-        "\n"
-        "The source run, its tasks and its evaluation stay unchanged. Tasks without saved evaluation state are skipped and listed on the new run."
-    ),
-)
-async def regrade_benchmark(
-    benchmark_id: TrackedBenchmarkId,
-    http_request: Request,
+async def _service_regrade(
+    source: RegradeSource,
     request: RegradeBenchmarkRequest,
+    http_request: Request,
     issued_keys: IssuedKeys,
-    session: Session = Depends(get_session),
-    run_starter: RequestIdentity = Depends(get_current_runner),
-) -> RegradeBenchmarkResponse:
-    org, bind = run_starter.org, session.get_bind()
-    try:
-        validate_service_headers(request.service_headers)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.close()
-    source = await asyncio.to_thread(_prepare_regrade, bind, org, benchmark_id)
-    arguments = source.run.arguments
+    run_starter: RequestIdentity,
+) -> tuple[Benchmark, dict[str, str]]:
+    org, arguments = run_starter.org, source.run.arguments
     if source.run.custom_benchmark_service is not None:
         _authorize_custom_benchmark_destination(source.run.custom_benchmark_service, org)
-    resolved_properties: AWSResources | None = None
-    if isinstance(arguments.properties, LocalResources):
-        if local_config.resources is None:
-            raise HTTPException(status_code=400, detail="Server has no local configuration")
-    else:
-        resolved_properties = resolve_start_aws_runtime(org).resources
     destination = classify_benchmark_service_destination(source.run.name, source.run.custom_benchmark_service)
     _reject_docker_with_hosted_service(arguments.sandbox_provider, destination)
     run_key = await run_service_key(http_request, org, destination, request.service_headers, issued_keys)
@@ -2692,6 +2713,69 @@ async def regrade_benchmark(
         dataset_version=dataset_version,
         concurrency=request.concurrency,
     )
+    return run, service_headers
+
+
+async def _dataset_regrade(
+    source: RegradeSource, request: RegradeBenchmarkRequest, run_starter: RequestIdentity, bind: Engine | Connection
+) -> Benchmark:
+    if request.service_headers:
+        raise HTTPException(status_code=400, detail="A dataset run can't set benchmark service headers")
+    benchmark, _, rest = request.dataset.partition("/")
+    name, at, ref = rest.partition("@")
+    if not benchmark or not name or (at and not ref) or (ref and request.dataset_version):
+        raise HTTPException(
+            status_code=400,
+            detail="Name the dataset as BENCHMARK/DATASET, with its version after @ or in dataset_version",
+        )
+    target = await _resolve_hosted_dataset(
+        HostedDataset(benchmark=benchmark, dataset=name, ref=request.dataset_version or ref or "latest"),
+        bind,
+        run_starter.org.id,
+    )
+    available = await dataset_tasks(bind, target)
+    missing = [task_id for task_id in source.tasks.task_ids if task_id not in available]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Tasks not found in the dataset: {', '.join(missing)}")
+    return regrade_run(source.run, source.tasks, run_starter, concurrency=request.concurrency, dataset_ref=target)
+
+
+@app.post(
+    "/regrade-benchmark/{benchmark_id}",
+    description=(
+        "Regrade a finished run's saved task states into a new run on another dataset.\n"
+        "\n"
+        "The source run, its tasks and its evaluation stay unchanged. Tasks without saved evaluation state are skipped and listed on the new run.\n"
+        "\n"
+        "A dataset run's graded tasks are graded again from their saved artifacts in a fresh separate verifier."
+    ),
+)
+async def regrade_benchmark(
+    benchmark_id: TrackedBenchmarkId,
+    http_request: Request,
+    request: RegradeBenchmarkRequest,
+    issued_keys: IssuedKeys,
+    session: Session = Depends(get_session),
+    run_starter: RequestIdentity = Depends(get_current_runner),
+) -> RegradeBenchmarkResponse:
+    org, bind = run_starter.org, session.get_bind()
+    try:
+        validate_service_headers(request.service_headers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.close()
+    source = await asyncio.to_thread(_prepare_regrade, bind, org, benchmark_id)
+    arguments = source.run.arguments
+    resolved_properties: AWSResources | None = None
+    if isinstance(arguments.properties, LocalResources):
+        if local_config.resources is None:
+            raise HTTPException(status_code=400, detail="Server has no local configuration")
+    else:
+        resolved_properties = resolve_start_aws_runtime(org).resources
+    if source.dataset_ref is None:
+        run, service_headers = await _service_regrade(source, request, http_request, issued_keys, run_starter)
+    else:
+        run, service_headers = await _dataset_regrade(source, request, run_starter, bind), {}
     if resolved_properties is not None:
         run.arguments = run.arguments.model_copy(update={"properties": resolved_properties})
     if not reads_secrets_file(run.arguments.properties):
@@ -2714,6 +2798,7 @@ async def regrade_benchmark(
             uuid4(),
             _executor_telemetry_context(),
             issued_keys,
+            run.arguments.dataset_ref,
         )
     )
     try:
@@ -2739,8 +2824,27 @@ async def regrade_benchmark(
 def _linked_project(projects: ProjectRepository, run_id: UUID) -> Project | None:
     project = projects.get_for_run(run_id, strict=True)
     if project is not None:
-        reject_archived_project(projects.get_for_link(project.org_id, project.id))
+        project = projects.get_for_link(project.org_id, project.id)
+        reject_archived_project(project)
     return project
+
+
+def _rebind_recovery_gateway(
+    benchmark: Benchmark, projects: ProjectRepository, preparation: RecoveryPreparation
+) -> None:
+    prepared, secrets = preparation.gateway_project, preparation.project_gateway_secrets
+    if prepared is None or secrets is None:
+        return
+    project = _linked_project(projects, benchmark.id)
+    if project is None or project.id != prepared.id:
+        raise HTTPException(status_code=409, detail="Run changed project during recovery; retry the request.")
+    arguments = benchmark.arguments
+    benchmark.arguments = arguments.model_copy(
+        update={
+            "contract": arguments.contract.model_copy(update={"secrets": arguments.contract.secrets | secrets}),
+            "selected_project_gateway_secret_ref": secrets[MODEL_GATEWAY_API_KEY],
+        }
+    )
 
 
 def _apply_recovery(
@@ -3050,6 +3154,8 @@ def _apply_recovery(
                 benchmark_url=benchmark_url,
                 lambda_function=lambda_function,
             )
+
+        _rebind_recovery_gateway(benchmark_row, projects, preparation)
 
         if benchmark_row.arguments.environment == "local":
             resume_request = benchmark_row.local_start_benchmark_request(service_headers=service_headers)

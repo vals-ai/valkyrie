@@ -8,13 +8,13 @@ Valkyrie runs your AI agent on benchmark tasks, such as coding problems from SWE
 Verified or Terminal-Bench 2.0.
 
 - Choose an agent and a dataset of tasks, then start a run from the CLI or Python SDK.
-- Tasks run in parallel, each in its own sandbox: a separate cloud environment.
+- Tasks run in parallel, each in its own sandbox: a container on your machine or in a cloud provider such as Modal.
 - Your team can view each run's score, logs, outputs, and settings.
 
 <CardGroup cols={2}>
 
 <Card title="Run your first benchmark" icon="rocket" href="/get-started/quickstart">
-Install the CLI, sign in, and run your first task.
+Run your first task on hosted Valkyrie.
 </Card>
 
 <Card title="Package an agent" icon="file-code" href="/agents/package-an-agent">
@@ -30,17 +30,6 @@ Start and inspect runs from Python.
 </Card>
 
 </CardGroup>
-
-## Why agents need different evaluation infrastructure
-
-An agent needs more than a question and an answer to work on a task:
-
-- Each task needs its own sandbox with the right repository and tools.
-- The agent works in it for minutes or hours.
-- The benchmark grades the work when the agent finishes.
-
-Valkyrie prepares these environments, runs tasks in parallel, and saves the results so
-your team can compare runs without setting up each task by hand.
 
 ## How Valkyrie divides the work
 
@@ -83,8 +72,8 @@ You can [follow progress and logs](/runs/monitor) while the run is in progress.
 
 - **Run:** one agent evaluated on one benchmark dataset. A run is made of tasks.
 - **Task:** one problem from the dataset, run in its own sandbox.
-- **Sandbox provider:** the service that creates sandboxes, such as Daytona or Modal. Runs
-  use your organization's own provider account.
+- **Sandbox provider:** what creates sandboxes, such as Docker, Daytona, or Modal. Runs use
+  your own provider account.
 - **Organization:** the owner of runs, agents, and secrets. Members of an organization see
   its runs.
 
@@ -93,8 +82,8 @@ You can [follow progress and logs](/runs/monitor) while the run is in progress.
 - **Hosted by Vals AI.** Sign in and create an organization to use the hosted service,
   where Vals AI stores your results.
   - Sandboxes run on your own provider account.
-- **On your machine.** Run the Tracker yourself with no AWS account, as in
-  [Run Tracker locally](/self-hosting/local-tracker).
+- **On your machine.** Run the Tracker yourself with no account, as
+  [Run Tracker locally](/self-hosting/local-tracker) shows.
 
 ## Paper
 
@@ -112,18 +101,3 @@ consistent with the scores on each benchmark's public leaderboard:
 | mini-SWE-agent (Claude Sonnet 4.6) | 76.2% | 61.79% |
 | Claude Code (Claude Sonnet 4.6) | 51.4% | 57.3% |
 | Codex CLI (GPT-5.3-Codex) | 66.0% | 66.29% |
-
-```bibtex
-@inproceedings{forzano2026valkyrie,
-  author    = {Forzano, Jarett and Almatov, Omar and Nashold, Langston and Ravi, Nikil and Kassian, Orestes},
-  title     = {Valkyrie: A Microservice-Based Framework for Scalable Evaluation of AI Agents},
-  booktitle = {Proceedings of the 1st ACM Conference on Agentic and AI Systems},
-  series    = {CAIS '26},
-  year      = {2026},
-  month     = {may},
-  address   = {San Jose, CA, USA},
-  publisher = {ACM},
-  doi       = {10.1145/3786335.3813231},
-  url       = {https://doi.org/10.1145/3786335.3813231}
-}
-```

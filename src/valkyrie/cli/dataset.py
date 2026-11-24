@@ -1,22 +1,31 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import get_args
+from typing import TYPE_CHECKING, get_args
 
 import click
-from pydantic import TypeAdapter
-from valkyrie.sdk import ValkyrieClient
 from valkyrie.sdk.errors import ValkyrieAPIError, ValkyrieDatasetPushError
-from valkyrie.sdk.harbor_dataset import dataset_problems
 from valkyrie.sdk.models import (
     BlobResponse,
     DatasetLocation,
     DatasetResponse,
-    DatasetTaskResponse,
     DatasetVersionDetailResponse,
 )
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, local_time, one_line
+from valkyrie.cli.display import (
+    emit,
+    json_option,
+    format_table,
+    local_time,
+    one_line,
+    confirm,
+    console,
+    done,
+    fail,
+    warn,
+)
 from valkyrie.cli.resource import (
     DATASET_REFERENCE,
     INCLUDE_ARCHIVED,
@@ -26,6 +35,9 @@ from valkyrie.cli.resource import (
     list_resources,
     show_resource,
 )
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 
 @click.group(help="Publish, version and manage the datasets in your benchmarks.")
@@ -46,17 +58,18 @@ def dataset() -> None:
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--description", default="", help="What the dataset holds.")
-def create_dataset(benchmark: str, name: str, description: str) -> None:
+@json_option()
+def create_dataset(benchmark: str, name: str, description: str, output_format: str) -> None:
     created = call(lambda client: client.datasets.create(benchmark, name, description=description))
-    click.echo(
-        click.style(f"✓ Dataset created: {one_line(created.benchmark)}/{one_line(created.name)}", fg="green", bold=True)
-    )
+    if emit(created, output_format):
+        return
+    done(f"Dataset created: {one_line(created.benchmark)}/{one_line(created.name)}")
 
 
 @dataset.command(name="list", help="List the datasets in a benchmark.")
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @INCLUDE_ARCHIVED
-@format_option()
+@json_option()
 def list_datasets(benchmark: str, include_archived: bool, output_format: str) -> None:
     response = call(lambda client: client.datasets.list(benchmark, include_archived=include_archived))
     list_resources(response, response.datasets, output_format, "dataset")
@@ -68,7 +81,7 @@ def list_datasets(benchmark: str, include_archived: bool, output_format: str) ->
 )
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
-@format_option()
+@json_option()
 def show_dataset(benchmark: str, name: str, output_format: str) -> None:
     async def fetch(client: ValkyrieClient) -> tuple[DatasetResponse, DatasetVersionDetailResponse | None]:
         found = await client.datasets.get(benchmark, name)
@@ -82,30 +95,41 @@ def show_dataset(benchmark: str, name: str, output_format: str) -> None:
             return found, None
 
     found, latest = call(fetch)
-    show_resource(found, output_format, f"Benchmark:   {one_line(found.benchmark)}")
-    if output_format == "json":
-        return
-    if latest is None:
-        click.echo("Version:     none published")
-        return
-    click.echo(
-        f"Version:     @{latest.revision} ({latest.digest.removeprefix('sha256:')[:12]}), {latest.task_count} task(s), "
-        f"tags {one_line(', '.join(latest.tags))}"
+    manifest = latest.manifest if latest is not None else None
+    show_resource(
+        found,
+        output_format,
+        "Dataset",
+        before=[("Benchmark", one_line(found.benchmark))],
+        after=[
+            (
+                "Version",
+                f"@{latest.revision} ({latest.digest.removeprefix('sha256:')[:12]}), {latest.task_count} task(s), "
+                f"tags {one_line(', '.join(latest.tags))}"
+                if latest is not None
+                else "none published",
+            ),
+            *(
+                [
+                    (
+                        "Source",
+                        one_line(manifest.name) + (f" {one_line(manifest.version)}" if manifest.version else ""),
+                    ),
+                    (
+                        "Authors",
+                        one_line(", ".join(f"{a.name} <{a.email}>" if a.email else a.name for a in manifest.authors)),
+                    ),
+                    ("Keywords", one_line(", ".join(manifest.keywords))),
+                    (
+                        "Metadata",
+                        one_line(json.dumps(manifest.metadata, sort_keys=True)) if manifest.metadata else None,
+                    ),
+                ]
+                if manifest is not None
+                else []
+            ),
+        ],
     )
-    if (manifest := latest.manifest) is None:
-        return
-    click.echo(
-        f"Source:      {one_line(manifest.name)}" + (f" {one_line(manifest.version)}" if manifest.version else "")
-    )
-    if manifest.authors:
-        click.echo(
-            "Authors:     "
-            + one_line(", ".join(f"{a.name} <{a.email}>" if a.email else a.name for a in manifest.authors))
-        )
-    if manifest.keywords:
-        click.echo(f"Keywords:    {one_line(', '.join(manifest.keywords))}")
-    if manifest.metadata:
-        click.echo(f"Metadata:    {one_line(json.dumps(manifest.metadata, sort_keys=True))}")
 
 
 @dataset.command(
@@ -119,11 +143,12 @@ def show_dataset(benchmark: str, name: str, output_format: str) -> None:
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--description", required=True, help="The description the dataset now has.")
-def update_dataset(benchmark: str, name: str, description: str) -> None:
+@json_option()
+def update_dataset(benchmark: str, name: str, description: str, output_format: str) -> None:
     updated = call(lambda client: client.datasets.update(benchmark, name, description=description))
-    click.echo(
-        click.style(f"✓ Dataset updated: {one_line(updated.benchmark)}/{one_line(updated.name)}", fg="green", bold=True)
-    )
+    if emit(updated, output_format):
+        return
+    done(f"Dataset updated: {one_line(updated.benchmark)}/{one_line(updated.name)}")
 
 
 @dataset.command(
@@ -133,24 +158,26 @@ def update_dataset(benchmark: str, name: str, description: str) -> None:
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def remove_dataset(benchmark: str, name: str, yes: bool) -> None:
-    if not yes and not click.confirm(f"Archive dataset '{benchmark}/{name}'?"):
-        click.echo("Cancelled.")
+@json_option()
+def remove_dataset(benchmark: str, name: str, yes: bool, output_format: str) -> None:
+    if not confirm(f"Archive dataset '{benchmark}/{name}'?", yes=yes):
+        click.echo("Cancelled.", err=True)
         return
     call(lambda client: client.datasets.remove(benchmark, name))
-    click.echo(click.style(f"✓ Dataset '{benchmark}/{name}' archived.", fg="green", bold=True))
+    if emit({"archived": f"{benchmark}/{name}"}, output_format):
+        return
+    done(f"Dataset '{benchmark}/{name}' archived.")
 
 
 @dataset.command(name="restore", help="Restore an archived dataset so its tasks can change again.")
 @click.argument("benchmark", metavar="BENCHMARK", type=RESOURCE_NAME)
 @click.argument("name", metavar="NAME", type=RESOURCE_NAME)
-def restore_dataset(benchmark: str, name: str) -> None:
+@json_option()
+def restore_dataset(benchmark: str, name: str, output_format: str) -> None:
     restored = call(lambda client: client.datasets.restore(benchmark, name))
-    click.echo(
-        click.style(
-            f"✓ Dataset restored: {one_line(restored.benchmark)}/{one_line(restored.name)}", fg="green", bold=True
-        )
-    )
+    if emit(restored, output_format):
+        return
+    done(f"Dataset restored: {one_line(restored.benchmark)}/{one_line(restored.name)}")
 
 
 def _publish(
@@ -158,25 +185,27 @@ def _publish(
     tags: tuple[str, ...],
     concurrency: int,
     source: Path | tuple[DatasetLocation, str],
+    output_format: str,
 ) -> None:
     benchmark, _, dataset_name = dataset_reference.partition("/")
     uploaded: list[str] = []
+    progress = console(err=True).status("Preparing tasks")
 
     def report(task_id: str, blob: BlobResponse) -> None:
         uploaded.append(task_id)
-        click.echo(f"✓ Uploaded {one_line(task_id)} ({blob.size:,} bytes)")
+        progress.update(f"Uploaded {len(uploaded)} task(s)")
         for warning in blob.warnings:
-            click.secho(f"! {one_line(task_id)}: {one_line(warning)}", fg="yellow")
+            warn(f"{one_line(task_id)}: {one_line(warning)}")
 
     def announce(created: str) -> None:
-        click.echo(f"✓ Created {one_line(created)}")
+        done(f"Created {one_line(created)}")
 
     def note(message: str) -> None:
-        click.secho(f"! {one_line(message)}", fg="yellow")
+        warn(one_line(message))
 
-    def warn(task_id: str, entries: list[str]) -> None:
+    def left_out(task_id: str, entries: list[str]) -> None:
         names = ", ".join(one_line(entry) for entry in entries)
-        click.secho(f"! {one_line(task_id)}: not stored because they are not part of a task: {names}", fg="yellow")
+        warn(f"{one_line(task_id)}: not stored because they are not part of a task: {names}")
 
     async def push(client: ValkyrieClient) -> DatasetVersionDetailResponse:
         try:
@@ -189,11 +218,11 @@ def _publish(
                     concurrency=concurrency,
                     on_stored=report,
                     on_created=announce,
-                    on_left_out=warn,
+                    on_left_out=left_out,
                     on_warning=note,
                 )
             location, name = source
-            click.echo(f"Downloading {one_line(name)} from {location.replace('_', ' ')}...")
+            click.echo(f"Downloading {one_line(name)} from {location.replace('_', ' ')}...", err=True)
             return await client.datasets.install(
                 benchmark,
                 dataset_name,
@@ -203,25 +232,24 @@ def _publish(
                 concurrency=concurrency,
                 on_stored=report,
                 on_created=announce,
-                on_left_out=warn,
+                on_left_out=left_out,
                 on_warning=note,
             )
         except ValkyrieDatasetPushError as error:
             for task_id, message in error.failed.items():
-                click.echo(click.style(f"✗ {one_line(task_id)}: {one_line(message)}", fg="red"), err=True)
+                fail(f"{one_line(task_id)}: {one_line(message)}")
             raise click.ClickException(
                 f"{len(error.failed)} of {len(error.stored) + len(error.failed)} uploads failed and nothing was "
                 "published; run the command again to retry them"
             ) from error
 
-    version = call(push)
-    click.echo(
-        click.style(
-            f"✓ Published {benchmark}/{dataset_name}@{version.revision}: {version.task_count} task(s), "
-            f"{len(uploaded)} uploaded{', with metric.py' if version.metric_digest else ''}. Tags: {', '.join(version.tags)}.",
-            fg="green",
-            bold=True,
-        )
+    with progress:
+        version = call(push)
+    if emit(version, output_format):
+        return
+    done(
+        f"Published {benchmark}/{dataset_name}@{version.revision}: {version.task_count} task(s), "
+        f"{len(uploaded)} uploaded{', with metric.py' if version.metric_digest else ''}. Tags: {', '.join(version.tags)}."
     )
 
 
@@ -239,8 +267,11 @@ _CONCURRENCY = click.option(
 @click.argument("folder", metavar="FOLDER", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @_TAGS
 @_CONCURRENCY
-def push_dataset(dataset_reference: str, folder: Path, tags: tuple[str, ...], concurrency: int) -> None:
-    _publish(dataset_reference, tags, concurrency, folder)
+@json_option()
+def push_dataset(
+    dataset_reference: str, folder: Path, tags: tuple[str, ...], concurrency: int, output_format: str
+) -> None:
+    _publish(dataset_reference, tags, concurrency, folder, output_format)
 
 
 @dataset.command(
@@ -259,13 +290,20 @@ def push_dataset(dataset_reference: str, folder: Path, tags: tuple[str, ...], co
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="A `details.json` a grader wrote, checked against the score types. Repeatable.",
 )
-def check_dataset(folder: Path, details: tuple[Path, ...]) -> None:
+@json_option()
+def check_dataset(folder: Path, details: tuple[Path, ...], output_format: str) -> None:
+    from valkyrie.sdk.harbor_dataset import dataset_problems
+
     problems = dataset_problems(folder, details)
+    if emit({"folder": str(folder), "problems": problems}, output_format):
+        if problems:
+            raise SystemExit(1)
+        return
     for problem in problems:
-        click.echo(click.style(f"✗ {one_line(problem)}", fg="red"), err=True)
+        fail(one_line(problem))
     if problems:
         raise click.ClickException(f"{len(problems)} problem(s) found in {folder}")
-    click.secho(f"✓ {folder} follows the Harbor dataset standard", fg="green", bold=True)
+    done(f"{folder} follows the Harbor dataset standard")
 
 
 @dataset.command(
@@ -286,20 +324,26 @@ def check_dataset(folder: Path, details: tuple[Path, ...]) -> None:
 )
 @_TAGS
 @_CONCURRENCY
+@json_option()
 def install_dataset(
-    dataset_reference: str, source: str, location: DatasetLocation, tags: tuple[str, ...], concurrency: int
+    dataset_reference: str,
+    source: str,
+    location: DatasetLocation,
+    tags: tuple[str, ...],
+    concurrency: int,
+    output_format: str,
 ) -> None:
-    _publish(dataset_reference, tags, concurrency, (location, source))
+    _publish(dataset_reference, tags, concurrency, (location, source), output_format)
 
 
 @dataset.command(name="versions", help="List the versions of a dataset, newest first, with the tags on each.")
 @click.argument("dataset_reference", metavar="BENCHMARK/DATASET", type=DATASET_REFERENCE)
-@format_option()
+@json_option()
 def list_versions(dataset_reference: str, output_format: str) -> None:
     benchmark, _, dataset_name = dataset_reference.partition("/")
     response = call(lambda client: client.datasets.versions.list(benchmark, dataset_name))
     if output_format == "json":
-        click.echo(response.model_dump_json())
+        emit(response)
         return
     format_table(
         [
@@ -332,29 +376,25 @@ def list_versions(dataset_reference: str, output_format: str) -> None:
 @click.argument("dataset_reference", metavar="BENCHMARK/DATASET[@VERSION]", type=VERSIONED_DATASET_REFERENCE)
 @click.argument("tag_name", metavar="TAG")
 @click.option("--force", is_flag=True, help="Move the tag when it already points at another version.")
-def tag_version(dataset_reference: tuple[str, str, str], tag_name: str, force: bool) -> None:
+@json_option()
+def tag_version(dataset_reference: tuple[str, str, str], tag_name: str, force: bool, output_format: str) -> None:
     benchmark, dataset_name, version_ref = dataset_reference
     tagged = call(lambda client: client.datasets.versions.tag(benchmark, dataset_name, tag_name, version_ref, force))
-    click.echo(
-        click.style(
-            f"✓ Tagged {benchmark}/{dataset_name}@{tagged.revision} as {one_line(tag_name)}", fg="green", bold=True
-        )
-    )
+    if emit(tagged, output_format):
+        return
+    done(f"Tagged {benchmark}/{dataset_name}@{tagged.revision} as {one_line(tag_name)}")
 
 
 @dataset.command(name="untag", help="Remove a tag from a dataset. The latest tag can't be removed.")
 @click.argument("dataset_reference", metavar="BENCHMARK/DATASET", type=DATASET_REFERENCE)
 @click.argument("tag_name", metavar="TAG")
-def untag_version(dataset_reference: str, tag_name: str) -> None:
+@json_option()
+def untag_version(dataset_reference: str, tag_name: str, output_format: str) -> None:
     benchmark, _, dataset_name = dataset_reference.partition("/")
     removed = call(lambda client: client.datasets.versions.untag(benchmark, dataset_name, tag_name))
-    click.echo(
-        click.style(
-            f"✓ Removed tag {one_line(tag_name)} from {benchmark}/{dataset_name}@{removed.revision}",
-            fg="green",
-            bold=True,
-        )
-    )
+    if emit(removed, output_format):
+        return
+    done(f"Removed tag {one_line(tag_name)} from {benchmark}/{dataset_name}@{removed.revision}")
 
 
 @dataset.group(name="task", help="List and download the tasks of a dataset version")
@@ -372,12 +412,12 @@ def task() -> None:
     ),
 )
 @click.argument("dataset_reference", metavar="BENCHMARK/DATASET[@VERSION]", type=VERSIONED_DATASET_REFERENCE)
-@format_option()
+@json_option()
 def list_tasks(dataset_reference: tuple[str, str, str], output_format: str) -> None:
     benchmark, dataset_name, version_ref = dataset_reference
     tasks = call(lambda client: client.datasets.versions.tasks(benchmark, dataset_name, version_ref))
     if output_format == "json":
-        click.echo(TypeAdapter(list[DatasetTaskResponse]).dump_json(tasks).decode())
+        emit(tasks)
         return
     format_table(
         [
@@ -404,7 +444,10 @@ def list_tasks(dataset_reference: tuple[str, str, str], output_format: str) -> N
 @click.argument("task_id", metavar="TASK_ID", type=TASK_ID)
 @click.option("--output", "-o", type=click.Path(dir_okay=False, path_type=Path), help="Where to save the archive.")
 @click.option("--overwrite", is_flag=True, help="Replace the file if it exists.")
-def download_task(dataset_reference: tuple[str, str, str], task_id: str, output: Path | None, overwrite: bool) -> None:
+@json_option()
+def download_task(
+    dataset_reference: tuple[str, str, str], task_id: str, output: Path | None, overwrite: bool, output_format: str
+) -> None:
     benchmark, dataset_name, version_ref = dataset_reference
     destination = output or Path(f"{task_id}.zip")
     saved = call(
@@ -412,4 +455,6 @@ def download_task(dataset_reference: tuple[str, str, str], task_id: str, output:
             benchmark, dataset_name, task_id, destination, ref=version_ref, overwrite=overwrite
         )
     )
-    click.echo(click.style(f"✓ Task downloaded: {saved}", fg="green", bold=True))
+    if emit({"path": saved}, output_format):
+        return
+    done(f"Task downloaded: {saved}")

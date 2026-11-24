@@ -34,7 +34,7 @@ from tracker.repositories import project as project_repository
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest
 from valkyrie.sdk import ValkyrieClient
 
-from valkyrie.cli import client as cli_client
+import valkyrie.sdk as sdk
 
 TEST_ORG_ID = UUID("c15649d2-6ec4-4b4a-974a-cc00ea80bbf7")
 
@@ -118,7 +118,7 @@ def route_cli_to_local_tracker(
 ) -> None:
     monkeypatch.setenv("VALKYRIE_URL", "http://tracker.test")
     monkeypatch.setattr(
-        cli_client, "ValkyrieClient", partial(ValkyrieClient, transport=httpx.ASGITransport(app=local_tracker_app))
+        sdk, "ValkyrieClient", partial(ValkyrieClient, transport=httpx.ASGITransport(app=local_tracker_app))
     )
 
 

@@ -6,11 +6,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from benchmark_service import SandboxProvider, SandboxProviderConfig
-from benchmark_service.client import BenchmarkServiceClient
-from benchmark_service.schemas import FinalScoreResponse, RetrieveTaskResponse
+from benchmark_service.schemas import RetrieveTaskResponse
 from sqlmodel import Session, col, select
 
+from tests.integration.live_dataset import LIVE_DATASET_TASK_IDS
 from tests.utils import TEST_ORG_ID
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.services.datasets.scoring import MeanScorer
 from tracker.database.models import Benchmark, EvaluationResult, FinalEvaluation, Task
 from tracker.domain import TaskStatus
 from tracker.sandbox import SandboxCreationState, create_sandbox
@@ -46,13 +48,14 @@ def create_evaluation_result(
 def create_final_evaluation(
     database_session: Session,
     benchmark_row: Benchmark,
-    final_score_response: FinalScoreResponse,
+    final_score: float | None,
+    properties: dict[str, Any],
 ) -> FinalEvaluation:
     final_evaluation_row = FinalEvaluation(
         org_id=TEST_ORG_ID,
         benchmark=benchmark_row.id,
-        final_score=final_score_response.final_score,
-        properties=final_score_response.metadata,
+        final_score=final_score,
+        properties=properties,
     )
     database_session.add(final_evaluation_row)
     database_session.flush()
@@ -61,7 +64,7 @@ def create_final_evaluation(
 
 async def evaluate_instance(
     database_session: Session,
-    benchmark_service: BenchmarkServiceClient,
+    live_dataset_service: DatasetTaskService,
     sandbox_provider: SandboxProvider,
     sandbox_provider_config: SandboxProviderConfig,
     benchmark_row: Benchmark,
@@ -83,17 +86,19 @@ async def evaluate_instance(
         record_sandbox=AsyncMock(),
         labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id), "Task": task_row.task_id},
     ) as sandbox:
-        setup_response = await benchmark_service.setup_task(
+        setup_response = await live_dataset_service.setup_task(
             task_id=task_row.task_id,
             instance_id=str(sandbox.id),
             sandbox_provider=sandbox_provider_config,
         )
         assert setup_response.status == "ok"
-        return await benchmark_service.evaluate_instance(
+        result = await live_dataset_service.evaluate_instance(
             task_id=task_row.task_id,
             instance_id=sandbox.id,
             sandbox_provider=sandbox_provider_config,
         )
+        assert isinstance(result, dict)
+        return result
 
 
 @pytest.mark.description(
@@ -101,28 +106,25 @@ async def evaluate_instance(
         "Live evaluation results must round-trip through tracker rows without loss.\n"
         "\n"
         "Test cases:\n"
-        "- Three service tasks run concurrently in real sandboxes and persist successful evaluations.\n"
+        "- Three dataset tasks run concurrently in real sandboxes and persist successful evaluations.\n"
         "- Final score metadata and fetched result payloads match the stored rows."
     )
 )
 async def test_live_results_round_trip_through_tracker_database(
     database_session: Session,
-    benchmark_service: BenchmarkServiceClient,
+    live_dataset_service: DatasetTaskService,
     sandbox_provider: SandboxProvider,
     sandbox_provider_config: SandboxProviderConfig,
     example_benchmark_object: Benchmark,
     creation_semaphore: Semaphore,
 ) -> None:
-    health = await benchmark_service.health_check()
-    assert health.status == "ok"
-
     benchmark_row = example_benchmark_object
     database_session.add(benchmark_row)
     database_session.flush()
 
-    verify_response = await benchmark_service.verify_task_ids(task_ids=None, slice_str=None)
+    verify_response = await live_dataset_service.verify_task_ids(task_ids=None, slice_str=None)
     assert verify_response.task_ids is not None
-    assert len(verify_response.task_ids) == 500
+    assert verify_response.task_ids == LIVE_DATASET_TASK_IDS
     task_ids = verify_response.task_ids[:3]
     task_rows = {task_id: create_task_row(database_session, task_id, benchmark_row.id) for task_id in task_ids}
     evaluation_results: dict[str, dict[str, Any]] = {}
@@ -130,11 +132,11 @@ async def test_live_results_round_trip_through_tracker_database(
 
     async def process_task(task_id: str) -> None:
         async with concurrency:
-            task_data = await benchmark_service.retrieve_task(task_id=task_id)
+            task_data = await live_dataset_service.retrieve_task(task_id=task_id)
             task_row = task_rows[task_id]
             evaluation_result = await evaluate_instance(
                 database_session,
-                benchmark_service,
+                live_dataset_service,
                 sandbox_provider,
                 sandbox_provider_config,
                 benchmark_row,
@@ -148,8 +150,11 @@ async def test_live_results_round_trip_through_tracker_database(
     await gather(*(process_task(task_id) for task_id in task_ids))
     assert set(evaluation_results) == set(task_ids)
 
-    final_score_response = await benchmark_service.final_score(evaluation_results=evaluation_results)
-    final_evaluation_row = create_final_evaluation(database_session, benchmark_row, final_score_response)
+    scored = await MeanScorer().score(evaluation_results)
+    assert scored.final_score == 100.0
+    final_evaluation_row = create_final_evaluation(
+        database_session, benchmark_row, scored.final_score, scored.properties
+    )
     fetched_evaluation_results = benchmark_row.fetch_evaluation_results(database_session)
 
     assert set(fetched_evaluation_results) == set(task_ids)
@@ -167,5 +172,5 @@ async def test_live_results_round_trip_through_tracker_database(
         }
         assert evaluation_result == expected
 
-    assert final_evaluation_row.final_score == final_score_response.final_score
-    assert final_evaluation_row.properties == final_score_response.metadata
+    assert final_evaluation_row.final_score == scored.final_score
+    assert final_evaluation_row.properties == scored.properties

@@ -174,6 +174,7 @@ def reset_to_in_progress_status(
                 retry_started_at = task.started_at + timedelta(microseconds=1)
             task.started_at = retry_started_at
             task.finished_at = None
+            task.last_log_at = None
             task.build_phase_dispatch_id = None
             task.build_phase_token = None
             task.evaluation_phase_dispatch_id = None

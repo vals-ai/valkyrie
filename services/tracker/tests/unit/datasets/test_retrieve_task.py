@@ -3,7 +3,15 @@ import shlex
 from pathlib import Path
 
 import pytest
-from benchmark_service import ComposeSource, DockerfileSource, ImageSource, MCPServer, Resources
+from benchmark_service import (
+    ComposeSource,
+    DockerfileSource,
+    ImageSource,
+    MCPServer,
+    Resources,
+    SnapshotSource,
+    TargetedSnapshotSource,
+)
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 
 from tracker.services.datasets.config import TaskConfig
@@ -11,7 +19,6 @@ from tracker.services.datasets.retrieve_task import (
     DEFAULT_CWD,
     TaskFolderResponse,
     UnsupportedTaskError,
-    dockerfile_workdir,
     retrieve_task_response,
 )
 
@@ -137,28 +144,6 @@ class TestWorkingDirectory:
 
         assert declared.cwd == "/app"
         assert (fallback.cwd, fallback.problem_path) == ("/testbed", "/testbed/instruction.md")
-        assert dockerfile_workdir(tmp_path / "missing" / "Dockerfile") is None
-
-    @pytest.mark.description("The workdir is that of the last build stage.")
-    @pytest.mark.parametrize(
-        ("dockerfile", "expected"),
-        [
-            ("FROM x\nworkdir /lower\n", "/lower"),
-            ("FROM x\nWORKDIR /a\nWORKDIR b\n", "/a/b"),
-            ("FROM x\nWORKDIR b\n", "/b"),
-            ("FROM build\nWORKDIR /build\nFROM runtime\nRUN true\n", None),
-            ("FROM build\nWORKDIR /build\nFROM runtime\nWORKDIR /app\n", "/app"),
-            ("# WORKDIR /commented\nFROM x\n", None),
-            ("FROM x\nWORKDIR\n", None),
-        ],
-    )
-    def test_the_workdir_is_that_of_the_last_build_stage(
-        self, tmp_path: Path, dockerfile: str, expected: str | None
-    ) -> None:
-        path = tmp_path / "Dockerfile"
-        path.write_text(dockerfile)
-
-        assert dockerfile_workdir(path) == expected
 
 
 @pytest.mark.description("Each stage's egress policy, falling back to the environment's.")
@@ -254,12 +239,46 @@ class TestDockerfileTasks:
 
 @pytest.mark.description("Tasks whose source this version can't run.")
 class TestUnmappableTasks:
-    @pytest.mark.description("A task without an image or a dockerfile is refused.")
+    @pytest.mark.description("A task without a snapshot, an image or a dockerfile is refused.")
     def test_a_task_without_an_image_or_a_dockerfile_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(
-            UnsupportedTaskError, match="no docker_image, environment/Dockerfile or environment/docker-compose.yaml"
+            UnsupportedTaskError,
+            match="no snapshot, docker_image, environment/Dockerfile or environment/docker-compose.yaml",
         ):
             mapped(tmp_path, "[environment]\ncpus = 1")
+
+
+@pytest.mark.description("A snapshot task runs from the provider snapshot it names.")
+class TestSnapshotTasks:
+    @pytest.mark.description(
+        "A snapshot maps to a snapshot source, or a targeted one with a target, and keeps the task's resources."
+    )
+    @pytest.mark.parametrize(
+        ("target", "source"),
+        [
+            ("", SnapshotSource(snapshot="env-build")),
+            ('snapshot_target = "us"\n', TargetedSnapshotSource(snapshot="env-build", target="us")),
+        ],
+        ids=["snapshot", "targeted"],
+    )
+    def test_a_snapshot_maps_to_its_source_and_keeps_the_resources(
+        self, tmp_path: Path, target: str, source: SnapshotSource | TargetedSnapshotSource
+    ) -> None:
+        toml = f'[environment]\nsnapshot = "env-build"\n{target}cpus = 4\nmemory_mb = 8192\nstorage_mb = 30720\n'
+
+        response = mapped(tmp_path, toml)
+
+        assert response.source == source
+        assert response.resources == Resources(vcpu=4, memory=8, disk=30)
+        assert response.cwd == DEFAULT_CWD
+        assert response.cwd_from_image
+
+    @pytest.mark.description("A snapshot task with a workdir uses it instead of the snapshot's.")
+    def test_a_snapshot_task_with_a_workdir_uses_it(self, tmp_path: Path) -> None:
+        response = mapped(tmp_path, '[environment]\nsnapshot = "env-build"\nworkdir = "/app"')
+
+        assert response.cwd == "/app"
+        assert not response.cwd_from_image
 
 
 @pytest.mark.description(

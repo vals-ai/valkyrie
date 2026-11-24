@@ -17,7 +17,8 @@ BENCHMARK must already exist. `valkyrie dataset push` creates a missing one. NAM
 valkyrie dataset create \
   <BENCHMARK> \
   <NAME> \
-  [--description <TEXT>]
+  [--description <TEXT>] \
+  [--json]
 ```
 
 ```bash Example
@@ -44,6 +45,11 @@ valkyrie dataset create \
   <p className="mb-0 mt-1">{"What the dataset holds."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -56,7 +62,7 @@ List the datasets in a benchmark.
 valkyrie dataset list \
   <BENCHMARK> \
   [--include-archived] \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 **Arguments**
@@ -73,8 +79,8 @@ valkyrie dataset list \
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -89,7 +95,7 @@ Show one dataset, archived or not, with its latest version and the dataset.toml 
 valkyrie dataset show \
   <BENCHMARK> \
   <NAME> \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 **Arguments**
@@ -105,8 +111,8 @@ valkyrie dataset show \
 **Options**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -121,7 +127,8 @@ Change a dataset's description. Its name never changes.
 valkyrie dataset update \
   <BENCHMARK> \
   <NAME> \
-  --description <TEXT>
+  --description <TEXT> \
+  [--json]
 ```
 
 ```bash Example
@@ -148,6 +155,11 @@ valkyrie dataset update \
   <p className="mb-0 mt-1">{"The description the dataset now has."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -160,7 +172,8 @@ Archive a dataset. It stays readable, keeps its name, and can be restored.
 valkyrie dataset remove \
   <BENCHMARK> \
   <NAME> \
-  [--yes|-y]
+  [--yes|-y] \
+  [--json]
 ```
 
 **Arguments**
@@ -180,6 +193,11 @@ valkyrie dataset remove \
   <p className="mb-0 mt-1">{"Skip the confirmation prompt."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -191,7 +209,8 @@ Restore an archived dataset so its tasks can change again.
 ```bash Syntax
 valkyrie dataset restore \
   <BENCHMARK> \
-  <NAME>
+  <NAME> \
+  [--json]
 ```
 
 **Arguments**
@@ -202,6 +221,13 @@ valkyrie dataset restore \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"NAME"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -217,7 +243,8 @@ valkyrie dataset push \
   <BENCHMARK/DATASET> \
   <FOLDER> \
   [--tag <TEXT>...] \
-  [--concurrency <INTEGER>]
+  [--concurrency <INTEGER>] \
+  [--json]
 ```
 
 **Arguments**
@@ -242,6 +269,11 @@ valkyrie dataset push \
   <p className="mb-0 mt-1">{"Tasks to upload at once"}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -253,7 +285,8 @@ List every way the Harbor dataset under FOLDER departs from the porting standard
 ```bash Syntax
 valkyrie dataset check \
   <FOLDER> \
-  [--details <PATH>...]
+  [--details <PATH>...] \
+  [--json]
 ```
 
 ```bash Example
@@ -275,6 +308,11 @@ valkyrie dataset check \
   <p className="mb-0 mt-1">{"A `details.json` a grader wrote, checked against the score types. Repeatable."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -289,7 +327,8 @@ valkyrie dataset install \
   <SOURCE> \
   --location <CHOICE> \
   [--tag <TEXT>...] \
-  [--concurrency <INTEGER>]
+  [--concurrency <INTEGER>] \
+  [--json]
 ```
 
 ```bash Example
@@ -326,6 +365,11 @@ valkyrie dataset install \
   <p className="mb-0 mt-1">{"Tasks to upload at once"}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -337,7 +381,7 @@ List the versions of a dataset, newest first, with the tags on each.
 ```bash Syntax
 valkyrie dataset versions \
   <BENCHMARK/DATASET> \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 **Arguments**
@@ -349,8 +393,8 @@ valkyrie dataset versions \
 **Options**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -369,7 +413,8 @@ A tag is lowercase letters, digits, hyphens and dots, starts with a letter or di
 valkyrie dataset tag \
   <BENCHMARK/DATASET[@VERSION]> \
   <TAG> \
-  [--force]
+  [--force] \
+  [--json]
 ```
 
 ```bash Example
@@ -395,6 +440,11 @@ valkyrie dataset tag \
   <p className="mb-0 mt-1">{"Move the tag when it already points at another version."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Dataset guides](/benchmarks/datasets).
 
 ---
@@ -406,7 +456,8 @@ Remove a tag from a dataset. The latest tag can't be removed.
 ```bash Syntax
 valkyrie dataset untag \
   <BENCHMARK/DATASET> \
-  <TAG>
+  <TAG> \
+  [--json]
 ```
 
 **Arguments**
@@ -417,6 +468,13 @@ valkyrie dataset untag \
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"TAG"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -430,7 +488,7 @@ List the tasks of a dataset version: the latest one, or the version after @, whi
 ```bash Syntax
 valkyrie dataset task list \
   <BENCHMARK/DATASET[@VERSION]> \
-  [--format <CHOICE>]
+  [--json]
 ```
 
 ```bash Example
@@ -446,8 +504,8 @@ valkyrie dataset task list swe-bench/verified@2
 **Options**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--format"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"choice"}</code> · default: <code>{"'text'"}</code> · constraints: {"one of text, json; case-insensitive"}</span></div>
-  <p className="mb-0 mt-1">{"Output format."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).
@@ -463,7 +521,8 @@ valkyrie dataset task download \
   <BENCHMARK/DATASET[@VERSION]> \
   <TASK_ID> \
   [--output|-o <PATH>] \
-  [--overwrite]
+  [--overwrite] \
+  [--json]
 ```
 
 **Arguments**
@@ -486,6 +545,11 @@ valkyrie dataset task download \
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--overwrite"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
   <p className="mb-0 mt-1">{"Replace the file if it exists."}</p>
+</div>
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Dataset guides](/benchmarks/datasets).

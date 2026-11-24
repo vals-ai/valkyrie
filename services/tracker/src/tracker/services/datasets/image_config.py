@@ -1,10 +1,13 @@
+import json
+import logging
 import re
-from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
 from tracker.outbound_security import is_public_host
+
+logger = logging.getLogger(__name__)
 
 DOCKER_HUB = "registry-1.docker.io"
 DOCKER_HUB_NAMES = {"docker.io", "index.docker.io"}
@@ -18,7 +21,13 @@ MANIFEST_TYPES = ", ".join(
 )
 PLATFORM = {"os": "linux", "architecture": "amd64"}
 TIMEOUT_SEC = 15
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 CHALLENGE_FIELD = re.compile(r'(\w+)="([^"]*)"')
+
+
+class ImageConfig(NamedTuple):
+    user: str | None
+    workdir: str | None
 
 
 def image_reference(image: str) -> tuple[str, str, str]:
@@ -36,25 +45,12 @@ def image_reference(image: str) -> tuple[str, str, str]:
     return registry, repository, digest or tag
 
 
-def dockerfile_base_image(dockerfile: Path) -> str | None:
-    stages: set[str] = set()
-    base: str | None = None
-    for line in dockerfile.read_text().splitlines():
-        words = [word for word in line.split() if not word.startswith("--")]
-        if len(words) < 2 or words[0].upper() != "FROM":
-            continue
-        base = None if words[1].lower() in stages or "$" in words[1] else words[1]
-        if len(words) >= 4 and words[2].upper() == "AS":
-            stages.add(words[3].lower())
-    return base
-
-
 async def _public_https_only(request: httpx.Request) -> None:
     if request.url.scheme != "https" or not is_public_host(request.url.host):
         raise httpx.RequestError(f"Refusing to contact {request.url.host} for image config", request=request)
 
 
-async def image_workdir(image: str) -> str | None:
+async def image_config(image: str) -> ImageConfig | None:
     registry, repository, reference = image_reference(image)
     base = f"https://{registry}/v2/{repository}"
     try:
@@ -62,34 +58,44 @@ async def image_workdir(image: str) -> str | None:
             timeout=TIMEOUT_SEC, follow_redirects=True, event_hooks={"request": [_public_https_only]}
         ) as client:
             headers = {"Accept": MANIFEST_TYPES}
-            response = await client.get(f"{base}/manifests/{reference}", headers=headers)
-            if response.status_code == 401:
-                headers["Authorization"] = f"Bearer {await _anonymous_token(client, response)}"
-                response = await client.get(f"{base}/manifests/{reference}", headers=headers)
-            manifest: dict[str, Any] = response.raise_for_status().json()
+            try:
+                manifest = await _get_json(client, f"{base}/manifests/{reference}", headers=headers)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 401:
+                    raise
+                headers["Authorization"] = f"Bearer {await _anonymous_token(client, error.response)}"
+                manifest = await _get_json(client, f"{base}/manifests/{reference}", headers=headers)
             if "manifests" in manifest:
                 chosen = next(
                     entry
                     for entry in manifest["manifests"]
                     if all(entry.get("platform", {}).get(key) == value for key, value in PLATFORM.items())
                 )
-                manifest = (
-                    (await client.get(f"{base}/manifests/{chosen['digest']}", headers=headers))
-                    .raise_for_status()
-                    .json()
-                )
-            config = (
-                (await client.get(f"{base}/blobs/{manifest['config']['digest']}", headers=headers))
-                .raise_for_status()
-                .json()
-            )
-    except (httpx.HTTPError, ValueError, KeyError, StopIteration):
+                manifest = await _get_json(client, f"{base}/manifests/{chosen['digest']}", headers=headers)
+            settings: dict[str, Any] = (
+                await _get_json(client, f"{base}/blobs/{manifest['config']['digest']}", headers=headers)
+            ).get("config") or {}
+            return ImageConfig(str(settings.get("User") or "") or None, str(settings.get("WorkingDir") or "") or None)
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, TypeError, AttributeError, StopIteration) as error:
+        logger.warning(
+            "Could not read the config of image %s, so its user and working directory are unknown: %r", image, error
+        )
         return None
-    return config.get("config", {}).get("WorkingDir") or None
+
+
+async def _get_json(client: httpx.AsyncClient, url: str, **options: Any) -> Any:
+    async with client.stream("GET", url, **options) as response:
+        response.raise_for_status()
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError(f"{url} returned more than {MAX_RESPONSE_BYTES} bytes")
+    return json.loads(body)
 
 
 async def _anonymous_token(client: httpx.AsyncClient, response: httpx.Response) -> str:
     challenge = dict(CHALLENGE_FIELD.findall(response.headers.get("www-authenticate", "")))
     realm = challenge.pop("realm")
-    token = (await client.get(realm, params=challenge)).raise_for_status().json()
+    token = await _get_json(client, realm, params=challenge)
     return token.get("token") or token["access_token"]

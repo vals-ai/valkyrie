@@ -22,6 +22,7 @@ from typing import Any, AsyncGenerator, Literal, Never, assert_never
 import logfire
 import sentry_sdk
 from benchmark_service import (
+    Checkpoint,
     Episode,
     ComposeSandbox,
     ComposeSource,
@@ -45,6 +46,7 @@ from benchmark_service import (
 from benchmark_service.sandbox import SandboxCommandError as ProviderSandboxCommandError
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_created_scope
 from benchmark_service.sandbox import SandboxError as ProviderSandboxError
+from benchmark_service.sandbox import SandboxRejectedError as ProviderSandboxRejectedError
 from benchmark_service.sandbox import UnsupportedSandboxConfigError
 from opentelemetry import trace
 from tenacity import (
@@ -62,13 +64,14 @@ from tracker.runtime.lifecycle import finish_cleanup
 from tracker.generation_plan import GenerationPlan
 from tracker.runtime.storage import ObjectStore
 from tracker.egress import EgressPolicy
-from tracker.clients.model_gateway import MODEL_GATEWAY_URL
+from tracker.clients.model_gateway import GENERATION_MODEL_GATEWAY_URL, MODEL_GATEWAY_URL
 from tracker.external_service_gateway import (
     GenerationAccountingSummary,
     ExternalServiceDeadlineController,
 )
 from tracker.types import MAX_OUTPUT_ARTIFACT_BYTES, AgentContractRequest, OutputArtifactSpec
 from tracker.domain import AgentCausedExitReason
+from tracker.services.datasets.grading import LOG_DIRS
 from tracker.services.datasets.user import run_as
 from tracker.exceptions import (
     AgentRunFailedError,
@@ -322,6 +325,8 @@ def _source_name(source: SandboxSource) -> str:
             return "snapshot"
         case DockerfileSource():
             return "dockerfile"
+        case Checkpoint():
+            return "checkpoint"
         case _:
             assert_never(source)
 
@@ -336,6 +341,28 @@ def runtime_sandbox(sandbox: Sandbox, source: SandboxSource) -> Sandbox:
     if isinstance(source, ComposeSource):
         return ComposeSandbox(sandbox, source)
     return sandbox
+
+
+class SandboxSourceRejectedError(ProviderSandboxRejectedError):
+    cause_code = "sandbox_source_rejected"
+
+
+def rejection_source(source: SandboxSource) -> str | None:
+    match source:
+        case ComposeSource(outer=outer):
+            return rejection_source(outer)
+        case ImageSource(image=image):
+            return f"image:{image}"
+        case SnapshotSource(snapshot=snapshot):
+            return f"snapshot:{snapshot}"
+        case TargetedSnapshotSource(snapshot=snapshot, target=target):
+            return f"snapshot:{snapshot}@{target}"
+        case Checkpoint(ref=ref):
+            return f"checkpoint:{ref}"
+        case DockerfileSource():
+            return None
+        case _:
+            assert_never(source)
 
 
 def _metric_source_name(source: SandboxSource) -> str:
@@ -509,7 +536,7 @@ async def create_sandbox(
 
                 await finish_cleanup(asyncio.create_task(settle_creation()))
                 raise
-            except (SandboxNotFoundError, UnsupportedSandboxConfigError):
+            except (SandboxNotFoundError, ProviderSandboxRejectedError, UnsupportedSandboxConfigError):
                 raise
             except ProviderSandboxError as e:
                 if isinstance(e, SandboxBuildError) and isinstance(_provider_source(source), DockerfileSource):
@@ -1110,6 +1137,10 @@ async def _cancel_and_join_controlled_tasks(*tasks: asyncio.Task[Any]) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def gateway_env_name(episode: Episode | None, staged: bool) -> str:
+    return MODEL_GATEWAY_URL if episode is None and not staged else GENERATION_MODEL_GATEWAY_URL
+
+
 async def _stream_controlled_output(
     sandbox: Sandbox,
     command: str,
@@ -1131,10 +1162,9 @@ async def _stream_controlled_output(
     controller = deadline_controller
     stage = _StageOutput(stage_key, on_output) if stage_key is not None else None
     try:
-        env_name = MODEL_GATEWAY_URL if episode is None and stage is None else "VALKYRIE_GENERATION_MODEL_GATEWAY_URL"
         env_vars = {**(extra_env or {})}
         if generation_gateway_url is not None:
-            env_vars[env_name] = generation_gateway_url
+            env_vars[gateway_env_name(episode, stage is not None)] = generation_gateway_url
         error_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.error" if redact_error is not None else None
         if error_path is not None:
             await _exec(sandbox, f"mkdir -p {shlex.quote(_STATUS_DIR)}")
@@ -1859,9 +1889,15 @@ def _find_root_for_glob(source: str) -> str:
 
 async def _resolve_output_artifact_sandbox_path(sandbox: Sandbox, artifact: OutputArtifactSpec, task_id: str) -> str:
     source = _format_output_artifact_source(_output_artifact_source(artifact), task_id)
+    required = _output_artifact_is_required(artifact)
+    probe_path = source
     if _has_glob(source):
-        find_root = _find_root_for_glob(source)
-        find_command = f"find {shlex.quote(find_root)} -type f -path {shlex.quote(source)} | sort | head -n 1"
+        probe_path = _find_root_for_glob(source)
+        find_root = shlex.quote(probe_path)
+        find_command = (
+            f"test -e {find_root} && {{ matches=$(find {find_root} -type f -path {shlex.quote(source)}) || exit 2; "
+            "printf '%s\\n' \"$matches\" | sort | head -n 1; }"
+        )
         source_result = await _exec(sandbox, find_command)
         source_path = source_result.stdout.strip()
         if source_result.exit_code == _SUCCESS_EXIT_CODE and source_path:
@@ -1869,17 +1905,23 @@ async def _resolve_output_artifact_sandbox_path(sandbox: Sandbox, artifact: Outp
     else:
         quoted_source = shlex.quote(source)
         exists_command = f"test -f {quoted_source}"
-        if not _output_artifact_is_required(artifact):
+        if not required:
             exists_command += f" && ! test -L {quoted_source}"
-        exists = await _exec(sandbox, exists_command)
-        if exists.exit_code == _SUCCESS_EXIT_CODE:
+        source_result = await _exec(sandbox, exists_command)
+        if source_result.exit_code == _SUCCESS_EXIT_CODE:
             return source
-        if not _output_artifact_is_required(artifact):
-            present = await _exec(sandbox, f"test -e {quoted_source} || test -L {quoted_source}")
-            if present.exit_code == _SUCCESS_EXIT_CODE:
-                raise OutputArtifactError(f"Output artifact is a symlink or not a regular file: {source}")
 
-    artifact_label = "Required output artifact" if _output_artifact_is_required(artifact) else "Output artifact"
+    if source_result.exit_code != _SUCCESS_EXIT_CODE:
+        if source_result.exit_code != 1:
+            raise OutputArtifactError(f"Failed to check output artifact: {source}: {source_result.stdout.strip()}")
+        stat_flags = "-Lc%F" if required else "-c%F"
+        probe = await _exec(sandbox, f"LC_ALL=C stat {stat_flags} {shlex.quote(probe_path)} 2>&1")
+        if probe.exit_code == _SUCCESS_EXIT_CODE:
+            raise OutputArtifactError(f"Output artifact is a symlink or not a regular file: {source}")
+        if probe.exit_code != 1 or not probe.stdout.rstrip().endswith(": No such file or directory"):
+            raise OutputArtifactError(f"Failed to check output artifact: {source}: {probe.stdout.strip()}")
+
+    artifact_label = "Required output artifact" if required else "Output artifact"
     raise OutputArtifactError(f"{artifact_label} missing: {source}", missing=True)
 
 
@@ -2068,6 +2110,7 @@ async def run_agent(
     skills_dir: str | None = None,
     task_dir: str | None = None,
     on_search_costs: Callable[[list[SearchCharge]], Awaitable[None]] | None = None,
+    safe_python_path: bool = True,
 ) -> tuple[AgentCausedExitReason | None, float]:
     if contract.isolate_agent_uid and (user is not None or plan.episode is None):
         raise InvalidSandboxConfigurationError("UID isolation requires an episode without agent.user")
@@ -2097,7 +2140,11 @@ async def run_agent(
 
     setup = working_directory_command(cwd, user)
     if user is not None:
-        setup += f"; mkdir -p {shlex.quote(_STATUS_DIR)} && chmod 1777 {shlex.quote(_STATUS_DIR)}"
+        setup += (
+            f"; mkdir -p {shlex.quote(_STATUS_DIR)} && chmod 1777 {shlex.quote(_STATUS_DIR)}"
+            f"; [ ! -d /logs ] || find /logs -mindepth 1 \\( {' -o '.join(f'-path {path}' for path in LOG_DIRS)} \\) -prune"
+            f" -o -user 0 ! -type l -exec chown {shlex.quote(user)} {{}} +"
+        )
     await _exec(sandbox, setup)
     stage_key = await _provision_stage(sandbox, isolate_agent_uid=contract.isolate_agent_uid) if plan.staged else None
     if plan.episode is not None:
@@ -2197,7 +2244,7 @@ async def run_agent(
             await _kill_agent_group(sandbox, agent_group)
 
     try:
-        command = f"PYTHONSAFEPATH=1 {run_cmd}"
+        command = f"PYTHONSAFEPATH=1 {run_cmd}" if safe_python_path else run_cmd
         if stage_key is not None:
             command = f"export VALKYRIE_STAGE_DIR={_STAGE_DIR}; {command}"
         command = _in_own_process_group(command, agent_group)

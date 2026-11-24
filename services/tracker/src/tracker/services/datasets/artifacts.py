@@ -2,11 +2,14 @@ import logging
 import posixpath
 import shlex
 import uuid
-from collections.abc import AsyncIterable, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 
 from benchmark_service.sandbox.types import Sandbox
 
+from tracker.runtime.artifacts import EPOCH, task_artifact_key
+from tracker.runtime.storage import ObjectStore
 from tracker.services.datasets.config import MAIN_SERVICE, ArtifactConfig, CollectConfig
 from tracker.services.datasets.grading import ARTIFACTS_DIR
 from tracker.services.datasets.user import run_as
@@ -20,6 +23,9 @@ ARCHIVE_TIMEOUT_SEC = 600
 ULIMIT_BLOCK_BYTES = 512
 
 CONVENTION_ARTIFACT = ArtifactConfig(source=ARTIFACTS_DIR)
+SAVED_ARTIFACTS_RUN = "saved_artifacts_run_id"
+ARCHIVE_SUFFIX = ".tar.gz"
+ABSENT_SUFFIX = ".absent"
 ArtifactSink = Callable[[str, str, AsyncIterable[bytes]], Awaitable[None]]
 Say = Callable[[str], None]
 
@@ -30,6 +36,7 @@ class StagedArtifact:
     source: str
     archive_path: str
     service: str
+    read: Callable[[], AsyncIterable[bytes]]
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,7 @@ class SkippedArtifact:
     source: str
     reason: str
     absent: bool
+    name: str
 
 
 def _last_number(output: str) -> int | None:
@@ -72,19 +80,27 @@ async def stage_artifacts(
         if service not in directories:
             directory = f"{STAGING_ROOT}/valkyrie-artifacts-{uuid.uuid4().hex}"
             if (await sandbox.exec(f"mkdir -m 700 {shlex.quote(directory)}")).exit_code != 0:
-                skipped.append(SkippedArtifact(artifact.source, "the staging folder couldn't be created", False))
+                skipped.append(
+                    SkippedArtifact(artifact.source, "the staging folder couldn't be created", False, artifact.name)
+                )
                 continue
             directories[service] = directory
-        archive_path = f"{directories[service]}/{index}.tar.gz"
-        source = posixpath.normpath(
-            artifact.source if artifact.source.startswith("/") else posixpath.join(cwd, artifact.source)
-        )
+        archive_path = f"{directories[service]}/{index}{ARCHIVE_SUFFIX}"
+        source = posixpath.normpath(posixpath.join(cwd, artifact.source))
         try:
             skip = await _archive(sandbox, artifact, source, archive_path)
         except Exception as error:
-            skip = SkippedArtifact(artifact.source, f"{type(error).__name__}: {error}", False)
+            skip = SkippedArtifact(artifact.source, f"{type(error).__name__}: {error}", False, artifact.name)
         if skip is None:
-            staged.append(StagedArtifact(f"{artifact.name}.tar.gz", source, archive_path, service))
+            staged.append(
+                StagedArtifact(
+                    f"{artifact.name}{ARCHIVE_SUFFIX}",
+                    source,
+                    archive_path,
+                    service,
+                    partial(sandbox.stream_download, archive_path),
+                )
+            )
         else:
             skipped.append(skip)
     for service, directory in directories.items():
@@ -93,21 +109,66 @@ async def stage_artifacts(
     return staged, skipped
 
 
+class MissingSavedArtifactError(RuntimeError):
+    pass
+
+
+async def _nothing() -> AsyncIterator[bytes]:
+    return
+    yield b""
+
+
 async def upload_artifacts(
     task_id: str,
-    services: Mapping[str, Sandbox],
     staged: Sequence[StagedArtifact],
+    skipped: Sequence[SkippedArtifact],
     sink: ArtifactSink,
     say: Say,
     folder: str = "artifacts",
 ) -> None:
-    for artifact in staged:
+    for source, name, chunks in [
+        *((artifact.source, artifact.name, artifact.read()) for artifact in staged),
+        *((artifact.source, f"{artifact.name}{ABSENT_SUFFIX}", _nothing()) for artifact in skipped if artifact.absent),
+    ]:
         try:
-            await sink(
-                task_id, f"{folder}/{artifact.name}", services[artifact.service].stream_download(artifact.archive_path)
-            )
+            await sink(task_id, f"{folder}/{name}", chunks)
         except Exception as error:
-            say(f"Artifact {artifact.source} could not be saved: {error}")
+            say(f"Artifact {source} could not be saved: {error}")
+
+
+async def saved_artifacts(
+    objects: ObjectStore, run_id: str, task_id: str, artifacts: Sequence[ArtifactConfig], cwd: str
+) -> tuple[list[StagedArtifact], list[SkippedArtifact]]:
+    staged: list[StagedArtifact] = []
+    skipped: list[SkippedArtifact] = []
+    for artifact in {
+        CONVENTION_ARTIFACT.name: CONVENTION_ARTIFACT,
+        **{artifact.name: artifact for artifact in artifacts},
+    }.values():
+        key = task_artifact_key(run_id, task_id, f"artifacts/{artifact.name}")
+        saved = [
+            stored
+            async for stored in objects.list_objects(key)
+            if stored.key in (f"{key}{ARCHIVE_SUFFIX}", f"{key}{ABSENT_SUFFIX}")
+        ]
+        if not saved:
+            if artifact is not CONVENTION_ARTIFACT:
+                raise MissingSavedArtifactError(f"Run {run_id} saved no artifact {artifact.source} for task {task_id}")
+            continue
+        newest = max(saved, key=lambda stored: (stored.last_modified or EPOCH, stored.key)).key
+        if newest.endswith(ABSENT_SUFFIX):
+            skipped.append(SkippedArtifact(artifact.source, "the agent never wrote it", True, artifact.name))
+            continue
+        staged.append(
+            StagedArtifact(
+                f"{artifact.name}{ARCHIVE_SUFFIX}",
+                posixpath.normpath(posixpath.join(cwd, artifact.source)),
+                newest,
+                artifact.service or MAIN_SERVICE,
+                partial(objects.get_stream, newest),
+            )
+        )
+    return staged, skipped
 
 
 async def discard_staged(services: Mapping[str, Sandbox], staged: Sequence[StagedArtifact]) -> None:
@@ -122,7 +183,7 @@ async def _archive(
     sandbox: Sandbox, artifact: ArtifactConfig, source: str, archive_path: str
 ) -> SkippedArtifact | None:
     def skip(reason: str, *, absent: bool = False) -> SkippedArtifact:
-        return SkippedArtifact(artifact.source, reason, absent)
+        return SkippedArtifact(artifact.source, reason, absent, artifact.name)
 
     quoted = shlex.quote(source)
     if (await sandbox.exec(f"test -e {quoted} || test -L {quoted}")).exit_code != 0:

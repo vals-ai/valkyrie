@@ -93,14 +93,14 @@ MODELS: dict[str, ModelOverlay] = {
     "SingleTaskResponse": {
         "module": "benchmarks",
         "doc": "Detailed state and evaluation output for one task.",
-        "fields": {"started_at": {**DATETIME}, "finished_at": {**DATETIME}},
+        "fields": {"started_at": {**DATETIME}, "finished_at": {**DATETIME}, "last_log_at": {**DATETIME}},
     },
     "TaskArtifactsResponse": {"module": "benchmarks", "doc": "Temporary artifact and log links for one task."},
     "TaskBreakdown": {"module": "benchmarks", "doc": "Per-task runtime and generation accounting metadata."},
     "TaskSummary": {
         "module": "benchmarks",
         "doc": "Summary information for one task in a paginated run.",
-        "fields": {"started_at": {**DATETIME}, "finished_at": {**DATETIME}},
+        "fields": {"started_at": {**DATETIME}, "finished_at": {**DATETIME}, "last_log_at": {**DATETIME}},
     },
     "TasksResponse": {"module": "benchmarks", "doc": "Paginated task summaries for one run."},
     "AWSResources": {

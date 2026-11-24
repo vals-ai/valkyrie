@@ -105,10 +105,10 @@ Tracker.
 - An AWS-backed local Tracker can explicitly select a non-manual mode only with a Gateway
   configured for its own project database and organization. A DEV Gateway URL alone does
   not establish that trust.
-- On retry or resume, a run keeps its original saved `MODEL_GATEWAY_URL` and
-  `MODEL_GATEWAY_API_KEY` references, or their absence.
-- It doesn't accept overrides for those keys or select a new project's key after a retag.
-  Other secret overrides still work.
+- On retry or resume, a run started on a project Gateway key switches to the key of the
+  project it was last retagged into. A run without one keeps its saved `MODEL_GATEWAY_URL`
+  and `MODEL_GATEWAY_API_KEY` references, or their absence.
+- It doesn't accept overrides for those keys. Other secret overrides still work.
 
 ## Dataset archive worker
 

@@ -69,10 +69,23 @@ def _invoke(*arguments: str, agent: str = "remote-agent", project: tuple[str, ..
 @pytest.mark.description(
     "Tracker resolves the published contract, so the request carries only name, model, kwargs and secrets."
 )
-def test_single_start_sends_the_agent_by_name_and_prints_next_steps(tracker: MockTracker) -> None:
-    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+@pytest.mark.parametrize("json_output", [False, True])
+def test_single_start_sends_the_agent_by_name_and_prints_next_steps(tracker: MockTracker, json_output: bool) -> None:
+    response = _started(_FIRST_RUN_ID).json()
+    response["dataset_version_warning"] = "Dataset version changed."
+    tracker.reply("POST", "/start-benchmark", httpx.Response(200, json=response))
 
-    result = _invoke("--model", "anthropic/claude-opus-5", "-k", "variant", "max", "-s", "API_KEY", "custom-secret")
+    result = _invoke(
+        "--model",
+        "anthropic/claude-opus-5",
+        "-k",
+        "variant",
+        "max",
+        "-s",
+        "API_KEY",
+        "custom-secret",
+        *(["--json"] if json_output else []),
+    )
 
     assert result.exit_code == 0, result.output
     (body,) = _start_bodies(tracker)
@@ -80,13 +93,17 @@ def test_single_start_sends_the_agent_by_name_and_prints_next_steps(tracker: Moc
     contract = body["contract"]
     assert (contract["name"], contract["model"], contract["run_cmd"]) == ("remote-agent", "anthropic/claude-opus-5", "")
     assert (contract["kwargs"], contract["secrets"]) == ({"variant": "max"}, {"API_KEY": "custom-secret"})
-    assert f"valkyrie run fetch {_FIRST_RUN_ID} --connect" in result.output
-    assert f"valkyrie run outputs {_FIRST_RUN_ID} --output-dir ." in result.output
+    assert f"valkyrie run show {_FIRST_RUN_ID} --follow" in result.output
+    assert f"valkyrie run download {_FIRST_RUN_ID} --output ." in result.output
     assert "requested runs successfully started" not in result.output
+    if json_output:
+        assert json.loads(result.stdout) == {"run_ids": [str(_FIRST_RUN_ID)]}
+        assert "Run ID" in result.stderr
+        assert "Dataset version changed." in result.stderr
 
 
 @pytest.mark.description(
-    "`run start --connect` keeps streaming while tasks are still being discovered until the run completes."
+    "`run start --follow` keeps streaming while tasks are still being discovered until the run completes."
 )
 def test_connected_start_stays_connected_while_tasks_are_discovered(tracker: MockTracker) -> None:
     discovered = make_fetch_response(
@@ -100,11 +117,11 @@ def test_connected_start_stays_connected_while_tasks_are_discovered(tracker: Moc
         stream=run_stream(discovered, completed),
     )
 
-    result = _invoke("-n", "1", "--connect")
+    result = _invoke("--count", "1", "--follow")
 
     assert result.exit_code == 0, result.output
     assert "0/0 (0.0%)" in result.output
-    assert "Pending: 1" in result.output
+    assert "pending: 1" in result.output
     assert "2/2 (100.0%)" in result.output
     assert "✓ Run completed!" in result.output
 
@@ -113,20 +130,26 @@ def test_connected_start_stays_connected_while_tasks_are_discovered(tracker: Moc
     "`run start --count 2` starts two runs from one contract and prints one track command for both IDs."
 )
 def test_counted_start_reuses_one_contract_and_reports_every_run(tracker: MockTracker) -> None:
-    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID), _started(_SECOND_RUN_ID))
+    tracker.reply(
+        "POST",
+        "/start-benchmark",
+        _started(_FIRST_RUN_ID),
+        httpx.Response(503, headers={"Retry-After": "0"}, json={"detail": "warming"}),
+        _started(_SECOND_RUN_ID),
+    )
 
     result = _invoke("-k", "temperature", "1", "--label", "stable", "--count", "2")
 
     assert result.exit_code == 0, result.output
-    first, second = _start_bodies(tracker)
-    assert first == second
+    first, unavailable, second = _start_bodies(tracker)
+    assert first == unavailable == second
     assert first["label"] == "stable"
     assert first["contract"]["kwargs"] == {"temperature": "1"}
 
     details, summary = result.output.split("2 / 2 requested runs successfully started.", maxsplit=1)
     assert str(_FIRST_RUN_ID) in details
     assert str(_SECOND_RUN_ID) in details
-    assert f"Track progress: valkyrie run status --ids {_FIRST_RUN_ID},{_SECOND_RUN_ID}" in summary
+    assert f"Track progress: valkyrie run show {_FIRST_RUN_ID} {_SECOND_RUN_ID}" in summary
 
 
 @pytest.mark.description(
@@ -217,7 +240,7 @@ def test_missing_agent_directory_fails_before_any_request(tracker: MockTracker, 
         ["--count", "0"],
         ["--count", "11"],
         ["--concurrency", "0"],
-        ["--count", "2", "--connect", "--task-ids-file", "unread.txt"],
+        ["--count", "2", "--follow", "--task-ids", "@unread.txt"],
     ],
 )
 def test_invalid_options_fail_before_any_request(tracker: MockTracker, arguments: list[str]) -> None:
@@ -266,7 +289,7 @@ def test_start_sends_only_the_provider_and_priority_it_was_given(
     (body,) = _start_bodies(tracker)
     fields = ("sandbox_provider", "ignore_custom_services", "priority", "service_headers")
     assert tuple(body.get(field) for field in fields) == sent
-    assert ("Priority override:" in result.output) == ("--priority" in options)
+    assert ("Priority override" in result.output) == ("--priority" in options)
 
 
 @pytest.mark.description(
@@ -304,7 +327,7 @@ def test_failure_stops_and_reports_confirmed_progress(
     assert (_UNKNOWN_OUTCOME in result.output) is unknown_outcome
     if count > 1:
         assert f"{confirmed} / {count} requested runs successfully started." in result.output
-    assert (f"valkyrie run status --ids {_FIRST_RUN_ID}" in result.output) is bool(confirmed)
+    assert (f"valkyrie run show {_FIRST_RUN_ID}" in result.output) is bool(confirmed)
 
 
 @pytest.mark.description("`run start --project` sends the project and prints its spend type, subcategory, and tags.")
@@ -316,7 +339,7 @@ def test_start_sends_the_project_and_shows_its_spend_fields(tracker: MockTracker
     assert result.exit_code == 0, result.output
     (body,) = _start_bodies(tracker)
     assert body["project"] == "google-report-xyz"
-    assert "│ Spend:            customer · google-report-xyz · report · google · engagement=q4" in result.output
+    assert "Spend customer · google-report-xyz · report · google · engagement=q4" in " ".join(result.output.split())
 
 
 @pytest.mark.description("When the Tracker saved no project, `run start` shows the spend as `untagged`.")
@@ -326,7 +349,7 @@ def test_start_shows_untagged_when_the_tracker_saved_no_project(tracker: MockTra
     result = _invoke()
 
     assert result.exit_code == 0, result.output
-    assert "│ Spend:            untagged" in result.output
+    assert "Spend untagged" in " ".join(result.output.split())
 
 
 @pytest.mark.description("`run start` shows escape characters in project fields as visible `\\x1b` text.")
@@ -373,7 +396,7 @@ def test_start_without_a_project_sends_no_project(tracker: MockTracker) -> None:
     assert result.exit_code == 0, result.output
     (body,) = _start_bodies(tracker)
     assert "project" not in body
-    assert "│ Spend:            untagged" in result.output
+    assert "Spend untagged" in " ".join(result.output.split())
 
 
 @pytest.mark.description("When the organization requires a project, `run start` prints the Tracker's message in full.")
@@ -430,7 +453,7 @@ def test_a_hosted_dataset_run_is_named_for_the_datasets_benchmark(
             assert "archive_sha256" not in body["contract"]["agent_release"]
     assert "dataset" not in body and "dataset_version" not in body
     assert body["service_headers"] == {}
-    assert "Dataset:" in result.output and "verified" in result.output
+    assert "Dataset" in result.output and "verified" in result.output
 
 
 @pytest.mark.description("A hosted dataset run names the version after the at sign.")

@@ -1,5 +1,6 @@
 from benchmark_service import SandboxProviders
 import asyncio
+import os
 from collections.abc import AsyncIterable
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,13 @@ from benchmark_service.remote_grading import RemoteGradingAuthorization
 
 from tests.unit.datasets.support import FakeSandbox, OuterSandbox, store_archive, zip_bytes
 from tracker.services.datasets import artifacts
-from tracker.services.datasets.artifacts import STAGING_ROOT, ArtifactSink
+from tracker.runtime.artifacts import task_artifact_key
+from tracker.services.datasets.artifacts import (
+    SAVED_ARTIFACTS_RUN,
+    STAGING_ROOT,
+    ArtifactSink,
+    MissingSavedArtifactError,
+)
 from tracker.services.datasets.env import SecretReader
 from tracker.services.datasets.grading import (
     REWARD_TEXT_PATH,
@@ -23,6 +30,7 @@ from tracker.services.datasets.grading import (
     VerifierResultError,
 )
 from tracker.services.datasets.config import MultiStepRewardStrategy
+from tracker.services.datasets.image_config import ImageConfig
 from tracker.services.datasets.retrieve_task import TaskFolderResponse
 from tracker.clients import dataset_tasks
 from tracker.clients.dataset_tasks import DatasetTaskService, InvalidTaskError, TaskSelectionError
@@ -49,6 +57,14 @@ GATEWAY = ScopedGateway("https://gateway.example", "mgwt_grading")
 DAYTONA = cast(SandboxProviderConfig, SimpleNamespace(type="daytona"))
 MODAL_VM = ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 DOCKERFILE_TOML = "[environment]\ncpus = 1\nworkdir = '/app'"
+
+
+@pytest.fixture(autouse=True)
+def root_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def image_config(_image: str) -> ImageConfig:
+        return ImageConfig(None, None)
+
+    monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", image_config)
 
 
 def write_task(root: Path, name: str, toml: str = TASK_TOML) -> Path:
@@ -100,6 +116,7 @@ def dataset(tmp_path: Path) -> Path:
 
 LOG_DIRS_COMMAND = (
     "mkdir -p /logs/agent /logs/verifier /logs/artifacts && chmod 777 /logs/agent /logs/verifier /logs/artifacts"
+    " && chmod 1777 /logs"
 )
 
 STEPS_TOML = (
@@ -233,24 +250,27 @@ class TestImageWorkdir:
         [
             pytest.param("[environment]\ndocker_image = 'golang:1.22'", "/go", "/go", id="image-workdir"),
             pytest.param("[environment]\ndocker_image = 'python:3.12-slim'", "/root", "/workspace", id="no-workdir"),
+            pytest.param("[environment]\ndocker_image = 'rooted:1'", "/root", "/root", id="registry-confirms-root"),
             pytest.param(TASK_TOML, "/go", "/app", id="task-workdir-wins"),
             pytest.param("[environment]\ndocker_image = 'golang:1.22'", "/", "/go", id="registry-workdir"),
             pytest.param("[environment]\ndocker_image = 'python:3.12-slim'", "/", "/workspace", id="registry-none"),
             pytest.param("[environment]\ncpus = 1", "/", "/go", id="dockerfile-base-from-registry"),
+            pytest.param("[environment]\nsnapshot = 'env-build'", "/app", "/app", id="snapshot-workdir"),
+            pytest.param("[environment]\nsnapshot = 'env-build'", "/", "/workspace", id="snapshot-without-workdir"),
         ],
     )
     async def test_the_instruction_lands_in_the_working_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, process_cwd: str, expected_cwd: str
     ) -> None:
         task = write_task(tmp_path, "task-a", toml)
-        if "docker_image" not in toml and toml != TASK_TOML:
+        if "docker_image" not in toml and "snapshot" not in toml and toml != TASK_TOML:
             (task / "environment").mkdir()
             (task / "environment" / "Dockerfile").write_text("FROM golang:1.22\nRUN true\n")
 
-        async def registry_workdir(image: str) -> str | None:
-            return {"golang:1.22": "/go"}.get(image)
+        async def registry(image: str) -> ImageConfig:
+            return ImageConfig(None, {"golang:1.22": "/go", "rooted:1": "/root"}.get(image))
 
-        monkeypatch.setattr("tracker.clients.dataset_tasks.image_workdir", registry_workdir)
+        monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", registry)
         sandbox = FakeSandbox(process_cwd=process_cwd)
         service = service_for(LocalFolderSource(tmp_path), sandbox, monkeypatch)
 
@@ -274,6 +294,112 @@ class TestWorkingDirectoryOwner:
         await service_for(LocalFolderSource(tmp_path), sandbox, monkeypatch).setup_task("task-a", "sandbox-1", PROVIDER)
 
         assert "[ -d /app ] || { mkdir -p /app && chown agent /app; }" in sandbox.commands
+
+    @pytest.mark.description("A non-root image `USER` gets a root sandbox, and the agent runs as that user.")
+    @pytest.mark.parametrize(
+        ("agent_user", "dockerfile", "image_user", "expected"),
+        [
+            pytest.param(None, None, "agent", "agent", id="image-user"),
+            pytest.param("runner", None, "agent", "runner", id="agent-user-wins"),
+            pytest.param(
+                None,
+                "FROM ubuntu:24.04\nUSER nobody:nogroup\n",
+                "nobody:nogroup",
+                "nobody:nogroup",
+                id="dockerfile-user",
+            ),
+            pytest.param(None, "FROM ubuntu:24.04\nRUN true\n", "agent", "agent", id="dockerfile-base-user"),
+        ],
+    )
+    async def test_non_root_image_user(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agent_user: str | None,
+        dockerfile: str | None,
+        image_user: str,
+        expected: str,
+    ) -> None:
+        toml = TASK_TOML
+        if agent_user is not None:
+            toml = toml.replace("timeout_sec = 600", f'timeout_sec = 600\nuser = "{agent_user}"')
+        if dockerfile is not None:
+            toml = toml.replace('docker_image = "ubuntu:24.04"\n', "")
+        task = write_task(tmp_path, "task-a", toml)
+        if dockerfile is not None:
+            (task / "environment").mkdir()
+            (task / "environment" / "Dockerfile").write_text(dockerfile)
+
+        async def registry(image: str) -> ImageConfig:
+            return ImageConfig({"ubuntu:24.04": "agent"}.get(image), None)
+
+        monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", registry)
+        service = service_for(LocalFolderSource(tmp_path), FakeSandbox(), monkeypatch)
+
+        try:
+            response = cast(TaskFolderResponse, await service.retrieve_task("task-a"))
+            dockerfile = Path(cast(DockerfileSource, response.source).dockerfile).read_text()
+        finally:
+            await service.close()
+
+        assert dockerfile.endswith("USER root\n")
+        assert (response.image_user, response.agent_user) == (image_user, expected)
+
+    @pytest.mark.description(
+        "An image whose user can't be read or checked runs as its own default user, and only a failed read is retried."
+    )
+    @pytest.mark.parametrize(
+        ("unknown", "later_user"),
+        [(None, "agent"), (ImageConfig("two words", None), None)],
+        ids=["unreadable", "invalid"],
+    )
+    async def test_an_unknown_image_user_keeps_the_image_and_only_a_failed_read_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unknown: ImageConfig | None, later_user: str | None
+    ) -> None:
+        write_task(tmp_path, "task-a")
+        write_task(tmp_path, "task-b")
+        answers = iter([unknown, ImageConfig("agent", None)])
+
+        async def registry(_image: str) -> ImageConfig | None:
+            return next(answers)
+
+        monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", registry)
+        service = service_for(LocalFolderSource(tmp_path), FakeSandbox(), monkeypatch)
+
+        try:
+            first = await service.retrieve_task("task-a")
+            second = await service.retrieve_task("task-b")
+        finally:
+            await service.close()
+
+        assert isinstance(first, TaskFolderResponse)
+        assert (first.source, first.image_user, first.agent_user) == (ImageSource(image="ubuntu:24.04"), None, None)
+        assert isinstance(second, TaskFolderResponse)
+        assert (second.image_user, second.agent_user) == (later_user, later_user)
+
+    @pytest.mark.description("Tasks that share an image read its config once, even at the same time.")
+    async def test_tasks_that_share_an_image_read_its_config_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_task(tmp_path, "task-a")
+        write_task(tmp_path, "task-b")
+        reads: list[str] = []
+
+        async def registry(image: str) -> ImageConfig:
+            reads.append(image)
+            await asyncio.sleep(0)
+            return ImageConfig("agent", None)
+
+        monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", registry)
+        service = service_for(LocalFolderSource(tmp_path), FakeSandbox(), monkeypatch)
+
+        try:
+            responses = await asyncio.gather(service.retrieve_task("task-a"), service.retrieve_task("task-b"))
+        finally:
+            await service.close()
+
+        assert reads == ["ubuntu:24.04"]
+        assert [cast(TaskFolderResponse, response).image_user for response in responses] == ["agent", "agent"]
 
 
 @pytest.mark.description("Putting the instruction in the sandbox.")
@@ -736,6 +862,34 @@ class TestEvaluateInstance:
         assert sandbox.cwds == ["/app"]
         assert "mkdir -p /logs/verifier /app" in sandbox.commands
 
+    @pytest.mark.description("Without `[environment].workdir`, the grader runs in the Dockerfile's `WORKDIR`.")
+    async def test_the_grader_runs_in_the_dockerfile_workdir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        task = write_task(tmp_path, "task-w", "[environment]\ncpus = 1")
+        (task / "environment").mkdir()
+        (task / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /root\n")
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+
+        await service_for(LocalFolderSource(tmp_path), sandbox, monkeypatch).evaluate_instance(
+            "task-w", "sandbox-1", PROVIDER
+        )
+
+        assert sandbox.cwds == ["/root"]
+
+    @pytest.mark.description("When nothing names a working directory, the grader runs where the sandbox starts it.")
+    async def test_without_a_named_directory_the_grader_runs_where_the_sandbox_starts_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_task(tmp_path, "task-a", "[environment]\ndocker_image = 'python:3.12-slim'")
+        sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+        service = service_for(LocalFolderSource(tmp_path), sandbox, monkeypatch)
+
+        await service.use_image_workdir("task-a", "sandbox-1", PROVIDER)
+        await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+
+        assert sandbox.cwds == [None]
+
     @pytest.mark.description("The grader environment is filled from secrets.")
     async def test_the_grader_environment_is_filled_from_secrets(
         self, dataset: Path, monkeypatch: pytest.MonkeyPatch
@@ -823,6 +977,126 @@ class TestEvaluateInstance:
             )
 
         assert sandbox.files == {}
+
+
+SEPARATE_TOML = "artifacts = ['/app/out']\n" + TASK_TOML.replace(
+    "[verifier]\n", "[verifier]\nenvironment_mode = 'separate'\n"
+)
+SAVED_RUN = "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.mark.description("A regrade grades a dataset task again from the artifacts its source run saved.")
+class TestRegrade:
+    @pytest.fixture
+    def store(self, tmp_path: Path) -> FilesystemObjectStore:
+        return FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+
+    @pytest.fixture
+    def graded(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+        calls: list[tuple[Any, ...]] = []
+
+        async def grade_separately(*args: Any) -> dict[str, Any]:
+            calls.append(args)
+            return {"rewards": {"reward": 1.0}}
+
+        monkeypatch.setattr("tracker.clients.dataset_tasks.grade_separately", grade_separately)
+        return calls
+
+    @pytest.mark.description(
+        "A saved artifact reaches a fresh separate verifier with the new run's labels, over an older absent marker."
+    )
+    async def test_a_saved_artifact_reaches_a_fresh_separate_verifier(
+        self,
+        dataset: Path,
+        tmp_path: Path,
+        store: FilesystemObjectStore,
+        graded: list[tuple[Any, ...]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (dataset / "task-a" / "task.toml").write_text(SEPARATE_TOML)
+        key = task_artifact_key(SAVED_RUN, "task-a", "artifacts/app/out")
+        await store.put_bytes(f"{key}.absent", b"")
+        os.utime(tmp_path / "objects" / f"{key}.absent", (0, 0))
+        await store.put_bytes(f"{key}.tar.gz", b"archive")
+        service = service_for(LocalFolderSource(dataset), FakeSandbox(), monkeypatch)
+
+        result = await service.regrade(
+            "task-a",
+            {SAVED_ARTIFACTS_RUN: SAVED_RUN},
+            objects=store,
+            labels={"Id": "new-run"},
+            sandbox_provider=PROVIDER,
+        )
+
+        (call,) = graded
+        labels, staged, skipped = call[5], call[9], call[10]
+        assert result == {"rewards": {"reward": 1.0}}
+        assert labels == {"Id": "new-run"}
+        assert [artifact.source for artifact in staged] == ["/app/out"]
+        assert b"".join([chunk async for chunk in staged[0].read()]) == b"archive"
+        assert skipped == []
+
+    @pytest.mark.description(
+        "An artifact the agent never wrote is regraded as absent over an older archive, and one never saved is refused."
+    )
+    async def test_an_unwritten_artifact_is_absent_and_an_unsaved_one_is_refused(
+        self,
+        dataset: Path,
+        tmp_path: Path,
+        store: FilesystemObjectStore,
+        graded: list[tuple[Any, ...]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (dataset / "task-a" / "task.toml").write_text(SEPARATE_TOML)
+        write_task(dataset, "task-b", SEPARATE_TOML)
+        key = task_artifact_key(SAVED_RUN, "task-a", "artifacts/app/out")
+        await store.put_bytes(f"{key}.tar.gz", b"archive")
+        os.utime(tmp_path / "objects" / f"{key}.tar.gz", (0, 0))
+        await store.put_bytes(f"{key}.absent", b"")
+        service = service_for(LocalFolderSource(dataset), FakeSandbox(), monkeypatch)
+
+        await service.regrade(
+            "task-a", {SAVED_ARTIFACTS_RUN: SAVED_RUN}, objects=store, labels={}, sandbox_provider=PROVIDER
+        )
+
+        (call,) = graded
+        assert call[9] == []
+        assert [(artifact.source, artifact.absent) for artifact in call[10]] == [("/app/out", True)]
+
+        with pytest.raises(MissingSavedArtifactError, match="saved no artifact /app/out for task task-b"):
+            await service.regrade(
+                "task-b", {SAVED_ARTIFACTS_RUN: SAVED_RUN}, objects=store, labels={}, sandbox_provider=PROVIDER
+            )
+
+    @pytest.mark.description("A task that grades in the agent's sandbox or has steps is not regraded.")
+    @pytest.mark.parametrize(
+        ("toml", "reason"),
+        [
+            (TASK_TOML, "grades in the agent's sandbox"),
+            (SEPARATE_TOML + "\n[[steps]]\nname = 'one'\n", "has steps"),
+        ],
+        ids=["shared verifier", "steps"],
+    )
+    async def test_a_task_that_cannot_be_regraded_is_refused(
+        self,
+        dataset: Path,
+        store: FilesystemObjectStore,
+        graded: list[tuple[Any, ...]],
+        monkeypatch: pytest.MonkeyPatch,
+        toml: str,
+        reason: str,
+    ) -> None:
+        (dataset / "task-a" / "task.toml").write_text(toml)
+        (dataset / "task-a" / "steps" / "one").mkdir(parents=True)
+        (dataset / "task-a" / "steps" / "one" / "instruction.md").write_text("Step one.")
+        service = service_for(LocalFolderSource(dataset), FakeSandbox(), monkeypatch)
+
+        with pytest.raises(InvalidTaskError, match=reason):
+            await service.regrade(
+                "task-a", {SAVED_ARTIFACTS_RUN: SAVED_RUN}, objects=store, labels={}, sandbox_provider=PROVIDER
+            )
+
+        assert graded == []
 
 
 @pytest.mark.description("A hosted dataset: the same answers from task archives in storage.")

@@ -30,6 +30,8 @@ from tracker.executor.control_store import (
 from tracker.executor.control_tasks import (
     BenchmarkState,
     DirectAdmissionResponse,
+    SourceRejectionRequest,
+    SourceRejectionResponse,
     EgressGrantRequest,
     EgressGrantResponse,
     EgressRevokeRequest,
@@ -171,20 +173,39 @@ def monitor_tasks(
     invocation: Invocation = Depends(authenticated_invocation),
     session: Session = Depends(get_session),
 ) -> TaskMonitorResponse:
-    benchmark = _owner(session, invocation, body.ref, lock=False)
-    tasks = (
-        BenchmarkRepository(session).list_tasks_by_id_for_benchmark(benchmark.id, body.task_ids)
-        if body.task_ids
-        else []
+    benchmark, _, dispatch = _owned_dispatch(
+        session, invocation, body.ref, live=True, admission=False, lock=bool(body.last_logs), shared=True
     )
-    return complete_response(
-        session,
-        TaskMonitorResponse(
-            benchmark_status=benchmark.status,
-            concurrency=benchmark.arguments.concurrency,
-            tasks={task.task_id: _state(task) for task in tasks},
-        ),
+    repository = BenchmarkRepository(session)
+    if body.last_logs:
+        assigned = None if dispatch.assigned_task_ids is None else set(dispatch.assigned_task_ids)
+        reports = [entry for entry in body.last_logs if assigned is None or entry.attempt.task_id in assigned]
+        locked = {
+            task.id: task
+            for task in repository.lock_tasks_by_row_id_for_benchmark(
+                benchmark.id, {entry.attempt.task_row_id for entry in reports}
+            )
+        }
+        for entry in reports:
+            ref = entry.attempt
+            task = locked.get(ref.task_row_id)
+            if task is not None and (task.org_id, task.task_id, task.started_at) == (
+                ref.org_id,
+                ref.task_id,
+                ref.started_at,
+            ):
+                if task.last_log_at is None or entry.last_log_at > task.last_log_at:
+                    task.last_log_at = entry.last_log_at
+    tasks = repository.list_tasks_by_id_for_benchmark(benchmark.id, body.task_ids) if body.task_ids else []
+    response = TaskMonitorResponse(
+        benchmark_status=benchmark.status,
+        concurrency=benchmark.arguments.concurrency,
+        tasks={task.task_id: _state(task) for task in tasks},
     )
+    if body.last_logs:
+        session.commit()
+        return response
+    return complete_response(session, response)
 
 
 @router.post(
@@ -279,6 +300,21 @@ def ensure_task_deadline(
         BenchmarkRepository(session).save(task)
         session.commit()
     return complete_response(session, TaskDeadlineResponse(deadline=task.credited_wall_deadline_at))
+
+
+@router.post(
+    "/read_source_rejection",
+    response_model=SourceRejectionResponse,
+    description="Return the provider's refusal of a sandbox source for another errored task in the run.",
+)
+def read_source_rejection(
+    body: SourceRejectionRequest,
+    invocation: Invocation = Depends(authenticated_invocation),
+    session: Session = Depends(get_session),
+) -> SourceRejectionResponse:
+    benchmark = _owner(session, invocation, body.ref, shared=True, lock=False)
+    message = BenchmarkRepository(session).source_rejection(benchmark.id, body.source)
+    return complete_response(session, SourceRejectionResponse(message=message))
 
 
 @router.post(
@@ -493,8 +529,10 @@ def fail_task(
             cause_code=failure.cause_code,
             phase=failure.phase,
             transient=failure.transient,
+            sandbox_provider=failure.sandbox_provider,
             retry_scheduled=body.retry_scheduled,
             failed_attempt_number=body.failed_attempt_number,
+            sandbox_source=failure.sandbox_source,
         )
     )
     if not body.retry_scheduled:

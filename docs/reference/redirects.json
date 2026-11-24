@@ -1,5 +1,41 @@
 [
   {
+    "source": "/reference/cli/run/fetch",
+    "destination": "/reference/cli/run#show"
+  },
+  {
+    "source": "/reference/cli/run/status",
+    "destination": "/reference/cli/run#show"
+  },
+  {
+    "source": "/reference/cli/run/retag",
+    "destination": "/reference/cli/run#update"
+  },
+  {
+    "source": "/reference/cli/run/shed",
+    "destination": "/reference/cli/run#update"
+  },
+  {
+    "source": "/reference/cli/run/output",
+    "destination": "/reference/cli/run#download"
+  },
+  {
+    "source": "/reference/cli/run/outputs",
+    "destination": "/reference/cli/run#download"
+  },
+  {
+    "source": "/reference/cli/run/artifacts",
+    "destination": "/reference/cli/run#files"
+  },
+  {
+    "source": "/reference/cli/run/task-artifacts",
+    "destination": "/reference/cli/run#task"
+  },
+  {
+    "source": "/reference/cli/run/filter-options",
+    "destination": "/reference/sdk/runs#filter-options"
+  },
+  {
     "source": "/introduction",
     "destination": "/introduction/what-is-valkyrie"
   },
@@ -10,6 +46,10 @@
   {
     "source": "/get-started/hosting",
     "destination": "/introduction/what-is-valkyrie"
+  },
+  {
+    "source": "/get-started/hosted",
+    "destination": "/get-started/quickstart"
   },
   {
     "source": "/self-hosting/infrastructure",
@@ -100,12 +140,8 @@
     "destination": "/reference/cli/run#errors"
   },
   {
-    "source": "/reference/cli/run/fetch",
-    "destination": "/reference/cli/run#fetch"
-  },
-  {
-    "source": "/reference/cli/run/filter-options",
-    "destination": "/reference/cli/run#filter-options"
+    "source": "/reference/cli/run/show",
+    "destination": "/reference/cli/run#show"
   },
   {
     "source": "/reference/cli/run/list",
@@ -116,16 +152,12 @@
     "destination": "/reference/cli/run#logs"
   },
   {
-    "source": "/reference/cli/run/artifacts",
-    "destination": "/reference/cli/run#artifacts"
+    "source": "/reference/cli/run/files",
+    "destination": "/reference/cli/run#files"
   },
   {
-    "source": "/reference/cli/run/output",
-    "destination": "/reference/cli/run#output"
-  },
-  {
-    "source": "/reference/cli/run/outputs",
-    "destination": "/reference/cli/run#outputs"
+    "source": "/reference/cli/run/download",
+    "destination": "/reference/cli/run#download"
   },
   {
     "source": "/reference/cli/run/results",
@@ -140,10 +172,6 @@
     "destination": "/reference/cli/run#regrade"
   },
   {
-    "source": "/reference/cli/run/retag",
-    "destination": "/reference/cli/run#retag"
-  },
-  {
     "source": "/reference/cli/run/resume",
     "destination": "/reference/cli/run#resume"
   },
@@ -152,16 +180,8 @@
     "destination": "/reference/cli/run#retry"
   },
   {
-    "source": "/reference/cli/run/shed",
-    "destination": "/reference/cli/run#shed"
-  },
-  {
     "source": "/reference/cli/run/start",
     "destination": "/reference/cli/run#start"
-  },
-  {
-    "source": "/reference/cli/run/status",
-    "destination": "/reference/cli/run#status"
   },
   {
     "source": "/reference/cli/run/stop",
@@ -178,10 +198,6 @@
   {
     "source": "/reference/cli/run/task",
     "destination": "/reference/cli/run#task"
-  },
-  {
-    "source": "/reference/cli/run/task-artifacts",
-    "destination": "/reference/cli/run#task-artifacts"
   },
   {
     "source": "/reference/cli/agent/install",
@@ -322,6 +338,26 @@
   {
     "source": "/reference/cli/provider/default",
     "destination": "/reference/cli/provider#default"
+  },
+  {
+    "source": "/reference/cli/tracker/start",
+    "destination": "/reference/cli/tracker#start"
+  },
+  {
+    "source": "/reference/cli/tracker/list",
+    "destination": "/reference/cli/tracker#list"
+  },
+  {
+    "source": "/reference/cli/tracker/add",
+    "destination": "/reference/cli/tracker#add"
+  },
+  {
+    "source": "/reference/cli/tracker/use",
+    "destination": "/reference/cli/tracker#use"
+  },
+  {
+    "source": "/reference/cli/tracker/remove",
+    "destination": "/reference/cli/tracker#remove"
   },
   {
     "source": "/reference/cli/token/create",

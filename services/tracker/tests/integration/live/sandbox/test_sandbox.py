@@ -59,6 +59,7 @@ async def test_sandbox(
 @pytest.fixture
 def egress_allowlist_probe_command() -> str:
     script = """
+import time
 import urllib.error
 import urllib.request
 
@@ -74,8 +75,12 @@ def can_request(url):
         return False
 
 
-allowed = can_request("https://example.com")
-blocked = can_request("https://www.wikipedia.org")
+for attempt in range(5):
+    allowed = can_request("https://example.com")
+    blocked = can_request("https://www.wikipedia.org")
+    if allowed and not blocked:
+        break
+    time.sleep(3)
 print(f"allowed={allowed} blocked={blocked}", flush=True)
 raise SystemExit(0 if allowed and not blocked else 1)
 """
@@ -86,6 +91,7 @@ raise SystemExit(0 if allowed and not blocked else 1)
 @pytest.fixture
 def restored_egress_probe_command() -> str:
     script = """
+import time
 import urllib.request
 
 
@@ -94,8 +100,15 @@ request = urllib.request.Request(
     method="HEAD",
     headers={"User-Agent": "valkyrie-egress-test"},
 )
-with urllib.request.urlopen(request, timeout=5) as response:
-    print(f"restored=True status={response.status}", flush=True)
+for attempt in range(5):
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            print(f"restored=True status={response.status}", flush=True)
+            break
+    except OSError:
+        if attempt == 4:
+            raise
+        time.sleep(3)
 """
 
     return f"python -c {shlex.quote(script)}"

@@ -1,9 +1,11 @@
 """Exceptions raised by the Valkyrie SDK."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    import httpx
 
 _FIELD_ERROR_TEMPLATES = {
     "missing": "'{field}' is required but was not provided",
@@ -34,14 +36,16 @@ class ValkyrieTransportError(ValkyrieSDKError):
 class ValkyrieAPIError(ValkyrieSDKError):
     """The Valkyrie API returned a non-success response."""
 
-    def __init__(self, status_code: int, detail: Any, headers: httpx.Headers | None = None):
+    def __init__(self, status_code: int, detail: Any, headers: "httpx.Headers | None" = None):
+        import httpx
+
         self.status_code = status_code
         self.detail = detail
         self.headers = httpx.Headers(headers)
         super().__init__(f"Valkyrie API request failed ({status_code}): {detail}")
 
     @classmethod
-    def from_response(cls, response: httpx.Response) -> "ValkyrieAPIError":
+    def from_response(cls, response: "httpx.Response") -> "ValkyrieAPIError":
         """Build one from a read non-success response, using its JSON `detail` or body as the detail.
 
         `headers` keeps the response headers, such as `Retry-After` and `X-RateLimit-Limit` on a 429.

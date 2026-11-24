@@ -1,4 +1,4 @@
-.PHONY: help build run stop clean logs tracker-service local-tracker dataset-worker prepare-upload-bucket \
+.PHONY: help build run stop clean logs tracker-service local-tracker local-stop local-reset dataset-worker prepare-upload-bucket \
         test test-integration-local test-integration-live test-unit test-alembic \
         migrate-gen venv-check
 
@@ -8,6 +8,7 @@ COMPOSE := docker compose
 EXECUTOR_IMAGE ?= valkyrie-executor:local
 CONFIG ?= $(abspath ../../local-server.yaml)
 LOCAL_DATABASE_URL ?= postgresql://tracker:tracker@localhost:5432/tracker
+LOCAL_BIN := $(if $(wildcard ../../.venv/bin/python),../../.venv/bin,.venv/bin)
 
 help:
 	@echo "Available commands:"
@@ -57,21 +58,35 @@ logs:
 	@$(COMPOSE) logs -f tracker
 tracker-service: build run logs
 local-tracker: export PROJECT_SERVICE_TOKEN := $(or $(PROJECT_SERVICE_TOKEN),$(shell sed -n 's/^PROJECT_SERVICE_TOKEN=//p' .env 2>/dev/null | tail -n 1 | tr -d "\"'"),local-project-token)
-local-tracker: venv-check
+local-tracker: export AWS_REGION ?=
+local-tracker: export REMOTE_GRADER_KMS_KEY_ID ?=
+local-tracker:
+	@if [ ! -x "$(LOCAL_BIN)/alembic" ]; then \
+		echo "Tracker dependencies not found. Run \`make install\` from the repository root."; \
+		exit 1; \
+	fi
 	@: "$${EXECUTOR_BOOTSTRAP_KEY:?Set EXECUTOR_BOOTSTRAP_KEY for local control}"
-	@$(COMPOSE) up -d --wait postgres projects
-	@DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run alembic upgrade head
+	@$(COMPOSE) up -d --wait --quiet-pull postgres projects
+	@DATABASE_URL="$(LOCAL_DATABASE_URL)" "$(LOCAL_BIN)/alembic" upgrade head
 	@set -e; \
 	  if [ -z "$${EXECUTOR_PAYLOAD_LOCAL_KEY+x}" ]; then \
-	    EXECUTOR_PAYLOAD_LOCAL_KEY="$$(uv run python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"; \
+	    EXECUTOR_PAYLOAD_LOCAL_KEY="$$($(LOCAL_BIN)/python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"; \
 	  fi; \
 	  export EXECUTOR_PAYLOAD_LOCAL_KEY EXECUTOR_LAUNCHER=local PROJECT_SERVICE_URL=http://127.0.0.1:8010; \
 	  unset EXECUTOR_PAYLOAD_KMS_KEY_ID; \
-	  DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run uvicorn tracker.executor.control_app:app --host 127.0.0.1 --port 8002 & \
+	  DATABASE_URL="$(LOCAL_DATABASE_URL)" "$(LOCAL_BIN)/uvicorn" tracker.executor.control_app:app --host 127.0.0.1 --port 8002 --no-access-log & \
 	  control_pid=$$!; \
 	  trap 'kill "$$control_pid"; wait "$$control_pid"' EXIT; \
-	  DATABASE_URL="$(LOCAL_DATABASE_URL)" EXECUTOR_CONTROL_URL=http://127.0.0.1:8002 uv run python -m tracker.serve --config "$(CONFIG)"
+	  DATABASE_URL="$(LOCAL_DATABASE_URL)" EXECUTOR_CONTROL_URL=http://127.0.0.1:8002 "$(LOCAL_BIN)/python" -m tracker.serve --config "$(CONFIG)"
 
+local-stop local-reset: export EXECUTOR_BOOTSTRAP_KEY ?= unused
+local-stop local-reset: export AWS_REGION ?=
+local-stop local-reset: export REMOTE_GRADER_KMS_KEY_ID ?=
+local-stop:
+	@$(COMPOSE) stop
+local-reset:
+	@$(COMPOSE) down -v
+	@rm -rf ../../.local
 dataset-worker: venv-check
 	@DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python -m tracker.dataset_worker --config "$(CONFIG)"
 
@@ -80,9 +95,9 @@ prepare-upload-bucket: venv-check
 
 # --- Tests ---
 test: venv-check
-	$(PYTEST) tests/unit tests/integration/local --test-alembic -n 4 --cov=src/tracker --cov=main --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+	$(PYTEST) tests/unit tests/integration/local -n 4 --cov=src/tracker --cov=main --cov-report=term-missing --cov-report=xml --cov-fail-under=85
 test-unit: venv-check
-	$(PYTEST) tests/unit --test-alembic
+	$(PYTEST) tests/unit
 test-alembic: venv-check
 	$(PYTEST) --test-alembic -m alembic
 test-integration-local: venv-check

@@ -358,7 +358,7 @@ def test_list_prints_escape_codes_in_handle_and_name_as_text(tracker: MockTracke
 def test_list_json_prints_the_tracker_response(tracker: MockTracker) -> None:
     tracker.reply("GET", "/projects", httpx.Response(200, json={"projects": [_ROUTER_BENCH]}))
 
-    result = _invoke("list", "--format", "json")
+    result = _invoke("list", "--json")
 
     assert result.exit_code == 0, result.output
     assert [(project["handle"], project["name"]) for project in json.loads(result.output)["projects"]] == [

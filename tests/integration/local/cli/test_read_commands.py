@@ -27,7 +27,7 @@ def test_cli_reads_persisted_tracker_state(
 ) -> None:
     running, finished = seeded_runs
 
-    list_result = cli_runner.invoke(cli, ["run", "list", "--format", "json", "--all"])
+    list_result = cli_runner.invoke(cli, ["run", "list", "--json"])
     assert list_result.exit_code == 0, list_result.output
     list_payload = json.loads(list_result.output)
     assert [run["id"] for run in list_payload["benchmarks"]] == [str(finished.id), str(running.id)]
@@ -42,7 +42,7 @@ def test_cli_reads_persisted_tracker_state(
 
     status_result = cli_runner.invoke(
         cli,
-        ["run", "status", "--ids", f"{running.id},{finished.id}", "--format", "json"],
+        ["run", "show", str(running.id), str(finished.id), "--json"],
     )
     assert status_result.exit_code == 0, status_result.output
     status_payload = json.loads(status_result.output)
@@ -51,7 +51,7 @@ def test_cli_reads_persisted_tracker_state(
         (str(finished.id), 1),
     ]
 
-    fetch_result = cli_runner.invoke(cli, ["run", "fetch", str(running.id), "--format", "json"])
+    fetch_result = cli_runner.invoke(cli, ["run", "show", str(running.id), "--json"])
     assert fetch_result.exit_code == 0, fetch_result.output
     fetch_payload = json.loads(fetch_result.output)
     arguments = fetch_payload["metadata"]["benchmark_arguments"]
@@ -72,7 +72,7 @@ def test_queue_status_reads_persisted_scheduler_state(
     database_session.add(running)
     database_session.commit()
 
-    result = cli_runner.invoke(cli, ["queue", "status", "--format", "json"])
+    result = cli_runner.invoke(cli, ["queue", "status", "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -88,7 +88,7 @@ def test_queue_status_reads_persisted_scheduler_state(
     assert "must-not-leak" not in result.output
 
     for exhausted, remaining in (("waiting", "active"), ("active", "waiting")):
-        page_result = cli_runner.invoke(cli, ["queue", "status", "--format", "json", f"--{exhausted}-offset", "1"])
+        page_result = cli_runner.invoke(cli, ["queue", "status", "--json", f"--{exhausted}-offset", "1"])
 
         assert page_result.exit_code == 0, page_result.output
         page = json.loads(page_result.output)
@@ -131,20 +131,19 @@ def test_cli_task_inspection(cli_runner: CliRunner, seeded_runs: tuple[Benchmark
             "task_id",
             "--limit",
             "1",
-            "--format",
-            "json",
+            "--json",
         ],
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["total_count"] == 1
     assert [task["task_id"] for task in payload["tasks"]] == ["pending"]
-    detail = cli_runner.invoke(cli, ["run", "task", str(finished.id), "complete", "--format", "json"])
+    detail = cli_runner.invoke(cli, ["run", "task", str(finished.id), "complete", "--json"])
     assert detail.exit_code == 0, detail.output
     assert json.loads(detail.output)["evaluation_result"] == {"score": 1}
     missing = cli_runner.invoke(cli, ["run", "task", str(running.id), "missing"])
     assert missing.exit_code == 1
-    assert "404" in missing.output
+    assert "not found" in missing.output
     text = cli_runner.invoke(cli, ["run", "tasks", str(running.id), "--offset", "50"])
     assert text.exit_code == 0, text.output
 
@@ -154,7 +153,7 @@ def test_cli_task_artifact_links(
     cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark], agent_library: dict[str, bytes]
 ) -> None:
     _, finished = seeded_runs
-    result = cli_runner.invoke(cli, ["run", "task-artifacts", str(finished.id), "complete", "--format", "json"])
+    result = cli_runner.invoke(cli, ["run", "task", str(finished.id), "complete", "--links", "--json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["agent_output_url"] is None
     text = cli_runner.invoke(cli, ["run", "task", str(finished.id), "complete"])
@@ -188,17 +187,14 @@ async def test_sdk_iterates_run_and_task_pages(
     assert request.cursor is None
 
 
-@pytest.mark.description("The CLI lists the filters available for runs.")
-def test_cli_discovers_run_filters(cli_runner: CliRunner, seeded_runs: tuple[Benchmark, Benchmark]) -> None:
-    result = cli_runner.invoke(cli, ["run", "filter-options", "--format", "json"])
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {
+@pytest.mark.description("The SDK lists the filters available for runs.")
+async def test_sdk_discovers_run_filters(seeded_runs: tuple[Benchmark, Benchmark], local_tracker_app: FastAPI) -> None:
+    async with ValkyrieClient(transport=httpx.ASGITransport(app=local_tracker_app)) as client:
+        result = await client.runs.filter_options()
+    assert result.model_dump(mode="json") == {
         "benchmark_names": ["swebench", "terminalbench"],
         "agent_names": ["cli-agent", "review-agent"],
         "models": ["openai/gpt-5"],
         "datasets": ["default", "verified"],
         "started_by_emails": ["reviewer@example.com", "runner@example.com"],
     }
-    text = cli_runner.invoke(cli, ["run", "filter-options"])
-    assert text.exit_code == 0, text.output
-    assert "swebench" in text.output

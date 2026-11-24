@@ -9,7 +9,7 @@ from valkyrie.sdk import SPEND_SUBCATEGORIES, NewProjectRequest, ProjectResponse
 from valkyrie.sdk.models import FetchBenchmarkMetadataResponse
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option, format_table, one_line
+from valkyrie.cli.display import Failure, command, emit, json_option, format_table, one_line, confirm, done
 
 _CORE_FIELDS = frozenset(name for name in NewProjectRequest.model_fields if name != "extra_tags")
 
@@ -76,14 +76,17 @@ class _Budget(click.ParamType):
         return budget
 
 
-def project_option(*, required: bool) -> Callable[[FC], FC]:
+def project_option(*, required: bool, help: str | None = None) -> Callable[[FC], FC]:
     return click.option(
         "--project",
         type=_ProjectName(),
         required=required,
-        help="Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`."
-        if required
-        else "Handle of the project this run is for. Without it, the run goes in your organization's default project.",
+        help=help
+        or (
+            "Handle of the project this run is for (e.g., router-bench). Create one with `valkyrie project create`."
+            if required
+            else "Handle of the project this run is for. Without it, the run goes in your organization's default project."
+        ),
     )
 
 
@@ -181,6 +184,7 @@ def project() -> None:
     default=None,
     help='Why the project needs that budget (e.g., "3 runs, about 100 each"). Required where projects get a Gateway key.',
 )
+@json_option()
 def create_project(
     handle: str,
     name: str,
@@ -190,6 +194,7 @@ def create_project(
     tags: dict[str, str],
     budget: Decimal | None,
     budget_reason: str | None,
+    output_format: str,
 ) -> None:
     resolved_type = SpendType(spend_type)
     allowed = SPEND_SUBCATEGORIES[resolved_type]
@@ -214,15 +219,17 @@ def create_project(
             budget_reason=budget_reason,
         )
     )
-    click.echo(click.style(f"✓ Project created: {describe_project(created)}", fg="green", bold=True))
+    if emit(created, output_format):
+        return
+    done(f"Project created: {describe_project(created)}")
 
 
 @project.command(name="list", help="List your organization's projects.")
-@format_option()
+@json_option()
 def list_projects(output_format: str) -> None:
     response = call(lambda client: client.projects.list())
     if output_format == "json":
-        click.echo(response.model_dump_json())
+        emit(response)
         return
     format_table(
         [
@@ -261,6 +268,7 @@ def list_projects(output_format: str) -> None:
 )
 @click.option("--clear-tags", is_flag=True, help="Remove all extra tags.")
 @click.pass_context
+@json_option()
 def update_project(
     context: click.Context,
     handle: str,
@@ -271,6 +279,7 @@ def update_project(
     clear_customer: bool,
     tags: dict[str, str],
     clear_tags: bool,
+    output_format: str,
 ) -> None:
     tags_given = context.get_parameter_source("tags") is ParameterSource.COMMANDLINE
     if customer is not None and clear_customer:
@@ -296,7 +305,7 @@ def update_project(
     projects = call(lambda client: client.projects.list(include_archived=True)).projects
     saved = next((entry for entry in projects if entry.handle == handle), None)
     if saved is None:
-        raise click.ClickException(f"Project '{handle}' was not found.")
+        raise Failure(f"Project '{handle}' was not found.", hint=command("project", "list"))
     resolved_subcategory = subcategory if subcategory is not None else saved.subcategory
     if resolved_subcategory is None:
         raise click.ClickException("This project needs a subcategory before it can be updated.")
@@ -311,7 +320,8 @@ def update_project(
         resolved_customer,
         resolved_tags,
     ) == (saved.name, saved.spend_type, saved.subcategory, saved.customer, saved.extra_tags):
-        click.echo(f"No changes to project '{handle}'.")
+        click.echo(f"No changes to project '{handle}'.", err=True)
+        emit(saved, output_format)
         return
     updated = call(
         lambda client: client.projects.update(
@@ -323,15 +333,20 @@ def update_project(
             extra_tags=resolved_tags,
         )
     )
-    click.echo(click.style(f"✓ Project updated: {describe_project(updated)}", fg="green", bold=True))
+    if emit(updated, output_format):
+        return
+    done(f"Project updated: {describe_project(updated)}")
 
 
 @project.command(name="delete", help="Delete an unused project. Projects with run history cannot be deleted.")
 @click.argument("handle", metavar="HANDLE", type=_ProjectHandle())
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
-def delete_project(handle: str, yes: bool) -> None:
-    if not yes and not click.confirm(f"Delete project '{handle}'? Only projects without run history can be deleted."):
-        click.echo("Cancelled.")
+@json_option()
+def delete_project(handle: str, yes: bool, output_format: str) -> None:
+    if not confirm(f"Delete project '{handle}'? Only projects without run history can be deleted.", yes=yes):
+        click.echo("Cancelled.", err=True)
         return
     deleted = call(lambda client: client.projects.delete(handle))
-    click.echo(click.style(f"✓ Project deleted: {describe_project(deleted)}", fg="green", bold=True))
+    if emit(deleted, output_format):
+        return
+    done(f"Project deleted: {describe_project(deleted)}")

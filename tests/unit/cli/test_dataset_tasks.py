@@ -60,7 +60,7 @@ def test_list_reports_the_tasks_of_the_latest_version_or_the_one_asked_for(track
 
     tracker.reply("GET", f"{_URL}/versions/stable/tasks", httpx.Response(200, json={"tasks": [_OTHER, _TASK]}))
     text = _invoke("list", "swe-bench/verified@stable")
-    as_json = _invoke("list", "swe-bench/verified@stable", "--format", "json")
+    as_json = _invoke("list", "swe-bench/verified@stable", "--json")
 
     assert text.exit_code == 0, text.output
     assert "astropy-12907" in text.output and "django-11099" in text.output

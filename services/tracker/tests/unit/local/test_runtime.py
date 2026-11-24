@@ -1,7 +1,8 @@
 import base64
 import os
+from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -45,8 +46,16 @@ def test_server_configuration_selects_execution_mode(
         argv.extend(["--config", str(configuration)])
     monkeypatch.setattr("sys.argv", argv)
     monkeypatch.setattr("tracker.database.session.engine", database_session.bind)
+    monkeypatch.setattr("tracker.executor.dispatch_recovery.engine", database_session.bind)
     run = Mock()
+    server = Mock()
     monkeypatch.setattr(serve.uvicorn, "run", run)
+    monkeypatch.setattr(serve.uvicorn, "Server", server)
+    monkeypatch.setattr(serve.uvicorn.Config, "bind_socket", lambda self: nullcontext(Mock()))
+    monkeypatch.setattr(
+        "tracker.repositories.advisory_lock.local_tracker_lock",
+        lambda engine: Mock(acquire=AsyncMock(return_value=True)),
+    )
 
     serve.main()
 
@@ -54,8 +63,12 @@ def test_server_configuration_selects_execution_mode(
     if config.resources is not None:
         assert config.resources.data_root == tmp_path.resolve()
         assert config.resources.secrets_file is None
-    assert run.call_args.kwargs["host"] == ("127.0.0.1" if local else "0.0.0.0")
-    assert run.call_args.kwargs["workers"] == (1 if local else 2)
+        assert server.call_args.args[0].host == "127.0.0.1"
+        assert not run.called
+    else:
+        assert run.call_args.kwargs["host"] == "0.0.0.0"
+        assert run.call_args.kwargs["workers"] == 2
+        assert not server.called
 
     database_session.expire_all()
     admission = database_session.get(ExecutorAdmission, 1)
@@ -137,7 +150,7 @@ async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(
         assert all(value.encode() not in path.read_bytes() for path in root.rglob("*") if path.is_file())
     assert source.read_text(encoding="utf-8") == "MODEL_KEY=rotated-key\nUNRELATED_KEY=must-not-inject\n"
     source.write_text("UNRELATED_KEY=present\n", encoding="utf-8")
-    with pytest.raises(SecretsError, match="missing keys: MODEL_KEY"):
+    with pytest.raises(SecretsError, match="no value for MODEL_KEY"):
         await get_execution_runtime(
             request,
             benchmark_id=benchmark.id,
@@ -164,3 +177,27 @@ async def test_executor_reads_only_declared_credentials_fresh_for_each_dispatch(
             saved_sandbox_provider_secret_name=benchmark.arguments.sandbox_provider_secret_name,
             context_version=None,
         )
+
+
+@pytest.mark.description(
+    "A local Tracker exits before startup recovery while another local Tracker holds the database."
+)
+def test_second_local_tracker_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tracker import serve
+    from tracker.local import config
+
+    monkeypatch.setattr(config, "resources", None)
+    monkeypatch.setenv("EXECUTOR_LAUNCHER", "ecs")
+    configuration = tmp_path / "server.yaml"
+    configuration.write_text(f"data_root: {tmp_path}\n")
+    monkeypatch.setattr("sys.argv", ["tracker.serve", "--config", str(configuration)])
+    monkeypatch.setattr(
+        "tracker.repositories.advisory_lock.local_tracker_lock",
+        lambda engine: Mock(acquire=AsyncMock(return_value=False)),
+    )
+    recover = Mock()
+    monkeypatch.setattr("tracker.executor.dispatch_recovery.recover_interrupted_local_dispatches", recover)
+
+    with pytest.raises(SystemExit, match="Another local Tracker"):
+        serve.main()
+    assert not recover.called

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 from datetime import UTC, datetime, timezone
 from decimal import Decimal
@@ -42,7 +43,7 @@ from tracker.egress import EgressPolicy
 from tracker.runtime.artifacts import TASK_ID_PATTERN
 
 from tracker.services.datasets.digest import DIGEST_PATTERN
-from tracker.services.datasets.ref import DatasetRef, HostedDataset
+from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDataset
 from tracker.services.datasets.version_ref import MAX_VERSION_TAGS, MAX_VERSION_TASKS, validate_tag
 
 if TYPE_CHECKING:
@@ -214,8 +215,10 @@ class _BenchmarkArguments(BaseModel):
     regraded_from_run_id: UUID | None = Field(default=None, exclude=True)
     regrade_skipped_task_ids: list[str] | None = Field(default=None, exclude=True)
 
-    def with_hosted_dataset(self) -> Self:
+    def with_dataset_metadata(self) -> Self:
         ref = self.dataset_ref
+        if isinstance(ref, LocalDataset):
+            return self.model_copy(update={"dataset": ref.path})
         if not isinstance(ref, HostedDataset) or ref.revision is None:
             return self
         version = DatasetVersion(id=f"{ref.benchmark}/{ref.dataset}@{ref.revision}", label=None)
@@ -731,6 +734,13 @@ class RunProjectRequest(BaseModel):
     project: NonBlankText
 
 
+def split_provider(benchmark_name: str, provider_secrets: dict[str, str]) -> str | None:
+    from tracker.config import PROVIDER_SPLIT_BENCHMARKS, PROVIDER_SPLIT_PROVIDERS
+
+    providers = [provider for provider in PROVIDER_SPLIT_PROVIDERS if provider in provider_secrets]
+    return random.choice(providers) if benchmark_name in PROVIDER_SPLIT_BENCHMARKS and providers else None
+
+
 class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -783,8 +793,12 @@ class StartBenchmarkRequest(FetchBenchmarkTasksRequest):
         return self
 
     def use_settings(self, settings: RunSettingsResponse, provider_secrets: dict[str, str]) -> None:
-        if "sandbox_provider" not in self.model_fields_set and settings.default_provider:
-            self.sandbox_provider = settings.default_provider
+        if "sandbox_provider" not in self.model_fields_set:
+            self.sandbox_provider = (
+                settings.default_provider
+                or (self.priority is None and split_provider(self.benchmark_name, provider_secrets))
+                or self.sandbox_provider
+            )
         self.sandbox_provider_secret_name = provider_secrets.get(self.sandbox_provider)
         self.service_auth_header_name, self.service_auth_secret_name = self.use_saved_service(settings) or (None, None)
 
@@ -1241,6 +1255,7 @@ class TaskSummary(BaseModel):
     status: TaskStatus
     started_at: datetime
     finished_at: datetime | None
+    last_log_at: datetime | None = None
     error_message: str | None = None
     failure_category: FailureCategory | None = None
 
@@ -1250,8 +1265,8 @@ class TaskSummary(BaseModel):
         assert result is not None
         return result
 
-    @field_serializer("finished_at")
-    def _serialize_finished_at(self, value: datetime | None) -> str | None:
+    @field_serializer("finished_at", "last_log_at")
+    def _serialize_optional_timestamp(self, value: datetime | None) -> str | None:
         return _serialize_utc(value)
 
 
@@ -1282,6 +1297,7 @@ class SingleTaskResponse(BaseModel):
     status: TaskStatus
     started_at: datetime
     finished_at: datetime | None
+    last_log_at: datetime | None = None
     error_message: str | None
     failure_category: FailureCategory | None = None
     evaluation_result: dict[str, Any] | None
@@ -1294,8 +1310,8 @@ class SingleTaskResponse(BaseModel):
         assert result is not None
         return result
 
-    @field_serializer("finished_at")
-    def _serialize_finished_at(self, value: datetime | None) -> str | None:
+    @field_serializer("finished_at", "last_log_at")
+    def _serialize_optional_timestamp(self, value: datetime | None) -> str | None:
         return _serialize_utc(value)
 
 

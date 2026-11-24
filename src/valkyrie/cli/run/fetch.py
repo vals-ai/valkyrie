@@ -3,38 +3,44 @@ from uuid import UUID
 import click
 
 from valkyrie.cli.client import call
-from valkyrie.cli.run.progress import follow_run_status, format_benchmark_status, format_run_snapshot_json
+from valkyrie.cli.run.progress import follow_run_status, format_benchmark_status, run_snapshot_data
 from valkyrie.cli.project import describe_run_spend
-from valkyrie.cli.display import format_option
+from valkyrie.cli.display import emit, json_option
+from valkyrie.cli.run.status import show_statuses
 
 
-@click.command(
-    help="Show a run by its ID.\n\nExample:\n    valkyrie run fetch 123e4567-e89b-12d3-a456-426614174000 --connect"
-)
-@click.argument("run_id", type=UUID)
+@click.command(help="Show one run's details or several runs' status. Use --follow to stream one run.")
+@click.argument("run_ids", type=UUID, nargs=-1, required=True)
 @click.option(
-    "--connect",
+    "--follow",
     is_flag=True,
     required=False,
     help="Connect to the tracker service to stream run updates.",
 )
-@format_option("Output format. Use json for a snapshot or jsonl with --connect.", choices=("text", "json", "jsonl"))
-def fetch(run_id: UUID, connect: bool, output_format: str):
+@json_option(stream=True)
+def show(run_ids: tuple[UUID, ...], follow: bool, output_format: str):
+    run_ids = tuple(dict.fromkeys(run_ids))
+    if len(run_ids) > 1:
+        if follow or output_format == "jsonl":
+            raise click.UsageError("--follow and --jsonl require one run.")
+        show_statuses(list(run_ids), output_format)
+        return
+    run_id = run_ids[0]
 
-    if connect and output_format == "json":
-        raise click.UsageError("--format json cannot be used with --connect; use --format jsonl.")
-    if not connect and output_format == "jsonl":
-        raise click.UsageError("--format jsonl requires --connect.")
+    if follow and output_format == "json":
+        raise click.UsageError("--json cannot be used with --follow; use --jsonl.")
+    if not follow and output_format == "jsonl":
+        raise click.UsageError("--jsonl requires --follow.")
 
-    if connect and output_format == "jsonl":
+    if follow and output_format == "jsonl":
         follow_run_status(run_id, output_format="jsonl")
         return
-    if connect:
+    if follow:
         follow_run_status(run_id, show_identity=True)
         return
 
     snapshot = call(lambda client: client.runs.snapshot(run_id))
     if output_format == "json":
-        click.echo(format_run_snapshot_json(snapshot))
+        emit(run_snapshot_data(snapshot))
     else:
         format_benchmark_status(snapshot.run, describe_run_spend(snapshot.metadata), snapshot.metadata)

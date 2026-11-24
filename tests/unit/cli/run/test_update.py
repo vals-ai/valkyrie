@@ -26,13 +26,26 @@ def test_update_prints_the_concurrency_tracker_applied(cli_runner: CliRunner, tr
     assert result.output == "✓ Run concurrency updated to 6.\n"
 
 
-@pytest.mark.description("Reject invalid concurrency values before contacting the tracker.")
-@pytest.mark.parametrize("value", ["0", "-1", "1.5", "not-an-integer"])
+@pytest.mark.description("Invalid concurrency and incomplete shed options fail before contacting the Tracker.")
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--concurrency", "0"],
+        ["--concurrency", "-1"],
+        ["--concurrency", "1.5"],
+        ["--concurrency", "not-an-integer"],
+        ["--shed"],
+        ["--concurrency", "2", "--dry-run"],
+        ["--concurrency", "2", "--yes"],
+        ["--concurrency", "2", "--shed", "--dry-run", "--project", "blog"],
+    ],
+)
 def test_update_rejects_non_positive_integer(
     cli_runner: CliRunner,
-    value: str,
+    options: list[str],
+    tracker: MockTracker,
 ) -> None:
-    result = cli_runner.invoke(update, [str(_RUN_ID), "--concurrency", value])
+    result = cli_runner.invoke(update, [str(_RUN_ID), *options])
 
     assert result.exit_code == 2
-    assert "--concurrency" in result.output
+    assert tracker.requests == []

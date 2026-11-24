@@ -30,9 +30,10 @@ from tracker.database.models import (
     Task,
     TaskStatus,
 )
+from tracker.domain import ACCOUNT_REJECTION_SOURCE, SANDBOX_REJECTED_CAUSE
 from tracker.types import BenchmarkFilters, Order
 
-TaskSort = Literal["task_id", "started_at", "duration", "status"]
+TaskSort = Literal["task_id", "started_at", "duration", "status", "last_log_at"]
 
 _STATUS_SORT_PRIORITY = case(
     {
@@ -431,11 +432,12 @@ class BenchmarkRepository:
         sort_expr = {
             "task_id": col(Task.task_id),
             "started_at": col(Task.started_at),
+            "last_log_at": col(Task.last_log_at),
             "duration": func.coalesce(col(Task.finished_at), func.now()) - col(Task.started_at),
             "status": _STATUS_SORT_PRIORITY,
         }[sort]
         primary = sort_expr.asc() if sort_dir == "asc" else sort_expr.desc()
-        order_by = [primary, col(Task.started_at).desc()]
+        order_by = [primary.nulls_last() if sort == "last_log_at" else primary, col(Task.started_at).desc()]
 
         rows = self._session.exec(
             select(Task, col(ErrorResult.error_message), col(ErrorResult.category))
@@ -474,6 +476,14 @@ class BenchmarkRepository:
             select(Task).where(col(Task.benchmark) == benchmark_id, col(Task.task_id).in_(task_ids))
         ).all()
 
+    def lock_tasks_by_row_id_for_benchmark(self, benchmark_id: UUID, row_ids: Collection[UUID]) -> Sequence[Task]:
+        return self._session.exec(
+            select(Task)
+            .where(col(Task.benchmark) == benchmark_id, col(Task.id).in_(row_ids))
+            .order_by(col(Task.id))
+            .with_for_update()
+        ).all()
+
     def record_sandbox_link(
         self, provider: str, sandbox_id: str, benchmark_id: UUID, seen_at: datetime, attempt_id: str | None = None
     ) -> None:
@@ -500,6 +510,18 @@ class BenchmarkRepository:
         if task_ids is not None:
             query = query.where(col(Task.task_id).in_(task_ids))
         return set(self._session.exec(query).all())
+
+    def source_rejection(self, benchmark_id: UUID, source: str | None) -> str | None:
+        return self._session.exec(
+            select(ErrorResult.error_message)
+            .join(Task, col(Task.id) == col(ErrorResult.task))
+            .where(col(Task.benchmark) == benchmark_id)
+            .where(col(Task.status) == TaskStatus.ERROR)
+            .where(col(ErrorResult.created_at) >= col(Task.started_at))
+            .where(col(ErrorResult.cause_code) == SANDBOX_REJECTED_CAUSE)
+            .where(col(ErrorResult.sandbox_source).in_((ACCOUNT_REJECTION_SOURCE, source)))
+            .limit(1)
+        ).first()
 
     def count_tasks(self, org_id: UUID, benchmark_id: UUID, statuses: Sequence[TaskStatus]) -> int:
         return self._session.exec(
@@ -848,6 +870,7 @@ class BenchmarkRepository:
             .where(col(Task.status) == TaskStatus.EVALUATING)
             .values(
                 started_at=started_at,
+                last_log_at=None,
                 evaluation_phase_dispatch_id=None,
                 evaluation_phase_token=None,
             )

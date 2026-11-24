@@ -2,7 +2,7 @@
 
 [![Paper](https://img.shields.io/badge/Paper-alphaXiv-B31B1B)](https://www.alphaxiv.org/abs/valkyrie) [![valkyrie-cli on PyPI](https://img.shields.io/pypi/v/valkyrie-cli?label=valkyrie-cli)](https://pypi.org/project/valkyrie-cli/) [![valkyrie-sdk on PyPI](https://img.shields.io/pypi/v/valkyrie-sdk?label=valkyrie-sdk)](https://pypi.org/project/valkyrie-sdk/) ![CLI coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/cli-coverage.json) ![Tracker coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/vals-ai/Valkyrie/gh-pages/tracker-coverage.json)
 
-Valkyrie orchestrates scalable, reproducible evaluations for AI agents. Run it on infrastructure that Vals AI hosts, or on your own machine with a local Tracker.
+Valkyrie orchestrates scalable, reproducible evaluations for AI agents. Run it on your own machine with a local Tracker, or on infrastructure that Vals AI hosts.
 
 Guides, the CLI reference and the Python SDK reference are published at [docs.valkyrie.vals.ai](https://docs.valkyrie.vals.ai/introduction/what-is-valkyrie).
 
@@ -10,60 +10,42 @@ Guides, the CLI reference and the Python SDK reference are published at [docs.va
   <img src="docs/images/valk-tui.gif" alt="valkyrie tui showing a run's tasks, errors first, next to the highlighted task's log" width="720">
 </p>
 
+Use the same `valk` commands either on hosted infrastructure or on your machine:
+
+- **On hosted infrastructure:** follow the [quickstart below](#quickstart). Vals AI runs the Tracker and keeps your results, so you can run many tasks at once in cloud sandboxes and your whole organization sees every run.
+- **On your machine:** follow [Run Tracker locally](https://docs.valkyrie.vals.ai/self-hosting/local-tracker). You don't need an account.
+
 ## Quickstart
 
-Run Claude Code on one Terminal-Bench task with Vals AI's hosted Valkyrie. You need [uv](https://docs.astral.sh/uv/), a Vals AI account (email [contact@vals.ai](mailto:contact@vals.ai)), a [Modal](https://modal.com) account, and an Anthropic API key.
+This runs Claude Code on one Terminal-Bench task on hosted Valkyrie, in a Modal sandbox. You need [uv](https://docs.astral.sh/uv/), a Vals AI account, a [Modal](https://modal.com) account, and an Anthropic API key.
 
-1. Install the CLI. It installs as `valkyrie`, with the short alias `valk`:
+```bash
+uv tool install valkyrie-cli
+valk login
+valk org create ORG_ID
+```
 
-   ```bash
-   uv tool install valkyrie-cli
-   ```
+Replace *`ORG_ID`* with an unused organization ID. Connect Modal to your organization with [Set up Modal](https://docs.valkyrie.vals.ai/get-started/sandbox-providers#set-up-modal), then run:
 
-   If you installed the CLI from GitHub before, remove that install first with `uv tool uninstall valkyrie`.
+```bash
+valk secret set ANTHROPIC_API_KEY
+valk agent install \
+  https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
+valk dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
+valk run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
+  --model anthropic/claude-sonnet-4-6 --provider modal \
+  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --concurrency 1 --follow
+```
 
-2. Sign in:
-
-   ```bash
-   valkyrie login
-   ```
-
-3. Connect Modal by following [Set up Modal](https://docs.valkyrie.vals.ai/get-started/sandbox-providers#set-up-modal). It's set once per organization, so skip it if someone in yours already did.
-
-4. Install Claude Code from the [public agent registry](https://github.com/vals-ai/public-agent-registry), and store your Anthropic API key at the prompt:
-
-   ```bash
-   valkyrie agent install \
-     https://github.com/vals-ai/public-agent-registry/tree/main/examples/claude_code-v1.0.0
-
-   valkyrie secret set anthropic-api-key
-   ```
-
-5. Install Terminal-Bench 2 from Harbor as the dataset `tb/tb2`:
-
-   ```bash
-   valkyrie dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
-   ```
-
-6. Run one task:
-
-   ```bash
-   valkyrie run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
-     --model anthropic/claude-sonnet-4-6 --provider modal \
-     -s ANTHROPIC_API_KEY anthropic-api-key --slice 0:1 --concurrency 1
-   ```
-
-7. Watch it with `valkyrie tui`.
-
-The [quickstart guide](https://docs.valkyrie.vals.ai/get-started/quickstart) walks through each step and how to read the result.
+The [quickstart guide](https://docs.valkyrie.vals.ai/get-started/quickstart) explains each step, including how to join an existing organization.
 
 ## Browse runs in the terminal
 
-`valkyrie tui` lists your organization's runs with live status, so everyone signed in to the same organization sees the same runs. Open one to see its tasks, errors first, next to the highlighted task's log.
+`valk tui` lists your organization's runs with live status, so everyone signed in to the same organization sees the same runs. Open one to see its tasks, errors first, next to the highlighted task's log.
 
 - `/` filters the list, `e` groups a run's errors by message, and `s` picks how far back the list goes.
 - `y` copies the matching `valkyrie` command, to run yourself or hand to an agent.
-- `valkyrie tui --fake` opens it on sample runs, with no account needed.
+- `valk tui --fake` opens it on sample runs, with no account needed.
 
 ## Where to go next
 

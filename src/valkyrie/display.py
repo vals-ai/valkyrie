@@ -2,10 +2,22 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from valkyrie.sdk.models import FailureCategory
+
+
+def ago(moment: datetime, now: datetime, *, compact: bool = False) -> str:
+    seconds = max(int((now - moment).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h" if compact else f"{seconds // 3600}h {seconds % 3600 // 60:02}m"
+    return f"{seconds // 86400}d"
 
 
 def terminal_safe(value: str, *, preserve_newlines: bool) -> str:

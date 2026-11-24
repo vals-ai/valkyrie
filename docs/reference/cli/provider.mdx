@@ -16,7 +16,8 @@ Replaces the secret the provider had. SECRET is the name or reference that `valk
 ```bash Syntax
 valkyrie provider set \
   <NAME> \
-  <SECRET>
+  <SECRET> \
+  [--json]
 ```
 
 ```bash Example
@@ -35,6 +36,13 @@ valkyrie provider set \
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"SECRET"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
 </div>
 
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Provider guides](/get-started/sandbox-providers).
 
 ---
@@ -47,7 +55,8 @@ Runs on it fail until it has a secret again.
 
 ```bash Syntax
 valkyrie provider remove \
-  <NAME>
+  <NAME> \
+  [--json]
 ```
 
 ```bash Example
@@ -60,6 +69,13 @@ valkyrie provider remove modal
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"NAME"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
 </div>
 
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Provider guides](/get-started/sandbox-providers).
 
 ---
@@ -69,8 +85,16 @@ Task guidance: [Provider guides](/get-started/sandbox-providers).
 List the secret behind each sandbox provider. Your default provider is marked *.
 
 ```bash Syntax
-valkyrie provider list
+valkyrie provider list \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Provider guides](/get-started/sandbox-providers).
 
@@ -82,7 +106,8 @@ Run on this sandbox provider unless a run passes --provider.
 
 ```bash Syntax
 valkyrie provider default \
-  <NAME>
+  <NAME> \
+  [--json]
 ```
 
 ```bash Example
@@ -93,6 +118,13 @@ valkyrie provider default modal
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"NAME"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Provider guides](/get-started/sandbox-providers).

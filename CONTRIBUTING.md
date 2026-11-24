@@ -1,14 +1,9 @@
 # Contributing to Valkyrie
 
-To report a bug or request a feature, email [contact@vals.ai](mailto:contact@vals.ai).
-Include:
-
-- The exact command or SDK call you ran.
-- What you expected, what happened, and the full error output.
-- Your CLI version from `uv tool list` and, if you use the SDK, its version from
-  `uv pip show valkyrie-sdk`.
-- Whether you use hosted Valkyrie or a local Tracker.
-- The run ID, if the problem involves a run.
+To report a bug or request a feature, open an issue with the
+[bug report](https://github.com/vals-ai/Valkyrie/issues/new?template=bug_report.yml) or
+[feature request](https://github.com/vals-ai/Valkyrie/issues/new?template=feature_request.yml) form.
+To request a Vals AI account, email [contact@vals.ai](mailto:contact@vals.ai).
 
 ## Set up your environment
 

@@ -4,6 +4,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
@@ -363,6 +364,41 @@ class TestTaskExecution:
         finally:
             getattr(tracked, "_coro").close()
         cancellation.assert_not_called()
+
+    @pytest.mark.description("Task monitoring resumes on the next tick after a temporary server failure.")
+    async def test_task_monitor_retries_server_failure(
+        self,
+        control_postgres_session: Session,
+        example_benchmark_object: Benchmark,
+        bound_controls: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monitor, tracked, cancellation, control = self._monitor_for_task(
+            control_postgres_session, example_benchmark_object, bound_controls, status=TaskStatus.STOPPED
+        )
+        response = httpx.Response(500, request=httpx.Request("POST", "http://tracker/monitor_tasks"))
+        attempts = 0
+        original_monitor = control.monitor
+
+        async def monitor_after_failure(task_ids: list[str]) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                response.raise_for_status()
+            return await original_monitor(task_ids)
+
+        def complete_task(*_: object) -> None:
+            setattr(tracked, "_status", TrackedTaskStatus.DONE)
+
+        cancellation.side_effect = complete_task
+        monkeypatch.setattr(control, "monitor", monitor_after_failure)
+        monkeypatch.setattr(task_execution.asyncio, "sleep", AsyncMock())
+        try:
+            await monitor.track_tasks()
+        finally:
+            getattr(tracked, "_coro").close()
+        assert attempts > 1
+        cancellation.assert_called_once()
 
     @pytest.mark.description(
         (

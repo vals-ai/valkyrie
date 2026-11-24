@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from datetime import datetime, timezone
 from uuid import UUID
 
 import click
-from valkyrie.sdk import LogEvent, ValkyrieClient, ValkyrieStreamError
+from valkyrie.sdk import LogEvent, ValkyrieStreamError
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import format_option
+from valkyrie.cli.display import emit, json_option
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 
 @click.command(help="Fetch or follow logs for a run or one task.")
@@ -17,7 +21,7 @@ from valkyrie.cli.display import format_option
 @click.option("--since", "since_value", help="Inclusive RFC 3339 start time with a timezone offset.")
 @click.option("--until", "until_value", help="Inclusive RFC 3339 end time with a timezone offset.")
 @click.option("--follow", is_flag=True, help="Follow one task stream until interrupted.")
-@format_option(choices=("text", "jsonl"))
+@json_option(stream=True)
 def logs(
     run_id: UUID,
     task_id: str | None,
@@ -29,6 +33,8 @@ def logs(
 ) -> None:
     if follow and task_id is None:
         raise click.UsageError("--follow requires --task-id")
+    if follow and output_format == "json":
+        raise click.UsageError("Use --jsonl with --follow.")
     if query is not None and not query.strip():
         raise click.BadParameter("must not be blank", param_hint="--query")
 
@@ -38,6 +44,7 @@ def logs(
         raise click.UsageError("--until must be later than --since")
 
     async def write_logs(client: ValkyrieClient) -> None:
+        events: list[LogEvent] = []
         if follow:
             assert task_id is not None
             async for event in client.logs.stream_task(
@@ -58,10 +65,15 @@ def logs(
                     run_id, query=query, start_time=start_time, end_time=end_time, cursor=cursor
                 )
             for event in page.events:
-                _write_event(event, output_format)
+                if output_format == "json":
+                    events.append(event)
+                else:
+                    _write_event(event, output_format)
 
             cursor = page.next_cursor
             if cursor is None:
+                if output_format == "json":
+                    emit(events)
                 return
             if cursor in seen_cursors:
                 raise ValkyrieStreamError("Valkyrie log pagination returned a repeated cursor")
@@ -87,7 +99,7 @@ def _parse_timestamp(value: str | None, parameter: str) -> datetime | None:
 
 def _write_event(event: LogEvent, output_format: str) -> None:
     if output_format == "jsonl":
-        click.echo(event.model_dump_json())
+        emit(event)
         return
 
     timestamp = event.timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

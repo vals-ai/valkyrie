@@ -491,7 +491,7 @@ def test_websocket_setup_task_falls_back_to_header_provider_config(
             "/ws/setup-task",
             headers={
                 "DAYTONA_API_KEY": "key",
-                "DAYTONA_API_URL": "url",
+                "DAYTONA_API_URL": "https://app.daytona.io/api",
                 "DAYTONA_TARGET": "target",
             },
         ) as ws:

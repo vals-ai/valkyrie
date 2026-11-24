@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import click
 
 from valkyrie.cli.client import call
-from valkyrie.cli.display import utc_isoformat
+from valkyrie.cli.display import emit, utc_isoformat, json_option
+from valkyrie.cli.tracker_profiles import TrackerProfiles
 from valkyrie.sdk import (
     IdentityResponse,
-    LoginSession,
     OrganizationsResponse,
-    SessionAuth,
     ValkyrieAPIError,
-    ValkyrieClient,
-    ValkyrieConfig,
     ValkyrieTransportError,
-    device_login,
 )
+
+if TYPE_CHECKING:
+    from valkyrie.sdk import ValkyrieClient
 
 
 def show_organizations(listing: OrganizationsResponse) -> None:
@@ -38,9 +39,15 @@ async def _organizations_or_identity(client: ValkyrieClient) -> OrganizationsRes
     return await client.account.identity()
 
 
-@click.command(help="Sign in with your browser, save the login, and use this Tracker by default.")
+@click.command(help="Sign in to the active Tracker with your browser and save the login for it.")
 @click.option("--no-browser", is_flag=True, help="Print the sign-in link without opening a browser.")
-def login(no_browser: bool) -> None:
+@click.option("--yes", "-y", is_flag=True, help="Allow the browser sign-in flow with --json.")
+@json_option()
+def login(no_browser: bool, yes: bool, output_format: str) -> None:
+    from valkyrie.sdk import SessionAuth, ValkyrieConfig, device_login
+
+    if output_format != "text" and not yes:
+        raise click.UsageError("Use --yes to allow browser sign-in with --json.")
     tracker_url = ValkyrieConfig().url
 
     def announce(link: str, user_code: str) -> None:
@@ -57,29 +64,53 @@ def login(no_browser: bool) -> None:
     if ValkyrieConfig().api_key:
         click.echo("VALKYRIE_API_KEY is set and takes precedence over this login; unset it to use the login.", err=True)
     listing = call(_organizations_or_identity, auth=SessionAuth(session))
+    if emit(listing, output_format):
+        return
     if isinstance(listing, IdentityResponse):
         who = listing.email or listing.name or "your account"
-        click.echo(f"Logged in to {session.tracker_url} as {who} for {listing.organization}.")
+        click.echo(
+            f"Logged in to {TrackerProfiles.load().describe(session.tracker_url)} as {who} for {listing.organization}.",
+            err=True,
+        )
         return
-    click.echo(f"Logged in to {session.tracker_url} as {listing.email or 'your account'}.")
+    click.echo(
+        f"Logged in to {TrackerProfiles.load().describe(session.tracker_url)} as {listing.email or 'your account'}.",
+        err=True,
+    )
     show_organizations(listing)
 
 
-@click.command(help="Forget the saved login for this Tracker, and stop using it by default.")
-def logout() -> None:
+@click.command(help="Forget the saved login for the active Tracker.")
+@json_option()
+def logout(output_format: str) -> None:
+    from valkyrie.sdk import LoginSession, ValkyrieConfig
+
     tracker_url = ValkyrieConfig().url
-    if LoginSession.forget(tracker_url):
-        click.echo(f"Logged out of {tracker_url}.")
+    forgotten = LoginSession.forget(tracker_url)
+    if emit({"tracker": tracker_url, "logged_out": forgotten}, output_format):
+        return
+    if forgotten:
+        click.echo(f"Logged out of {TrackerProfiles.load().describe(tracker_url)}.", err=True)
     else:
-        click.echo(f"You were not logged in to {tracker_url}.")
+        click.echo(f"You were not logged in to {TrackerProfiles.load().describe(tracker_url)}.", err=True)
 
 
 @click.command(help="Show which Tracker, organization and account your requests use.")
-def whoami() -> None:
+@json_option()
+def whoami(output_format: str) -> None:
+    from valkyrie.sdk import ValkyrieConfig
+
     identity = call(lambda client: client.account.identity())
-    credential = {"login": "a login", "access_key": "an access key"}.get(identity.credential, "no credential")
+    tracker = ValkyrieConfig().url
+    if emit({**identity.model_dump(mode="json"), "tracker": tracker}, output_format):
+        return
+    where = f"{identity.organization} on {TrackerProfiles.load().describe(tracker)}"
+    credential = {"login": "a login", "access_key": "an access key"}.get(identity.credential)
+    if credential is None:
+        click.echo(f"{where} (no sign-in needed)")
+        return
     who = identity.email or identity.name or "unknown user"
-    click.echo(f"{who} in {identity.organization} on {ValkyrieConfig().url} (using {credential})")
+    click.echo(f"{who} in {where} (using {credential})")
 
 
 @click.group(help="Create and revoke access keys for CI and other headless use.")
@@ -98,8 +129,11 @@ def token() -> None:
     show_default=True,
     help="Days until the key stops working.",
 )
-def token_create(name: str, expires_in_days: int) -> None:
+@json_option()
+def token_create(name: str, expires_in_days: int, output_format: str) -> None:
     created = call(lambda client: client.account.create_access_key(name, expires_in_days=expires_in_days))
+    if emit(created, output_format):
+        return
     click.echo(f"Created access key {created.key_id}, expiring {utc_isoformat(created.expires_at)}.", err=True)
     click.echo("It is shown only once:", err=True)
     click.echo(created.key)
@@ -110,6 +144,9 @@ def token_create(name: str, expires_in_days: int) -> None:
     help="Delete an access key you created. The Tracker may accept it for up to one more minute, and tokens exchanged from it until they expire.",
 )
 @click.argument("key_id")
-def token_revoke(key_id: str) -> None:
+@json_option()
+def token_revoke(key_id: str, output_format: str) -> None:
     call(lambda client: client.account.revoke_access_key(key_id))
-    click.echo(f"Revoked access key {key_id}.")
+    if emit({"revoked": key_id}, output_format):
+        return
+    click.echo(f"Revoked access key {key_id}.", err=True)

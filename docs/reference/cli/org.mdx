@@ -12,8 +12,16 @@ This page documents all 8 commands in the `org` group in registration order. Use
 List the organizations your login belongs to. The one marked * is the one your requests act for.
 
 ```bash Syntax
-valkyrie org list
+valkyrie org list \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
 
@@ -28,7 +36,8 @@ ORGANIZATION is its ID: 3 to 63 lowercase letters, digits, dots or hyphens.
 ```bash Syntax
 valkyrie org create \
   <ORGANIZATION> \
-  [--name <TEXT>]
+  [--name <TEXT>] \
+  [--json]
 ```
 
 **Arguments**
@@ -44,6 +53,11 @@ valkyrie org create \
   <p className="mb-0 mt-1">{"Display name. Defaults to the organization ID."}</p>
 </div>
 
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
+
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
 
 ---
@@ -54,13 +68,21 @@ Act for another organization your login belongs to.
 
 ```bash Syntax
 valkyrie org use \
-  <ORGANIZATION>
+  <ORGANIZATION> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"ORGANIZATION"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
@@ -73,13 +95,21 @@ Invite someone to your current organization. Only admins can invite.
 
 ```bash Syntax
 valkyrie org invite \
-  <EMAIL>
+  <EMAIL> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"EMAIL"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
@@ -92,13 +122,21 @@ Join an organization that invited you, and switch to it.
 
 ```bash Syntax
 valkyrie org accept \
-  <ORGANIZATION>
+  <ORGANIZATION> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"ORGANIZATION"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
@@ -111,13 +149,21 @@ Decline an invitation to an organization.
 
 ```bash Syntax
 valkyrie org decline \
-  <ORGANIZATION>
+  <ORGANIZATION> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"ORGANIZATION"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
@@ -129,8 +175,16 @@ Task guidance: [Org guides](/get-started/configuration#join-an-organization).
 List the members and pending invitations of your current organization.
 
 ```bash Syntax
-valkyrie org members
+valkyrie org members \
+  [--json]
 ```
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
+</div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).
 
@@ -142,13 +196,21 @@ Remove someone from your current organization, or cancel their invitation. Only 
 
 ```bash Syntax
 valkyrie org remove \
-  <EMAIL>
+  <EMAIL> \
+  [--json]
 ```
 
 **Arguments**
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
   <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"EMAIL"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">required · <code>{"text"}</code></span></div>
+</div>
+
+**Options**
+
+<div className="border-b border-gray-200 py-3 dark:border-gray-800">
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--json"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"boolean"}</code> · default: <code>{"False"}</code></span></div>
+  <p className="mb-0 mt-1">{"Print machine-readable JSON."}</p>
 </div>
 
 Task guidance: [Org guides](/get-started/configuration#join-an-organization).

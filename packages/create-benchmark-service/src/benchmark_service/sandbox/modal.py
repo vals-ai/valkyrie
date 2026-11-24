@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 import os
 import re
 import shlex
-import socket
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Coroutine, Mapping
 from pathlib import Path, PurePosixPath
@@ -39,6 +37,7 @@ from benchmark_service.sandbox.types import (
     SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxAccountRejectedError,
     SandboxCreateRequest,
     SandboxError,
     UnsupportedSandboxConfigError,
@@ -57,10 +56,8 @@ _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
-_RESOLVE_IN_SANDBOX = (
-    'for host in "$@"; do getent ahostsv4 "$host" 2>/dev/null | awk \'{print $1}\'; done; '
-    "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
-)
+_ALLOW_ALL_DOMAINS = ("*",)
+_UNMATCHABLE_DOMAINS = ("blocked.invalid",)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CAPACITY_RETRY_DELAYS_SECONDS = (10, 20, 40, 60, 60)
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
@@ -143,6 +140,10 @@ def _is_transport_error(exc: Exception) -> bool:
     return isinstance(exc, _TRANSPORT_ERRORS) or (
         isinstance(exc, GRPCError) and not isinstance(exc, ModalError) and exc.status in _TRANSIENT_GRPC_STATUSES
     )
+
+
+def _is_spend_limit(exc: ModalResourceExhaustedError) -> bool:
+    return "spend limit" in str(exc).lower()
 
 
 def _sandbox_error(exc: Exception) -> SandboxError:
@@ -400,41 +401,14 @@ class ModalSandbox(Sandbox):
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _host_cidrs(self, hosts: list[str]) -> list[str]:
-        """The IPv4 addresses the hosts resolve to here and in the sandbox, and the sandbox's DNS servers."""
-        if not hosts:
-            return []
-        result = await self.exec(f"sh -c {shlex.quote(_RESOLVE_IN_SANDBOX)} _ " + " ".join(map(shlex.quote, hosts)))
-        local = [address for host in hosts for address in await _resolve_ipv4(host)]
-        return [f"{address}/32" for address in [*result.stdout.split(), *local] if _is_ipv4(address)]
-
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
-        # A domain rule needs a domain allowlist at creation, which stops Modal applying later policy changes.
-        if wildcards := [host for host in hosts if host.startswith("*")]:
-            raise ValueError(f"Modal can't allow a wildcard hostname such as {wildcards[0]}; list each hostname")
-        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(hosts)])), [])
+        await self._set_outbound_network_policy(*resolve_allowed_addresses(allowed_addresses))
 
     async def block_all_egress(self) -> None:
         await self._set_outbound_network_policy([], [])
 
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), [])
-
-
-def _is_ipv4(value: str) -> bool:
-    try:
-        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
-    except ValueError:
-        return False
-
-
-async def _resolve_ipv4(host: str) -> list[str]:
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-    except OSError:
-        return []
-    return [str(info[4][0]) for info in infos]
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 
 class ModalSandboxProvider(SandboxProvider):
@@ -558,8 +532,8 @@ class ModalSandboxProvider(SandboxProvider):
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
-            "block_network": request.network_block_all,
-            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else [],
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS if allow_all_egress else _UNMATCHABLE_DOMAINS),
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.
@@ -580,7 +554,7 @@ class ModalSandboxProvider(SandboxProvider):
                     except ModalResourceExhaustedError as exc:
                         creation = None
                         delay = next(delays, None)
-                        if delay is None:
+                        if delay is None or _is_spend_limit(exc):
                             raise
                         logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
                         await asyncio.sleep(delay)
@@ -598,11 +572,15 @@ class ModalSandboxProvider(SandboxProvider):
                 ) from exc
             raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
+            if _is_spend_limit(exc):
+                raise SandboxAccountRejectedError(f"Modal rejected the sandbox request: {exc}") from exc
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
         except ModalNotFoundError as exc:
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc
             raise _sandbox_error(exc) from exc
+        except ModalInvalidError as exc:
+            raise UnsupportedSandboxConfigError(f"Modal refused the sandbox settings: {exc}") from exc
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name, labels=request.labels)
@@ -619,8 +597,8 @@ class ModalSandboxProvider(SandboxProvider):
         client, _ = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
-            if await inner.poll.aio() is not None:
-                raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.")
+            if (poll_result := await inner.poll.aio()) is not None:
+                raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}, poll_result={poll_result}.")
         except ModalInvalidError as exc:
             raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.") from exc
         except _PROVIDER_ERRORS as exc:

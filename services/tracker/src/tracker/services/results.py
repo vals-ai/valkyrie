@@ -357,7 +357,7 @@ def build_benchmark_table_rows(
     rows: list[BenchmarkTableRow] = []
     for b in benchmarks:
         counts = counts_by_bench.get(b.id, {})
-        arguments = b.arguments.with_hosted_dataset()
+        arguments = b.arguments.with_dataset_metadata()
         ref = b.arguments.dataset_ref
         dataset_version = (
             arguments.dataset_version if isinstance(ref, HostedDataset) and ref.revision is not None else None

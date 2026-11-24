@@ -117,7 +117,13 @@ async def test_local_launcher_spawns_one_detached_watchdog(monkeypatch: pytest.M
     monkeypatch.setenv("DATABASE_URL", "postgresql://must-not-enter-executor")
     monkeypatch.setenv("EXECUTOR_CONTROL_URL", "http://control.test")
     spawn_threads: list[int] = []
-    popen = Mock(side_effect=lambda *_args, **_kwargs: spawn_threads.append(threading.get_ident()))
+    process = Mock(**{"poll.return_value": None})
+
+    def spawn(*_args: object, **_kwargs: object) -> Mock:
+        spawn_threads.append(threading.get_ident())
+        return process
+
+    popen = Mock(side_effect=spawn)
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
     dispatch_id = uuid4()
 
@@ -132,6 +138,9 @@ async def test_local_launcher_spawns_one_detached_watchdog(monkeypatch: pytest.M
     assert "DB_PASSWORD" not in options["env"]
     assert "DATABASE_URL" not in options["env"]
     assert spawn_threads != [threading.get_ident()]
+    await launcher.stop_local_watchdogs()
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with()
 
 
 @pytest.mark.description("The launched ECS task ARN is stored in `ExecutorDispatch.ecs_task_arn`.")

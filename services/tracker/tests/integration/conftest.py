@@ -1,13 +1,13 @@
 import os
 from asyncio import Semaphore
 from collections.abc import AsyncGenerator, Generator
+from pathlib import Path
 from uuid import uuid4
 from typing import Any, cast
 
 import pytest
 import boto3
 from benchmark_service import Resources, SandboxProvider, SandboxProviderConfig
-from benchmark_service.client import BenchmarkServiceClient
 from dotenv import load_dotenv
 from sqlmodel import Session
 
@@ -17,15 +17,18 @@ from tests.integration.seed_agent_artifacts import (
     integration_test_agent_name,
     seed_test_agent_artifact,
 )
+from tests.integration.live_dataset import LIVE_DATASET_NAME, write_live_dataset
 from tests.utils import TEST_ORG_ID
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.runtime.artifacts import agent_bundle_key
 from tracker.aws.secrets import SecretsManagerStore
-from tracker.config import create_benchmark_service_url
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.types import AgentContractRequest
-from tracker.clients.benchmark_service import create_benchmark_service_client, fetch_sandbox_provider_config
+from tracker.clients.benchmark_service import fetch_sandbox_provider_config
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.services.datasets.ref import LocalDataset
+from tracker.services.datasets.source import LocalFolderSource
 
 _ = load_dotenv()
 
@@ -109,9 +112,8 @@ def contract(seeded_test_agent_artifact: str) -> AgentContractRequest:
 
 
 @pytest.fixture(scope="session")
-def service_headers() -> dict[str, str]:
-    auth_key = os.getenv("BENCHMARK_SERVICE_AUTH_KEY")
-    return {"x-descope-api-key": auth_key} if auth_key else {}
+def live_dataset(tmp_path_factory: pytest.TempPathFactory) -> LocalDataset:
+    return write_live_dataset(tmp_path_factory.mktemp(LIVE_DATASET_NAME))
 
 
 @pytest.fixture
@@ -119,17 +121,10 @@ def creation_semaphore() -> Semaphore:
     return Semaphore(5)
 
 
-@pytest.fixture(scope="function")
-async def benchmark_service(service_headers: dict[str, str]) -> AsyncGenerator[BenchmarkServiceClient, None]:
-    service = create_benchmark_service_client(
-        url=create_benchmark_service_url("swebench"),
-        service_headers=service_headers,
-    )
-
-    try:
+@pytest.fixture
+async def live_dataset_service(live_dataset: LocalDataset) -> AsyncGenerator[DatasetTaskService, None]:
+    async with DatasetTaskService(LocalFolderSource(Path(live_dataset.path))) as service:
         yield service
-    finally:
-        await service.close()
 
 
 @pytest.fixture
@@ -145,11 +140,12 @@ async def sandbox_provider_config(
 
 
 @pytest.fixture
-def sandbox_provider(
-    benchmark_service: BenchmarkServiceClient,
-    sandbox_provider_config: SandboxProviderConfig,
-) -> SandboxProvider:
-    return benchmark_service.get_sandbox_provider(sandbox_provider_config)
+async def sandbox_provider(sandbox_provider_config: SandboxProviderConfig) -> AsyncGenerator[SandboxProvider, None]:
+    provider = sandbox_provider_config.create_provider()
+    try:
+        yield provider
+    finally:
+        await provider.close()
 
 
 @pytest.fixture

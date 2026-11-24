@@ -1017,7 +1017,7 @@ class TestProcessTaskEnvironment:
             assert 165 * 3600 < remaining <= 166 * 3600
 
     @pytest.mark.description(
-        "A benchmark service task hands its MCP servers, skills folder and task folder to the agent."
+        "A benchmark service task hands its MCP servers, skills folder and task folder to the agent with `PYTHONSAFEPATH` set."
     )
     @pytest.mark.parametrize(
         ("tools", "handed"),
@@ -1049,12 +1049,14 @@ class TestProcessTaskEnvironment:
         )
         task_response = make_retrieve_task_response().model_copy(update=tools)
         observed: list[tuple[list[MCPServer], str | None, str | None]] = []
+        safe_python_paths: list[bool] = []
 
         async def retrieve_task(*_args: Any, **_kwargs: Any) -> RetrieveTaskResponse:
             return task_response
 
         async def capture_run_agent(*_args: Any, **kwargs: Any) -> tuple[None, float]:
             observed.append((kwargs["mcp_servers"], kwargs["skills_dir"], kwargs["task_dir"]))
+            safe_python_paths.append(kwargs["safe_python_path"])
             return await _complete_base_only_agent(**kwargs)
 
         monkeypatch.setattr(BenchmarkServiceClient, "retrieve_task", retrieve_task)
@@ -1066,6 +1068,7 @@ class TestProcessTaskEnvironment:
 
         assert result == {"task_0": {"status": "success", "score": 1.0}}
         assert observed == [handed]
+        assert safe_python_paths == [True]
 
     @pytest.mark.parametrize("native_key", [False, True], ids=["without-token", "with-token"])
     @pytest.mark.usefixtures("process_benchmark_env")

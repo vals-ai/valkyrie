@@ -33,11 +33,13 @@ class TestResultsCommand:
             "- Agent secrets and private runtime kwargs are excluded from the saved file."
         )
     )
+    @pytest.mark.parametrize("json_output", [False, True])
     def test_local_results_write_complete_payload_and_subset_summary(
         self,
         tmp_path: Path,
         tracker: MockTracker,
         cli_runner: CliRunner,
+        json_output: bool,
     ) -> None:
         response = make_final_view(
             _RUN_ID,
@@ -51,7 +53,14 @@ class TestResultsCommand:
 
         result = cli_runner.invoke(
             results,
-            [str(_RUN_ID), "--path", str(output_path), "--task-ids", "task-a,task-b,missing"],
+            [
+                str(_RUN_ID),
+                "--output",
+                str(output_path),
+                "--task-ids",
+                "task-a,task-b,missing",
+                *(["--json"] if json_output else []),
+            ],
         )
 
         assert result.exit_code == 0, result.output
@@ -66,6 +75,13 @@ class TestResultsCommand:
         assert saved_payload["task_errors"] == {"task-b": "evaluation failed"}
         assert "secrets" not in saved_payload["benchmark_arguments"]["contract"]
         assert "kwargs" not in saved_payload["benchmark_arguments"]["contract"]
+        if json_output:
+            payload = json.loads(result.stdout)
+            assert payload["benchmark_id"] == str(_RUN_ID)
+            assert "secrets" not in payload["benchmark_arguments"]["contract"]
+            assert "kwargs" not in payload["benchmark_arguments"]["contract"]
+            assert "excluded-secret-name" not in result.stdout
+            assert "excluded-kwarg-value" not in result.stdout
 
     @pytest.mark.description("A run without a headline score says so, and a scored run does not.")
     @pytest.mark.parametrize(("score", "says_no_headline"), [(None, True), (50.0, False)])
@@ -82,7 +98,7 @@ class TestResultsCommand:
         )
         tracker.reply("GET", "/retrieve-results", ok(response))
 
-        result = cli_runner.invoke(results, [str(_RUN_ID), "--path", str(tmp_path / "results.json")])
+        result = cli_runner.invoke(results, [str(_RUN_ID), "--output", str(tmp_path / "results.json")])
 
         assert result.exit_code == 0, result.output
         assert ("no single headline score" in result.output) is says_no_headline
@@ -105,7 +121,7 @@ class TestResultsCommand:
         )
         tracker.reply("GET", "/retrieve-results", ok(response))
 
-        result = cli_runner.invoke(results, [str(_RUN_ID), "--path", str(tmp_path / "results.json")])
+        result = cli_runner.invoke(results, [str(_RUN_ID), "--output", str(tmp_path / "results.json")])
 
         assert result.exit_code == 0, result.output
         assert "metric script failed, so the run has no score: The script exited with status 1: boom" in result.output
@@ -163,7 +179,7 @@ class TestResultsCommand:
         ("path", "expected_message"),
         [
             ("missing/results.json", "directory does not exist"),
-            ("existing.json", "Aborted"),
+            ("existing.json", "Use --overwrite"),
         ],
     )
     def test_local_output_refuses_invalid_or_declined_paths(
@@ -181,7 +197,7 @@ class TestResultsCommand:
 
         result = cli_runner.invoke(
             results,
-            [str(_RUN_ID), "--path", str(output_path)],
+            [str(_RUN_ID), "--output", str(output_path)],
             input="n\n",
         )
 
@@ -192,7 +208,7 @@ class TestResultsCommand:
 
     @pytest.mark.description(
         (
-            "--yes overwrites existing results without prompting.\n"
+            "--overwrite replaces local files, and --yes answers S3 prompts.\n"
             "\n"
             "Test cases:\n"
             "- An existing local results file is replaced.\n"
@@ -210,7 +226,10 @@ class TestResultsCommand:
         output_path = tmp_path / "existing.json"
         output_path.write_text("original", encoding="utf-8")
 
-        local = cli_runner.invoke(results, [str(_RUN_ID), "--path", str(output_path), "--yes"])
+        refused = cli_runner.invoke(results, [str(_RUN_ID), "--output", str(output_path), "--yes"])
+        assert refused.exit_code == 1
+        assert output_path.read_text(encoding="utf-8") == "original"
+        local = cli_runner.invoke(results, [str(_RUN_ID), "--output", str(output_path), "--overwrite"])
         tracker.reply("GET", "/retrieve-results", ok(_S3_RESULTS))
         s3 = cli_runner.invoke(results, [str(_RUN_ID), "--s3", "-y"])
 

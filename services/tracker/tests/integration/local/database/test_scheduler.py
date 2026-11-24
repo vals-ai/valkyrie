@@ -768,7 +768,7 @@ async def test_manual_recovery_restarts_only_selected_generation_wall(
                 runtime_services,
                 OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
                 sandbox_provider_config=DaytonaProviderConfig(
-                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
                 ),
                 sandbox_provider=context.provider,
                 creation_semaphore=Semaphore(1),
@@ -1870,7 +1870,7 @@ async def test_setup_retry_reenters_fifo_before_competitor(
         OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
         sandbox_provider_config=DaytonaProviderConfig(
             DAYTONA_API_KEY="test-api-key",
-            DAYTONA_API_URL="http://localhost:8001",
+            DAYTONA_API_URL="https://app.daytona.io/api",
             DAYTONA_TARGET="us",
         ),
         sandbox_provider=context.provider,
@@ -1973,7 +1973,7 @@ async def test_queued_worker_holds_grading_capacity_until_the_grading_sandbox_ex
                 runtime_services,
                 OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
                 sandbox_provider_config=DaytonaProviderConfig(
-                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
                 ),
                 sandbox_provider=context.provider,
                 creation_semaphore=Semaphore(1),
@@ -2077,7 +2077,7 @@ async def test_queued_worker_setup_retry_waits_for_retention_then_finishes_with_
                 runtime_services,
                 OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
                 sandbox_provider_config=DaytonaProviderConfig(
-                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+                    DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
                 ),
                 sandbox_provider=context.provider,
                 creation_semaphore=Semaphore(1),
@@ -3035,7 +3035,7 @@ async def test_cancelled_failed_build_disposition_commits_before_phase_handoff(
             runtime_services,
             OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
             sandbox_provider_config=DaytonaProviderConfig(
-                DAYTONA_API_KEY="controlled", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+                DAYTONA_API_KEY="controlled", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
             ),
             sandbox_provider=context.provider,
             creation_semaphore=Semaphore(1),
@@ -4265,7 +4265,7 @@ async def test_evaluation_uses_saved_project_grading_root(
         runtime_services,
         OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
         sandbox_provider_config=DaytonaProviderConfig(
-            DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="http://localhost:8001", DAYTONA_TARGET="us"
+            DAYTONA_API_KEY="test-api-key", DAYTONA_API_URL="https://app.daytona.io/api", DAYTONA_TARGET="us"
         ),
         sandbox_provider=context.provider,
         creation_semaphore=Semaphore(1),
@@ -4624,7 +4624,7 @@ async def test_saved_project_grader_records_real_gateway_ledger(
                                 OrgContext(id=org.id, name=org.name, storage_key=org.storage_key),
                                 sandbox_provider_config=DaytonaProviderConfig(
                                     DAYTONA_API_KEY="local",
-                                    DAYTONA_API_URL="http://localhost:8001",
+                                    DAYTONA_API_URL="https://app.daytona.io/api",
                                     DAYTONA_TARGET="us",
                                 ),
                                 sandbox_provider=context.provider,

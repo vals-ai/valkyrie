@@ -1153,7 +1153,8 @@ class TestBenchmarkServiceFailures:
         assert "404" in error_message
 
     @pytest.mark.usefixtures("process_benchmark_env")
-    async def test_required_missing_output_artifact_persists_compatible_error(
+    @pytest.mark.description("A task with a missing required output records a terminal agent failure.")
+    async def test_missing_required_output_persists_agent_failure(
         self,
         contract: AgentContractRequest,
         control_postgres_session: Session,
@@ -1190,6 +1191,8 @@ class TestBenchmarkServiceFailures:
                 return ExecResult(exit_code=0, output="")
             if command == "test -f /tmp/valkyrie/artifacts/missing.json":
                 return ExecResult(exit_code=1, output="")
+            if command == "LC_ALL=C stat -Lc%F /tmp/valkyrie/artifacts/missing.json 2>&1":
+                return ExecResult(exit_code=1, output="stat: cannot statx: No such file or directory")
             raise AssertionError(f"unexpected command: {command}")
 
         def _mock_write_benchmark_log_event(_self: Any, _stream_key: str, lines: list[TaskLogLine]) -> None:
@@ -1217,7 +1220,7 @@ class TestBenchmarkServiceFailures:
         assert error_result.operation == "upload_output_artifacts"
         assert error_result.error_type == "OutputArtifactError"
         assert error_result.cause_code is None
-        assert error_result.category == FailureCategory.INFRASTRUCTURE
+        assert error_result.category == FailureCategory.AGENT
         assert error_result.retry_scheduled is False
         assert error_result.failed_attempt_number is None
         assert any(expected_log in message for message in logged_messages)

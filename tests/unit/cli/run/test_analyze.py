@@ -32,8 +32,9 @@ def serve_pushed_agent(tracker: MockTracker, contract: str | None) -> None:
 
 
 @pytest.mark.description("Only `ingest_lambda` is read, so a pushed contract missing required fields still works.")
+@pytest.mark.parametrize("output_format", ["text", "json", "jsonl"])
 def test_analysis_uses_the_pushed_contracts_lambda_and_reports_the_plan(
-    tracker: MockTracker, cli_runner: CliRunner
+    tracker: MockTracker, cli_runner: CliRunner, output_format: str
 ) -> None:
     serve_pushed_agent(tracker, "name: mini_sweagent\ningest_lambda: docent-ingest\n")
     events = [
@@ -44,11 +45,18 @@ def test_analysis_uses_the_pushed_contracts_lambda_and_reports_the_plan(
     body = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
     tracker.reply("POST", _ANALYZE_PATH, httpx.Response(200, text=body, headers={"content-type": "text/event-stream"}))
 
-    result = cli_runner.invoke(analyze, [str(_RUN_ID), "--no-cache"])
+    result = cli_runner.invoke(
+        analyze, [str(_RUN_ID), "--no-cache", *([] if output_format == "text" else [f"--{output_format}"])]
+    )
 
     assert result.exit_code == 0, result.output
-    assert "Invoking docent-ingest" in result.output
-    assert "Reading plan: https://docent.example/plan" in result.output
+    assert "Invoking docent-ingest" in result.stderr
+    if output_format == "text":
+        assert "Reading plan: https://docent.example/plan" in result.stdout
+    elif output_format == "json":
+        assert json.loads(result.stdout) == {"reading_plan_url": "https://docent.example/plan"}
+    else:
+        assert [json.loads(line)["event"] for line in result.stdout.splitlines()] == ["started", "heartbeat", "done"]
     assert "event:" not in result.output
 
     (request,) = tracker.requested("POST", _ANALYZE_PATH)

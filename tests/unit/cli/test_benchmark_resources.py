@@ -129,7 +129,7 @@ def test_list_reports_the_resources_or_that_there_are_none(tracker: MockTracker,
 
     tracker.reply("GET", kind.collection, httpx.Response(200, json={kind.key: [kind.first, kind.record]}))
     text = _invoke(kind, "list", *kind.parent)
-    as_json = _invoke(kind, "list", *kind.parent, "--format", "json")
+    as_json = _invoke(kind, "list", *kind.parent, "--json")
 
     assert text.exit_code == 0, text.output
     assert "SWE-bench tasks" in text.output
@@ -142,11 +142,11 @@ def test_show_prints_the_resource_or_its_json(tracker: MockTracker, kind: Kind) 
     tracker.reply("GET", kind.shown_at, httpx.Response(200, json=kind.shown_body))
 
     text = _invoke(kind, "show", *kind.parent, kind.name)
-    as_json = _invoke(kind, "show", *kind.parent, kind.name, "--format", "json")
+    as_json = _invoke(kind, "show", *kind.parent, kind.name, "--json")
 
     assert text.exit_code == 0, text.output
-    assert f"Name:        {kind.name}" in text.output
-    assert "Description: SWE-bench tasks" in text.output
+    assert f"Name {kind.name}" in " ".join(text.output.split())
+    assert "Description SWE-bench tasks" in " ".join(text.output.split())
     assert "by ada@example.com" in text.output
     assert json.loads(as_json.output)["name"] == kind.name
 
@@ -187,7 +187,7 @@ def test_show_says_when_a_resource_was_archived(tracker: MockTracker, kind: Kind
 
     result = _invoke(kind, "show", *kind.parent, kind.name)
 
-    assert "Archived:" in result.output
+    assert "Archived" in result.output
 
 
 @pytest.mark.description("`dataset show` prints the parent benchmark's name.")
@@ -196,7 +196,7 @@ def test_a_dataset_shows_its_benchmark(tracker: MockTracker) -> None:
 
     result = _invoke(_DATASETS, "show", "swe-bench", "verified")
 
-    assert "Benchmark:   swe-bench" in result.output
+    assert "Benchmark swe-bench" in " ".join(result.output.split())
 
 
 @pytest.mark.description("`update` sends only the new description.")
