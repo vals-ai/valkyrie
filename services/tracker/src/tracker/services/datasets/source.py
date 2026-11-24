@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from tracker import config
 from tracker.services.datasets.extract import UnsafeArchiveError, extract
 from tracker.services.datasets.folder import (
     COMPOSE_FILE,
@@ -33,6 +34,7 @@ TASK_FILES = (
     f"{STEPS_DIR}/*/{STEP_TESTS}/{DOCKERFILE}",
     f"{STEPS_DIR}/*/{STEP_TESTS}/{COMPOSE_FILE}",
 )
+STAGED_ARCHIVE_BYTES = config.DATASET_TASK_UPLOAD_MAX_BYTES
 
 
 class TaskSource(Protocol):
@@ -79,6 +81,8 @@ class ArchiveSource:
         self._objects = objects
         self._dataset_id = str(dataset_id)
         self._tasks = dict(tasks)
+        self._staged = 0
+        self._unstaged = asyncio.Event()
 
     async def task_ids(self) -> list[str]:
         return sorted(self._tasks)
@@ -88,14 +92,30 @@ class ArchiveSource:
         if task_id not in self._tasks:
             raise FileNotFoundError(f"The dataset version has no task {task_id!r}")
         key = dataset_blob_key(self._dataset_id, self._tasks[task_id])
+        size = (await self._objects.stat(key)).size
         with tempfile.TemporaryDirectory(prefix="task-") as scratch:
             archive_path = Path(scratch) / "archive.zip"
             task_dir = Path(scratch) / "tasks" / task_id
             task_dir.mkdir(parents=True)
-            await self._download(key, archive_path)
-            await asyncio.to_thread(self._unpack, archive_path, task_dir, [*TASK_FILES, *parts])
-            archive_path.unlink()
+            async with self._staging(size):
+                try:
+                    await self._download(key, archive_path)
+                    await asyncio.to_thread(self._unpack, archive_path, task_dir, [*TASK_FILES, *parts])
+                finally:
+                    archive_path.unlink(missing_ok=True)
             yield task_dir
+
+    @asynccontextmanager
+    async def _staging(self, size: int) -> AsyncGenerator[None]:
+        while self._staged and self._staged + size > STAGED_ARCHIVE_BYTES:
+            self._unstaged.clear()
+            await self._unstaged.wait()
+        self._staged += size
+        try:
+            yield
+        finally:
+            self._staged -= size
+            self._unstaged.set()
 
     async def _download(self, key: str, destination: Path) -> None:
         sink = await asyncio.to_thread(destination.open, "xb")

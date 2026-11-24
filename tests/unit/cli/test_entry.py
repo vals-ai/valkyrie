@@ -41,6 +41,7 @@ RUN = "123e4567-e89b-12d3-a456-426614174000"
         (f"run shed {RUN} --concurrency 2", f"run update {RUN} --concurrency 2 --shed", 1),
         ("run start -n 2 --task-ids-file ids.txt", "run start --count 2 --task-ids @ids.txt", 2),
         ("run start -n2", "run start --count 2", 1),
+        ("run start --slice=1:8:2", "run start --task-range 1:8:2", 1),
         (f"run resume {RUN} --retry", f"run retry {RUN}", 1),
         (f"run results {RUN} --path r.json --format text", f"run results {RUN} --output r.json", 2),
         ("run list --agent-name a --benchmark-name b --order-by c", "run list --agent a --benchmark b --order c", 3),

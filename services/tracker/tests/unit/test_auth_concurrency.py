@@ -118,11 +118,10 @@ async def test_rate_limited_starts_leave_resources_free(
                 for index in range(60)
             ]
             try:
-                await asyncio.sleep(0.25)
+                await asyncio.wait_for(owners_waiting.wait(), timeout=5)
                 started = time.monotonic()
                 health = await http.get("/health")
                 latency = time.monotonic() - started
-                await asyncio.wait_for(owners_waiting.wait(), timeout=5)
                 tokens = anyio.to_thread.current_default_thread_limiter().borrowed_tokens
                 connections = engine.pool.checkedout()
                 credential_available = await asyncio.wait_for(

@@ -338,6 +338,39 @@ async def test_sandbox_that_does_not_start_is_deleted(monkeypatch: pytest.Monkey
     assert client.deleted == ["sbx-1"]
 
 
+@pytest.mark.description(
+    "A create keeps a sandbox whose start wait was rate limited, and deletes a failed one past a rate-limited delete."
+)
+async def test_create_rides_out_rate_limits_on_the_start_wait_and_the_delete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_backoff", wait_fixed(0))
+    limited = DaytonaError("x", status_code=429, code="RATE_LIMITED")
+
+    class LimitedOnceSandbox(FakeSandbox):
+        limited = True
+
+        async def wait(self, *, until: str, timeout: float) -> FakeSandbox:
+            if self.limited:
+                self.limited = False
+                raise limited
+            return await super().wait(until=until, timeout=timeout)
+
+    class LimitedDeleteClient(FakeClient):
+        async def delete(self, sandbox_id: str) -> None:
+            if not self.calls or self.calls[-1][0] != "delete":
+                self.calls.append(("delete", sandbox_id, {}))
+                raise limited
+            await super().delete(sandbox_id)
+
+    assert (
+        await _provider(monkeypatch, FakeClient(LimitedOnceSandbox())).create_sandbox(_request())
+    ).state == "started"
+
+    client = LimitedDeleteClient(FakeSandbox(state="error"))
+    with pytest.raises(SandboxError, match="did not start"):
+        await _provider(monkeypatch, client).create_sandbox(_request())
+    assert client.deleted == ["sbx-1"]
+
+
 @pytest.mark.parametrize(
     ("status", "build_error", "expected"),
     [("failed", "", "img-1 failed: broken"), ("raise", "no space left", "image failed")],
@@ -460,6 +493,25 @@ async def test_exec_collects_output_and_maps_exit_codes(
     assert result.exit_code == exit_code
     assert result.output == ("hi err" if frames else "")
     assert inner.process.started == [{"command": "echo hi", "cwd": "/w", "env": None, "execution_timeout": 5}]
+
+
+@pytest.mark.description("An exec whose log read loses its connection reads the log again instead of failing.")
+async def test_exec_rereads_the_log_after_a_dropped_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_v2, "_backoff", wait_fixed(0))
+
+    class DroppingProcess(FakeProcess):
+        dropped = False
+
+        async def logs(self, *, cursor: str | None = None) -> SimpleNamespace:
+            if not self.dropped:
+                self.dropped = True
+                raise daytona_v2.DaytonaConnectionError("ConnectionTerminated")
+            return await super().logs(cursor=cursor)
+
+    inner = FakeSandbox()
+    inner.process = DroppingProcess([_frame("hi")], _wait(0))
+    result = await _sandbox(inner).exec("echo hi")
+    assert (result.exit_code, result.output) == (0, "hi")
 
 
 async def test_command_streams_output_raises_on_failure_and_stops_when_closed() -> None:

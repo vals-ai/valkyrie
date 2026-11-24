@@ -3621,7 +3621,7 @@ dev = [
 
 [[package]]
 name = "valkyrie-sdk"
-version = "0.45.1"
+version = "0.45.2"
 source = { editable = "packages/valkyrie-sdk" }
 dependencies = [
     { name = "filelock" },

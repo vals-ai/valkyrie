@@ -193,6 +193,10 @@ def _rate_limited(exc: BaseException) -> bool:
     return isinstance(exc, DaytonaError) and exc.status_code == 429
 
 
+def _rate_limited_or_dropped(exc: BaseException) -> bool:
+    return _rate_limited(exc) or isinstance(exc, DaytonaConnectionError)
+
+
 def _retry_after(exc: BaseException | None) -> object:
     if isinstance(exc, httpx.HTTPStatusError):
         with suppress(ValueError):
@@ -216,13 +220,18 @@ def _rate_limit_wait(state: RetryCallState) -> float:
     return max(retry_after if isinstance(retry_after, int | float) else 0, _backoff(state))
 
 
-async def _patient[T](call: Callable[[], Awaitable[T]], deadline: float | None = None) -> T:
+async def _patient[T](
+    call: Callable[[], Awaitable[T]],
+    deadline: float | None = None,
+    *,
+    retry_on: Callable[[BaseException], bool] = _rate_limited,
+) -> T:
     budget = _RATE_LIMIT_SECONDS
     if deadline is not None:
         budget = min(budget, deadline - asyncio.get_running_loop().time())
 
     @retry(
-        retry=retry_if_exception(_rate_limited),
+        retry=retry_if_exception(retry_on),
         wait=_rate_limit_wait,
         stop=stop_before_delay(max(budget, 0)),
         reraise=True,
@@ -250,12 +259,12 @@ async def _await_started(sandbox: AsyncSandbox, timeout: float) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(timeout, 1)
     try:
-        await sandbox.wait(until="started", timeout=max(timeout, 1))
+        await _patient(lambda: sandbox.wait(until="started", timeout=max(deadline - loop.time(), 1)), deadline)
         while sandbox.state != "started":
             if sandbox.state in _ENDED_STATES or loop.time() > deadline:
                 raise SandboxError(f"Daytona v2 sandbox {sandbox.id} did not start: {sandbox.state}")
             await asyncio.sleep(_POLL_SECONDS)
-            await sandbox.refresh_data()
+            await _patient(sandbox.refresh_data, deadline)
     except (SandboxTerminalStateError, RequestTimeoutError) as exc:
         detail = f"{sandbox.state} {sandbox.error or ''}".strip()
         raise SandboxError(f"Daytona v2 sandbox {sandbox.id} did not start: {detail}") from exc
@@ -430,7 +439,7 @@ class DaytonaV2Sandbox(Sandbox):
             cursor: str | None = None
             while True:
                 async with self._sandbox_errors(what):
-                    page = await _patient(lambda: handle.logs(cursor=cursor))
+                    page = await _patient(lambda: handle.logs(cursor=cursor), retry_on=_rate_limited_or_dropped)
                 for frame in page.items:
                     if frame.channel in _OUTPUT_CHANNELS:
                         yield frame.data
@@ -439,9 +448,11 @@ class DaytonaV2Sandbox(Sandbox):
                     break
                 if not page.items:
                     async with self._sandbox_errors(what):
-                        await _patient(lambda: handle.wait(timeout=_LOG_WAIT_SECONDS))
+                        await _patient(
+                            lambda: handle.wait(timeout=_LOG_WAIT_SECONDS), retry_on=_rate_limited_or_dropped
+                        )
             async with self._sandbox_errors(what):
-                result = await _patient(handle.wait)
+                result = await _patient(handle.wait, retry_on=_rate_limited_or_dropped)
             yield _exit_code(result)
         finally:
             if result is None:
@@ -753,7 +764,7 @@ class DaytonaV2SandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             with _errors(f"delete sandbox {instance_id}"):
-                await self._client.delete(instance_id)
+                await _patient(lambda: self._client.delete(instance_id))
         except SandboxNotFoundError:
             return
 

@@ -414,7 +414,7 @@ def _agent_input_problems(task_id: str, config: Mapping[str, Any]) -> list[str]:
     problems = [
         f"{task_id}: [verifier.environment].{key} is ignored. Declare it under [environment] for the agent."
         for key in _AGENT_ONLY_KEYS
-        if key in verifier_environment
+        if verifier_environment.get(key)
     ]
     declared: object = environment.get("mcp_servers", [])
     if not isinstance(declared, list):

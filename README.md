@@ -43,7 +43,7 @@ This runs Claude Code on one Terminal-Bench task in a Modal sandbox. You need [u
    ```bash
    valk run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
      --model anthropic/claude-sonnet-4-6 --provider modal \
-     -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --follow
+     -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --task-range 0:1 --follow
    ```
 
 The [quickstart guide](https://docs.valkyrie.vals.ai/get-started/quickstart) explains each step, including how to join an existing organization.

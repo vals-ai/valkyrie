@@ -37,6 +37,7 @@ def test_error_result_provenance_schema_matches_metadata(postgres_engine: Engine
         "sandbox_provider",
         "retry_scheduled",
         "failed_attempt_number",
+        "attempt_started_at",
         "sandbox_source",
     }
     metadata_columns = {column.name for column in metadata_table.columns}

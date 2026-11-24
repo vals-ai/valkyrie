@@ -64,12 +64,12 @@ valk dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
 ```bash
 valk run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
   --model anthropic/claude-sonnet-4-6 --provider modal \
-  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --follow
+  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --task-range 0:1 --follow
 ```
 
 - `-s` sets the agent's `ANTHROPIC_API_KEY` from the secret you saved under that name.
 - The CLI prints a **Run ID** and streams progress until the run finishes, which can take 10 minutes or more.
-- To run more tasks at once, raise `--slice` and `--concurrency`, for example `--slice 0:10 --concurrency 10`.
+- To run more tasks at once, widen the task range and raise concurrency, for example `--task-range 0:10 --concurrency 10`.
 
 ## 7. Read the result
 

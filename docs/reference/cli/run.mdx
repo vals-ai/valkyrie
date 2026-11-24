@@ -775,7 +775,7 @@ valkyrie run start \
   [--concurrency <INTEGER>] \
   [--lambda <TEXT>] \
   [--task-ids <TEXT>] \
-  [--slice <TEXT>] \
+  [--task-range <TEXT>] \
   [--dataset <TEXT>] \
   [--dataset-version <TEXT>] \
   [--provider <TEXT>] \
@@ -844,8 +844,8 @@ valkyrie run start \
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">
-  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--slice"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
-  <p className="mb-0 mt-1">{"Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10)."}</p>
+  <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1"><span className="break-all font-mono text-sm">{"--task-range"}</span><span className="min-w-0 break-words text-sm text-gray-500 dark:text-gray-400">optional · <code>{"text"}</code> · default: <code>{"None"}</code></span></div>
+  <p className="mb-0 mt-1">{"Tasks by 0-based position as start:stop[:step], stop excluded, such as 0:10."}</p>
 </div>
 
 <div className="border-b border-gray-200 py-3 dark:border-gray-800">

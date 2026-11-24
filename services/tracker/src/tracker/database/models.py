@@ -901,4 +901,5 @@ class ErrorResult(ResultBase, table=True):
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
     failed_attempt_number: int | None = Field(default=None)
+    attempt_started_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
     sandbox_source: str | None = Field(default=None)

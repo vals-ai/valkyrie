@@ -208,12 +208,12 @@ def _dataset_reference(dataset: str | None, benchmark: str | None) -> HostedData
     help="Comma-separated task IDs, @FILE, or an http(s) URL with one task ID per line.",
 )
 @click.option(
-    "--slice",
+    "--task-range",
     "slice_str",
     type=str,
     required=False,
     default=None,
-    help="Dataset slice in Python slice syntax start:stop[:step] (e.g., 0:10).",
+    help="Tasks by 0-based position as start:stop[:step], stop excluded, such as 0:10.",
 )
 @click.option(
     "--dataset",

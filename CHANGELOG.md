@@ -1,5 +1,18 @@
 # Changelog
 
+## v2026.11.24.2
+
+### CLI
+
+- Stop `valkyrie dataset check` flagging empty verifier `mcp_servers` or `skills_dir` settings.
+- Rename `run start --slice` to `--task-range`. `--slice` still works with a warning.
+
+### Tracker
+
+- Fix large regrade starts timing out with a 504 after the run was already created.
+- Retry tasks automatically when the agent reports a hung command, up to three times.
+- Fix Daytona v2 tasks failing or leaking sandboxes on rate limits or dropped connections.
+
 ## v2026.11.24
 
 ### Tracker

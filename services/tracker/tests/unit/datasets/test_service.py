@@ -3,7 +3,8 @@ import asyncio
 import os
 import io
 import tarfile
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator, Collection
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1269,6 +1270,49 @@ class TestRegrade:
             )
 
         assert graded == []
+
+    @pytest.mark.description(
+        "Regrade checks open tasks concurrently up to the limit and still report problems in task order."
+    )
+    async def test_regrade_checks_open_tasks_concurrently(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        task_ids = [f"task-{index:03}" for index in range(40)]
+        for task_id in task_ids:
+            write_task(tmp_path, task_id, TASK_TOML if task_id in ("task-005", "task-030") else SEPARATE_TOML)
+        folders = LocalFolderSource(tmp_path)
+        open_folder = folders.open_task
+        open_now = 0
+        most_open = 0
+
+        @asynccontextmanager
+        async def open_slowly(task_id: str, parts: Collection[str] = ()) -> AsyncIterator[Path]:
+            nonlocal open_now, most_open
+            open_now += 1
+            most_open = max(most_open, open_now)
+            await asyncio.sleep(0.01)
+            async with open_folder(task_id, parts) as task_dir:
+                yield task_dir
+            open_now -= 1
+
+        monkeypatch.setattr(dataset_tasks, "REGRADE_CHECK_CONCURRENCY", 8)
+        monkeypatch.setattr(folders, "open_task", open_slowly)
+        service = DatasetTaskService(folders, regrade_only=True)
+
+        with pytest.raises(InvalidTaskError) as refused:
+            await service.regrade_requirements(task_ids)
+
+        assert most_open == 8
+        assert str(refused.value).index("task-005") < str(refused.value).index("task-030")
+
+    @pytest.mark.description("A regrade task whose config is invalid is refused with its own error.")
+    async def test_an_invalid_regrade_task_config_is_refused_with_its_error(self, dataset: Path) -> None:
+        (dataset / "task-b" / "task.toml").write_text("[verifier\n")
+
+        with pytest.raises(InvalidTaskError, match="task-b"):
+            await DatasetTaskService(LocalFolderSource(dataset), regrade_only=True).regrade_requirements(
+                ["task-a", "task-b"]
+            )
 
 
 @pytest.mark.description("A hosted dataset: the same answers from task archives in storage.")

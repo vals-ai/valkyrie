@@ -108,6 +108,7 @@ logger = logging.getLogger(__name__)
 
 _Result = TypeVar("_Result")
 TESTS_PART = "tests"
+REGRADE_CHECK_CONCURRENCY = 32
 
 
 class TaskSelectionError(ValueError):
@@ -269,16 +270,24 @@ class DatasetTaskService:
         )
 
     async def regrade_requirements(self, task_ids: list[str]) -> list[str]:
-        configs: list[tuple[str, TaskConfig]] = []
-        incompatible: list[str] = []
-        for task_id in task_ids:
-            async with self.source.open_task(task_id) as task_dir:
+        limit = asyncio.Semaphore(REGRADE_CHECK_CONCURRENCY)
+
+        async def check(task_id: str) -> tuple[TaskConfig, str | None]:
+            async with limit, self.source.open_task(task_id) as task_dir:
                 config = self._config(task_id, task_dir)
                 try:
                     _check_regradable(task_id, config, lambda: retrieve_task_response(task_dir, config).cwd_from_image)
                 except InvalidTaskError as error:
-                    incompatible.append(str(error))
-                configs.append((task_id, config))
+                    return config, str(error)
+                return config, None
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                checks = [group.create_task(check(task_id)) for task_id in task_ids]
+        except ExceptionGroup as failed:
+            raise failed.exceptions[0] from None
+        configs = [(task_id, task.result()[0]) for task_id, task in zip(task_ids, checks, strict=True)]
+        incompatible = [problem for task in checks if (problem := task.result()[1]) is not None]
         if incompatible:
             raise InvalidTaskError("; ".join(incompatible))
         models: dict[str, None] = {}

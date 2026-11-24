@@ -102,6 +102,18 @@ def test_single_start_sends_the_agent_by_name_and_prints_next_steps(tracker: Moc
         assert "Dataset version changed." in result.stderr
 
 
+@pytest.mark.description("A task range reaches the Tracker unchanged for both hosted and benchmark service datasets.")
+@pytest.mark.parametrize("dataset", [(), ("--dataset", "swebench/verified")])
+def test_task_range_sends_the_slice_to_tracker(tracker: MockTracker, dataset: tuple[str, ...]) -> None:
+    tracker.reply("POST", "/start-benchmark", _started(_FIRST_RUN_ID))
+
+    result = _invoke("--task-range", "1:8:2", *dataset)
+
+    assert result.exit_code == 0, result.output
+    (body,) = _start_bodies(tracker)
+    assert body["slice_str"] == "1:8:2"
+
+
 @pytest.mark.description(
     "`run start --follow` keeps streaming while tasks are still being discovered until the run completes."
 )

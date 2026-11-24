@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from uuid import uuid4
 
@@ -5,6 +6,7 @@ import pytest
 
 from tests.unit.datasets.support import TASK, store_archive, zip_bytes
 from tracker.services.datasets.extract import UnsafeArchiveError
+from tracker.services.datasets import source as task_sources
 from tracker.services.datasets.source import ArchiveSource, LocalFolderSource, discover_task_folders
 from tracker.local.storage import FilesystemObjectStore
 from tracker.runtime.artifacts import dataset_blob_key
@@ -139,6 +141,42 @@ class TestArchiveSource:
 
         assert scratch is not None
         assert not scratch.exists()
+
+    @pytest.mark.description(
+        "Concurrent opens stage archives only up to the byte limit, and an archive over the limit still opens alone."
+    )
+    async def test_concurrent_opens_stage_archives_only_up_to_the_byte_limit(
+        self, store: FilesystemObjectStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dataset_id = uuid4()
+        archive = zip_bytes(TASK)
+        digest = await store_archive(store, dataset_id, archive)
+        source = ArchiveSource(store, dataset_id, {f"task-{index}": digest for index in range(6)})
+        download = source._download
+        staged_now = 0
+        most_staged = 0
+
+        async def download_slowly(key: str, destination: Path) -> None:
+            nonlocal staged_now, most_staged
+            staged_now += 1
+            most_staged = max(most_staged, staged_now)
+            await asyncio.sleep(0.01)
+            await download(key, destination)
+            staged_now -= 1
+
+        async def open_one(task_id: str) -> None:
+            async with source.open_task(task_id):
+                pass
+
+        monkeypatch.setattr(source, "_download", download_slowly)
+        monkeypatch.setattr(task_sources, "STAGED_ARCHIVE_BYTES", 2 * len(archive))
+        await asyncio.gather(*(open_one(f"task-{index}") for index in range(6)))
+        assert most_staged == 2
+
+        most_staged = 0
+        monkeypatch.setattr(task_sources, "STAGED_ARCHIVE_BYTES", len(archive) - 1)
+        await asyncio.gather(*(open_one(f"task-{index}") for index in range(3)))
+        assert most_staged == 1
 
     @pytest.mark.description("A task outside the version is not found.")
     async def test_a_task_outside_the_version_is_not_found(self, store: FilesystemObjectStore) -> None:

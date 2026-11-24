@@ -199,13 +199,16 @@ class TestDatasetProblems:
         assert any("test.sh" in p for p in problems)
         assert any("tests/Dockerfile" in p for p in problems)
 
-    @pytest.mark.description("MCP servers and skills folders that the Tracker would refuse or ignore are reported.")
+    @pytest.mark.description(
+        "MCP servers and skills folders that the Tracker would refuse or ignore are reported."
+        " An empty verifier list is not, because the Tracker treats it as unset."
+    )
     def test_mcp_servers_and_skills_the_tracker_would_refuse_or_ignore_are_reported(self, tmp_path: Path) -> None:
         root = write(tmp_path / "a2j", make_task(mcp_servers=[SEARCH], skills_dir="/skills"))
         toml_path = root / "both__case-001/task.toml"
         toml_path.write_text(
             toml_path.read_text().replace(
-                "[verifier.environment]\n", '[verifier.environment]\nskills_dir = "/skills"\n'
+                "[verifier.environment]\n", '[verifier.environment]\nskills_dir = "/skills"\nmcp_servers = []\n'
             )
             + '\n[[environment.mcp_servers]]\nname = "calc"\ntransport = "stdio"\n'
             + '\n[[environment.mcp_servers]]\nname = "search"\nurl = "http://search:8000/mcp"\n'

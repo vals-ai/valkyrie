@@ -14,6 +14,7 @@ _FLAGS = {
     "--benchmark-name": "--benchmark",
     "--order-by": "--order",
     "--output-dir": "--output",
+    "--slice": "--task-range",
 }
 _COMMAND_FLAGS = {"start": {"-n": "--count"}, "results": {"--path": "--output"}}
 _POSITIONAL_FLAGS = {"status": "--ids", "artifacts": "--prefix"}

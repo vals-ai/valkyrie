@@ -39,10 +39,10 @@ valkyrie run start --agent my-agent --benchmark terminal-bench \
 To run a dataset your organization published, pass `BENCHMARK/DATASET[@VERSION]` to
 `--dataset`. See [Publish a dataset](/benchmarks/datasets).
 
-Run a slice of the dataset for a cheap first try:
+Run a range of tasks from the dataset for a cheap first try:
 
 ```bash
-valkyrie run start --agent my-agent --benchmark swebench --slice 0:10
+valkyrie run start --agent my-agent --benchmark swebench --task-range 0:10
 ```
 
 To pick tasks by ID, export the dataset's task IDs, edit the file, and pass it back:
