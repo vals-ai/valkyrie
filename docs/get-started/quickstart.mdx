@@ -64,7 +64,7 @@ valk dataset install tb/tb2 terminal-bench/terminal-bench-2 --location harbor
 ```bash
 valk run start --agent claude_code-v1.0.0 --dataset tb/tb2 \
   --model anthropic/claude-sonnet-4-6 --provider modal \
-  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --concurrency 1 --follow
+  -s ANTHROPIC_API_KEY ANTHROPIC_API_KEY --slice 0:1 --follow
 ```
 
 - `-s` sets the agent's `ANTHROPIC_API_KEY` from the secret you saved under that name.
