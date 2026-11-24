@@ -3,7 +3,7 @@ import logging
 import os
 from functools import partial
 import tarfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
@@ -25,7 +25,8 @@ from benchmark_service.sandbox.types import SandboxSource
 from tests.unit.datasets.support import FakeSandbox, OuterSandbox, ShellSandbox
 from tracker.services.datasets import artifacts, separate_verifier
 from tracker import egress
-from tracker.services.datasets.artifacts import SkippedArtifact, StagedArtifact, stage_artifacts
+from tracker.services.datasets.artifacts import ArtifactSink, SkippedArtifact, StagedArtifact, stage_artifacts
+from tracker.runtime.artifacts import task_artifact_key
 from tracker.services.datasets.compose import ComposeRuntime
 from tracker.services.datasets.config import ArtifactConfig, TaskConfig
 from tracker.services.datasets.grading import OPEN_LOG_DIRS, REWARD_TEXT_PATH, GradingSandbox, VerifierResultError
@@ -103,6 +104,7 @@ async def grade(
     default_user: str | None = None,
     image_workdir: Callable[[GradingSandbox, SandboxSource], Awaitable[str | None]] | None = None,
     staged: Sequence[StagedArtifact] = (),
+    artifact_sink: ArtifactSink | None = None,
 ) -> dict[str, object]:
     return await grade_separately(
         "task-1",
@@ -121,6 +123,7 @@ async def grade(
         gateway_url=gateway_url,
         default_user=default_user,
         image_workdir=image_workdir,
+        artifact_sink=artifact_sink,
     )
 
 
@@ -140,6 +143,56 @@ def labelled_agent() -> FakeSandbox:
 
 def verifier_sandbox() -> FakeSandbox:
     return FakeSandbox(id="verifier-1", writes={REWARD_TEXT_PATH: b"1"})
+
+
+@pytest.mark.description("Separate grading retains verifier files before deletion, including after grading fails.")
+@pytest.mark.parametrize("reward", [b"1", b"bad", None])
+async def test_separate_verifier_archive(tests_dir: Path, reward: bytes | None) -> None:
+    files = {
+        "/logs/verifier/details.json": b'{"attempts": ["complete response"]}',
+        "/logs/verifier/test-stdout.txt": b"complete stdout",
+    }
+    if reward is not None:
+        files[REWARD_TEXT_PATH] = reward
+    provider = FakeProvider([FakeSandbox(writes=files)])
+    uploaded: dict[str, bytes] = {}
+
+    async def sink(_task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+        assert not provider.deleted
+        uploaded[name] = b"".join([chunk async for chunk in chunks])
+
+    if reward == b"1":
+        await grade(
+            TaskConfig.parse("[verifier]\nenvironment_mode = 'separate'"), provider, tests_dir, artifact_sink=sink
+        )
+    else:
+        with pytest.raises(VerifierResultError):
+            await grade(
+                TaskConfig.parse("[verifier]\nenvironment_mode = 'separate'"), provider, tests_dir, artifact_sink=sink
+            )
+
+    assert provider.deleted == ["sandbox-1"]
+    with tarfile.open(fileobj=io.BytesIO(uploaded["verifier_output.tar.gz"])) as archive:
+        assert {
+            member.name: cast(io.BufferedReader, archive.extractfile(member)).read()
+            for member in archive
+            if member.isfile()
+        } == {path.removeprefix("/logs/"): content for path, content in files.items()}
+
+
+@pytest.mark.description("A verifier upload failure fails separate grading and the sandbox is still deleted.")
+async def test_separate_verifier_upload_failure(tests_dir: Path) -> None:
+    provider = FakeProvider([verifier_sandbox()])
+
+    async def sink(_task_id: str, _name: str, _chunks: AsyncIterable[bytes]) -> None:
+        raise OSError("storage unavailable")
+
+    with pytest.raises(RuntimeError, match="Required artifact /logs/verifier could not be saved: storage unavailable"):
+        await grade(
+            TaskConfig.parse("[verifier]\nenvironment_mode = 'separate'"), provider, tests_dir, artifact_sink=sink
+        )
+
+    assert provider.deleted == ["verifier-1"]
 
 
 COMPOSE_AGENT = ComposeSource(outer=ImageSource(image="docker:dind"), compose_command="docker compose -p agent")
@@ -545,6 +598,111 @@ def write_archive(
 
 @pytest.mark.description("What the agent leaves is carried to the verifier without trusting the archive.")
 class TestCarryArtifacts:
+    @pytest.mark.description("A legacy symlink chain cannot escape through paths that change meaning after rebasing.")
+    def test_rebased_symlink_chain_cannot_escape(self, tmp_path: Path) -> None:
+        archive = tmp_path / "legacy.tar.gz"
+        write_archive(
+            archive,
+            {"workspace/output/escape/planted.txt": b"must not escape"},
+            links={"workspace/output/deep/link": "..", "workspace/output/escape": "deep/link/../../outside"},
+        )
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        (scratch / "outside").mkdir()
+
+        with pytest.raises(SeparateVerifierError, match="can't be carried"):
+            clean_archive(archive, "output", "/workspace/output", scratch, "workspace/output")
+
+        assert not (scratch / "outside" / "planted.txt").exists()
+
+    @pytest.mark.description("A legacy archive restores only the declared subtree and drops unrelated members.")
+    @pytest.mark.parametrize("single_file", [False, True])
+    async def test_legacy_subtree(self, shell: Sandbox, tmp_path: Path, single_file: bool) -> None:
+        archive = tmp_path / "legacy.tar.gz"
+        write_archive(
+            archive,
+            {
+                "workspace/output/audio.wav": b"recording",
+                "workspace/output/audio.json": b"metadata",
+                "workspace/output-other/ignored": b"sibling",
+                "workspace/private.txt": b"unrelated",
+            },
+            links={"workspace/output/alias": "audio.wav", "unrelated-link": "/private"},
+        )
+        destination = tmp_path / "restored" / ("audio.wav" if single_file else "output")
+        staged = StagedArtifact(
+            "recording.tar.gz",
+            str(destination),
+            str(archive),
+            "main",
+            partial(shell.stream_download, str(archive)),
+            "workspace/output/audio.wav" if single_file else "workspace/output",
+        )
+
+        await _carry_artifacts(shell, [staged], [])
+
+        if single_file:
+            assert destination.read_bytes() == b"recording"
+            assert sorted(path.name for path in destination.parent.iterdir()) == ["audio.wav"]
+        else:
+            assert (destination / "audio.wav").read_bytes() == b"recording"
+            assert (destination / "audio.json").read_bytes() == b"metadata"
+            assert (destination / "alias").is_symlink()
+            assert (destination / "alias").read_bytes() == b"recording"
+            assert sorted(path.name for path in destination.parent.iterdir()) == ["output"]
+
+    @pytest.mark.description("A missing legacy subtree names the source run, task and source before restoring files.")
+    @pytest.mark.parametrize("source", ["/workspace/output", "/logs/artifacts"])
+    async def test_missing_legacy_subtree(self, shell: Sandbox, tmp_path: Path, source: str) -> None:
+        archive = tmp_path / "legacy.tar.gz"
+        write_archive(archive, {"workspace/elsewhere/audio.wav": b"not the source"})
+        staged = StagedArtifact(
+            "recording.tar.gz",
+            source,
+            task_artifact_key("old-run", "task-1", "agent_output.tar.gz"),
+            "main",
+            partial(shell.stream_download, str(archive)),
+            source.lstrip("/"),
+        )
+
+        with pytest.raises(SeparateVerifierError) as caught:
+            await _carry_artifacts(shell, [staged], [])
+
+        assert all(value in str(caught.value) for value in ["old-run", "task-1", source, "missing subtree"])
+
+    @pytest.mark.description("Legacy subtree selection preserves path escape and link checks.")
+    @pytest.mark.parametrize(
+        "members,links,hardlinks",
+        [
+            ({"../../escaped": b"x"}, {}, {}),
+            ({}, {"workspace/output/link": "../private"}, {}),
+            ({}, {"workspace/output/link": "/etc/passwd"}, {}),
+            ({}, {}, {"workspace/output/link": "workspace/private"}),
+        ],
+    )
+    def test_legacy_escape_rejected(
+        self, tmp_path: Path, members: dict[str, bytes], links: dict[str, str], hardlinks: dict[str, str]
+    ) -> None:
+        archive = tmp_path / "legacy.tar.gz"
+        write_archive(archive, members, links, hardlinks)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+
+        with pytest.raises(SeparateVerifierError):
+            clean_archive(archive, "output", "/workspace/output", scratch, "workspace/output")
+
+    @pytest.mark.description("Dropped legacy members still count toward entry and decompressed size limits.")
+    @pytest.mark.parametrize("limit", ["entries", "bytes"])
+    def test_legacy_limits(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str) -> None:
+        monkeypatch.setattr(separate_verifier, "MAX_ARTIFACT_FILES" if limit == "entries" else "MAX_UNPACKED_BYTES", 1)
+        archive = tmp_path / "legacy.tar.gz"
+        write_archive(archive, {"ignored": b"outside", "workspace/output/audio.wav": b"recording"})
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+
+        with pytest.raises(SeparateVerifierError):
+            clean_archive(archive, "output", "/workspace/output", scratch, "workspace/output")
+
     @pytest.mark.description(
         "A folder arrives at its declared path with its contents' modes, and the folder is open to every user."
     )

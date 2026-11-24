@@ -938,6 +938,7 @@ async def _process_task_attempt(
         benchmark_row.selected_project_gateway_secret_ref,
         start_benchmark_request.benchmark_name,
         start_benchmark_request.custom_benchmark_service,
+        dataset_task=isinstance(benchmark_service, DatasetTaskService),
     )
     remote_grading_service: str | None = None
 

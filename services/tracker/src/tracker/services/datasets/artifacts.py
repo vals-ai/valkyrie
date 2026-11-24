@@ -2,16 +2,18 @@ import logging
 import posixpath
 import shlex
 import uuid
+from asyncio import CancelledError
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
+from contextlib import asynccontextmanager
 
 from benchmark_service.sandbox.types import Sandbox
 
 from tracker.runtime.artifacts import EPOCH, task_artifact_key
 from tracker.runtime.storage import ObjectStore
 from tracker.services.datasets.config import MAIN_SERVICE, ArtifactConfig, CollectConfig
-from tracker.services.datasets.grading import ARTIFACTS_DIR
+from tracker.services.datasets.grading import ARTIFACTS_DIR, VERIFIER_DIR
 from tracker.services.datasets.user import run_as
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ class StagedArtifact:
     archive_path: str
     service: str
     read: Callable[[], AsyncIterable[bytes]]
+    archive_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,15 +128,54 @@ async def upload_artifacts(
     sink: ArtifactSink,
     say: Say,
     folder: str = "artifacts",
+    *,
+    required: bool = False,
 ) -> None:
     for source, name, chunks in [
         *((artifact.source, artifact.name, artifact.read()) for artifact in staged),
         *((artifact.source, f"{artifact.name}{ABSENT_SUFFIX}", _nothing()) for artifact in skipped if artifact.absent),
     ]:
         try:
-            await sink(task_id, f"{folder}/{name}", chunks)
+            await sink(task_id, posixpath.join(folder, name), chunks)
         except Exception as error:
+            if required:
+                raise RuntimeError(f"Required artifact {source} could not be saved: {error}") from error
             say(f"Artifact {source} could not be saved: {error}")
+
+
+@asynccontextmanager
+async def collect_verifier_output(
+    task_id: str, sandbox: Sandbox, sink: ArtifactSink | None, folder: str = "artifacts"
+) -> AsyncIterator[None]:
+    grading_failed = False
+    cancelled = False
+    try:
+        yield
+    except CancelledError:
+        cancelled = True
+        raise
+    except BaseException:
+        grading_failed = True
+        raise
+    finally:
+        try:
+            if sink is not None and not cancelled:
+                services = {MAIN_SERVICE: sandbox}
+                staged, skipped = await stage_artifacts(
+                    services, [ArtifactConfig(source=VERIFIER_DIR, destination="verifier_output")], "/"
+                )
+                try:
+                    if skipped:
+                        raise RuntimeError(f"Verifier output could not be saved: {skipped[0].reason}")
+                    await upload_artifacts(
+                        task_id, staged, [], sink, lambda _message: None, posixpath.dirname(folder), required=True
+                    )
+                finally:
+                    await discard_staged(services, staged)
+        except Exception:
+            if not grading_failed:
+                raise
+            logger.exception("Verifier output for task %s could not be saved after grading failed", task_id)
 
 
 async def saved_artifacts(
@@ -152,8 +194,26 @@ async def saved_artifacts(
             if stored.key in (f"{key}{ARCHIVE_SUFFIX}", f"{key}{ABSENT_SUFFIX}")
         ]
         if not saved:
-            if artifact is not CONVENTION_ARTIFACT:
+            if artifact is CONVENTION_ARTIFACT:
+                continue
+            legacy = task_artifact_key(run_id, task_id, "agent_output.tar.gz")
+            if (
+                not artifact.source.startswith("/")
+                or artifact.exclude
+                or artifact.service not in (None, MAIN_SERVICE)
+                or not await objects.exists(legacy)
+            ):
                 raise MissingSavedArtifactError(f"Run {run_id} saved no artifact {artifact.source} for task {task_id}")
+            staged.append(
+                StagedArtifact(
+                    f"{artifact.name}{ARCHIVE_SUFFIX}",
+                    posixpath.normpath(artifact.source),
+                    legacy,
+                    artifact.service or MAIN_SERVICE,
+                    partial(objects.get_stream, legacy),
+                    posixpath.normpath(artifact.source).lstrip("/"),
+                )
+            )
             continue
         newest = max(saved, key=lambda stored: (stored.last_modified or EPOCH, stored.key)).key
         if newest.endswith(ABSENT_SUFFIX):

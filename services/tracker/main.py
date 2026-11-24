@@ -1,7 +1,7 @@
 import asyncio
 import io
 import tarfile
-from collections.abc import AsyncGenerator, AsyncIterator, Buffer, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Buffer, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import json
@@ -35,7 +35,7 @@ from tracker.api.agents import router as agents_router
 from tracker.api.benchmark_services import router as benchmark_services_router
 from tracker.api.benchmarks_status import router as benchmarks_status_router
 from tracker.api.dependencies import TrackedBenchmarkId, bind_benchmark_id, get_agent_library_runtime
-from tracker.api.dependencies import RunBenchmarkDependency, RunRuntimeDependency
+from tracker.api.dependencies import RunBenchmarkDependency, RunRuntimeDependency, get_run_runtime
 from tracker.api.costs import router as costs_router
 from tracker.api.cost_reports import router as cost_reports_router
 from tracker.api.project_service import router as project_service_router
@@ -105,7 +105,7 @@ from tracker.runtime.artifacts import (
     benchmark_prefix as benchmark_artifact_prefix,
     copy_agent_to_benchmark,
 )
-from tracker.runtime.secrets import resolve_secrets
+from tracker.runtime.secrets import SecretStore, resolve_secrets
 from tracker.services.gateway.tokens import validate_gateway_models
 from tracker.runtime.services import RuntimeServices
 from tracker.runtime.storage import ObjectStore, StoredObjectCopy
@@ -257,7 +257,13 @@ from tracker.services.final_views import (
 from tracker.api.storage_errors import storage_errors
 from tracker.services.runs.attempts import record_prior_attempts
 from tracker.services.runs.limits import RUN_LIMIT_RETRY_AFTER_SECONDS, AutomaticRunLimitsRefresh, ensure_run_capacity
-from tracker.services.runs.regrade import RegradeTasks, regrade_run, regrade_task_rows, regrade_tasks
+from tracker.services.runs.regrade import (
+    RegradeTasks,
+    regrade_run,
+    regrade_task_rows,
+    regrade_tasks,
+    validate_regrade,
+)
 from tracker.services.runs.retry import (
     RetryState,
     prepare_retry_state,
@@ -734,6 +740,12 @@ def _resolve_secret_name(name: str, org: Org) -> str:
     return resolve_secret_name(name, org_id=org.id, org_name=org.name, auth_required=AUTH_REQUIRED)
 
 
+def _org_secrets(store: SecretStore, names: Iterable[str], org: Org) -> SecretStore:
+    if not AUTH_REQUIRED:
+        return store
+    return OrgSecretStore(store, names, org_id=org.id, org_name=org.name, auth_required=True)
+
+
 def _authorize_secret_names(request: StartBenchmarkRequest, org: Org) -> StartBenchmarkRequest:
     secrets = {env_name: _resolve_secret_name(name, org) for env_name, name in request.contract.secrets.items()}
     request = request.model_copy(
@@ -1116,7 +1128,9 @@ async def start_benchmark(
     if request.service_auth_header_name and request.service_auth_secret_name:
         resolved = await resolve_secrets(
             {request.service_auth_header_name: request.service_auth_secret_name},
-            runtime.secrets,
+            runtime.secrets
+            if request.environment == "local" and reads_secrets_file(local_config.resources)
+            else _org_secrets(runtime.secrets, [request.service_auth_secret_name], run_starter.org),
         )
         service_headers = _replace_headers(service_headers, resolved)
 
@@ -1224,15 +1238,9 @@ async def start_benchmark(
             try:
                 gateway_env = await resolve_secrets(
                     gateway_secrets,
-                    OrgSecretStore(
-                        runtime.secrets,
-                        request.contract.secrets.values(),
-                        org_id=run_starter.org.id,
-                        org_name=run_starter.org.name,
-                        auth_required=True,
-                    )
-                    if AUTH_REQUIRED and request.environment != "local"
-                    else runtime.secrets,
+                    runtime.secrets
+                    if request.environment == "local"
+                    else _org_secrets(runtime.secrets, request.contract.secrets.values(), run_starter.org),
                 )
             except Exception:
                 logger.warning("Model Gateway credentials unavailable for start-time model validation")
@@ -1426,7 +1434,8 @@ async def fetch_benchmark_tasks(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         service_headers = _replace_headers(
-            service_headers, await resolve_secrets({header: reference}, secret_store(org))
+            service_headers,
+            await resolve_secrets({header: reference}, _org_secrets(secret_store(org), [reference], org)),
         )
 
     destination = classify_benchmark_service_destination(request.benchmark_name, request.custom_benchmark_service)
@@ -2588,8 +2597,12 @@ def _regrade_source(session: Session, org: Org, source_run_id: UUID, *, for_upda
     tasks = regrade_tasks(repository.list_tasks(org.id, source.id), source.id if dataset_ref is not None else None)
     if not tasks.eval_resume_states:
         raise HTTPException(status_code=400, detail=f"Run {source_run_id} has no tasks with saved evaluation state.")
+    snapshot = Benchmark.model_validate(source.model_dump())
+    snapshot.arguments = snapshot.arguments.model_copy(
+        update={"selected_project_gateway_secret_ref": source.arguments.selected_project_gateway_secret_ref}
+    )
     return RegradeSource(
-        Benchmark.model_validate(source.model_dump()),
+        snapshot,
         tasks,
         dataset_ref,
         source.arguments.selected_project_gateway_secret_ref,
@@ -2786,6 +2799,22 @@ async def regrade_benchmark(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         _ = _authorize_secret_names(prospective_request, org)
+    try:
+        await validate_regrade(
+            run,
+            await get_run_runtime(run, org),
+            org,
+            await dataset_tasks(bind, run.arguments.dataset_ref)
+            if isinstance(run.arguments.dataset_ref, HostedDataset)
+            else None,
+        )
+    except InvalidTaskError as error:
+        ref = run.arguments.dataset_ref
+        dataset = f"{ref.benchmark}/{ref.dataset}@{ref.ref}" if isinstance(ref, HostedDataset) else request.dataset
+        raise HTTPException(
+            status_code=400,
+            detail=f"Valkyrie cannot regrade dataset '{dataset}': {error}. Run `valkyrie run start` instead.",
+        ) from None
     commit_task = asyncio.create_task(
         asyncio.to_thread(
             _commit_regrade,

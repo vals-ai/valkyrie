@@ -106,13 +106,18 @@ def selected_project_gateway_reference(
     selected_project_gateway_secret_ref: str | None,
     benchmark_name: str,
     custom_benchmark_service: str | None,
+    *,
+    dataset_task: bool = False,
 ) -> str | None:
     reference = secret_names.get(MODEL_GATEWAY_API_KEY)
     prefix = tenant_secret_prefix(org.id)
     if (
         org.name in config.GATEWAY_KEY_ORGS
-        and config.classify_benchmark_service_destination(benchmark_name, custom_benchmark_service)
-        == config.BenchmarkServiceDestination.HOSTED
+        and (
+            dataset_task
+            or config.classify_benchmark_service_destination(benchmark_name, custom_benchmark_service)
+            == config.BenchmarkServiceDestination.HOSTED
+        )
         and selected_project_gateway_secret_ref is not None
         and reference == selected_project_gateway_secret_ref
         and reference == secret_names.get(MODEL_GATEWAY_URL)

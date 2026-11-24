@@ -170,7 +170,7 @@ async def test_run_secret_reader_tries_the_run_org_first(
     request = cast(Any, SimpleNamespace(properties=None))
     runtime = cast(Any, SimpleNamespace(secrets=StubStore(values)))
 
-    read = start._task_secret_reader(request, runtime, org)
+    read = start.task_secret_reader(request, runtime, org)
 
     if expected is None:
         with pytest.raises(SecretNotFoundError, match="Checked names: TOKEN"):

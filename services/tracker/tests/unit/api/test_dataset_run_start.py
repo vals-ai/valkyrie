@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from main import app
+from tracker.database.models import ExecutorDispatch
 from tests.unit.datasets.support import publish_version, zip_bytes
 from tests.unit.services.task_execution_support import MockLauncher
 from tests.utils import TEST_ORG_ID
@@ -25,6 +27,7 @@ from tracker.services.datasets.ref import DatasetRef, HostedDataset, LocalDatase
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
 from tracker.types import StartBenchmarkRequest
+from tracker.secret_access import tenant_secret_prefix
 
 pytestmark = pytest.mark.usefixtures("active_executor_release")
 _client = TestClient(app, base_url="http://localhost")
@@ -302,6 +305,259 @@ class TestDatasetRunRequest:
         run = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
         assert run is not None
         assert run.custom_benchmark_service is None
+
+
+@pytest.mark.description("A Valkyrie regrade validates task compatibility and grading credentials before admission.")
+class TestRegradeSecrets:
+    @pytest.mark.description("Relative artifacts require a known working directory before regrade admission.")
+    @pytest.mark.parametrize("workdir", [None, "/app"])
+    @pytest.mark.parametrize("artifact", ["out", "/out"])
+    def test_image_workdir_artifacts_are_validated_before_admission(
+        self,
+        contract: AgentContractRequest,
+        hosted_tasks: list[str],
+        database_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        workdir: str | None,
+        artifact: str,
+    ) -> None:
+        response = _client.post("/start-benchmark", json=_start(contract, _HOSTED, task_ids=["task-a"]))
+        assert response.status_code == 200, response.text
+        source = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+        assert source is not None
+        source.status = BenchmarkStatus.FINISHED
+        task = database_session.exec(select(Task).where(Task.benchmark == source.id)).one()
+        task.status = TaskStatus.FINISHED
+        database_session.add_all([source, task])
+        database_session.commit()
+        files = _task_files("task-a")
+        if workdir:
+            files["task.toml"] += f"workdir = '{workdir}'\n"
+        files["task.toml"] += f"[verifier]\nenvironment_mode = 'separate'\n[[artifacts]]\nsource = '{artifact}'\n"
+        publish_version(_client, f"{_DATASETS}/verified", {"task-a": zip_bytes(files)})
+        capture = Mock()
+        monkeypatch.setattr("sentry_sdk.capture_exception", capture)
+
+        response = _client.post(f"/regrade-benchmark/{source.id}", json={"dataset": "swe-bench/verified"})
+
+        if workdir is None and not artifact.startswith("/"):
+            assert response.status_code == 400, response.text
+            detail = response.json()["detail"]
+            assert "Valkyrie" in detail and "swe-bench/verified" in detail and "Task 'task-a'" in detail
+            assert "relative artifact path" in detail and "working directory from its image" in detail
+            assert "valkyrie run start" in detail
+            assert len(database_session.exec(select(Benchmark)).all()) == 1
+            assert len(database_session.exec(select(ExecutorDispatch)).all()) == 1
+        else:
+            assert response.status_code == 200, response.text
+        capture.assert_not_called()
+
+    @pytest.mark.description(
+        "A verifier using models requires an eligible selected project key before regrade admission."
+    )
+    @pytest.mark.parametrize("binding", ["missing", "untrusted", "valid", "regraded"])
+    @pytest.mark.parametrize("target_benchmark", ["swe-bench", "my_benchmark"])
+    def test_grading_requires_a_selected_project_key(
+        self,
+        contract: AgentContractRequest,
+        hosted_tasks: list[str],
+        database_session: Session,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        binding: str,
+        target_benchmark: str,
+    ) -> None:
+        monkeypatch.setattr("tracker.config.GATEWAY_KEY_ORGS", {"default"})
+        credentials = tmp_path / "credentials.env"
+        credentials.write_text("MODEL_GATEWAY_URL=https://gateway.example\nMODEL_GATEWAY_API_KEY=grading-token\n")
+        monkeypatch.setattr(
+            local_config, "resources", LocalResources(data_root=tmp_path / "data", secrets_file=credentials)
+        )
+        response = _client.post("/start-benchmark", json=_start(contract, _HOSTED, task_ids=["task-a"]))
+        assert response.status_code == 200, response.text
+        source = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+        assert source is not None
+        reference = f"{tenant_secret_prefix(TEST_ORG_ID)}model-gateway-00000000-0000-0000-0000-000000000001"
+        source.status = BenchmarkStatus.FINISHED
+        source.arguments = source.arguments.model_copy(
+            update={
+                "selected_project_gateway_secret_ref": None if binding == "missing" else reference,
+                "contract": source.arguments.contract.model_copy(
+                    update={
+                        "secrets": {
+                            "MODEL_GATEWAY_URL": reference,
+                            "MODEL_GATEWAY_API_KEY": reference,
+                        }
+                    }
+                ),
+            }
+        )
+        for task in database_session.exec(select(Task).where(Task.benchmark == source.id)):
+            task.status = TaskStatus.FINISHED
+            database_session.add(task)
+        database_session.add(source)
+        database_session.commit()
+        if binding == "untrusted":
+            monkeypatch.setattr("tracker.config.GATEWAY_KEY_ORGS", set())
+        if target_benchmark != "swe-bench":
+            _store_tasks(target_benchmark, "verified", ["task-a"])
+        target_dataset = f"{target_benchmark}/verified"
+        target_path = f"/v1/benchmarks/{target_benchmark}/datasets/verified"
+        files = _task_files("task-a")
+        files["task.toml"] += "[verifier]\nenvironment_mode = 'separate'\nmodels = ['grader']\n"
+        if binding == "regraded":
+            initial_files = _task_files("task-a")
+            initial_files["task.toml"] += "[verifier]\nenvironment_mode = 'separate'\n"
+            publish_version(_client, target_path, {"task-a": zip_bytes(initial_files)})
+            response = _client.post(f"/regrade-benchmark/{source.id}", json={"dataset": target_dataset})
+            assert response.status_code == 200, response.text
+            source = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+            assert source is not None
+            assert source.arguments.contract.secrets == {}
+            assert source.arguments.selected_project_gateway_secret_ref == reference
+            source.status = BenchmarkStatus.FINISHED
+            task = database_session.exec(select(Task).where(Task.benchmark == source.id)).one()
+            task.status = TaskStatus.FINISHED
+            database_session.add_all([source, task])
+            database_session.commit()
+        publish_version(_client, target_path, {"task-a": zip_bytes(files)})
+        capture = Mock()
+        monkeypatch.setattr("sentry_sdk.capture_exception", capture)
+
+        response = _client.post(f"/regrade-benchmark/{source.id}", json={"dataset": target_dataset})
+
+        if binding in {"valid", "regraded"}:
+            assert response.status_code == 200, response.text
+            result = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+            assert result is not None
+            assert result.arguments.contract.secrets == {
+                "MODEL_GATEWAY_URL": reference,
+                "MODEL_GATEWAY_API_KEY": reference,
+            }
+        else:
+            assert response.status_code == 400, response.text
+            detail = response.json()["detail"]
+            assert "Valkyrie" in detail and "selected project Gateway key" in detail
+            assert "valkyrie run start" in detail
+            assert len(database_session.exec(select(Benchmark)).all()) == 1
+            assert len(database_session.exec(select(ExecutorDispatch)).all()) == 1
+        capture.assert_not_called()
+
+    @pytest.mark.description("Incompatible dataset tasks are named and refused before a regrade run is created.")
+    @pytest.mark.parametrize("configuration", ["shared", "steps", "mixed"])
+    def test_incompatible_tasks_are_rejected_before_admission(
+        self,
+        contract: AgentContractRequest,
+        hosted_tasks: list[str],
+        database_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        configuration: str,
+    ) -> None:
+        response = _client.post("/start-benchmark", json=_start(contract, _HOSTED))
+        assert response.status_code == 200, response.text
+        source = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+        assert source is not None
+        source.status = BenchmarkStatus.FINISHED
+        for task in database_session.exec(select(Task).where(Task.benchmark == source.id)):
+            task.status = TaskStatus.FINISHED
+            database_session.add(task)
+        database_session.add(source)
+        database_session.commit()
+        archives: dict[str, bytes] = {}
+        for name in hosted_tasks:
+            files = _task_files(name)
+            if configuration == "steps" or configuration == "mixed" and name != "task-b":
+                files["task.toml"] += "[verifier]\nenvironment_mode = 'separate'\n"
+                if configuration == "steps" or name == "task-c":
+                    files["task.toml"] += "[[steps]]\nname = 'one'\n"
+                    files["steps/one/instruction.md"] = "Complete step one."
+            archives[name] = zip_bytes(files)
+        publish_version(_client, f"{_DATASETS}/verified", archives)
+        capture = Mock()
+        monkeypatch.setattr("sentry_sdk.capture_exception", capture)
+
+        response = _client.post(f"/regrade-benchmark/{source.id}", json={"dataset": "swe-bench/verified"})
+
+        assert response.status_code == 400, response.text
+        detail = response.json()["detail"]
+        assert "Valkyrie" in detail and "Tracker" not in detail
+        assert "swe-bench/verified" in detail
+        assert "steps or grades in the agent's sandbox" in detail
+        assert "valkyrie run start" in detail
+        for name in hosted_tasks:
+            assert (f"Task '{name}'" in detail) == (configuration != "mixed" or name != "task-a")
+        assert len(database_session.exec(select(Benchmark)).all()) == 1
+        assert len(database_session.exec(select(ExecutorDispatch)).all()) == 1
+        capture.assert_not_called()
+
+    @pytest.mark.description(
+        "A deleted agent credential does not block regrade and a missing verifier credential creates no run."
+    )
+    @pytest.mark.parametrize("verifier_secret", ["available", "missing", "missing_environment", "unused"])
+    def test_only_grading_secrets_are_required(
+        self,
+        contract: AgentContractRequest,
+        hosted_tasks: list[str],
+        database_session: Session,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        verifier_secret: str,
+    ) -> None:
+        credentials = tmp_path / "credentials.env"
+        credentials.write_text("GRADER_KEY=grading-value\n" if verifier_secret == "available" else "")
+        monkeypatch.setattr(
+            local_config, "resources", LocalResources(data_root=tmp_path / "data", secrets_file=credentials)
+        )
+        task_files = _task_files("task-a")
+        task_files["task.toml"] += (
+            "env = { AGENT_KEY = '${deleted-agent-key}' }\n[verifier]\nenvironment_mode = 'separate'\n"
+        )
+        if verifier_secret == "missing_environment":
+            task_files["task.toml"] += "[verifier.environment.env]\nKEY = '${GRADER_KEY}'\n"
+        elif verifier_secret != "unused":
+            task_files["task.toml"] += "[verifier.env]\nKEY = '${GRADER_KEY}'\n"
+        publish_version(_client, f"{_DATASETS}/verified", {"task-a": zip_bytes(task_files)})
+        response = _client.post("/start-benchmark", json=_start(contract, _HOSTED))
+        assert response.status_code == 200, response.text
+        source = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+        assert source is not None
+        source.status = BenchmarkStatus.FINISHED
+        source.arguments = source.arguments.model_copy(
+            update={
+                "contract": source.arguments.contract.model_copy(
+                    update={
+                        "secrets": {
+                            "AGENT_KEY": "deleted-agent-key",
+                            "MODEL_GATEWAY_URL": "deleted-unused-gateway",
+                            "MODEL_GATEWAY_API_KEY": "deleted-unused-gateway",
+                        }
+                    }
+                )
+            }
+        )
+        task = database_session.exec(select(Task).where(Task.benchmark == source.id)).one()
+        task.status = TaskStatus.FINISHED
+        database_session.add_all([source, task])
+        database_session.commit()
+        capture = Mock()
+        monkeypatch.setattr("sentry_sdk.capture_exception", capture)
+
+        response = _client.post(f"/regrade-benchmark/{source.id}", json={"dataset": "swe-bench/verified"})
+
+        if verifier_secret.startswith("missing"):
+            assert response.status_code == 400, response.text
+            detail = response.json()["detail"]
+            assert "Valkyrie" in detail and "Tracker" not in detail
+            assert "GRADER_KEY" in detail and "valkyrie secret set GRADER_KEY" in detail
+            assert len(database_session.exec(select(Benchmark)).all()) == 1
+            assert len(database_session.exec(select(ExecutorDispatch)).all()) == 1
+        else:
+            assert response.status_code == 200, response.text
+            run = database_session.get(Benchmark, UUID(response.json()["benchmark_id"]))
+            assert run is not None and run.arguments.contract.secrets == {}
+            assert response.json()["task_ids"] == ["task-a"]
+        capture.assert_not_called()
+        assert source.arguments.contract.secrets["AGENT_KEY"] == "deleted-agent-key"
 
 
 @pytest.mark.description("A run on a folder of tasks on the machine of a local Tracker.")

@@ -1,11 +1,14 @@
 import asyncio
 import json
+import io
+import tarfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import Mock
+from typing import Any, cast
+from collections.abc import AsyncIterable
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import httpx
@@ -22,7 +25,14 @@ import tracker.repositories.project as project_repository_module
 import tracker.services.runs.limits as run_limits_module
 from tests.project_service import MockProjectRoutes
 from tests.factories import make_error_result
+from tests.unit.datasets.support import FakeSandbox, store_archive, zip_bytes
 from tests.utils import TEST_ORG_ID
+from tracker.clients.dataset_tasks import DatasetTaskService
+from tracker.services.datasets.source import ArchiveSource, LocalFolderSource
+from tracker.services.datasets.image_config import ImageConfig
+from tracker.services.datasets.grading import REWARD_TEXT_PATH
+from tracker.runtime.artifacts import task_artifact_key
+from benchmark_service.sandbox import DockerProviderConfig
 from tracker.api import dependencies as run_dependencies
 from tracker.clients.projects import ProjectServiceClient
 from tracker.repositories.benchmark_definition import BenchmarkDefinitionRepository
@@ -33,7 +43,8 @@ from tracker.repositories.provider_secret import ProviderSecretRepository
 from tracker.services.datasets.artifacts import SAVED_ARTIFACTS_RUN
 from tracker.services.datasets.ref import HostedDataset
 from tracker.auth import RequestIdentity
-from tracker.aws.runtime import AWSResources
+from tracker.aws.clients import AWSClientProvider
+from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws import clients as aws_clients
 from tracker.executor import launcher
 from tracker.database.models import (
@@ -56,13 +67,13 @@ from tracker.domain import BenchmarkStatus, ExecutorReleaseStatus
 from tracker.services.cost_reports import COST_REPORT_TOKEN_HEADER, cost_report_token_hash
 from tracker.services.runs.limits import OrgRunLimitsCache
 from tracker.types import AWSBenchmarkArguments, AgentContractRequest, StartBenchmarkRequest
+from tracker.local.runtime import LocalRuntimeFactory
 from tracker.aws.secrets import SecretsManagerStore
 from tracker.exceptions import SecretsError
 from tracker.executor.dependencies import get_execution_runtime
 from tracker.executor.dispatch_payload import SealedPayload, open_payload
 from tracker.local import config as local_config
 from tracker.local.resources import LocalResources
-from tracker.local.runtime import LocalRuntimeFactory
 from tracker.services.runs import attempts as attempts_module
 from tracker.services.tasks.attempts import keep_replaced_attempts
 from tracker.services.tasks.execute import task_attempt_id
@@ -142,6 +153,74 @@ def _benchmark(session: Session, response: httpx.Response) -> Benchmark:
     benchmark = session.get(Benchmark, UUID(response.json()["benchmark_id"]))
     assert benchmark is not None
     return benchmark
+
+
+@pytest.mark.description("Dataset verifier output is listed and downloaded through the run artifact API after grading.")
+async def test_dataset_verifier_output_download(
+    local_tracker: TestClient, control_postgres_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch, tmp_path, PROVIDER_SETTINGS["daytona"])
+    monkeypatch.setitem(main_module.app.dependency_overrides, run_dependencies.get_current_org, lambda: ORG)
+    benchmark = _benchmark(control_postgres_session, _start(local_tracker, "daytona"))
+    assert isinstance(benchmark.arguments.properties, LocalResources)
+    objects = LocalRuntimeFactory.create_runtime(benchmark.arguments.properties, TEST_ORG_ID).objects
+    task = tmp_path / "dataset" / "task-1"
+    (task / "tests").mkdir(parents=True)
+    (task / "instruction.md").write_text("Produce an output.")
+    (task / "task.toml").write_text(
+        'artifacts = [{ source = "/workspace/output", destination = "verifier" }]\n'
+        '[environment]\ndocker_image = "ubuntu:24.04"\nworkdir = "/app"'
+    )
+    (task / "tests" / "test.sh").write_text("#!/bin/bash\n")
+    sandbox = FakeSandbox(
+        files={"/workspace/output/audio.wav": b"original recording"},
+        writes={REWARD_TEXT_PATH: b"1", "/logs/verifier/details.json": b"complete response"},
+    )
+
+    async def image_config(_image: str) -> ImageConfig:
+        return ImageConfig(None, None)
+
+    async def sink(task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+        await objects.put_stream(task_artifact_key(str(benchmark.id), task_id, name), chunks)
+
+    service = DatasetTaskService(LocalFolderSource(task.parent), artifact_sink=sink)
+    monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", image_config)
+    monkeypatch.setattr(
+        service, "get_sandbox_provider", lambda _config: SimpleNamespace(get_sandbox=AsyncMock(return_value=sandbox))
+    )
+
+    try:
+        await service.evaluate_instance("task-1", sandbox.id, DockerProviderConfig(type="docker"))
+    finally:
+        await service.close()
+
+    path = "task-1/verifier_output.tar.gz"
+    listed = local_tracker.get(f"/benchmarks/{benchmark.id}/artifacts", params={"prefix": "task-1"})
+    assert listed.status_code == 200, listed.text
+    assert sorted(entry["path"] for entry in listed.json()["artifacts"]) == ["task-1/artifacts/verifier.tar.gz", path]
+
+    link = local_tracker.get(f"/benchmarks/{benchmark.id}/artifacts/download-url", params={"path": path})
+    assert link.status_code == 200, link.text
+    downloaded = local_tracker.get(link.json()["download_url"])
+    assert downloaded.status_code == 200, downloaded.text
+    with tarfile.open(fileobj=io.BytesIO(downloaded.content)) as archive:
+        assert cast(io.BufferedReader, archive.extractfile("verifier/details.json")).read() == b"complete response"
+
+    recording = local_tracker.get(
+        f"/benchmarks/{benchmark.id}/artifacts/download-url", params={"path": "task-1/artifacts/verifier.tar.gz"}
+    )
+    assert recording.status_code == 200, recording.text
+    downloaded = local_tracker.get(recording.json()["download_url"])
+    assert downloaded.status_code == 200, downloaded.text
+    with tarfile.open(fileobj=io.BytesIO(downloaded.content)) as archive:
+        assert cast(io.BufferedReader, archive.extractfile("output/audio.wav")).read() == b"original recording"
+
+    outputs = local_tracker.get(f"/fetch-run-outputs/{benchmark.id}")
+    assert outputs.status_code == 200, outputs.text
+    with tarfile.open(fileobj=io.BytesIO(outputs.content)) as archive:
+        assert sorted(archive.getnames()) == ["task-1/artifacts/verifier.tar.gz", path]
+        with tarfile.open(fileobj=cast(io.BufferedReader, archive.extractfile(path))) as verifier:
+            assert cast(io.BufferedReader, verifier.extractfile("verifier/details.json")).read() == b"complete response"
 
 
 @pytest.mark.description(
@@ -683,8 +762,21 @@ def test_a_dataset_run_regrade_points_graded_tasks_at_saved_artifacts(
     benchmark = BenchmarkDefinitionRepository(control_postgres_session).create(source.org_id, "ioi", "", None)
     dataset = DatasetRepository(control_postgres_session).create(benchmark.id, "2024", "", None)
     versions = DatasetVersionRepository(control_postgres_session)
+    resources = local_config.resources
+    assert resources is not None
+    objects = LocalRuntimeFactory.create_runtime(resources, source.org_id).objects
     for revision in (1, 2):
-        versions.publish(dataset.id, {task_id: (f"sha256:{revision:064x}", 10) for task_id in task_ids}, [], None)
+        archive = zip_bytes(
+            {
+                "task.toml": "artifacts = [{source = '/workspace/output', destination = 'recording'}]\n"
+                "[environment]\ndocker_image = 'ubuntu:24.04'\nworkdir = '/app'\n"
+                "[verifier]\nenvironment_mode = 'separate'\n",
+                "instruction.md": f"Revision {revision}.",
+                "tests/test.sh": "#!/bin/sh\n",
+            }
+        )
+        digest = asyncio.run(store_archive(objects, dataset.id, archive))
+        versions.publish(dataset.id, {task_id: (digest, len(archive)) for task_id in task_ids}, [], None)
     source.status = BenchmarkStatus.FINISHED
     gateway_ref = f"{tenant_secret_prefix(source.org_id)}project-gateway"
     source.arguments = source.arguments.model_copy(
@@ -747,6 +839,54 @@ def test_a_dataset_run_regrade_points_graded_tasks_at_saved_artifacts(
     assert sealed is not None
     payload = open_payload(dispatch.id, SealedPayload(sealed.ciphertext, sealed.encrypted_data_key, sealed.nonce))
     assert payload["execution_context_json"]["start_benchmark_request"]["dataset_ref"]["revision"] == 2
+
+    legacy = io.BytesIO()
+    with tarfile.open(fileobj=legacy, mode="w:gz") as archive:
+        for name, content in {
+            "workspace/output/audio.wav": b"original recording",
+            "workspace/output/audio.json": b"original metadata",
+            "workspace/unrelated.txt": b"not an input",
+        }.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    asyncio.run(
+        objects.put_bytes(task_artifact_key(str(source.id), graded.task_id, "agent_output.tar.gz"), legacy.getvalue())
+    )
+    verifier = FakeSandbox(writes={REWARD_TEXT_PATH: b"1"})
+    provider = SimpleNamespace(
+        create_sandbox=AsyncMock(return_value=verifier), delete_sandbox=AsyncMock(), get_sandbox=AsyncMock()
+    )
+
+    async def image_config(_image: str) -> ImageConfig:
+        return ImageConfig(None, None)
+
+    service = DatasetTaskService(ArchiveSource(objects, dataset.id, {graded.task_id: digest}))
+    monkeypatch.setattr("tracker.clients.dataset_tasks.image_config", image_config)
+    monkeypatch.setattr(service, "get_sandbox_provider", lambda _config: provider)
+
+    async def regrade() -> Any:
+        try:
+            return await service.regrade(
+                graded.task_id,
+                tasks[graded.task_id][1] or {},
+                objects=objects,
+                labels={},
+                sandbox_provider=DockerProviderConfig(type="docker"),
+            )
+        finally:
+            await service.close()
+
+    result = asyncio.run(regrade())
+
+    assert result["rewards"] == {"reward": 1.0}
+    provider.create_sandbox.assert_awaited_once()
+    provider.get_sandbox.assert_not_awaited()
+    provider.delete_sandbox.assert_awaited_once()
+    (carried,) = [content for path, content in verifier.files.items() if path.endswith(".tar.gz")]
+    with tarfile.open(fileobj=io.BytesIO(carried)) as archive:
+        assert sorted(member.name for member in archive if member.isfile()) == ["output/audio.json", "output/audio.wav"]
+        assert cast(io.BufferedReader, archive.extractfile("output/audio.wav")).read() == b"original recording"
 
 
 @pytest.mark.description(
@@ -919,6 +1059,22 @@ def test_regrade_gives_a_pre_migration_source_fresh_start_properties(
         log_retention_days=30,
     )
     monkeypatch.setattr(main_module, "resolve_start_aws_runtime", Mock(return_value=SimpleNamespace(resources=fresh)))
+    monkeypatch.setattr(
+        run_dependencies,
+        "resolve_run_aws_runtime",
+        Mock(return_value=AWSRuntime(resources=fresh, clients=AWSClientProvider("us-east-1"))),
+    )
+    monkeypatch.setattr(
+        SecretsManagerStore,
+        "get",
+        AsyncMock(
+            return_value={
+                "DAYTONA_API_KEY": "key",
+                "DAYTONA_API_URL": "https://app.daytona.io/api",
+                "DAYTONA_TARGET": "us",
+            }
+        ),
+    )
     launched: list[UUID] = []
 
     async def launch(dispatch: ExecutorDispatch, **_kwargs: Any) -> None:

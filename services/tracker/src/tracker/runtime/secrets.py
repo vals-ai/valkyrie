@@ -4,7 +4,7 @@ from typing import Protocol, TypeAlias
 from benchmark_service import SandboxProviderConfig, sandbox_provider_config_from_mapping
 from pydantic import ValidationError
 
-from tracker.exceptions import InvalidSandboxConfigurationError, SecretsError
+from tracker.exceptions import InvalidSandboxConfigurationError, SecretConfigurationError
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -52,7 +52,10 @@ async def resolve_secrets(secrets: dict[str, str], secret_store: SecretStore) ->
         secret_value = fetched[secret_name]
         if isinstance(secret_value, dict):
             if env_name not in secret_value:
-                raise SecretsError(f"Key '{env_name}' not found in JSON secret '{secret_display_name(secret_name)}'")
+                raise SecretConfigurationError(
+                    f"Key '{env_name}' not found in JSON secret '{secret_display_name(secret_name)}'. "
+                    f"Add it to the JSON value. {secret_set_instruction(secret_name)}"
+                )
             resolved[env_name] = str(secret_value[env_name])
         else:
             resolved[env_name] = str(secret_value)

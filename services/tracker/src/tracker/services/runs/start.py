@@ -63,7 +63,7 @@ def _artifact_sink(runtime: RuntimeServices, benchmark_id: UUID) -> ArtifactSink
     return store
 
 
-def _task_secret_reader(request: RunExecutionRequest, runtime: RuntimeServices, org: OrgContext) -> SecretReader:
+def task_secret_reader(request: RunExecutionRequest, runtime: RuntimeServices, org: OrgContext) -> SecretReader:
     properties = request.properties
     if isinstance(properties, LocalResources) and reads_secrets_file(properties) and properties.secrets_file:
         return secret_reader(SecretsFile(properties.secrets_file), lambda name: [name])
@@ -477,13 +477,15 @@ async def _process_benchmark(
             else dataset_service(
                 dataset_ref,
                 runtime.objects,
-                _task_secret_reader(request, runtime, org),
+                task_secret_reader(request, runtime, org),
                 _artifact_sink(runtime, benchmark_id),
                 dataset_version.task_digests if dataset_version is not None else None,
+                regrade_only=arguments.regraded_from_run_id is not None,
             )
         )
         if (
-            classify_benchmark_service_destination(snapshot.benchmark_name, request.custom_benchmark_service)
+            dataset_ref is None
+            and classify_benchmark_service_destination(snapshot.benchmark_name, request.custom_benchmark_service)
             == BenchmarkServiceDestination.HOSTED
         ):
             wake_snapshot = await run_control.read_run_state(task_ids)

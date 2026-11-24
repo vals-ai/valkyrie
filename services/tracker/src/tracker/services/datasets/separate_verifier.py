@@ -29,7 +29,14 @@ from benchmark_service.sandbox.created import AnnouncedSandboxProvider, sandbox_
 from benchmark_service.sandbox.types import SandboxSource
 from benchmark_service.schemas import SandboxCreatedData
 
-from tracker.services.datasets.artifacts import MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, SkippedArtifact, StagedArtifact
+from tracker.services.datasets.artifacts import (
+    MAX_ARTIFACT_BYTES,
+    MAX_ARTIFACT_FILES,
+    ArtifactSink,
+    SkippedArtifact,
+    StagedArtifact,
+    collect_verifier_output,
+)
 from tracker.services.datasets.compose import ComposeRuntime, compose_runtime, compose_source, start_compose_runtime
 from tracker.services.datasets.config import EnvironmentConfig, TaskConfig
 from tracker.services.datasets.folder import COMPOSE_FILE, DOCKERFILE
@@ -216,26 +223,43 @@ def _plain(member: tarfile.TarInfo) -> tarfile.TarInfo:
     return member
 
 
-def _clean_archive(archive_path: Path, name: str, source: str, scratch: Path) -> tuple[Path, bool]:
+def _clean_archive(
+    archive_path: Path, name: str, source: str, scratch: Path, archive_root: str | None = None
+) -> tuple[Path, bool]:
     unpacked = scratch / "unpacked"
     unpacked.mkdir()
     files = 0
 
-    def keep_inside(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+    def keep_inside(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
         nonlocal files
+        files += 1
+        if files > MAX_ARTIFACT_FILES:
+            raise SeparateVerifierError(f"Artifact {source} holds more than {MAX_ARTIFACT_FILES} entries")
+        if archive_root is not None:
+            path = posixpath.normpath(member.name.lstrip("/"))
+            if archive_root and not _inside(path, archive_root):
+                return None
+            member = member.replace(
+                name=posixpath.normpath(posixpath.join(name, posixpath.relpath(path, archive_root or "."))), deep=False
+            )
+            if member.islnk():
+                member = member.replace(
+                    linkname=posixpath.normpath(
+                        posixpath.join(name, posixpath.relpath(member.linkname, archive_root or "."))
+                    ),
+                    deep=False,
+                )
         member = tarfile.data_filter(member, destination)
         path = posixpath.normpath(member.name)
-        if not _inside(path, name):
+        if name and not _inside(path, name):
             raise SeparateVerifierError(
                 f"Artifact {source} holds {member.name[:NAME_CHARS_IN_MESSAGES]!r}, outside itself"
             )
         if member.issym() or member.islnk():
             base = posixpath.dirname(path) if member.issym() else ""
-            if not _inside(posixpath.normpath(posixpath.join(base, member.linkname)), name):
+            target = posixpath.normpath(posixpath.join(base, member.linkname))
+            if name and not _inside(target, name):
                 raise SeparateVerifierError(f"Artifact {source} holds a link that leaves it")
-        files += 1
-        if files > MAX_ARTIFACT_FILES:
-            raise SeparateVerifierError(f"Artifact {source} holds more than {MAX_ARTIFACT_FILES} entries")
         return member
 
     try:
@@ -243,6 +267,8 @@ def _clean_archive(archive_path: Path, name: str, source: str, scratch: Path) ->
             reader = io.BufferedReader(_BoundedReader(compressed, MAX_UNPACKED_BYTES))
             with tarfile.open(fileobj=reader, mode="r|") as archive:
                 archive.extractall(unpacked, filter=keep_inside)
+        if archive_root is not None and not (unpacked / name).exists():
+            raise SeparateVerifierError(f"Artifact {source} is missing subtree {archive_root!r}")
         clean = scratch / "clean.tar.gz"
         with tarfile.open(clean, "w:gz") as repacked:
             repacked.add(unpacked / name, arcname=name, filter=_plain)
@@ -275,7 +301,14 @@ async def _carry(verifier: Sandbox, artifact: StagedArtifact) -> None:
         scratch = Path(scratch_name)
         archive_path = scratch / "artifact.tar.gz"
         await _download(artifact, archive_path)
-        clean, folder = await asyncio.to_thread(_clean_archive, archive_path, name, artifact.source, scratch)
+        try:
+            clean, folder = await asyncio.to_thread(
+                _clean_archive, archive_path, name, artifact.source, scratch, artifact.archive_root
+            )
+        except SeparateVerifierError as error:
+            if artifact.archive_root is None:
+                raise
+            raise SeparateVerifierError(f"Saved agent output {artifact.archive_path}: {error}") from error
         remote = f"{TRANSFER_DIR}/{uuid4().hex}.tar.gz"
         await verifier.exec(f"mkdir -p {shlex.quote(TRANSFER_DIR)} {shlex.quote(parent)}")
         await verifier.upload_file(remote, await asyncio.to_thread(clean.read_bytes))
@@ -306,7 +339,7 @@ async def _carry_artifacts(
         try:
             await _carry(verifier, artifact)
         except SeparateVerifierError as error:
-            if artifact.source != ARTIFACTS_DIR:
+            if artifact.source != ARTIFACTS_DIR or artifact.archive_root is not None:
                 raise
             say(f"The folder {ARTIFACTS_DIR} could not be carried to the verifier: {error}")
     await verifier.exec(f"rm -rf {shlex.quote(VERIFIER_DIR)}")
@@ -332,6 +365,9 @@ async def grade_separately(
     gateway_url: str | None = None,
     default_user: str | None = None,
     image_workdir: Callable[[GradingSandbox, SandboxSource], Awaitable[str | None]] | None = None,
+    *,
+    artifact_sink: ArtifactSink | None = None,
+    artifact_folder: str = "artifacts",
 ) -> dict[str, Any]:
     environment = verifier_environment(task_id, tests_dir, config, agent_source, agent_compose, layers)
     source = environment.source
@@ -362,18 +398,19 @@ async def grade_separately(
             else None
         )
         await _carry_artifacts(grader, staged, skipped, on_message or ignore)
-        result = await grade_task(
-            task_id,
-            config,
-            env,
-            tests_dir,
-            grader,
-            on_message,
-            redact=redact,
-            upload_tests=environment.upload_tests,
-            cwd=cwd,
-            default_user=default_user if source is agent_source else None,
-        )
+        async with collect_verifier_output(task_id, grader, artifact_sink, artifact_folder):
+            result = await grade_task(
+                task_id,
+                config,
+                env,
+                tests_dir,
+                grader,
+                on_message,
+                redact=redact,
+                upload_tests=environment.upload_tests,
+                cwd=cwd,
+                default_user=default_user if source is agent_source else None,
+            )
         result["metadata"]["verifier_environment_mode"] = "separate"
         return result
     finally:

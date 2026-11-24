@@ -1,6 +1,8 @@
 from benchmark_service import SandboxProviders
 import asyncio
 import os
+import io
+import tarfile
 from collections.abc import AsyncIterable
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +54,156 @@ cpus = 2
 memory_mb = 4096
 workdir = "/app"
 """
+
+
+@pytest.mark.description("In-place grading retains every verifier file even when grading fails.")
+@pytest.mark.parametrize("reward,exit_code", [(b"1", 0), (b"bad", 0), (None, 1), (None, 0)])
+async def test_in_place_verifier_archive(
+    dataset: Path, monkeypatch: pytest.MonkeyPatch, reward: bytes | None, exit_code: int
+) -> None:
+    files = {
+        "/logs/verifier/details.json": b'{"attempts": ["raw response"]}',
+        "/logs/verifier/nested/extra.bin": b"extra",
+        VERIFIER_OUTPUT_PATH: b"full stdout",
+    }
+    if reward is not None:
+        files[REWARD_TEXT_PATH] = reward
+    uploaded: dict[str, bytes] = {}
+
+    async def sink(_task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+        uploaded[name] = b"".join([chunk async for chunk in chunks])
+
+    service = service_for(
+        LocalFolderSource(dataset), FakeSandbox(writes=files, exit_code=exit_code), monkeypatch, artifact_sink=sink
+    )
+
+    if reward == b"1":
+        result = await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+        assert isinstance(result, dict) and result["rewards"] == {"reward": 1.0}
+    else:
+        with pytest.raises(VerifierResultError):
+            await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+
+    with tarfile.open(fileobj=io.BytesIO(uploaded["verifier_output.tar.gz"])) as archive:
+        assert {
+            member.name: cast(io.BufferedReader, archive.extractfile(member)).read()
+            for member in archive
+            if member.isfile()
+        } == {path.removeprefix("/logs/"): content for path, content in files.items()}
+
+
+@pytest.mark.description("A required verifier upload failure fails an otherwise successful task.")
+async def test_in_place_verifier_upload_failure(dataset: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def sink(_task_id: str, _name: str, _chunks: AsyncIterable[bytes]) -> None:
+        raise OSError("storage unavailable")
+
+    service = service_for(
+        LocalFolderSource(dataset), FakeSandbox(writes={REWARD_TEXT_PATH: b"1"}), monkeypatch, artifact_sink=sink
+    )
+
+    with pytest.raises(RuntimeError, match="Required artifact /logs/verifier could not be saved: storage unavailable"):
+        await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+
+
+@pytest.mark.description("An empty verifier directory is archived when grading produces no reward or output.")
+async def test_empty_verifier_archive(dataset: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    uploaded: dict[str, bytes] = {}
+
+    async def sink(_task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+        uploaded[name] = b"".join([chunk async for chunk in chunks])
+
+    service = service_for(LocalFolderSource(dataset), FakeSandbox(), monkeypatch, artifact_sink=sink)
+
+    with pytest.raises(VerifierResultError, match="no reward file"):
+        await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+
+    with tarfile.open(fileobj=io.BytesIO(uploaded["verifier_output.tar.gz"])) as archive:
+        assert not any(member.isfile() for member in archive)
+
+
+@pytest.mark.description("A snapshot failure is logged with the task ID without replacing the original grading error.")
+@pytest.mark.parametrize("failure", ["staging", "upload"])
+async def test_grading_error_survives_snapshot_failure(
+    dataset: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    if failure == "staging":
+        monkeypatch.setattr(artifacts, "MAX_ARTIFACT_FILES", 0)
+
+    async def sink(_task_id: str, _name: str, _chunks: AsyncIterable[bytes]) -> None:
+        raise OSError("storage unavailable")
+
+    service = service_for(LocalFolderSource(dataset), FakeSandbox(exit_code=23), monkeypatch, artifact_sink=sink)
+    artifacts.logger.addHandler(caplog.handler)
+
+    try:
+        with pytest.raises(VerifierResultError, match="The verifier failed with exit code 23"):
+            await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+    finally:
+        artifacts.logger.removeHandler(caplog.handler)
+
+    (record,) = [record for record in caplog.records if record.name == "tracker.services.datasets.artifacts"]
+    assert "task-a" in record.getMessage()
+    assert "could not be saved after grading failed" in record.getMessage()
+    assert record.exc_info is not None
+    assert ("holds more than 0 files" if failure == "staging" else "storage unavailable") in str(record.exc_info[1])
+
+
+@pytest.mark.description("A verifier archive that exceeds staging limits fails the task instead of being skipped.")
+async def test_verifier_staging_failure(dataset: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(artifacts, "MAX_ARTIFACT_FILES", 0)
+
+    async def sink(_task_id: str, _name: str, _chunks: AsyncIterable[bytes]) -> None:
+        pytest.fail("An incomplete verifier archive must not be uploaded")
+
+    service = service_for(
+        LocalFolderSource(dataset), FakeSandbox(writes={REWARD_TEXT_PATH: b"1"}), monkeypatch, artifact_sink=sink
+    )
+
+    with pytest.raises(RuntimeError, match="Verifier output could not be saved: it holds more than 0 files"):
+        await service.evaluate_instance("task-a", "sandbox-1", PROVIDER)
+
+
+@pytest.mark.description(
+    "Regrade saves fresh verifier output under the new run without replaying the old verifier archive."
+)
+async def test_regrade_verifier_archive(dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (dataset / "task-a" / "task.toml").write_text(
+        "artifacts = [{ source = '/workspace/output', destination = 'verifier' }]\n"
+        + TASK_TOML.replace("[verifier]", "[verifier]\nenvironment_mode = 'separate'")
+    )
+    objects = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+    old_key = task_artifact_key("old-run", "task-a", "verifier_output.tar.gz")
+    new_key = task_artifact_key("new-run", "task-a", "verifier_output.tar.gz")
+    await objects.put_bytes(old_key, b"old verifier output is not an input")
+    recording = io.BytesIO()
+    with tarfile.open(fileobj=recording, mode="w:gz") as archive:
+        member = tarfile.TarInfo("output/audio.wav")
+        member.size = len(b"saved recording")
+        archive.addfile(member, io.BytesIO(b"saved recording"))
+    await objects.put_bytes(task_artifact_key("old-run", "task-a", "artifacts/verifier.tar.gz"), recording.getvalue())
+    sandbox = FakeSandbox(writes={REWARD_TEXT_PATH: b"1", "/logs/verifier/details.json": b"new response"})
+    provider = SimpleNamespace(create_sandbox=AsyncMock(return_value=sandbox), delete_sandbox=AsyncMock())
+
+    async def sink(task_id: str, name: str, chunks: AsyncIterable[bytes]) -> None:
+        await objects.put_stream(task_artifact_key("new-run", task_id, name), chunks)
+
+    service = DatasetTaskService(LocalFolderSource(dataset), artifact_sink=sink)
+    monkeypatch.setattr(service, "get_sandbox_provider", lambda _config: provider)
+
+    result = await service.regrade(
+        "task-a", {SAVED_ARTIFACTS_RUN: "old-run"}, objects=objects, labels={}, sandbox_provider=PROVIDER
+    )
+
+    assert isinstance(result, dict) and result["rewards"] == {"reward": 1.0}
+    assert await objects.get_bytes(old_key) == b"old verifier output is not an input"
+    assert (
+        await objects.get_bytes(task_artifact_key("old-run", "task-a", "artifacts/verifier.tar.gz"))
+        == recording.getvalue()
+    )
+    with tarfile.open(fileobj=io.BytesIO(await objects.get_bytes(new_key))) as archive:
+        assert cast(io.BufferedReader, archive.extractfile("verifier/details.json")).read() == b"new response"
+
+
 PROVIDER = DockerProviderConfig(type="docker")
 GATEWAY = ScopedGateway("https://gateway.example", "mgwt_grading")
 DAYTONA = cast(SandboxProviderConfig, SimpleNamespace(type="daytona"))
@@ -616,6 +768,7 @@ class TestSteps:
         assert uploaded == [
             ("task-s", "steps/one/artifacts/app/one-out.tar.gz"),
             ("task-s", "steps/one/artifacts/logs/artifacts.tar.gz"),
+            ("task-s", "steps/one/verifier_output.tar.gz"),
         ]
 
     @pytest.mark.description("A step below its minimum reward says why it stopped.")
@@ -837,7 +990,7 @@ class TestEvaluateInstance:
         )
         carried: list[str] = []
 
-        async def grade_separately(*args: Any) -> dict[str, Any]:
+        async def grade_separately(*args: Any, **_kwargs: Any) -> dict[str, Any]:
             carried.extend(artifact.source for artifact in args[9])
             return {"rewards": {"reward": 1.0}}
 
@@ -944,7 +1097,8 @@ class TestEvaluateInstance:
 
         assert isinstance(result, dict)
         assert result["rewards"] == {"reward": 1.0}
-        assert uploaded == [("task-a", "artifacts/app/out.tar.gz", b"archive")]
+        assert uploaded[0] == ("task-a", "artifacts/app/out.tar.gz", b"archive")
+        assert uploaded[1][:2] == ("task-a", "verifier_output.tar.gz")
         assert sandbox.commands[0] == "snapshot"
         assert sandbox.commands.index(f"rm -rf {staging}") < sandbox.commands.index("chmod +x /tests/test.sh")
 
@@ -987,6 +1141,24 @@ SAVED_RUN = "11111111-1111-1111-1111-111111111111"
 
 @pytest.mark.description("A regrade grades a dataset task again from the artifacts its source run saved.")
 class TestRegrade:
+    @pytest.mark.description("Regrade skips agent environment credentials while retaining verifier credentials.")
+    async def test_only_verifier_environment_is_resolved(self, dataset: Path) -> None:
+        (dataset / "task-a" / "task.toml").write_text(
+            SEPARATE_TOML + "env = { AGENT_KEY = '${deleted-agent-key}' }\n" + "[verifier.env]\nKEY = '${GRADER_KEY}'\n"
+        )
+
+        async def read_secret(name: str) -> str | None:
+            assert name == "GRADER_KEY"
+            return "grading-value"
+
+        service = DatasetTaskService(LocalFolderSource(dataset), read_secret, regrade_only=True)
+        response = await service.retrieve_task("task-a")
+
+        assert isinstance(response, TaskFolderResponse)
+        assert response.env == {} and response.secret_env == []
+        assert await service.regrade_requirements(["task-a"]) == []
+        await service.close()
+
     @pytest.fixture
     def store(self, tmp_path: Path) -> FilesystemObjectStore:
         return FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
@@ -995,7 +1167,7 @@ class TestRegrade:
     def graded(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
         calls: list[tuple[Any, ...]] = []
 
-        async def grade_separately(*args: Any) -> dict[str, Any]:
+        async def grade_separately(*args: Any, **_kwargs: Any) -> dict[str, Any]:
             calls.append(args)
             return {"rewards": {"reward": 1.0}}
 

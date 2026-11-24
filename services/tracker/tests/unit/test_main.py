@@ -3426,6 +3426,62 @@ class TestTrackerAPI:
         )
 
     @pytest.mark.description(
+        "An org that may use shared secrets sends its own copy of a saved service secret before the shared one."
+    )
+    @pytest.mark.parametrize(
+        ("route", "environment"),
+        [("/start-benchmark", "aws"), ("/start-benchmark", "local"), ("/fetch-benchmark-tasks", "aws")],
+    )
+    async def test_a_saved_service_prefers_the_org_copy_of_a_shared_secret(
+        self,
+        contract: AgentContractRequest,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        mock_launcher: Any,
+        saved_settings: None,
+        route: str,
+        environment: str,
+        tmp_path: Path,
+    ) -> None:
+        _as_user(monkeypatch, "U-alice")
+        if environment == "local":
+            monkeypatch.setattr(
+                main_module.local_config,
+                "resources",
+                LocalResources(data_root=tmp_path, secrets_manager_region="us-east-1"),
+            )
+            monkeypatch.setattr(FilesystemObjectStore, "get_bytes", AsyncMock(return_value=b""))
+        monkeypatch.setattr(config, "AWS_SHARED_SECRET_TENANTS", "acme.example")
+        _save_service(
+            database_session, _SAVED_URL, "U-alice", auth_header_name="Authorization", auth_secret_name="swekey"
+        )
+        stored = {"swekey": "shared-key", f"{_TENANT_SECRETS}swekey": "org-key", "e2bsecret": {"api_key": "e2b"}}
+        headers: list[dict[str, str]] = []
+
+        async def _get(_store: object, name: str) -> object:
+            return stored[name]
+
+        async def _record_headers(service: BenchmarkServiceClient, *_args: Any, **_kwargs: Any) -> Any:
+            headers.append(getattr(service, "_headers"))
+            return VerifyTaskIdsResponse(task_ids=["task_0"])
+
+        monkeypatch.setattr(SecretsManagerStore, "get", _get)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _record_headers)
+        body = (
+            {
+                **_start_body(contract),
+                **({"environment": "local", "sandbox_provider": "docker"} if environment == "local" else {}),
+            }
+            if route == "/start-benchmark"
+            else {"benchmark_name": "swebench"}
+        )
+
+        response = (local_client if environment == "local" else client).post(route, json=body)
+
+        assert response.status_code == 200, response.text
+        assert [value for name, value in headers[0].items() if name.lower() == "authorization"] == ["org-key"]
+
+    @pytest.mark.description(
         "A Tracker without auth applies one local user's saved provider, secret, and service URL to runs."
     )
     async def test_a_tracker_without_auth_keeps_settings_for_one_local_user(

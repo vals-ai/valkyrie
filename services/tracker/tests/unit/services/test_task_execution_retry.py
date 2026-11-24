@@ -98,7 +98,9 @@ class TestTaskExecutionRetry:
         resume = AsyncMock(side_effect=asyncio.CancelledError)
         retrieve = AsyncMock()
         create = Mock()
-        monkeypatch.setattr(task_execution_module, "selected_project_gateway_reference", lambda *_args: "gateway")
+        monkeypatch.setattr(
+            task_execution_module, "selected_project_gateway_reference", lambda *_args, **_kwargs: "gateway"
+        )
         monkeypatch.setitem(task_execution_module.WORKER_SERVICE_FOR_BENCHMARK, request.benchmark_name, "vcb")
         monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements_response", discovery)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", resume)
@@ -144,7 +146,9 @@ class TestTaskExecutionRetry:
                 GradingRequirementsResponse(models=[]),
             ]
         )
-        monkeypatch.setattr(task_execution_module, "selected_project_gateway_reference", lambda *_args: "gateway")
+        monkeypatch.setattr(
+            task_execution_module, "selected_project_gateway_reference", lambda *_args, **_kwargs: "gateway"
+        )
         monkeypatch.setitem(task_execution_module.WORKER_SERVICE_FOR_BENCHMARK, request.benchmark_name, "vcb")
         monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements_response", discovery)
         monkeypatch.setattr(BenchmarkServiceClient, "grading_requirements", AsyncMock(return_value=[]))

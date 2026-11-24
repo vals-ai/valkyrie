@@ -42,6 +42,7 @@ from tracker.services.datasets.artifacts import (
     CONVENTION_ARTIFACT,
     SAVED_ARTIFACTS_RUN,
     ArtifactSink,
+    collect_verifier_output,
     discard_staged,
     run_collect_hooks,
     saved_artifacts,
@@ -141,12 +142,18 @@ class ResolvedTask(NamedTuple):
 
 class DatasetTaskService:
     def __init__(
-        self, source: TaskSource, read_secret: SecretReader | None = None, artifact_sink: ArtifactSink | None = None
+        self,
+        source: TaskSource,
+        read_secret: SecretReader | None = None,
+        artifact_sink: ArtifactSink | None = None,
+        *,
+        regrade_only: bool = False,
     ) -> None:
         self._sandbox_providers = SandboxProviders()
         self.source = source
         self._read_secret = read_secret
         self._artifact_sink = artifact_sink
+        self._regrade_only = regrade_only
         self._tasks: dict[str, ResolvedTask] = {}
         self._image_configs: dict[str, ImageConfig] = {}
         self._image_config_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -213,7 +220,9 @@ class DatasetTaskService:
                             ),
                         )
                     env, secret_env = await resolve_env(
-                        response.env, self._read_secret, f"Task {task_id!r} [environment].env"
+                        {} if self._regrade_only else response.env,
+                        self._read_secret,
+                        f"Task {task_id!r} [environment].env",
                     )
                     verifier_env, sandbox_env, secret_values = await self._resolve_grader(
                         f"Task {task_id!r}", config.verifier
@@ -221,7 +230,7 @@ class DatasetTaskService:
                     secret_values.extend(env[name] for name in secret_env)
                     steps: dict[str, ResolvedStep] = {}
                     grading_models = dict.fromkeys(config.verifier.models)
-                    for step in config.steps:
+                    for step in [] if self._regrade_only else config.steps:
                         verifier = step_verifier(config, step)
                         grading_models.update(dict.fromkeys(verifier.models))
                         step_env, step_sandbox_env, step_secrets = await self._resolve_grader(
@@ -259,6 +268,29 @@ class DatasetTaskService:
             [*(env[name] for name in from_secrets), *(sandbox_env[name] for name in sandbox_secrets)],
         )
 
+    async def regrade_requirements(self, task_ids: list[str]) -> list[str]:
+        configs: list[tuple[str, TaskConfig]] = []
+        incompatible: list[str] = []
+        for task_id in task_ids:
+            async with self.source.open_task(task_id) as task_dir:
+                config = self._config(task_id, task_dir)
+                try:
+                    _check_regradable(task_id, config, lambda: retrieve_task_response(task_dir, config).cwd_from_image)
+                except InvalidTaskError as error:
+                    incompatible.append(str(error))
+                configs.append((task_id, config))
+        if incompatible:
+            raise InvalidTaskError("; ".join(incompatible))
+        models: dict[str, None] = {}
+        checked: set[str] = set()
+        for task_id, config in configs:
+            models.update(dict.fromkeys(config.verifier.models))
+            settings = config.verifier.model_dump_json(include={"env", "environment"})
+            if settings not in checked:
+                await self._resolve_grader(f"Task {task_id!r}", config.verifier)
+                checked.add(settings)
+        return list(models)
+
     async def regrade(
         self,
         task_id: str,
@@ -277,16 +309,7 @@ class DatasetTaskService:
         task = await self._task(task_id)
         async with self.source.open_task(task_id, [TESTS_PART]) as task_dir:
             config = self._config(task_id, task_dir)
-            if config.steps or not config.verifier.is_separate:
-                raise InvalidTaskError(
-                    f"Task {task_id!r} has steps or grades in the agent's sandbox, so it can't be regraded"
-                )
-            if task.response.cwd_from_image and any(
-                not artifact.source.startswith("/") for artifact in config.artifacts
-            ):
-                raise InvalidTaskError(
-                    f"Task {task_id!r} has a relative artifact path and takes its working directory from its image"
-                )
+            _check_regradable(task_id, config, lambda: task.response.cwd_from_image)
             staged, skipped = await saved_artifacts(objects, run_id, task_id, config.artifacts, task.response.cwd)
             verifier_env, redact, gateway = _grading_gateway(task_id, config, task, task.verifier_env, grading_gateway)
             return await grade_separately(
@@ -308,6 +331,7 @@ class DatasetTaskService:
                 gateway.url if gateway is not None else None,
                 task.response.image_user,
                 self._image_workdir,
+                artifact_sink=self._artifact_sink,
             )
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
@@ -622,7 +646,10 @@ class DatasetTaskService:
                 await upload_artifacts(task_id, staged, skipped, self._artifact_sink, say, folder)
             if not config.verifier.is_separate:
                 await discard_staged(services, staged)
-                async with _open_to_gateway(outer, stage_egress(config.verifier, config.environment), gateway):
+                async with (
+                    collect_verifier_output(task_id, sandbox, self._artifact_sink, folder),
+                    _open_to_gateway(outer, stage_egress(config.verifier, config.environment), gateway),
+                ):
                     return await grade_task(
                         task_id,
                         config,
@@ -654,6 +681,8 @@ class DatasetTaskService:
                 gateway.url if gateway is not None else None,
                 task.response.image_user,
                 self._image_workdir,
+                artifact_sink=self._artifact_sink,
+                artifact_folder=folder,
             )
         finally:
             await discard_staged(services, staged)
@@ -680,6 +709,15 @@ async def _open_to_gateway(
         yield
     finally:
         await apply_egress_policy(sandbox, policy)
+
+
+def _check_regradable(task_id: str, config: TaskConfig, cwd_from_image: Callable[[], bool]) -> None:
+    if config.steps or not config.verifier.is_separate:
+        raise InvalidTaskError(f"Task {task_id!r} has steps or grades in the agent's sandbox, so it can't be regraded")
+    if cwd_from_image() and any(not artifact.source.startswith("/") for artifact in config.artifacts):
+        raise InvalidTaskError(
+            f"Task {task_id!r} has a relative artifact path and takes its working directory from its image"
+        )
 
 
 def _find_step(config: TaskConfig, name: str) -> StepConfig:
@@ -720,9 +758,15 @@ def dataset_service(
     read_secret: SecretReader | None = None,
     artifact_sink: ArtifactSink | None = None,
     tasks: Mapping[str, str] | None = None,
+    *,
+    regrade_only: bool = False,
 ) -> DatasetTaskService:
     if isinstance(ref, LocalDataset):
-        return DatasetTaskService(LocalFolderSource(Path(ref.path)), read_secret, artifact_sink)
+        return DatasetTaskService(
+            LocalFolderSource(Path(ref.path)), read_secret, artifact_sink, regrade_only=regrade_only
+        )
     if ref.dataset_id is None or tasks is None:
         raise ValueError(f"The dataset {ref.benchmark}/{ref.dataset} has not been resolved to a version")
-    return DatasetTaskService(ArchiveSource(objects, ref.dataset_id, tasks), read_secret, artifact_sink)
+    return DatasetTaskService(
+        ArchiveSource(objects, ref.dataset_id, tasks), read_secret, artifact_sink, regrade_only=regrade_only
+    )

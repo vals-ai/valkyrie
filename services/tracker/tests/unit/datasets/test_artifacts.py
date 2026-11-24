@@ -1,6 +1,7 @@
 import io
 import os
 import tarfile
+from asyncio import CancelledError
 from collections.abc import AsyncIterable
 from pathlib import Path
 from typing import cast
@@ -8,16 +9,21 @@ from typing import cast
 import pytest
 from benchmark_service.sandbox.types import ExecResult, Sandbox
 
-from tests.unit.datasets.support import ShellSandbox
+from tests.unit.datasets.support import FakeSandbox, ShellSandbox
 from tracker.services.datasets import artifacts
 from tracker.services.datasets.artifacts import (
+    MissingSavedArtifactError,
     SkippedArtifact,
+    collect_verifier_output,
     discard_staged,
     run_collect_hooks,
+    saved_artifacts,
     stage_artifacts,
     upload_artifacts,
 )
 from tracker.services.datasets.config import ArtifactConfig, CollectConfig
+from tracker.local.storage import FilesystemObjectStore
+from tracker.runtime.artifacts import task_artifact_key
 
 
 @pytest.fixture
@@ -33,6 +39,90 @@ def member_names(archive: bytes) -> list[str]:
 
 def staging_folders(tmp_path: Path) -> list[Path]:
     return list(tmp_path.glob("valkyrie-artifacts-*"))
+
+
+@pytest.mark.description("Saved regrade inputs prefer declared artifacts and fall back only for absolute sources.")
+class TestSavedArtifacts:
+    @pytest.mark.description("A missing absolute input reads the legacy agent archive with its full source root.")
+    async def test_legacy_fallback(self, tmp_path: Path) -> None:
+        objects = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+        key = task_artifact_key("old-run", "task-1", "agent_output.tar.gz")
+        await objects.put_bytes(key, b"legacy archive")
+
+        staged, skipped = await saved_artifacts(
+            objects, "old-run", "task-1", [ArtifactConfig(source="/workspace/output", destination="recording")], "/app"
+        )
+
+        assert skipped == []
+        (artifact,) = staged
+        assert (artifact.source, artifact.archive_path, artifact.archive_root) == (
+            "/workspace/output",
+            key,
+            "workspace/output",
+        )
+        assert b"".join([chunk async for chunk in artifact.read()]) == b"legacy archive"
+
+    @pytest.mark.description("A declared archive or absence marker takes precedence over legacy output.")
+    @pytest.mark.parametrize("suffix", [".tar.gz", ".absent"])
+    async def test_declared_precedence(self, tmp_path: Path, suffix: str) -> None:
+        objects = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+        await objects.put_bytes(task_artifact_key("old-run", "task-1", "agent_output.tar.gz"), b"legacy")
+        key = task_artifact_key("old-run", "task-1", f"artifacts/recording{suffix}")
+        await objects.put_bytes(key, b"declared")
+
+        staged, skipped = await saved_artifacts(
+            objects, "old-run", "task-1", [ArtifactConfig(source="/workspace/output", destination="recording")], "/app"
+        )
+
+        if suffix == ".absent":
+            assert staged == []
+            assert len(skipped) == 1 and skipped[0].absent
+        else:
+            assert skipped == []
+            (artifact,) = staged
+            assert artifact.archive_path == key and artifact.archive_root is None
+            assert b"".join([chunk async for chunk in artifact.read()]) == b"declared"
+
+    @pytest.mark.description("A missing input still fails when its source is relative or no legacy output exists.")
+    @pytest.mark.parametrize("source,legacy", [("output", True), ("/workspace/output", False)])
+    async def test_missing_input(self, tmp_path: Path, source: str, legacy: bool) -> None:
+        objects = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+        if legacy:
+            await objects.put_bytes(task_artifact_key("old-run", "task-1", "agent_output.tar.gz"), b"legacy")
+
+        with pytest.raises(MissingSavedArtifactError, match=f"Run old-run saved no artifact {source} for task task-1"):
+            await saved_artifacts(objects, "old-run", "task-1", [ArtifactConfig(source=source)], "/app")
+
+    @pytest.mark.description("A legacy fallback rejects exclusions and non-main service artifacts.")
+    @pytest.mark.parametrize(
+        "artifact",
+        [
+            ArtifactConfig(source="/workspace/output", exclude=["*.json"]),
+            ArtifactConfig(source="/workspace/output", service="database"),
+        ],
+    )
+    async def test_legacy_fallback_restrictions(self, tmp_path: Path, artifact: ArtifactConfig) -> None:
+        objects = FilesystemObjectStore(tmp_path / "objects", tmp_path / "staging")
+        await objects.put_bytes(task_artifact_key("old-run", "task-1", "agent_output.tar.gz"), b"legacy")
+
+        with pytest.raises(MissingSavedArtifactError, match="Run old-run saved no artifact"):
+            await saved_artifacts(objects, "old-run", "task-1", [artifact], "/app")
+
+
+@pytest.mark.description("Cancelled grading propagates cancellation without staging or uploading verifier output.")
+async def test_cancelled_grading_skips_verifier_snapshot() -> None:
+    sandbox = FakeSandbox()
+    cancellation = CancelledError("task deadline")
+
+    async def sink(_task_id: str, _name: str, _chunks: AsyncIterable[bytes]) -> None:
+        pytest.fail("Cancelled grading must not upload a snapshot")
+
+    with pytest.raises(CancelledError) as caught:
+        async with collect_verifier_output("task-a", cast(Sandbox, sandbox), sink):
+            raise cancellation
+
+    assert caught.value is cancellation
+    assert sandbox.commands == []
 
 
 @pytest.mark.description("Hooks snapshot state before artifacts are read, and never fail the task.")

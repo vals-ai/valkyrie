@@ -1,5 +1,17 @@
 # Changelog
 
+## v2026.11.24
+
+### Tracker
+
+- Allow regrades after the source run's agent-only secrets are deleted.
+- Report missing regrade grading secrets before creating a run.
+- Reject regrades of tasks that grade in the agent sandbox before creating a run.
+- Report a JSON secret missing a required key as a 400 with the command that fixes it.
+- Save each dataset task's grader output as `verifier_output.tar.gz` after grading.
+- Use your org's copy of a saved service secret before the shared one.
+- Regrade older runs from their saved agent output when a declared artifact wasn't saved.
+
 ## v2026.11.23
 
 ### CLI

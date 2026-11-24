@@ -19,6 +19,10 @@ from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
 from tracker.database.models import (
     Benchmark,
+    BenchmarkDefinition,
+    Dataset,
+    DatasetVersion,
+    DatasetVersionTask,
     Org,
 )
 from tracker.domain import BenchmarkStatus
@@ -34,9 +38,10 @@ from tracker.types import (
     StartBenchmarkRequest,
 )
 from tracker.services.benchmarks import start_benchmark_request_to_benchmark
+from tracker.services.datasets.ref import HostedDataset
 from tracker.services.runs.start import (
     _parse_queued_execution,  # pyright: ignore[reportPrivateUsage]
-    _task_secret_reader,
+    task_secret_reader,
     process_benchmark,
 )
 
@@ -114,7 +119,7 @@ async def test_execution_runtime_resolves_org_secrets(
     ]
 
     monkeypatch.setattr("tracker.services.runs.start.AUTH_REQUIRED", True)
-    read_dataset_secret = _task_secret_reader(request, runtime, org)
+    read_dataset_secret = task_secret_reader(request, runtime, org)
 
     assert await read_dataset_secret("dataset-config#FIELD") == "shared-field"
     assert [call.args[0] for call in store.get.await_args_list] == [f"{prefix}dataset-config", "dataset-config"]
@@ -435,6 +440,65 @@ async def test_managed_execution_completes_with_the_deployment_runtime(
     assert calls[-2:] == ["s3-final-upload", "lambda-post-run"]
     finalized_span = next(attributes for name, attributes in spans if name == "run.finalized")
     assert finalized_span["status"] == "FINISHED"
+
+
+@pytest.mark.description(
+    "A dataset run with an underscore in its name reports provider failures instead of hostname errors."
+)
+@pytest.mark.parametrize("regraded", [False, True])
+async def test_dataset_execution_accepts_resource_names(
+    regraded: bool,
+    contract: AgentContractRequest,
+    aws_runtime: AWSRuntime,
+    control_postgres_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    process_benchmark_env: None,
+    bound_controls: Any,
+) -> None:
+    definition = BenchmarkDefinition(org_id=TEST_ORG_ID, name="my_benchmark")
+    control_postgres_session.add(definition)
+    control_postgres_session.flush()
+    dataset = Dataset(benchmark_definition_id=definition.id, name="default")
+    control_postgres_session.add(dataset)
+    control_postgres_session.flush()
+    version = DatasetVersion(dataset_id=dataset.id, revision=1, digest="sha256:" + "a" * 64, task_count=2)
+    control_postgres_session.add(version)
+    control_postgres_session.flush()
+    control_postgres_session.add_all(
+        DatasetVersionTask(version_id=version.id, task_id=task_id, digest="sha256:" + "a" * 64, size_bytes=1)
+        for task_id in _TASK_IDS
+    )
+    ref = HostedDataset(
+        benchmark="my_benchmark", dataset="default", dataset_id=dataset.id, revision=1, digest=version.digest
+    )
+    request = _managed_request(contract.model_copy(update={"secrets": {}})).model_copy(
+        update={"benchmark_name": "my_benchmark", "dataset_ref": ref}
+    )
+    benchmark = _persist_benchmark(control_postgres_session, request)
+    if regraded:
+        benchmark.arguments = benchmark.arguments.model_copy(update={"regraded_from_run_id": uuid4()})
+        control_postgres_session.add(benchmark)
+        control_postgres_session.commit()
+
+    def deployment_runtime(_org_id: UUID, properties: AWSResources | None = None) -> AWSRuntime:
+        return aws_runtime
+
+    monkeypatch.setattr("tracker.aws.services.deployment_aws_runtime", deployment_runtime)
+    monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", AsyncMock())
+    monkeypatch.setattr(
+        RuntimeServices,
+        "get_sandbox_provider_config",
+        AsyncMock(side_effect=RuntimeError("provider configuration unavailable")),
+    )
+
+    await process_benchmark(
+        execution_context_json=_execution_context(request, benchmark.id),
+        **bound_controls(benchmark, session=control_postgres_session),
+    )
+
+    control_postgres_session.refresh(benchmark)
+    assert benchmark.status == BenchmarkStatus.ERROR
+    assert "provider configuration unavailable" in (benchmark.error_message or "")
 
 
 @pytest.mark.description("Managed execution checks its AWS dependencies in order before it starts.")

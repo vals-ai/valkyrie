@@ -1,4 +1,5 @@
 from typing import cast
+from uuid import uuid4
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,8 +8,10 @@ from benchmark_service.sandbox.modal import ModalProviderConfig
 from tracker.aws.clients import AWSClientProvider
 from tracker.aws.runtime import AWSResources, AWSRuntime
 from tracker.aws.services import CloudRuntimeFactory
-from tracker.exceptions import InvalidSandboxConfigurationError
+from tracker.exceptions import InvalidSandboxConfigurationError, SecretNotFoundError
 from tracker.aws.secrets import SecretsManagerStore
+from tracker.aws.cloudwatch_logs import CloudWatchBenchmarkLogSink
+from tracker.types import AgentContractRequest, StartBenchmarkRequest
 
 
 @pytest.mark.description("Read the persisted secret only when sandbox configuration is needed.")
@@ -42,3 +45,17 @@ async def test_read_only_runtime_needs_no_provider_credentials() -> None:
     with pytest.raises(InvalidSandboxConfigurationError, match="provider secret name"):
         await runtime.get_sandbox_provider_config()
     assert clients.mock_calls == []
+
+
+@pytest.mark.description("A normal start still requires the agent credentials during cloud runtime preparation.")
+async def test_start_still_requires_agent_secrets(monkeypatch: pytest.MonkeyPatch, aws_runtime: AWSRuntime) -> None:
+    monkeypatch.setattr(CloudWatchBenchmarkLogSink, "create_benchmark", AsyncMock())
+    monkeypatch.setattr(SecretsManagerStore, "get", AsyncMock(side_effect=SecretNotFoundError("deleted-agent-key")))
+    runtime = CloudRuntimeFactory.create_runtime(aws_runtime)
+    request = StartBenchmarkRequest(
+        benchmark_name="swe-bench",
+        contract=AgentContractRequest(name="agent", secrets={"AGENT_KEY": "deleted-agent-key"}),
+    )
+
+    with pytest.raises(SecretNotFoundError, match="deleted-agent-key"):
+        await runtime.prepare_execution(request, uuid4())

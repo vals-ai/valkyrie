@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import shlex
+import tarfile
 import zipfile
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
@@ -110,6 +111,23 @@ class FakeSandbox:
             return ExecResult(exit_code=0, output=f"{self.process_cwd}\n")
         if command.startswith("test -L"):
             return ExecResult(exit_code=1)
+        if command.startswith("sh -c ") and "exec tar -czf" in command:
+            words = shlex.split(shlex.split(command)[2])
+            target = words[words.index("-czf") + 1]
+            if target not in self.files:
+                source = words[words.index("-C") + 1].rstrip("/") + "/" + words[-1]
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+                    directory = tarfile.TarInfo(words[-1])
+                    directory.type = tarfile.DIRTYPE
+                    archive.addfile(directory)
+                    for path, content in self.files.items():
+                        if path.startswith(source + "/"):
+                            member = tarfile.TarInfo(path.removeprefix(source.rsplit("/", 1)[0] + "/"))
+                            member.size = len(content)
+                            archive.addfile(member, io.BytesIO(content))
+                self.files[target] = buffer.getvalue()
+            return ExecResult(exit_code=0)
         if command.startswith("rm -f "):
             for path in shlex.split(command)[2:]:
                 self.files.pop(path, None)

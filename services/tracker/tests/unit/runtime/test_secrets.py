@@ -2,7 +2,7 @@ from collections.abc import Mapping
 
 import pytest
 
-from tracker.exceptions import SecretsError
+from tracker.exceptions import SecretConfigurationError
 from tracker.runtime.secrets import SecretValue, resolve_secrets
 
 
@@ -35,12 +35,16 @@ async def test_resolve_secrets_requires_and_stringifies_object_members() -> None
     }
 
 
-@pytest.mark.description("A missing key in an object secret keeps its error.")
-async def test_resolve_secrets_preserves_missing_object_key_error() -> None:
+@pytest.mark.description("A missing key in an object secret is a configuration error that names the key and the fix.")
+async def test_resolve_secrets_reports_missing_object_key_as_configuration() -> None:
     store = RecordingSecretStore({"shared": {"OTHER": "value"}})
 
-    with pytest.raises(SecretsError, match="Key 'TOKEN' not found"):
+    with pytest.raises(SecretConfigurationError) as error:
         await resolve_secrets({"TOKEN": "shared"}, store)
+
+    assert error.value.args[0] == (
+        "Key 'TOKEN' not found in JSON secret 'shared'. Add it to the JSON value. Run `valkyrie secret set shared`."
+    )
 
 
 @pytest.mark.description("Secret values that are not objects are turned into strings.")

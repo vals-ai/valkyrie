@@ -15,7 +15,7 @@ from tracker.exceptions import (
 )
 from tracker.runtime.secrets import SecretValue, secret_display_name
 from tracker.runtime.services import RuntimeServices
-from tracker.services.runs.start import _task_secret_reader
+from tracker.services.runs.start import task_secret_reader
 from tracker.database.models import Org
 from tracker.secret_access import (
     OrgSecretStore,
@@ -96,7 +96,7 @@ async def test_dataset_fallback_preserves_overlapping_contract_secret(
     source.get.reset_mock()
     runtime_services.secrets = store
     monkeypatch.setattr("tracker.services.runs.start.AUTH_REQUIRED", True)
-    reader = _task_secret_reader(
+    reader = task_secret_reader(
         RunExecutionRequest(benchmark_name="swebench", contract=contract),
         runtime_services,
         OrgContext(id=_ORG_ID, name="internal.example", storage_key="test-bucket"),
@@ -322,3 +322,15 @@ def test_project_service_gateway_key_is_selected_for_a_hosted_run(monkeypatch: p
 
     assert selected_project_gateway_reference(names, org, reference, "swebench", None) == reference
     assert selected_project_gateway_reference(names, org, reference.replace("aa", "zz"), "swebench", None) is None
+
+
+@pytest.mark.description("A dataset project key does not depend on its benchmark name being a service hostname.")
+def test_dataset_gateway_key_accepts_resource_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "GATEWAY_KEY_ORGS", frozenset({"internal.example"}))
+    reference = f"valkyrie/tenants/{_ORG_ID}/projects/gateway-keys/00000000-0000-0000-0000-0000000000aa"
+    org = Org(id=_ORG_ID, name="internal.example")
+    names = {"MODEL_GATEWAY_URL": reference, "MODEL_GATEWAY_API_KEY": reference}
+
+    selected = selected_project_gateway_reference(names, org, reference, "my_benchmark", None, dataset_task=True)
+
+    assert selected == reference
