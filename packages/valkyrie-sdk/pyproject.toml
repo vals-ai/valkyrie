@@ -1,13 +1,13 @@
 [project]
 name = "valkyrie-sdk"
-version = "0.45.2"
+version = "0.45.3"
 description = "Async Python SDK for managing Valkyrie benchmark runs"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
-  "filelock>=3.20,<4",
+  "filelock>=3.20,<5",
   "httpx>=0.28.1,<1",
   "pathspec>=1.0.3,<2",
   "pydantic>=2,<3",

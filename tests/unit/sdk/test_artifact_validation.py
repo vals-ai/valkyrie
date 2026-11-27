@@ -23,7 +23,7 @@ Version: {SDK_VERSION}
 License-Expression: AGPL-3.0-only
 License-File: LICENSE
 Requires-Python: >=3.12
-Requires-Dist: filelock<4,>=3.20
+Requires-Dist: filelock<5,>=3.20
 Requires-Dist: httpx<1,>=0.28.1
 Requires-Dist: pathspec<2,>=1.0.3
 Requires-Dist: pydantic<3,>=2

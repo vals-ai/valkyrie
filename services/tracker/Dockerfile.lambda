@@ -12,7 +12,7 @@ COPY services/tracker/pyproject.toml services/tracker/uv.lock ./
 COPY packages/create-benchmark-service /packages/create-benchmark-service
 
 RUN uv export --locked --no-dev --no-emit-project --no-editable --output-file requirements.txt \
-    && uv pip install --system --no-config --requirements requirements.txt \
+    && uv pip install --system --no-config --no-deps --requirements requirements.txt \
     && rm requirements.txt
 
 COPY services/tracker/src/tracker ./tracker

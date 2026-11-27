@@ -57,6 +57,7 @@ build-backend = "hatchling.build"
 required-version = ">=0.13.5"
 exclude-newer = "7 days"
 exclude-newer-package = { certifi = false, valkyrie-sdk = false }
+override-dependencies = ["filelock>=4.2.1"]
 prerelease = "allow"
 default-groups = ["dev", "database"]
 # Editable installs copy force-included executor_protocol.py and metric_process.py, so rebuild when they change.

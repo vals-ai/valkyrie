@@ -1,5 +1,11 @@
 # Changelog
 
+## v2026.11.27
+
+### SDK 0.45.3
+
+- Allow filelock 4.x.
+
 ## v2026.11.24.2
 
 ### CLI
